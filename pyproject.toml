@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "machete"
 version = "0.1"
 description = "A library of ThunderKittens kernels"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 readme = "README.md"
 license = { file = "LICENSE" }
 dynamic = ["dependencies"]
