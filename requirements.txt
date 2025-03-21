@@ -1,0 +1,4 @@
+filelock
+torch>=2.5.0
+ninja
+jinja2
