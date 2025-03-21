@@ -36,7 +36,7 @@ def _flash_attn_forward(q: torch.Tensor,
                         k: torch.Tensor,
                         v: torch.Tensor,
                         causal: bool,
-                        sm_scale: float) -> torch.Tensor:
+                        sm_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     func_op = _get_flash_attention_ops()
     o, l_vec = func_op.fwd(q, k, v, causal, sm_scale)
@@ -48,7 +48,7 @@ def _flash_attn_forward_fake(q: torch.Tensor,
                             k: torch.Tensor,
                             v: torch.Tensor,
                             causal: bool,
-                            sm_scale: float) -> torch.Tensor:
+                            sm_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     o = torch.empty_like(q)
@@ -65,7 +65,7 @@ def _flash_attn_backward(do:torch.Tensor,
                          v: torch.Tensor,
                          l_vec: torch.Tensor,
                          causal: bool,
-                         sm_scale: float) -> torch.Tensor:
+                         sm_scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     func_op = _get_flash_attention_ops()
 
@@ -79,13 +79,13 @@ def _flash_attn_backward_fake(do: torch.Tensor,
                               v: torch.Tensor,
                               l_vec: torch.Tensor,
                               causal: bool,
-                              sm_scale: float) -> torch.Tensor:
+                              sm_scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    return dq, dk, dv, None, None
+    return dq, dk, dv
 
 
 class FlashAttention(torch.autograd.Function):
