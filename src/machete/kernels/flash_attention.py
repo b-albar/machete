@@ -39,7 +39,7 @@ def _flash_attn_forward(q: torch.Tensor,
                         sm_scale: float) -> torch.Tensor:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     func_op = _get_flash_attention_ops()
-    o, l_vec = func_op.fwd(q, k, v, causal)
+    o, l_vec = func_op.fwd(q, k, v, causal, sm_scale)
 
     return o, l_vec
 
@@ -92,23 +92,25 @@ class FlashAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
-        ctx.save_for_backward(q, k, v)
-        ctx.causal = causal
-        ctx.sm_scale = sm_scale
+        if sm_scale is None:
+            sm_scale = q.size(-1) ** (-0.5)
 
         o, l_vec = torch.ops.machete.flash_attention_3_fwd(q, k, v, causal, sm_scale)
-        ctx.save_for_backward(o, l_vec)
+
+        ctx.save_for_backward(q, k, v, o, l_vec)
+        ctx.causal = causal
+        ctx.sm_scale = sm_scale
 
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, l_vec = ctx.saved_tensors
+        q, k, v, o, l_vec = ctx.saved_tensors
         causal = ctx.causal
         sm_scale = ctx.sm_scale
 
         # Placeholder for backward implementation
-        dq, dk, dv = torch.ops.machete.flash_attention_3_bwd(q, k, v, l_vec, do, causal, sm_scale)
+        dq, dk, dv = torch.ops.machete.flash_attention_3_bwd(do, o, q, k, v, l_vec, causal, sm_scale)
 
         return dq, dk, dv, None, None
 
