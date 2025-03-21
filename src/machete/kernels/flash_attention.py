@@ -3,6 +3,7 @@ from machete.jit.jit import load_cuda_ops
 from typing import Optional, Callable
 
 from machete.jit.jit import get_cuda_arch
+from machete.jit.jit_env import ROOT_DIR
 from machete.utils.utils import maybe_contiguous
 
 
@@ -15,14 +16,14 @@ def _get_flash_attention_ops():
     if _flash_attention_ops is None:
         arch = get_cuda_arch()
 
-        if arch == "90a":
+        if arch == "90" or arch == "90a":
             _flash_attention_ops = load_cuda_ops(
                 "flash_attention_3",
                 arch_target="hopper",
                 sources=[
-                    "csrc/kernels/flash-attention/h100/h100_fwd.cu",
-                    "csrc/kernels/flash-attention/h100/h100_bwd.cu",
-                    "csrc/kernels/flash-attention/h100/h100_interface.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_fwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_bwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_interface.cu",
                 ],
             )
         else:
