@@ -53,7 +53,7 @@ def load_cuda_ops(
         TK_INCLUDE_DIR,
     ]
 
-    lock = FileLock(JIT_DIR + "/" + f"{name}.lock", thread_local=False)
+    lock = FileLock(JIT_DIR + "/" + f"{name}.lock")
     with lock:
 
         mod = torch_cpp_ext.load(
