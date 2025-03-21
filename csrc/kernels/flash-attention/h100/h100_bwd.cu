@@ -68,6 +68,8 @@ compute_bwd_loop(
         auto &og_smem, auto &ds_smem, auto &l_smem, auto &d_smem,
         int qo_idx, int q_start, int tic, int toc, const float sm_scale)
 {
+    const float LN2_INV = 1.44269504089f;
+
     wait(vec_b[tic], ((qo_idx - q_start)/2)%2);
     stream_tile(s_block_t, l_smem, tic);
     wait(q_b[tic], ((qo_idx - q_start)/2)%2);
@@ -80,7 +82,7 @@ compute_bwd_loop(
     warpgroup::mma_commit_group();
     warpgroup::mma_async_wait();
 
-    mul(s_block_t, s_block_t, 1.44269504089f*sm_scale);
+    mul(s_block_t, s_block_t, LN2_INV * sm_scale);
 
     if constexpr (is_causal) { causal_mask<tile_h_qo, tile_h>(s_block_t, qo_idx); }
 

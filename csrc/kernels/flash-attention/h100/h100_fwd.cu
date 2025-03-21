@@ -29,6 +29,9 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     int kv_head_idx = blockIdx.y / g.hr;
     int seq_idx     = blockIdx.x * CONSUMER_WARPGROUPS;
 
+    const float LN2 = 0.69314718056f;
+    const float LN2_INV = 1.44269504089f;
+
     __shared__ kittens::semaphore qsmem_semaphore, k_smem_arrived[K::stages], v_smem_arrived[K::stages], compute_done[K::stages];
     if (threadIdx.x == 0) {
         init_semaphore(qsmem_semaphore, 0, 1);
@@ -107,7 +110,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::mm_ABt(att_block, q_smem[warpgroupid], k_smem[(kv_idx)%K::stages]);
 
             copy(max_vec_last_scaled, max_vec);
-            mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f*g.sm_scale);
+            mul(max_vec_last_scaled, max_vec_last_scaled, LN2_INV * g.sm_scale);
 
             warpgroup::mma_async_wait();
 
@@ -131,8 +134,8 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
             row_max(max_vec, att_block, max_vec);
 
-            mul(att_block, att_block,    1.44269504089f*g.sm_scale);
-            mul(max_vec_scaled, max_vec, 1.44269504089f*g.sm_scale);
+            mul(att_block, att_block, LN2_INV * g.sm_scale);
+            mul(max_vec_scaled, max_vec, LN2_INV * g.sm_scale);
 
             sub_row(att_block, att_block, max_vec_scaled);
             exp2(att_block, att_block);
@@ -161,12 +164,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             tma::store_async(g.o, o_smem[warpgroupid], o_tile_idx);
         }
 
-        mul(max_vec_scaled, max_vec_scaled, 0.69314718056f);
+        mul(max_vec_scaled, max_vec_scaled, LN2);
         log(norm_vec, norm_vec);
         add(norm_vec, norm_vec, max_vec_scaled);
 
-        if constexpr (D == 64) { mul(norm_vec, norm_vec, -8.0f); }
-        else                   { mul(norm_vec, norm_vec, -11.313708499f); }
+        mul(norm_vec, norm_vec, -1.0 * D * g.sm_scale);
 
         warpgroup::store(l_smem[warpgroupid], norm_vec);
         warpgroup::sync(warpgroupid+4);
