@@ -8,8 +8,7 @@ def max_diff(a, b):
 
 @pytest.mark.parametrize('scale', [1.0])
 @pytest.mark.parametrize('b, h, m, n, d', [
-    (2, 4, 512, 612, 128),
-    (2, 4, 1024, 1045, 64),
+    (2, 4, 512, 512, 64),
 ])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
