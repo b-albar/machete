@@ -37,10 +37,16 @@ def load_cuda_ops(
     print(f"Loading JIT ops: {name}")
 
     if arch_target == "ada":
+        if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
         cuda_cflags.append("-DKITTENS_4090")
     elif arch_target == "ampere":
+        if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
         cuda_cflags.append("-DKITTENS_A100")
     elif arch_target == "hopper":
+        if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
         cuda_cflags.append("-DKITTENS_HOPPER")
 
     build_directory = JIT_DIR + "/" + name
