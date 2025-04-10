@@ -27,3 +27,4 @@ JIT_DIR = os.environ.get("MACHETE_JIT_DIR", "/tmp/machete_jit")
 
 ROOT_DIR = pathlib.Path(__file__).parent.parent.parent.parent
 TK_INCLUDE_DIR = ROOT_DIR / "csrc/ThunderKittens/include"
+MACHETE_INCLUDE_DIR = ROOT_DIR / "csrc/utils"

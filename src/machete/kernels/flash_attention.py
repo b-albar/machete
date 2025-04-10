@@ -18,7 +18,7 @@ def _get_flash_attention_ops():
 
         if arch == "90" or arch == "90a":
             _flash_attention_ops = load_cuda_ops(
-                "flash_attention_3",
+                "flash_attention",
                 arch_target="hopper",
                 sources=[
                     ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_fwd.cu",
@@ -26,12 +26,22 @@ def _get_flash_attention_ops():
                     ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_interface.cu",
                 ],
             )
+        elif arch == "80":
+            _flash_attention_ops = load_cuda_ops(
+                "flash_attention",
+                arch_target="ampere",
+                sources=[
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_fwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_bwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_interface.cu",
+                ],
+            )
         else:
             raise ValueError(f"Unsupported architecture: {arch}")
 
     return _flash_attention_ops
 
-@torch.library.custom_op("machete::flash_attention_3_fwd", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("machete::flash_attention_fwd", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(q: torch.Tensor,
                         k: torch.Tensor,
                         v: torch.Tensor,
@@ -43,7 +53,7 @@ def _flash_attn_forward(q: torch.Tensor,
 
     return o, l_vec
 
-@torch.library.register_fake("machete::flash_attention_3_fwd")
+@torch.library.register_fake("machete::flash_attention_fwd")
 def _flash_attn_forward_fake(q: torch.Tensor,
                             k: torch.Tensor,
                             v: torch.Tensor,
@@ -57,7 +67,7 @@ def _flash_attn_forward_fake(q: torch.Tensor,
     return o, l_vec
 
 
-@torch.library.custom_op("machete::flash_attention_3_bwd", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("machete::flash_attention_bwd", mutates_args=(), device_types="cuda")
 def _flash_attn_backward(do:torch.Tensor,
                          o: torch.Tensor,
                          q: torch.Tensor,
@@ -71,7 +81,7 @@ def _flash_attn_backward(do:torch.Tensor,
 
     return func_op.bwd(q, k, v, o, l_vec, do, causal, sm_scale)
 
-@torch.library.register_fake("machete::flash_attention_3_bwd")
+@torch.library.register_fake("machete::flash_attention_bwd")
 def _flash_attn_backward_fake(do: torch.Tensor,
                               o: torch.Tensor,
                               q: torch.Tensor,
@@ -95,7 +105,7 @@ class FlashAttention(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = q.size(-1) ** (-0.5)
 
-        o, l_vec = torch.ops.machete.flash_attention_3_fwd(q, k, v, causal, sm_scale)
+        o, l_vec = torch.ops.machete.flash_attention_fwd(q, k, v, causal, sm_scale)
 
         ctx.save_for_backward(q, k, v, o, l_vec)
         ctx.causal = causal
@@ -110,7 +120,7 @@ class FlashAttention(torch.autograd.Function):
         sm_scale = ctx.sm_scale
 
         # Placeholder for backward implementation
-        dq, dk, dv = torch.ops.machete.flash_attention_3_bwd(do, o, q, k, v, l_vec, causal, sm_scale)
+        dq, dk, dv = torch.ops.machete.flash_attention_bwd(do, o, q, k, v, l_vec, causal, sm_scale)
 
         return dq, dk, dv, None, None
 

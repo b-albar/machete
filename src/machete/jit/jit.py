@@ -1,11 +1,10 @@
 from typing import List, Optional, Union, Callable, Literal
 from pathlib import Path
 import re
-import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 import os
 from filelock import FileLock
-from .jit_env import CFLAGS, CUDA_CFLAGS, LD_FLAGS, JIT_DIR, TK_INCLUDE_DIR
+from .jit_env import CFLAGS, CUDA_CFLAGS, LD_FLAGS, JIT_DIR, TK_INCLUDE_DIR, MACHETE_INCLUDE_DIR
 
 def get_cuda_arch() -> str:
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
@@ -51,6 +50,7 @@ def load_cuda_ops(
         extra_include_paths = []
     extra_include_paths += [
         TK_INCLUDE_DIR,
+        MACHETE_INCLUDE_DIR
     ]
 
     lock = FileLock(JIT_DIR + "/" + f"{name}.lock")
