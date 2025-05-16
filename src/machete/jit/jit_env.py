@@ -3,7 +3,8 @@ import pathlib
 
 CFLAGS = [
     "-O3",
-    "-Wno-switch-bool"
+    "-Wno-switch-bool",
+    "-g"
 ]
 
 CUDA_CFLAGS = [

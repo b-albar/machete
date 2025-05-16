@@ -21,6 +21,9 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
     o_torch = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=False)
     o_hyp = flash_attention(q, k, v, causal, scale)
 
-    torch_max_diff = max_diff(o_torch, o_ref)
-    machete_max_diff = max_diff(o_hyp, o_ref)
-    assert machete_max_diff <= 2 * torch_max_diff + 1e-5
+    machete_max_diff = max_diff(o_ref, o_hyp)
+    ref_max_diff = max_diff(o_ref, o_torch)
+
+    assert machete_max_diff < 2 * ref_max_diff
+
+test_attention_fwd(1, 1, 128, 128, 64, False, torch.bfloat16, 1.0)

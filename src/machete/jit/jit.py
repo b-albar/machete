@@ -1,6 +1,7 @@
 from typing import List, Optional, Union, Callable, Literal
 from pathlib import Path
 import re
+import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 import os
 from filelock import FileLock
@@ -11,6 +12,9 @@ def get_cuda_arch() -> str:
         arch = re.search(r"compute_(\d+)", cuda_arch_flags).group(1)
         return arch
 
+def get_gpu_device(device_id: int) -> str:
+    return torch.cuda.get_device_name(device_id)
+
 def load_cuda_ops(
     name: str,
     sources: List[Union[str, Path]],
@@ -18,7 +22,7 @@ def load_cuda_ops(
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[str]] = None,
-    arch_target: Literal["ada", "ampere", "hopper"] = "hopper",
+    gpu_target: Literal["4090", "a100", "h100", "5070"] = "h100",
     verbose: bool = False,
 ) -> Callable:
     if extra_cflags is None:
@@ -36,18 +40,19 @@ def load_cuda_ops(
         ldflags += extra_ldflags
     print(f"Loading JIT ops: {name}")
 
-    if arch_target == "ada":
+    if gpu_target == "4090":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
-        cuda_cflags.append("-DKITTENS_4090")
-    elif arch_target == "ampere":
+    elif gpu_target == "a100":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
-        cuda_cflags.append("-DKITTENS_A100")
-    elif arch_target == "hopper":
+    elif gpu_target == "h100":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
         cuda_cflags.append("-DKITTENS_HOPPER")
+    elif gpu_target == "5070":
+        if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
 
     build_directory = JIT_DIR + "/" + name
     os.makedirs(build_directory, exist_ok=True)

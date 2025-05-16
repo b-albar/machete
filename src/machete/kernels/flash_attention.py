@@ -2,7 +2,7 @@ import torch
 from machete.jit.jit import load_cuda_ops
 from typing import Optional, Callable
 
-from machete.jit.jit import get_cuda_arch
+from machete.jit.jit import get_cuda_arch, get_gpu_device
 from machete.jit.jit_env import ROOT_DIR
 from machete.utils.utils import maybe_contiguous
 
@@ -14,22 +14,32 @@ def _get_flash_attention_ops():
     global _flash_attention_ops
 
     if _flash_attention_ops is None:
-        arch = get_cuda_arch()
+        device = get_gpu_device(0)
 
-        if arch == "90" or arch == "90a":
+        if "H100" in device:
             _flash_attention_ops = load_cuda_ops(
                 "flash_attention",
-                arch_target="hopper",
+                gpu_target="h100",
                 sources=[
                     ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_fwd.cu",
                     ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_bwd.cu",
                     ROOT_DIR / "csrc/kernels/flash-attention/h100/h100_interface.cu",
                 ],
             )
-        elif arch == "80":
+        elif "A100" in device:
             _flash_attention_ops = load_cuda_ops(
                 "flash_attention",
-                arch_target="ampere",
+                gpu_target="a100",
+                sources=[
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_fwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_bwd.cu",
+                    ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_interface.cu",
+                ],
+            )
+        elif "5070" in device:
+            _flash_attention_ops = load_cuda_ops(
+                "flash_attention",
+                gpu_target="5070",
                 sources=[
                     ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_fwd.cu",
                     ROOT_DIR / "csrc/kernels/flash-attention/a100/a100_bwd.cu",
@@ -37,7 +47,7 @@ def _get_flash_attention_ops():
                 ],
             )
         else:
-            raise ValueError(f"Unsupported architecture: {arch}")
+            raise ValueError(f"Unsupported device type: {device}")
 
     return _flash_attention_ops
 

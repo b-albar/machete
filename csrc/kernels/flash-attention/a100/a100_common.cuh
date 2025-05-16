@@ -22,25 +22,39 @@ template<unsigned int D> struct bwd_attend_ker_tile_dims;
 // Forward tile dimensions specializations
 template<> struct fwd_attend_ker_tile_dims<64> {
     constexpr static int tile_width = (64);
-    constexpr static int qo_height = (4*16);
-    constexpr static int kv_height = (8*16);
-    constexpr static int stages = (4);
+    constexpr static int qo_height = (4*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int stages = (2);
+
+    using q_tile = st_bf<qo_height, tile_width>;
+    using k_tile = st_bf<kv_height, tile_width>;
+    using v_tile = st_bf<kv_height, tile_width>;
+    using l_col_vec = col_vec<st_fl<qo_height, tile_width>>;
+    using o_tile = st_bf<qo_height, tile_width>;
 };
 
 template<> struct fwd_attend_ker_tile_dims<128> {
     constexpr static int tile_width = (128);
-    constexpr static int qo_height = (4*16);
-    constexpr static int kv_height = (8*16);
+    constexpr static int qo_height = (2*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int kv_height = (1*kittens::TILE_ROW_DIM<bf16>);
     constexpr static int stages = (2);
+
+    using q_tile = st_bf<qo_height, tile_width>;
+    using k_tile = st_bf<kv_height, tile_width>;
+    using v_tile = st_bf<kv_height, tile_width>;
+    using l_col_vec = col_vec<st_fl<qo_height, tile_width>>;
+    using o_tile = st_bf<qo_height, tile_width>;
 };
 
 // Forward globals definition
 template<int D> struct fwd_globals {
-    using q_tile = st_bf<fwd_attend_ker_tile_dims<D>::qo_height, fwd_attend_ker_tile_dims<D>::tile_width>;
-    using k_tile = st_bf<fwd_attend_ker_tile_dims<D>::kv_height, fwd_attend_ker_tile_dims<D>::tile_width>;
-    using v_tile = st_bf<fwd_attend_ker_tile_dims<D>::kv_height, fwd_attend_ker_tile_dims<D>::tile_width>;
-    using l_col_vec = col_vec<st_fl<fwd_attend_ker_tile_dims<D>::qo_height, fwd_attend_ker_tile_dims<D>::tile_width>>;
-    using o_tile = st_bf<fwd_attend_ker_tile_dims<D>::qo_height, fwd_attend_ker_tile_dims<D>::tile_width>;
+    using ker_tile_dims = fwd_attend_ker_tile_dims<D>;
+
+    using q_tile = ker_tile_dims::q_tile;
+    using k_tile = ker_tile_dims::k_tile;
+    using v_tile = ker_tile_dims::v_tile;
+    using l_col_vec = ker_tile_dims::l_col_vec;
+    using o_tile = ker_tile_dims::o_tile;
 
     using q_gl = gl<bf16,  -1, -1, -1, -1, q_tile>;
     using k_gl = gl<bf16,  -1, -1, -1, -1, k_tile>;
@@ -48,46 +62,30 @@ template<int D> struct fwd_globals {
     using l_gl = gl<float, -1, -1, -1, -1, l_col_vec>;
     using o_gl = gl<bf16,  -1, -1, -1, -1, o_tile>;
 
-    q_gl q;
-    k_gl k;
-    v_gl v;
-    l_gl l;
-    o_gl o;
+    q_gl Qg;
+    k_gl Kg;
+    v_gl Vg;
+    l_gl Lg;
+    o_gl Og;
 
-    const int seq_len;
-    const int heads_ratio;
+    const int seqlen_k;
+    const int seqlen_q;
+    const int num_heads_k;
+    const int num_heads_q;
     const float sm_scale;
+
+    // Compute the maximum shared memory required for the forward pass
+    size_t get_smem_size() {
+        // Shared memory for K, V tiles
+        int k_smem_size = 2 * ker_tile_dims::stages * sizeof(k_tile);
+        int v_smem_size = 2 * ker_tile_dims::stages * sizeof(v_tile);
+
+        // Shared memory for l tile
+        int l_smem_size = FWD_NUM_WORKERS * sizeof(l_col_vec);
+
+        return k_smem_size + v_smem_size + l_smem_size;
+    }
 };
-
-// Common device utility functions
-__device__ static inline void
-stream_tile(auto &reg_tile, auto &smem_vec, int tic) {
-    #pragma unroll
-    for(int i = 0; i < 4; i++) {
-        int base_col = 16*i + 2*(kittens::laneid()%4);
-        reg_tile.tiles[0][i].data[0] = *(float2*)&smem_vec[tic][base_col + 0];
-        reg_tile.tiles[0][i].data[1] = *(float2*)&smem_vec[tic][base_col + 0];
-        reg_tile.tiles[0][i].data[2] = *(float2*)&smem_vec[tic][base_col + 8];
-        reg_tile.tiles[0][i].data[3] = *(float2*)&smem_vec[tic][base_col + 8];
-    }
-}
-
-__device__ static inline void
-stream_sub_tile(auto &reg_tile, auto &smem_vec, int tic) {
-    #pragma unroll
-    for(int i = 0; i < 4; i++) {
-        int base_col = 16*i + 2*(laneid()%4);
-        reg_tile.tiles[0][i].data[0] = base_ops::sub::template op<float2>(reg_tile.tiles[0][i].data[0], *(float2*)&smem_vec[tic][base_col + 0]);
-        reg_tile.tiles[0][i].data[1] = base_ops::sub::template op<float2>(reg_tile.tiles[0][i].data[1], *(float2*)&smem_vec[tic][base_col + 0]);
-        reg_tile.tiles[0][i].data[2] = base_ops::sub::template op<float2>(reg_tile.tiles[0][i].data[2], *(float2*)&smem_vec[tic][base_col + 8]);
-        reg_tile.tiles[0][i].data[3] = base_ops::sub::template op<float2>(reg_tile.tiles[0][i].data[3], *(float2*)&smem_vec[tic][base_col + 8]);
-    }
-}
-
-template<int tile_h_qo, int tile_h>
-__device__ static inline void
-causal_mask(auto &reg_tile, int qo_idx) {
-}
 
 // Forward declarations of kernel functions
 template<int D, bool is_causal>
