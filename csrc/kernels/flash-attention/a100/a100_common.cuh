@@ -88,7 +88,7 @@ template<int D> struct fwd_globals {
 };
 
 // Forward declarations of kernel functions
-template<int D, bool is_causal>
+template<int D, bool is_causal, bool is_even_nm>
 __global__ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g);
 
 } // namespace fa_a100
