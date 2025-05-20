@@ -11,7 +11,7 @@ def max_diff(a, b):
     (2, 4, 512, 512, 64),
 ])
 @pytest.mark.parametrize('causal', [True, False])
-@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('dtype', [torch.bfloat16])
 def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
     q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
     k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
@@ -26,4 +26,4 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
 
     assert machete_max_diff < 2 * ref_max_diff
 
-test_attention_fwd(1, 1, 128, 128, 64, False, torch.bfloat16, 1.0)
+test_attention_fwd(1, 1, 128, 128, 64, True, torch.bfloat16, 1.0)

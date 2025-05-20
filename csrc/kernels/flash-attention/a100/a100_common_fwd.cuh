@@ -1,5 +1,5 @@
-#ifndef A100_COMMON_CUH
-#define A100_COMMON_CUH
+#ifndef A100_FWD_COMMON_CUH
+#define A100_FWD_COMMON_CUH
 
 #include "kittens.cuh"
 #include <cooperative_groups.h>
@@ -14,13 +14,12 @@ namespace cg = cooperative_groups;
 constexpr int FWD_NUM_WORKERS = 4;
 
 // Forward declaration
-template<unsigned int D> struct fwd_attend_ker_tile_dims;
-template<unsigned int D> struct bwd_attend_ker_tile_dims;
+template<unsigned int D> struct fwd_ker_tile_dims;
 
 // Forward pass constants and types
 
 // Forward tile dimensions specializations
-template<> struct fwd_attend_ker_tile_dims<64> {
+template<> struct fwd_ker_tile_dims<64> {
     constexpr static int tile_width = (64);
     constexpr static int qo_height = (4*kittens::TILE_ROW_DIM<bf16>);
     constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
@@ -33,7 +32,7 @@ template<> struct fwd_attend_ker_tile_dims<64> {
     using o_tile = st_bf<qo_height, tile_width>;
 };
 
-template<> struct fwd_attend_ker_tile_dims<128> {
+template<> struct fwd_ker_tile_dims<128> {
     constexpr static int tile_width = (128);
     constexpr static int qo_height = (2*kittens::TILE_ROW_DIM<bf16>);
     constexpr static int kv_height = (1*kittens::TILE_ROW_DIM<bf16>);
@@ -48,7 +47,7 @@ template<> struct fwd_attend_ker_tile_dims<128> {
 
 // Forward globals definition
 template<int D> struct fwd_globals {
-    using ker_tile_dims = fwd_attend_ker_tile_dims<D>;
+    using ker_tile_dims = fwd_ker_tile_dims<D>;
 
     using q_tile = ker_tile_dims::q_tile;
     using k_tile = ker_tile_dims::k_tile;
@@ -93,4 +92,4 @@ __global__ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g);
 
 } // namespace fa_a100
 
-#endif // A100_COMMON_CUH
+#endif // A100_FWD_COMMON_CUH

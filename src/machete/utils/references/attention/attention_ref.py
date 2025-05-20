@@ -26,8 +26,6 @@ def attn_ref(q: torch.Tensor,
     ns = torch.arange(k.shape[2], device=q.device)
 
     p = torch.matmul(q, k.transpose(2, 3))
-    print("Attn 1", p[0, 0, :64, :32])
-    print("Attn 2", p[0, 0, 64:, :32])
     p *= sm_scale
     if b is not None:
         p += b

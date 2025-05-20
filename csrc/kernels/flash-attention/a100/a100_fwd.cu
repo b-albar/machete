@@ -1,4 +1,4 @@
-#include "a100_common.cuh"
+#include "a100_common_fwd.cuh"
 
 namespace fa_a100 {
 
@@ -43,7 +43,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     const int head = blockIdx.y;
     const int seq_idx = blockIdx.x * FWD_NUM_WORKERS + workerid;
 
-    using ker_tile_dims = fwd_attend_ker_tile_dims<HEAD_DIM>;
+    using ker_tile_dims = fwd_ker_tile_dims<HEAD_DIM>;
     using q_tile = ker_tile_dims::q_tile;
     using k_tile = ker_tile_dims::k_tile;
     using v_tile = ker_tile_dims::v_tile;
@@ -56,10 +56,10 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     // number of iterations for the kv loop
     int kv_iters;
     if constexpr (IS_CAUSAL) {
-        /*kv_iters = (seq_idx_q + ker_tile_dims::qo_height) / ker_tile_dims::kv_height;
-        kv_iters = min(kv_iters, kv_blocks - 1);*/
+        kv_iters = (seq_idx_q + ker_tile_dims::qo_height) / ker_tile_dims::kv_height;
+        kv_iters = min(kv_iters, kv_blocks - 1);
 
-        kv_iters = kv_blocks - 1;
+        //kv_iters = kv_blocks - 1;
     }
     else {
         kv_iters = kv_blocks - 1;
