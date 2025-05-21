@@ -50,45 +50,47 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     using l_col_vec = ker_tile_dims::l_col_vec;
     using o_tile = ker_tile_dims::o_tile;
 
-    const int seq_idx_q = seq_idx * ker_tile_dims::qo_height;
+    constexpr static int kv_height = ker_tile_dims::kv_height;
+    constexpr static int qo_height = ker_tile_dims::qo_height;
+    constexpr static int stages = ker_tile_dims::stages;
 
-    int kv_blocks = (g.seqlen_k + ker_tile_dims::kv_height - 1) / ker_tile_dims::kv_height;
+    const int seq_idx_q = seq_idx * qo_height;
+
+    int kv_blocks = (g.seqlen_k + kv_height - 1) / kv_height;
     // number of iterations for the kv loop
     int kv_iters;
     if constexpr (IS_CAUSAL) {
-        kv_iters = (seq_idx_q + ker_tile_dims::qo_height) / ker_tile_dims::kv_height;
-        kv_iters = min(kv_iters, kv_blocks - 1);
-
-        //kv_iters = kv_blocks - 1;
+        kv_iters = (g.seqlen_q + qo_height) / kv_height;
+        kv_iters = min(kv_iters, kv_blocks);
     }
     else {
-        kv_iters = kv_blocks - 1;
+        kv_iters = kv_blocks;
     }
 
     // divide the kv_iters by the group size
-    kv_iters = kv_iters / load_group::GROUP_WARPS;
+    kv_iters = kv_iters / LOAD_BLOCKS - 1;
 
     // shared memory allocation for k, v tiles
-    k_tile (&k_smem)[LOAD_BLOCKS][ker_tile_dims::stages] = al.allocate<k_tile, LOAD_BLOCKS, ker_tile_dims::stages>();
-    v_tile (&v_smem)[LOAD_BLOCKS][ker_tile_dims::stages] = al.allocate<v_tile, LOAD_BLOCKS, ker_tile_dims::stages>();
+    k_tile (&k_smem)[LOAD_BLOCKS][stages] = al.allocate<k_tile, LOAD_BLOCKS, stages>();
+    v_tile (&v_smem)[LOAD_BLOCKS][stages] = al.allocate<v_tile, LOAD_BLOCKS, stages>();
 
     // use k_smem for loading Q and O tiles
     q_tile (&q_smem)[FWD_NUM_WORKERS] = reinterpret_cast<q_tile(&)[FWD_NUM_WORKERS]>(k_smem);
     o_tile (&o_smem)[FWD_NUM_WORKERS] = reinterpret_cast<o_tile(&)[FWD_NUM_WORKERS]>(k_smem);
     l_col_vec (&l_smem)[FWD_NUM_WORKERS] = al.allocate<l_col_vec, FWD_NUM_WORKERS>();
 
-    using att_tile = st_fl<ker_tile_dims::qo_height, ker_tile_dims::kv_height>;
+    using att_tile = st_fl<qo_height, kv_height>;
     att_tile (&att_smem)[FWD_NUM_WORKERS] = reinterpret_cast<att_tile(&)[FWD_NUM_WORKERS]>(k_smem);
 
     // register allocation
-    rt_bf<ker_tile_dims::qo_height, HEAD_DIM, row_l> q_reg;
-    rt_bf<ker_tile_dims::kv_height, HEAD_DIM, row_l> k_reg;
-    rt_bf<ker_tile_dims::kv_height, HEAD_DIM, col_l> v_reg;
-    rt_fl<ker_tile_dims::qo_height, ker_tile_dims::kv_height, row_l> att_block;
-    rt_bf<ker_tile_dims::qo_height, ker_tile_dims::kv_height, row_l> att_block_mma;
-    rt_fl<ker_tile_dims::qo_height, HEAD_DIM, row_l> o_reg;
+    rt_bf<qo_height, HEAD_DIM, row_l> q_reg;
+    rt_bf<kv_height, HEAD_DIM, row_l> k_reg;
+    rt_bf<kv_height, HEAD_DIM, col_l> v_reg;
+    rt_fl<qo_height, kv_height, row_l> att_block;
+    rt_bf<qo_height, kv_height, row_l> att_block_mma;
+    rt_fl<qo_height, HEAD_DIM, row_l> o_reg;
 
-    col_vec<rt_fl<ker_tile_dims::qo_height, ker_tile_dims::kv_height>> max_vec, norm_vec, max_vec_old;
+    col_vec<rt_fl<qo_height, kv_height>> max_vec, norm_vec, max_vec_old;
 
     // initialize some registers
     neg_infty(max_vec);
@@ -111,24 +113,21 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     load_group::load_async<2, false>(v_smem[loadid][tic], g.Vg, {batch, head, loadid, 0});
 
     // iterate over k, v for these q's that have been loaded
-    for(auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++, tic=(tic+1) % ker_tile_dims::stages) {
-        int next_load_idx = (kv_idx+1)*load_group::GROUP_WARPS + loadid;
+    for(auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++, tic=(tic+1) % stages) {
+        int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
+
         // load the next k, v tile if there are more iterations
-        if(kv_idx + 1 <= kv_iters && next_load_idx*ker_tile_dims::kv_height < g.Kg.rows()) {
-            int next_tic = (tic+1) % ker_tile_dims::stages;
+        if(kv_idx+1 <= kv_iters) {
+            int next_tic = (tic+1) % stages;
             load_group::load_async<2, false>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
             load_group::load_async<2, false>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
             load_async_wait<1>(); // next k, v can stay in flight.
         } else {
             load_async_wait();
         }
-        __syncthreads();
 
         #pragma unroll LOAD_BLOCKS
-        for(int subtile = 0; subtile < LOAD_BLOCKS &&
-                (kv_idx*LOAD_BLOCKS + subtile)*ker_tile_dims::kv_height < g.Kg.rows() &&
-                (kv_idx*LOAD_BLOCKS + subtile)*ker_tile_dims::kv_height < g.Og.rows(); subtile++) {
-
+        for(int subtile = 0; subtile < LOAD_BLOCKS; subtile++) {
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             zero(att_block); // zero attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
@@ -138,13 +137,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
                 causal_mask<IS_EVEN_NM>(
                     att_block,
                     seq_idx_q,
-                    (kv_idx*LOAD_BLOCKS + subtile) * ker_tile_dims::kv_height,
+                    (kv_idx*LOAD_BLOCKS + subtile) * kv_height,
                     g.seqlen_q,
                     g.seqlen_k
                 );
             }
-
-            __syncthreads();
 
             // save the previous max_vec
             copy(max_vec_old, max_vec);
@@ -173,23 +170,25 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
             mul_row(o_reg, o_reg, max_vec_old);
             mma_AB(o_reg, att_block_mma, v_reg, o_reg);
         }
+
+        // sync threads
+        __syncthreads();
     }
 
     div_row(o_reg, o_reg, norm_vec); // divide by l_i
 
-    // wait for all threads to finish
-    __syncthreads();
     if (seq_idx_q < g.Og.rows()) { // write out o.
         store(o_smem[workerid], o_reg);
         __syncwarp();
         store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
     }
 
+    mul(max_vec, max_vec, LN2);
     log(norm_vec, norm_vec);
     add(norm_vec, norm_vec, max_vec);
-    //mul(norm_vec, norm_vec, -1.0f * HEAD_DIM * g.sm_scale);
 
     store(l_smem[workerid], norm_vec);
+    store(g.Lg, l_smem[workerid], {batch, head, 0, seq_idx});
 }
 
 // Explicit instantiations for D=64

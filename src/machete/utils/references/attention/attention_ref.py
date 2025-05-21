@@ -33,9 +33,14 @@ def attn_ref(q: torch.Tensor,
     if causal:
         p = torch.where(ms + k.shape[2] - q.shape[2] >= ns, p, float("-inf"))
 
+    max_score = torch.max(p, dim=-1, keepdim=True)[0]
+    exp_p = torch.exp(p - max_score)
+    sum_exp_p = torch.sum(exp_p, dim=-1, keepdim=True)
+    l_vec = torch.log(sum_exp_p) + max_score
+
     p = torch.softmax(p.float(), dim=-1).to(q.dtype)
     if dropout_p > 0.0:
         p = torch.dropout(p, dropout_p, train=True)
 
     ref_out = torch.matmul(p, v)
-    return ref_out
+    return ref_out, l_vec

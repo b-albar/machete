@@ -45,8 +45,9 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
     bf16* v_ptr = reinterpret_cast<bf16*>(v.data_ptr<c10::BFloat16>());
 
     // for the returned outputs
-    torch::Tensor o = torch::empty({batch, qo_heads, seqlen_q, head_dim}, v.options());
-    torch::Tensor l_vec = torch::empty({batch, qo_heads, seqlen_q, 1},
+    torch::Tensor o = torch::empty({batch, qo_heads, seqlen_q, head_dim}, q.options());
+
+    torch::Tensor l_vec = torch::empty({batch, qo_heads, 1, seqlen_q},
                                         torch::TensorOptions().dtype(torch::kFloat).device(q.device()).memory_format(at::MemoryFormat::Contiguous));
 
 
