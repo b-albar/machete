@@ -89,7 +89,7 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
 
                 auto threads = FWD_NUM_WORKERS * kittens::WARP_THREADS;
 
-                int q_blocks = (seqlen_q + (FWD_NUM_WORKERS*ker_tile_dims::qo_height)/2) / (FWD_NUM_WORKERS*ker_tile_dims::qo_height);
+                int q_blocks = (seqlen_q + (FWD_NUM_WORKERS*ker_tile_dims::qo_height) - 1) / (FWD_NUM_WORKERS*ker_tile_dims::qo_height);
 
                 dim3 grid(q_blocks, qo_heads, batch);
 
@@ -169,11 +169,11 @@ attention_backward(torch::Tensor q,
     torch::Tensor qg = torch::zeros_like(q, q.options());
     torch::Tensor kg = torch::zeros_like(k, k.options());
     torch::Tensor vg = torch::zeros_like(v, v.options());
-    torch::Tensor d_vec = torch::empty_like(l_vec);
+    torch::Tensor d_vec = torch::zeros_like(l_vec);
 
-    bf16* d_q = reinterpret_cast<bf16*>(qg.data_ptr<c10::BFloat16>());
-    bf16* d_k = reinterpret_cast<bf16*>(kg.data_ptr<c10::BFloat16>());
-    bf16* d_v = reinterpret_cast<bf16*>(vg.data_ptr<c10::BFloat16>());
+    bf16* d_q = reinterpret_cast<bf16*>(q.data_ptr<c10::BFloat16>());
+    bf16* d_k = reinterpret_cast<bf16*>(k.data_ptr<c10::BFloat16>());
+    bf16* d_v = reinterpret_cast<bf16*>(v.data_ptr<c10::BFloat16>());
     bf16* d_o = reinterpret_cast<bf16*>(o.data_ptr<c10::BFloat16>());
 
     bf16* d_og = reinterpret_cast<bf16*>(og.data_ptr<c10::BFloat16>());
@@ -193,6 +193,12 @@ attention_backward(torch::Tensor q,
 
                 cudaDeviceSynchronize();
                 auto stream = at::cuda::getCurrentCUDAStream().stream();
+                auto threads = 0;
+                auto seqlen_per_worker = 0;
+                int smem_size = 0;
+
+                int max_smem_size;
+                cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
 
                 // prepare and launch the backward preparation kernel
                 using bwd_prep_globals = bwd_prep_globals<HEAD_DIM>;
@@ -207,15 +213,13 @@ attention_backward(torch::Tensor q,
 
                 bwd_prep_globals pg{o_prep_arg, og_prep_arg, d_prep_arg};
 
-                int max_smem_size;
-                cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-
-                int smem_size = pg.get_smem_size();
+                smem_size = pg.get_smem_size();
                 assert(smem_size <= max_smem_size);
 
-                auto threads = BWD_PREP_NUM_WORKERS * kittens::WARP_THREADS;
+                threads = BWD_PREP_NUM_WORKERS * kittens::WARP_THREADS;
+                seqlen_per_worker = BWD_PREP_NUM_WORKERS * ker_tile_dims::qo_height;
 
-                int q_blocks = (seqlen_q + (BWD_PREP_NUM_WORKERS*ker_tile_dims::qo_height)) / (BWD_PREP_NUM_WORKERS*ker_tile_dims::qo_height);
+                int q_blocks = (seqlen_q + seqlen_per_worker - 1) / seqlen_per_worker;
 
                 dim3 grid_prep(q_blocks, qo_heads, batch);
 
@@ -233,7 +237,6 @@ attention_backward(torch::Tensor q,
                 using q_global = bwd_globals::q_gl;
                 using k_global = bwd_globals::k_gl;
                 using v_global = bwd_globals::v_gl;
-                using o_global = bwd_globals::o_gl;
                 using og_global = bwd_globals::og_gl;
 
                 using qg_global = bwd_globals::qg_gl;
@@ -246,7 +249,6 @@ attention_backward(torch::Tensor q,
                 q_global q_arg{d_q, batch, qo_heads, seqlen_q, head_dim};
                 k_global k_arg{d_k, batch, kv_heads, seqlen_k, head_dim};
                 v_global v_arg{d_v, batch, kv_heads, seqlen_k, head_dim};
-                o_global o_arg{d_o, batch, qo_heads, seqlen_q, head_dim};
                 og_global og_arg{d_og, batch, qo_heads, seqlen_q, head_dim};
 
                 qg_global qg_arg{d_qg, batch, qo_heads, seqlen_q, head_dim};
@@ -257,7 +259,7 @@ attention_backward(torch::Tensor q,
                 l_global l_arg{d_l, batch, qo_heads, 1U, seqlen_q};
 
                 bwd_globals g{
-                    q_arg, k_arg, v_arg, o_arg,
+                    q_arg, k_arg, v_arg,
                     og_arg, qg_arg, kg_arg, vg_arg,
                     l_arg, d_arg,
                     seqlen_q, seqlen_k, qo_heads, kv_heads, sm_scale
@@ -267,10 +269,11 @@ attention_backward(torch::Tensor q,
                 assert(smem_size <= max_smem_size);
 
                 threads = BWD_NUM_WORKERS * kittens::WARP_THREADS;
+                seqlen_per_worker = BWD_NUM_WORKERS * ker_tile_dims::kv_height;
 
-                q_blocks = (seqlen_q + (BWD_NUM_WORKERS*ker_tile_dims::qo_height)) / (BWD_NUM_WORKERS*ker_tile_dims::qo_height);
+                int k_blocks = (seqlen_k + seqlen_per_worker - 1) / seqlen_per_worker;
 
-                dim3 grid_bwd(q_blocks, qo_heads, batch);
+                dim3 grid_bwd(k_blocks, kv_heads, batch);
 
                 cudaFuncSetAttribute(
                     bwd_attend_ker<HEAD_DIM, IS_CAUSAL>,
@@ -287,8 +290,6 @@ attention_backward(torch::Tensor q,
             });
         });
     });
-
-   //std::cout << "d_vec: " << d_vec << std::endl;
 
     return {qg, kg, vg};
 }

@@ -3,8 +3,7 @@ import pathlib
 
 CFLAGS = [
     "-O3",
-    "-Wno-switch-bool",
-    "-g"
+    "-Wno-switch-bool"
 ]
 
 CUDA_CFLAGS = [
@@ -12,8 +11,7 @@ CUDA_CFLAGS = [
     "-std=c++20",
     "-use_fast_math",
     "-Xnvlink=--verbose",
-    "-Xptxas=--verbose",
-    "-Xptxas=--warn-on-spills",
+    "-Xptxas=--warn-on-spills --verbose",
     "-MD", "-MT", "-MF",
     "-x", "cu",
     "-w"

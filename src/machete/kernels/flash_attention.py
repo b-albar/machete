@@ -121,16 +121,16 @@ class FlashAttention(torch.autograd.Function):
         ctx.causal = causal
         ctx.sm_scale = sm_scale
 
-        return o
+        return o, l_vec
 
     @staticmethod
-    def backward(ctx, do):
+    def backward(ctx, do, dl_vec=None):
         q, k, v, o, l_vec = ctx.saved_tensors
         causal = ctx.causal
         sm_scale = ctx.sm_scale
 
         # Placeholder for backward implementation
-        dq, dk, dv = torch.ops.machete.flash_attention_bwd(do, o, q, k, v, l_vec, causal, sm_scale)
+        dq, dk, dv = torch.ops.machete.flash_attention_bwd(do.clone(), o.clone(), q.clone(), k.clone(), v.clone(), l_vec.clone(), causal, sm_scale)
 
         return dq, dk, dv, None, None
 

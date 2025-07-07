@@ -26,7 +26,7 @@ causal_mask(auto &reg_tile, int q_blk, int k_blk, int seqlen_q, int seqlen_k) {
 }
 
 template<int HEAD_DIM, bool IS_CAUSAL, bool IS_EVEN_NM>
-__global__  __launch_bounds__((FWD_NUM_WORKERS)*kittens::WARP_THREADS, 1)
+__global__  __launch_bounds__(FWD_NUM_WORKERS*kittens::WARP_THREADS, 1)
 void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
 
     // Shared memory allocation

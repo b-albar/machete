@@ -40,33 +40,7 @@ template<> struct bwd_prep_ker_tile_dims<128> {
 
 template<> struct bwd_ker_tile_dims<64> {
     constexpr static int tile_width = (64);
-    constexpr static int qo_height = (2*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int kv_height = (1*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int stages = (2);
-
-    // input
-    using q_tile = st_bf<qo_height, tile_width>;
-    using k_tile = st_bf<kv_height, tile_width>;
-    using v_tile = st_bf<kv_height, tile_width>;
-    using o_tile = st_bf<qo_height, tile_width>;
-
-    // output
-    using og_tile = st_bf<qo_height, tile_width>;
-    using qg_tile = st_bf<qo_height, tile_width>;
-    using kg_tile = st_bf<kv_height, tile_width>;
-    using vg_tile = st_bf<kv_height, tile_width>;
-
-    using l_tile = row_vec<st_fl<qo_height, kv_height>>;
-    using d_tile = col_vec<st_fl<qo_height, tile_width>>;
-
-    // attention
-    using attn_tile = st_fl<qo_height, kv_height>;
-    using attn_tile_mma = st_bf<qo_height, kv_height>;
-};
-
-template<> struct bwd_ker_tile_dims<128> {
-    constexpr static int tile_width = (128);
-    constexpr static int qo_height = (4*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int qo_height = (1*kittens::TILE_ROW_DIM<bf16>);
     constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
     constexpr static int stages = (2);
 
@@ -74,20 +48,42 @@ template<> struct bwd_ker_tile_dims<128> {
     using q_tile = st_bf<qo_height, tile_width>;
     using k_tile = st_bf<kv_height, tile_width>;
     using v_tile = st_bf<kv_height, tile_width>;
-    using o_tile = st_bf<qo_height, tile_width>;
     using og_tile = st_bf<qo_height, tile_width>;
 
     // output
-    using qg_tile = st_fl<qo_height, tile_width>;
-    using kg_tile = st_fl<kv_height, tile_width>;
-    using vg_tile = st_fl<kv_height, tile_width>;
+    using qg_tile = st_bf<qo_height, tile_width>;
+    using kg_tile = st_bf<kv_height, tile_width>;
+    using vg_tile = st_bf<kv_height, tile_width>;
+
+    using l_tile = col_vec<st_fl<qo_height, kv_height>>;
+    using d_tile = col_vec<st_fl<qo_height, tile_width>>;
+
+    // attention
+    using attn_tile = st_fl<qo_height, kv_height>;
+};
+
+template<> struct bwd_ker_tile_dims<128> {
+    constexpr static int tile_width = (128);
+    constexpr static int qo_height = (1*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int stages = (2);
+
+    // input
+    using q_tile = st_bf<qo_height, tile_width>;
+    using k_tile = st_bf<kv_height, tile_width>;
+    using v_tile = st_bf<kv_height, tile_width>;
+    using og_tile = st_bf<qo_height, tile_width>;
+
+    // output
+    using qg_tile = st_bf<qo_height, tile_width>;
+    using kg_tile = st_bf<kv_height, tile_width>;
+    using vg_tile = st_bf<kv_height, tile_width>;
 
     // vectors
-    using l_tile = row_vec<st_fl<qo_height, kv_height>>;
+    using l_tile = col_vec<st_fl<qo_height, kv_height>>;
     using d_tile = col_vec<st_fl<qo_height, tile_width>>;
 
     using attn_tile = st_fl<qo_height, kv_height>;
-    using attn_tile_mma = st_bf<qo_height, kv_height>;
 };
 
 template<int D>
@@ -120,7 +116,6 @@ struct bwd_globals {
     using q_tile = ker_tile_dims::q_tile;
     using k_tile = ker_tile_dims::k_tile;
     using v_tile = ker_tile_dims::v_tile;
-    using o_tile = ker_tile_dims::o_tile;
 
     // output tiles
     using og_tile = ker_tile_dims::og_tile;
@@ -134,12 +129,10 @@ struct bwd_globals {
 
     // attention
     using attn_tile = ker_tile_dims::attn_tile;
-    using attn_tile_mma = ker_tile_dims::attn_tile_mma;
 
     using q_gl = gl<bf16,  -1, -1, -1, -1, q_tile>;
     using k_gl = gl<bf16,  -1, -1, -1, -1, k_tile>;
     using v_gl = gl<bf16,  -1, -1, -1, -1, v_tile>;
-    using o_gl = gl<bf16,  -1, -1, -1, -1, o_tile>;
 
     using og_gl = gl<bf16,  -1, -1, -1, -1, og_tile>;
     using qg_gl = gl<bf16, -1, -1, -1, -1, qg_tile>;
@@ -150,20 +143,19 @@ struct bwd_globals {
     using d_gl = gl<float, -1, -1, -1, -1, d_tile>;
 
     // global memory for input tensors
-    q_gl q;
-    k_gl k;
-    v_gl v;
-    o_gl o;
+    q_gl Qg;
+    k_gl Kg;
+    v_gl Vg;
+    og_gl OGg;
 
     // global memory for gradient tensors
-    og_gl og;
-    qg_gl qg;
-    kg_gl kg;
-    vg_gl vg;
+    qg_gl QGg;
+    kg_gl KGg;
+    vg_gl VGg;
 
     // other tensors
-    l_gl l;
-    d_gl d;
+    l_gl Lg;
+    d_gl Dg;
 
     const int seqlen_k;
     const int seqlen_q;
@@ -173,16 +165,34 @@ struct bwd_globals {
 
     size_t get_smem_size() {
 
-        size_t kv_smem_size = ker_tile_dims::stages * (sizeof(k_tile) + sizeof(v_tile));
-        size_t qo_smem_size = sizeof(q_tile) + sizeof(og_tile) + sizeof(o_tile);
-        size_t grad_smem_size = sizeof(qg_tile); // kg and vg use the same smem as q/k smem
-        size_t vec_smem_size = sizeof(l_tile) + sizeof(d_tile);
-        size_t attn_smem_size = sizeof(attn_tile) + sizeof(attn_tile_mma);
+        size_t kv_smem_size = BWD_NUM_WORKERS * (sizeof(k_tile) + sizeof(v_tile));
+        size_t qo_smem_size = ker_tile_dims::stages * (sizeof(q_tile) + sizeof(og_tile));
+        size_t grad_smem_size = ker_tile_dims::stages * sizeof(qg_tile); // kg and vg use the same smem as q/k smem
+        size_t vec_smem_size = ker_tile_dims::stages * (sizeof(l_tile) + sizeof(d_tile));
 
-        return kv_smem_size + qo_smem_size + grad_smem_size + vec_smem_size + attn_smem_size;
+        return kv_smem_size + qo_smem_size + grad_smem_size + vec_smem_size;
     }
 };
 
+// preload a register tile from a smem vector
+__device__ static inline void
+stream_tile(auto &reg_tile, auto &smem_vec, int tic, float scale) {
+
+    int base_col = kittens::laneid() / 4;
+    float first_value = *(float*)&smem_vec[tic][base_col + 0] * scale;
+    float second_value = *(float*)&smem_vec[tic][base_col + 8] * scale;
+
+    #pragma unroll
+    for(int i = 0; i < reg_tile.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < reg_tile.width; j++) {
+            reg_tile.tiles[i][j].data[0] = make_float2(first_value, first_value);
+            reg_tile.tiles[i][j].data[1] = make_float2(second_value, second_value);
+            reg_tile.tiles[i][j].data[2] = make_float2(first_value, first_value);
+            reg_tile.tiles[i][j].data[3] = make_float2(second_value, second_value);
+        }
+    }
+}
 
 // Forward declarations of kernel functions
 template<int D>

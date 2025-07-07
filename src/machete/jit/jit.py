@@ -23,6 +23,7 @@ def load_cuda_ops(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[str]] = None,
     gpu_target: Literal["4090", "a100", "h100", "5070"] = "h100",
+    debug: bool = False,
     verbose: bool = False,
 ) -> Callable:
     if extra_cflags is None:
@@ -36,6 +37,9 @@ def load_cuda_ops(
 
     cflags += extra_cflags
     cuda_cflags += extra_cuda_cflags
+    if debug:
+        cuda_cflags.append("-g -G -DDEBUG")
+
     if extra_ldflags is not None:
         ldflags += extra_ldflags
     print(f"Loading JIT ops: {name}")
