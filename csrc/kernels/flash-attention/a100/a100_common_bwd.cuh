@@ -157,10 +157,10 @@ struct bwd_globals {
     l_gl Lg;
     d_gl Dg;
 
-    const int seqlen_k;
     const int seqlen_q;
-    const int num_heads_k;
+    const int seqlen_k;
     const int num_heads_q;
+    const int num_heads_k;
     const float sm_scale;
 
     size_t get_smem_size() {

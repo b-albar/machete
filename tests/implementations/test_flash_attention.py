@@ -8,10 +8,12 @@ from machete.utils.references.attention.attention_ref import attn_ref, attn_bwd_
 def max_diff(a, b):
     return (a - b).abs().max().item()
 
-@pytest.mark.parametrize('scale', [1.0])
-@pytest.mark.parametrize('b, h, m, n, d', [
-    (2, 4, 512, 512, 64),
-])
+@pytest.mark.parametrize('scale', [0.125, 1.0])
+@pytest.mark.parametrize('b', [1, 2, 3, 4])
+@pytest.mark.parametrize('h', [4, 5, 8, 16])
+@pytest.mark.parametrize('m', [64, 128, 256, 512])
+@pytest.mark.parametrize('n', [64, 128, 256, 512])
+@pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
 def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
@@ -20,7 +22,7 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
     v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
 
     o_ref, _ = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=True)
-    o_torch, l_torch = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=False)
+    o_torch, _ = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=False)
     #o_spda = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
     #o_fa2 = flash_attn_func(q, k, v, softmax_scale=scale, causal=causal)
     o_hyp, _ = flash_attention(q, k, v, causal, scale)
@@ -82,10 +84,13 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     dk_diff_ref = max_diff(dk_ref, dk_torch)
     dv_diff_ref = max_diff(dv_ref, dv_torch)
 
+    print(dq_ref)
+    print(q_grad)
+
     # Assert that gradients are close enough
     assert dq_diff < 2 * dq_diff_ref, f"dQ difference too large: {dq_diff}"
     assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff}"
     assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff}"
 
-#test_attention_fwd(1, 1, 128, 128, 128, False, torch.bfloat16, 0.125)
-test_attention_bwd(1, 1, 256, 128, 64, False, torch.bfloat16, 0.125)
+#test_attention_fwd(2, 4, 512, 512, 64, True, torch.bfloat16, 0.125)
+test_attention_bwd(1, 1, 256, 256, 64, False, torch.bfloat16, 0.125)

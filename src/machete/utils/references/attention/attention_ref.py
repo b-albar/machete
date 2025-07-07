@@ -30,7 +30,7 @@ def attn_ref(q: torch.Tensor,
     if causal:
         ms = torch.arange(q.shape[2], device=q.device).unsqueeze(-1)
         ns = torch.arange(k.shape[2], device=q.device)
-        p = torch.where(ms + k.shape[2] - q.shape[2] >= ns, p, float("-inf"))
+        p = torch.where(ms >= ns, p, float("-inf"))
 
     max_score = torch.max(p, dim=-1, keepdim=True)[0]
     exp_p = torch.exp(p - max_score)
@@ -89,7 +89,7 @@ def attn_bwd_ref(q: torch.Tensor,
         # Zero out gradients for masked positions
         ms = torch.arange(q.shape[2], device=q.device).unsqueeze(-1)
         ns = torch.arange(k.shape[2], device=q.device)
-        ds = torch.where(ms + k.shape[2] - q.shape[2] >= ns, ds, 0.0)
+        ds = torch.where(ms >= ns, ds, 0.0)
 
     # Gradient w.r.t. q: dq = ds @ k * sm_scale
     dq = torch.matmul(ds, k) * sm_scale

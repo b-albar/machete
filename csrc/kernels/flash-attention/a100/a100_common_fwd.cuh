@@ -67,10 +67,10 @@ template<int D> struct fwd_globals {
     l_gl Lg;
     o_gl Og;
 
-    const int seqlen_k;
     const int seqlen_q;
-    const int num_heads_k;
+    const int seqlen_k;
     const int num_heads_q;
+    const int num_heads_k;
     const float sm_scale;
 
     // Compute the maximum shared memory required for the forward pass
@@ -87,7 +87,7 @@ template<int D> struct fwd_globals {
 };
 
 // Forward declarations of kernel functions
-template<int D, bool is_causal, bool is_even_nm>
+template<int D, bool is_causal>
 __global__ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g);
 
 } // namespace fa_a100

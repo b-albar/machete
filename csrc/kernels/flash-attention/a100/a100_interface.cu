@@ -56,54 +56,51 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
 
     HEAD_DIM_SWITCH(head_dim, HEAD_DIM, [&] {
         using ker_tile_dims = fwd_ker_tile_dims<HEAD_DIM>;
-        const bool is_even_nm = (seqlen_q % ker_tile_dims::qo_height) == 0 && (seqlen_k % ker_tile_dims::kv_height) == 0;
 
         BOOL_SWITCH(is_causal, IS_CAUSAL, [&] {
-            BOOL_SWITCH(is_even_nm, IS_EVEN_NM, [&] {
 
-                cudaDeviceSynchronize();
-                auto stream = at::cuda::getCurrentCUDAStream().stream();
+            cudaDeviceSynchronize();
+            auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-                using globals = fwd_globals<HEAD_DIM>;
+            using globals = fwd_globals<HEAD_DIM>;
 
-                using q_global = globals::q_gl;
-                using k_global = globals::k_gl;
-                using v_global = globals::v_gl;
-                using l_global = globals::l_gl;
-                using o_global = globals::o_gl;
+            using q_global = globals::q_gl;
+            using k_global = globals::k_gl;
+            using v_global = globals::v_gl;
+            using l_global = globals::l_gl;
+            using o_global = globals::o_gl;
 
-                q_global qg_arg{q_ptr, batch, qo_heads, seqlen_q, head_dim};
-                k_global kg_arg{k_ptr, batch, kv_heads, seqlen_k, head_dim};
-                v_global vg_arg{v_ptr, batch, kv_heads, seqlen_k, head_dim};
-                l_global lg_arg{l_ptr, batch, qo_heads, 1U, seqlen_q};
-                o_global og_arg{o_ptr, batch, qo_heads, seqlen_q, head_dim};
+            q_global qg_arg{q_ptr, batch, qo_heads, seqlen_q, head_dim};
+            k_global kg_arg{k_ptr, batch, kv_heads, seqlen_k, head_dim};
+            v_global vg_arg{v_ptr, batch, kv_heads, seqlen_k, head_dim};
+            l_global lg_arg{l_ptr, batch, qo_heads, 1U, seqlen_q};
+            o_global og_arg{o_ptr, batch, qo_heads, seqlen_q, head_dim};
 
-                globals g{qg_arg, kg_arg, vg_arg, lg_arg, og_arg, seqlen_q, seqlen_k, qo_heads, kv_heads, sm_scale};
+            globals g{qg_arg, kg_arg, vg_arg, lg_arg, og_arg, seqlen_q, seqlen_k, qo_heads, kv_heads, sm_scale};
 
-                int max_smem_size;
-                cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+            int max_smem_size;
+            cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
 
-                int smem_size = g.get_smem_size();
+            int smem_size = g.get_smem_size();
 
-                assert(smem_size <= max_smem_size);
+            assert(smem_size <= max_smem_size);
 
-                auto threads = FWD_NUM_WORKERS * kittens::WARP_THREADS;
+            auto threads = FWD_NUM_WORKERS * kittens::WARP_THREADS;
 
-                int q_blocks = (seqlen_q + (FWD_NUM_WORKERS*ker_tile_dims::qo_height) - 1) / (FWD_NUM_WORKERS*ker_tile_dims::qo_height);
+            int q_blocks = (seqlen_q + (FWD_NUM_WORKERS*ker_tile_dims::qo_height) - 1) / (FWD_NUM_WORKERS*ker_tile_dims::qo_height);
 
-                dim3 grid(q_blocks, qo_heads, batch);
+            dim3 grid(q_blocks, qo_heads, batch);
 
-                cudaFuncSetAttribute(
-                    fwd_attend_ker<HEAD_DIM, IS_CAUSAL, IS_EVEN_NM>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_size
-                );
+            cudaFuncSetAttribute(
+                fwd_attend_ker<HEAD_DIM, IS_CAUSAL>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_size
+            );
 
-                fwd_attend_ker<HEAD_DIM, IS_CAUSAL, IS_EVEN_NM><<<grid, threads, smem_size, stream>>>(g);
-                CHECK_CUDA_ERROR(cudaGetLastError());
-                cudaStreamSynchronize(stream);
-                cudaDeviceSynchronize();
-            });
+            fwd_attend_ker<HEAD_DIM, IS_CAUSAL><<<grid, threads, smem_size, stream>>>(g);
+            CHECK_CUDA_ERROR(cudaGetLastError());
+            cudaStreamSynchronize(stream);
+            cudaDeviceSynchronize();
         });
     });
 
@@ -186,108 +183,105 @@ attention_backward(torch::Tensor q,
 
     HEAD_DIM_SWITCH(head_dim, HEAD_DIM, [&] {
         using ker_tile_dims = bwd_ker_tile_dims<HEAD_DIM>;
-        const bool is_even_nm = (seqlen_q % ker_tile_dims::qo_height) == 0 && (seqlen_k % ker_tile_dims::kv_height) == 0;
 
         BOOL_SWITCH(is_causal, IS_CAUSAL, [&] {
-            BOOL_SWITCH(is_even_nm, IS_EVEN_NM, [&] {
 
-                cudaDeviceSynchronize();
-                auto stream = at::cuda::getCurrentCUDAStream().stream();
-                auto threads = 0;
-                auto seqlen_per_worker = 0;
-                int smem_size = 0;
+            cudaDeviceSynchronize();
+            auto stream = at::cuda::getCurrentCUDAStream().stream();
+            auto threads = 0;
+            auto seqlen_per_worker = 0;
+            int smem_size = 0;
 
-                int max_smem_size;
-                cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+            int max_smem_size;
+            cudaDeviceGetAttribute(&max_smem_size, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
 
-                // prepare and launch the backward preparation kernel
-                using bwd_prep_globals = bwd_prep_globals<HEAD_DIM>;
+            // prepare and launch the backward preparation kernel
+            using bwd_prep_globals = bwd_prep_globals<HEAD_DIM>;
 
-                using o_prep_global = bwd_prep_globals::o_gl;
-                using og_prep_global = bwd_prep_globals::og_gl;
-                using d_prep_global = bwd_prep_globals::d_gl;
+            using o_prep_global = bwd_prep_globals::o_gl;
+            using og_prep_global = bwd_prep_globals::og_gl;
+            using d_prep_global = bwd_prep_globals::d_gl;
 
-                o_prep_global o_prep_arg{d_o, batch, qo_heads, seqlen_q, head_dim};
-                og_prep_global og_prep_arg{d_og, batch, qo_heads, seqlen_q, head_dim};
-                d_prep_global d_prep_arg{d_d, batch, qo_heads, 1U, seqlen_q};
+            o_prep_global o_prep_arg{d_o, batch, qo_heads, seqlen_q, head_dim};
+            og_prep_global og_prep_arg{d_og, batch, qo_heads, seqlen_q, head_dim};
+            d_prep_global d_prep_arg{d_d, batch, qo_heads, 1U, seqlen_q};
 
-                bwd_prep_globals pg{o_prep_arg, og_prep_arg, d_prep_arg};
+            bwd_prep_globals pg{o_prep_arg, og_prep_arg, d_prep_arg};
 
-                smem_size = pg.get_smem_size();
-                assert(smem_size <= max_smem_size);
+            smem_size = pg.get_smem_size();
+            assert(smem_size <= max_smem_size);
 
-                threads = BWD_PREP_NUM_WORKERS * kittens::WARP_THREADS;
-                seqlen_per_worker = BWD_PREP_NUM_WORKERS * ker_tile_dims::qo_height;
+            threads = BWD_PREP_NUM_WORKERS * kittens::WARP_THREADS;
+            seqlen_per_worker = BWD_PREP_NUM_WORKERS * ker_tile_dims::qo_height;
 
-                int q_blocks = (seqlen_q + seqlen_per_worker - 1) / seqlen_per_worker;
+            int q_blocks = (seqlen_q + seqlen_per_worker - 1) / seqlen_per_worker;
 
-                dim3 grid_prep(q_blocks, qo_heads, batch);
+            dim3 grid_prep(q_blocks, qo_heads, batch);
 
-                cudaFuncSetAttribute(
-                    bwd_prep_ker<HEAD_DIM>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_size
-                );
+            cudaFuncSetAttribute(
+                bwd_prep_ker<HEAD_DIM>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_size
+            );
 
-                bwd_prep_ker<HEAD_DIM><<<grid_prep, threads, smem_size, stream>>>(pg);
+            bwd_prep_ker<HEAD_DIM><<<grid_prep, threads, smem_size, stream>>>(pg);
 
-                // launch the main backward kernel
-                using bwd_globals = bwd_globals<HEAD_DIM>;
+            // launch the main backward kernel
+            using bwd_globals = bwd_globals<HEAD_DIM>;
 
-                using q_global = bwd_globals::q_gl;
-                using k_global = bwd_globals::k_gl;
-                using v_global = bwd_globals::v_gl;
-                using og_global = bwd_globals::og_gl;
+            using q_global = bwd_globals::q_gl;
+            using k_global = bwd_globals::k_gl;
+            using v_global = bwd_globals::v_gl;
+            using og_global = bwd_globals::og_gl;
 
-                using qg_global = bwd_globals::qg_gl;
-                using kg_global = bwd_globals::kg_gl;
-                using vg_global = bwd_globals::vg_gl;
+            using qg_global = bwd_globals::qg_gl;
+            using kg_global = bwd_globals::kg_gl;
+            using vg_global = bwd_globals::vg_gl;
 
-                using d_global = bwd_globals::d_gl;
-                using l_global = bwd_globals::l_gl;
+            using d_global = bwd_globals::d_gl;
+            using l_global = bwd_globals::l_gl;
 
-                q_global q_arg{d_q, batch, qo_heads, seqlen_q, head_dim};
-                k_global k_arg{d_k, batch, kv_heads, seqlen_k, head_dim};
-                v_global v_arg{d_v, batch, kv_heads, seqlen_k, head_dim};
-                og_global og_arg{d_og, batch, qo_heads, seqlen_q, head_dim};
+            q_global q_arg{d_q, batch, qo_heads, seqlen_q, head_dim};
+            k_global k_arg{d_k, batch, kv_heads, seqlen_k, head_dim};
+            v_global v_arg{d_v, batch, kv_heads, seqlen_k, head_dim};
+            og_global og_arg{d_og, batch, qo_heads, seqlen_q, head_dim};
 
-                qg_global qg_arg{d_qg, batch, qo_heads, seqlen_q, head_dim};
-                kg_global kg_arg{d_kg, batch, kv_heads, seqlen_k, head_dim};
-                vg_global vg_arg{d_vg, batch, kv_heads, seqlen_k, head_dim};
+            qg_global qg_arg{d_qg, batch, qo_heads, seqlen_q, head_dim};
+            kg_global kg_arg{d_kg, batch, kv_heads, seqlen_k, head_dim};
+            vg_global vg_arg{d_vg, batch, kv_heads, seqlen_k, head_dim};
 
-                d_global d_arg{d_d, batch, qo_heads, 1U, seqlen_q};
-                l_global l_arg{d_l, batch, qo_heads, 1U, seqlen_q};
+            d_global d_arg{d_d, batch, qo_heads, 1U, seqlen_q};
+            l_global l_arg{d_l, batch, qo_heads, 1U, seqlen_q};
 
-                bwd_globals g{
-                    q_arg, k_arg, v_arg,
-                    og_arg, qg_arg, kg_arg, vg_arg,
-                    l_arg, d_arg,
-                    seqlen_q, seqlen_k, qo_heads, kv_heads, sm_scale
-                };
+            bwd_globals g{
+                q_arg, k_arg, v_arg,
+                og_arg, qg_arg, kg_arg, vg_arg,
+                l_arg, d_arg,
+                seqlen_q, seqlen_k, qo_heads, kv_heads, sm_scale
+            };
 
-                smem_size = g.get_smem_size();
-                assert(smem_size <= max_smem_size);
+            smem_size = g.get_smem_size();
+            assert(smem_size <= max_smem_size);
 
-                threads = BWD_NUM_WORKERS * kittens::WARP_THREADS;
-                seqlen_per_worker = BWD_NUM_WORKERS * ker_tile_dims::kv_height;
+            threads = BWD_NUM_WORKERS * kittens::WARP_THREADS;
+            seqlen_per_worker = BWD_NUM_WORKERS * ker_tile_dims::kv_height;
 
-                int k_blocks = (seqlen_k + seqlen_per_worker - 1) / seqlen_per_worker;
+            int k_blocks = (seqlen_k + seqlen_per_worker - 1) / seqlen_per_worker;
 
-                dim3 grid_bwd(k_blocks, kv_heads, batch);
+            dim3 grid_bwd(k_blocks, kv_heads, batch);
 
-                cudaFuncSetAttribute(
-                    bwd_attend_ker<HEAD_DIM, IS_CAUSAL>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    smem_size
-                );
+            cudaFuncSetAttribute(
+                bwd_attend_ker<HEAD_DIM, IS_CAUSAL>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_size
+            );
 
-                bwd_attend_ker<HEAD_DIM, IS_CAUSAL><<<grid_bwd, threads, smem_size, stream>>>(g);
+            bwd_attend_ker<HEAD_DIM, IS_CAUSAL><<<grid_bwd, threads, smem_size, stream>>>(g);
 
-                CHECK_CUDA_ERROR(cudaGetLastError());
-                cudaStreamSynchronize(stream);
-                cudaDeviceSynchronize();
+            CHECK_CUDA_ERROR(cudaGetLastError());
+            cudaStreamSynchronize(stream);
+            cudaDeviceSynchronize();
 
-            });
         });
     });
 

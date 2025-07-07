@@ -4,7 +4,6 @@ namespace fa_a100 {
 
 using namespace kittens;
 
-template<bool IS_EVEN_NM>
 __device__ static inline void
 causal_mask(auto &reg_tile, int q_blk, int k_blk, int seqlen_q, int seqlen_k) {
     #pragma unroll
@@ -25,7 +24,7 @@ causal_mask(auto &reg_tile, int q_blk, int k_blk, int seqlen_q, int seqlen_k) {
     }
 }
 
-template<int HEAD_DIM, bool IS_CAUSAL, bool IS_EVEN_NM>
+template<int HEAD_DIM, bool IS_CAUSAL>
 __global__  __launch_bounds__(FWD_NUM_WORKERS*kittens::WARP_THREADS, 1)
 void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
 
@@ -127,14 +126,14 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
         }
 
         #pragma unroll LOAD_BLOCKS
-        for(int subtile = 0; subtile < LOAD_BLOCKS; subtile++) {
+        for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile)*kv_height < g.seqlen_k; subtile++) {
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             zero(att_block); // zero attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
 
             // apply transformation of attention values (i.e. causal mask, bias, etc.)
             if constexpr (IS_CAUSAL) {
-                causal_mask<IS_EVEN_NM>(
+                causal_mask(
                     att_block,
                     seq_idx_q,
                     (kv_idx*LOAD_BLOCKS + subtile) * kv_height,
@@ -192,15 +191,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
 }
 
 // Explicit instantiations for D=64
-template __global__ void fwd_attend_ker<64, true, true>(const __grid_constant__ fwd_globals<64> g);
-template __global__ void fwd_attend_ker<64, true, false>(const __grid_constant__ fwd_globals<64> g);
-template __global__ void fwd_attend_ker<64, false, true>(const __grid_constant__ fwd_globals<64> g);
-template __global__ void fwd_attend_ker<64, false, false>(const __grid_constant__ fwd_globals<64> g);
+template __global__ void fwd_attend_ker<64, true>(const __grid_constant__ fwd_globals<64> g);
+template __global__ void fwd_attend_ker<64, false>(const __grid_constant__ fwd_globals<64> g);
 
 // Explicit instantiations for D=128
-template __global__ void fwd_attend_ker<128, true, true>(const __grid_constant__ fwd_globals<128> g);
-template __global__ void fwd_attend_ker<128, true, false>(const __grid_constant__ fwd_globals<128> g);
-template __global__ void fwd_attend_ker<128, false, true>(const __grid_constant__ fwd_globals<128> g);
-template __global__ void fwd_attend_ker<128, false, false>(const __grid_constant__ fwd_globals<128> g);
+template __global__ void fwd_attend_ker<128, true>(const __grid_constant__ fwd_globals<128> g);
+template __global__ void fwd_attend_ker<128, false>(const __grid_constant__ fwd_globals<128> g);
 
 } // namespace fa_a100

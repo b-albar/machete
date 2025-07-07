@@ -89,17 +89,22 @@ using namespace kittens;
 
         using attn_tile = ker_tile_dims::attn_tile;
 
+        constexpr static int kv_height = ker_tile_dims::kv_height;
+        constexpr static int qo_height = ker_tile_dims::qo_height;
+        constexpr static int tile_width = ker_tile_dims::tile_width;
+        constexpr static int stages = ker_tile_dims::stages;
+
         k_tile(&k_smem)[BWD_NUM_WORKERS] = al.allocate<k_tile, BWD_NUM_WORKERS>();
         v_tile(&v_smem)[BWD_NUM_WORKERS] = al.allocate<v_tile, BWD_NUM_WORKERS>();
 
         qg_tile(&max_qg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<qg_tile(&)[BWD_NUM_WORKERS]>(k_smem);
 
-        q_tile(&q_smem)[ker_tile_dims::stages] = al.allocate<q_tile, ker_tile_dims::stages>();
-        og_tile(&og_smem)[ker_tile_dims::stages] = al.allocate<og_tile, ker_tile_dims::stages>();
-        qg_tile(&qg_smem)[ker_tile_dims::stages] = al.allocate<qg_tile, ker_tile_dims::stages>();
+        q_tile(&q_smem)[stages] = al.allocate<q_tile, stages>();
+        og_tile(&og_smem)[stages] = al.allocate<og_tile, stages>();
+        qg_tile(&qg_smem)[stages] = al.allocate<qg_tile, stages>();
 
-        l_tile(&l_smem)[ker_tile_dims::stages] = al.allocate<l_tile, ker_tile_dims::stages>();
-        d_tile(&d_smem)[ker_tile_dims::stages] = al.allocate<d_tile, ker_tile_dims::stages>();
+        l_tile(&l_smem)[stages] = al.allocate<l_tile, stages>();
+        d_tile(&d_smem)[stages] = al.allocate<d_tile, stages>();
         kg_tile(&kg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<kg_tile(&)[BWD_NUM_WORKERS]>(k_smem);
         vg_tile(&vg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<vg_tile(&)[BWD_NUM_WORKERS]>(v_smem);
 
@@ -111,29 +116,28 @@ using namespace kittens;
         // TODO: understand why we cannot use group<4> here - causes incorrect results
         using load_group = kittens::group<4>; // share loading of q, og, l tiles
 
-        const int warpid = kittens::warpid();
         const int batch = blockIdx.z;
         const int head = blockIdx.y;
         const int workerid = kittens::warpid();
         const int seq_idx = blockIdx.x * BWD_NUM_WORKERS + workerid;
         const int seq_idx_k = seq_idx * ker_tile_dims::kv_height;
 
-        const int qo_blocks = (g.Qg.rows() + ker_tile_dims::qo_height - 1) / ker_tile_dims::qo_height;
+        const int qo_blocks = (g.Qg.rows() + qo_height - 1) / qo_height;
 
         const int q_start = (IS_CAUSAL) ? 0 : 0;
 
-        rt_bf<ker_tile_dims::qo_height, ker_tile_dims::tile_width, row_l> q_reg, og_reg;
-        rt_bf<ker_tile_dims::qo_height, ker_tile_dims::tile_width, col_l> q_reg_col, og_reg_col;
-        rt_bf<ker_tile_dims::kv_height, ker_tile_dims::tile_width, row_l> k_reg, v_reg;
-        rt_bf<ker_tile_dims::kv_height, ker_tile_dims::tile_width, col_l> k_reg_col;
+        rt_bf<qo_height, ker_tile_dims::tile_width, row_l> q_reg, og_reg;
+        rt_bf<qo_height, ker_tile_dims::tile_width, col_l> q_reg_col, og_reg_col;
+        rt_bf<kv_height, tile_width, row_l> k_reg, v_reg;
+        rt_bf<kv_height, tile_width, col_l> k_reg_col;
 
-        rt_fl<ker_tile_dims::kv_height, ker_tile_dims::tile_width, row_l> kg_reg, vg_reg;
-        rt_fl<ker_tile_dims::qo_height, ker_tile_dims::tile_width, row_l> qg_reg;
+        rt_fl<kv_height, tile_width, row_l> kg_reg, vg_reg;
+        rt_fl<qo_height, tile_width, row_l> qg_reg;
 
         // attention registers
-        rt_fl<ker_tile_dims::qo_height, ker_tile_dims::kv_height, row_l> s_block, ds_block;
-        rt_bf<ker_tile_dims::qo_height, ker_tile_dims::kv_height, row_l> ds_block_mma, s_block_mma;
-        rt_bf<ker_tile_dims::qo_height, ker_tile_dims::kv_height, col_l> ds_block_mma_col, s_block_mma_col;
+        rt_fl<qo_height, kv_height, row_l> s_block, ds_block;
+        rt_bf<qo_height, kv_height, row_l> ds_block_mma, s_block_mma;
+        rt_bf<qo_height, kv_height, col_l> ds_block_mma_col, s_block_mma_col;
 
         // load the K/V tiles
         // going through shared memory
@@ -162,10 +166,10 @@ using namespace kittens;
         load_group::load_async(d_smem[tic], g.Dg, {batch, head, 0, q_start});
         load_group::load_async(qg_smem[tic], g.QGg, {batch, head, q_start, 0});
 
-        for (auto qo_idx = q_start; qo_idx < qo_blocks ; qo_idx++, tic=(tic+1) % ker_tile_dims::stages) {
+        for (auto qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic=(tic+1) % stages) {
 
             if (qo_idx + 1 < qo_blocks) {
-                int next_tic = (tic + 1) % ker_tile_dims::stages;
+                int next_tic = (tic + 1) % stages;
                 load_group::load_async<2, false>(q_smem[next_tic], g.Qg, {batch, head, qo_idx + 1, 0});
                 load_group::load_async<2, false>(og_smem[next_tic], g.OGg, {batch, head, qo_idx + 1, 0});
                 load_group::load_async(l_smem[next_tic], g.Lg, {batch, head, 0, qo_idx + 1});
@@ -185,12 +189,12 @@ using namespace kittens;
             // result is P_i = S_ij - L_i
             mma_ABt(s_block, q_reg, k_reg, s_block);
 
-            mul(s_block, s_block, INV_LN2);
-
             // apply the causal mask
             if constexpr (IS_CAUSAL) {
-                causal_mask(s_block, qo_idx * ker_tile_dims::qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
+                causal_mask(s_block, qo_idx * qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
             }
+
+            mul(s_block, s_block, INV_LN2);
             exp2(s_block, s_block);
 
             // load the og tile and compute the dp block
@@ -203,7 +207,7 @@ using namespace kittens;
             mul(ds_block, s_block, ds_block);
 
             if (IS_CAUSAL) {
-                causal_mask(ds_block, qo_idx * ker_tile_dims::qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
+                causal_mask(ds_block, qo_idx * qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
             }
 
             // compute the dv block
@@ -221,12 +225,12 @@ using namespace kittens;
             mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
             atomic_add(qg_smem[tic], qg_reg);
             __syncthreads();
-            if (kittens::warpid() == 0) {
+            if (workerid == 0) {
                 store(g.QGg, qg_smem[tic], {batch, head, qo_idx, 0});
             }
 
-            /* // implementation dq computation w/ sum reduction and warp 0
-            load(qg_reg, qg_smem[tic]);
+            // implementation dq computation w/ sum reduction and warp 0
+            /*load(qg_reg, qg_smem[tic]);
             swap_layout(k_reg_col, k_reg);
             mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
             store(max_qg_smem[workerid], qg_reg);
