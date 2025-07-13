@@ -223,11 +223,14 @@ using namespace kittens;
             zero(qg_reg);
             swap_layout(k_reg_col, k_reg);
             mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
-            atomic_add(qg_smem[tic], qg_reg);
+            atomic_add(g.QGg, qg_reg, {batch, head, qo_idx, 0});
+
+            // implementation of atomic add in smem - need to have a lock to sync blocks
+            /*atomic_add(qg_smem[tic], qg_reg);
             __syncthreads();
             if (workerid == 0) {
                 store(g.QGg, qg_smem[tic], {batch, head, qo_idx, 0});
-            }
+            }*/
 
             // implementation dq computation w/ sum reduction and warp 0
             /*load(qg_reg, qg_smem[tic]);
