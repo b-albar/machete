@@ -16,9 +16,9 @@ using namespace kittens;
                 auto &attn_subtile = reinterpret_cast<rt_fl<kittens::TILE_ROW_DIM<float>, kittens::TILE_COL_DIM<float>>&>(reg_tile.tiles[i][j]);
 
                 if (k_idx > q_idx || q_idx >= seqlen_q || k_idx >= seqlen_k) {
-                    neg_infty(attn_subtile);
+                    zero(attn_subtile);
                 } else if (k_idx == q_idx) {
-                    make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::neg_infty());
+                    make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::zero());
                 }
                 __syncwarp();
             }
@@ -87,17 +87,17 @@ using namespace kittens;
         using l_tile = ker_tile_dims::l_tile;
         using d_tile = ker_tile_dims::d_tile;
 
-        using attn_tile = ker_tile_dims::attn_tile;
-
         constexpr static int kv_height = ker_tile_dims::kv_height;
         constexpr static int qo_height = ker_tile_dims::qo_height;
         constexpr static int tile_width = ker_tile_dims::tile_width;
         constexpr static int stages = ker_tile_dims::stages;
 
+        using attn_tile = st_bf<qo_height, kv_height>;
+
         k_tile(&k_smem)[BWD_NUM_WORKERS] = al.allocate<k_tile, BWD_NUM_WORKERS>();
         v_tile(&v_smem)[BWD_NUM_WORKERS] = al.allocate<v_tile, BWD_NUM_WORKERS>();
 
-        qg_tile(&max_qg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<qg_tile(&)[BWD_NUM_WORKERS]>(k_smem);
+        //qg_tile(&max_qg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<qg_tile(&)[BWD_NUM_WORKERS]>(k_smem);
 
         q_tile(&q_smem)[stages] = al.allocate<q_tile, stages>();
         og_tile(&og_smem)[stages] = al.allocate<og_tile, stages>();
@@ -108,7 +108,7 @@ using namespace kittens;
         kg_tile(&kg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<kg_tile(&)[BWD_NUM_WORKERS]>(k_smem);
         vg_tile(&vg_smem)[BWD_NUM_WORKERS] = reinterpret_cast<vg_tile(&)[BWD_NUM_WORKERS]>(v_smem);
 
-        //attn_tile(&att_smem) = al.allocate<attn_tile>();
+        attn_tile(&attn_smem) = reinterpret_cast<attn_tile(&)>(v_smem);
 
         constexpr float INV_LN2 = 1.44269504089f;
         constexpr float LN2 = 0.69314718056f;
@@ -124,7 +124,7 @@ using namespace kittens;
 
         const int qo_blocks = (g.Qg.rows() + qo_height - 1) / qo_height;
 
-        const int q_start = (IS_CAUSAL) ? 0 : 0;
+        const int q_start = (IS_CAUSAL) ? blockIdx.x * BWD_NUM_WORKERS * kv_height / qo_height : 0;
 
         rt_bf<qo_height, ker_tile_dims::tile_width, row_l> q_reg, og_reg;
         rt_bf<qo_height, ker_tile_dims::tile_width, col_l> q_reg_col, og_reg_col;
@@ -164,7 +164,6 @@ using namespace kittens;
         load_group::load_async<2, false>(og_smem[tic], g.OGg, {batch, head, q_start, 0});
         load_group::load_async(l_smem[tic], g.Lg, {batch, head, 0, q_start});
         load_group::load_async(d_smem[tic], g.Dg, {batch, head, 0, q_start});
-        load_group::load_async(qg_smem[tic], g.QGg, {batch, head, q_start, 0});
 
         for (auto qo_idx = q_start; qo_idx < qo_blocks; qo_idx++, tic=(tic+1) % stages) {
 
@@ -174,11 +173,13 @@ using namespace kittens;
                 load_group::load_async<2, false>(og_smem[next_tic], g.OGg, {batch, head, qo_idx + 1, 0});
                 load_group::load_async(l_smem[next_tic], g.Lg, {batch, head, 0, qo_idx + 1});
                 load_group::load_async(d_smem[next_tic], g.Dg, {batch, head, 0, qo_idx + 1});
-                load_group::load_async(qg_smem[next_tic], g.QGg, {batch, head, qo_idx + 1, 0});
                 load_async_wait<1>();
             } else {
                 load_async_wait();
             }
+
+            __syncthreads();
+
 
             load(q_reg, q_smem[tic]);
 
@@ -189,13 +190,13 @@ using namespace kittens;
             // result is P_i = S_ij - L_i
             mma_ABt(s_block, q_reg, k_reg, s_block);
 
+            mul(s_block, s_block, INV_LN2);
+            exp2(s_block, s_block);
+
             // apply the causal mask
             if constexpr (IS_CAUSAL) {
                 causal_mask(s_block, qo_idx * qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
             }
-
-            mul(s_block, s_block, INV_LN2);
-            exp2(s_block, s_block);
 
             // load the og tile and compute the dp block
             load(og_reg, og_smem[tic]);
@@ -206,7 +207,8 @@ using namespace kittens;
 
             mul(ds_block, s_block, ds_block);
 
-            if (IS_CAUSAL) {
+            // apply the causal mask
+            if constexpr (IS_CAUSAL) {
                 causal_mask(ds_block, qo_idx * qo_height, seq_idx_k, g.seqlen_q, g.seqlen_k);
             }
 
@@ -223,7 +225,9 @@ using namespace kittens;
             zero(qg_reg);
             swap_layout(k_reg_col, k_reg);
             mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
-            atomic_add(g.QGg, qg_reg, {batch, head, qo_idx, 0});
+            if (seq_idx_k < g.Kg.rows()) {
+                atomic_add(g.QGg, qg_reg, {batch, head, qo_idx, 0});
+            }
 
             // implementation of atomic add in smem - need to have a lock to sync blocks
             /*atomic_add(qg_smem[tic], qg_reg);
@@ -253,14 +257,16 @@ using namespace kittens;
         }
 
         // store the kg and vg tiles
-        mul(kg_reg, kg_reg, g.sm_scale);
-        store(kg_smem[workerid], kg_reg);
-        store(vg_smem[workerid], vg_reg);
-        __syncwarp();
+        if (seq_idx_k < g.Kg.rows()) {
+            // store the kg and vg tiles
+            mul(kg_reg, kg_reg, g.sm_scale);
+            store(kg_smem[workerid], kg_reg);
+            store(vg_smem[workerid], vg_reg);
+            __syncwarp();
 
-        // store the kg and vg tiles
-        store(g.KGg, kg_smem[workerid], {batch, head, seq_idx, 0});
-        store(g.VGg, vg_smem[workerid], {batch, head, seq_idx, 0});
+            store(g.KGg, kg_smem[workerid], {batch, head, seq_idx, 0});
+            store(g.VGg, vg_smem[workerid], {batch, head, seq_idx, 0});
+        }
     }
 
     template __global__ void bwd_prep_ker<64>(const __grid_constant__ bwd_prep_globals<64> g);

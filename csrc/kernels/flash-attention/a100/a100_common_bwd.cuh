@@ -57,9 +57,6 @@ template<> struct bwd_ker_tile_dims<64> {
 
     using l_tile = col_vec<st_fl<qo_height, kv_height>>;
     using d_tile = col_vec<st_fl<qo_height, tile_width>>;
-
-    // attention
-    using attn_tile = st_fl<qo_height, kv_height>;
 };
 
 template<> struct bwd_ker_tile_dims<128> {
@@ -82,8 +79,6 @@ template<> struct bwd_ker_tile_dims<128> {
     // vectors
     using l_tile = col_vec<st_fl<qo_height, kv_height>>;
     using d_tile = col_vec<st_fl<qo_height, tile_width>>;
-
-    using attn_tile = st_fl<qo_height, kv_height>;
 };
 
 template<int D>
@@ -126,9 +121,6 @@ struct bwd_globals {
     // vectors
     using l_tile = ker_tile_dims::l_tile;
     using d_tile = ker_tile_dims::d_tile;
-
-    // attention
-    using attn_tile = ker_tile_dims::attn_tile;
 
     using q_gl = gl<bf16,  -1, -1, -1, -1, q_tile>;
     using k_gl = gl<bf16,  -1, -1, -1, -1, k_tile>;
@@ -179,11 +171,13 @@ __device__ static inline void
 stream_tile(auto &reg_tile, auto &smem_vec, int tic, float scale) {
 
     int base_col = kittens::laneid() / 4;
-    float first_value = *(float*)&smem_vec[tic][base_col + 0] * scale;
-    float second_value = *(float*)&smem_vec[tic][base_col + 8] * scale;
+
+    __syncthreads();
 
     #pragma unroll
     for(int i = 0; i < reg_tile.height; i++) {
+        float first_value = *(float*)&smem_vec[tic][i*16 + base_col + 0] * scale;
+        float second_value = *(float*)&smem_vec[tic][i*16 + base_col + 8] * scale;
         #pragma unroll
         for(int j = 0; j < reg_tile.width; j++) {
             reg_tile.tiles[i][j].data[0] = make_float2(first_value, first_value);

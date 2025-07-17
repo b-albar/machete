@@ -67,7 +67,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     }
 
     // divide the kv_iters by the group size
-    kv_iters = kv_iters / LOAD_BLOCKS - 1;
+    kv_iters = kv_iters / LOAD_BLOCKS;
 
     // shared memory allocation for k, v tiles
     k_tile (&k_smem)[LOAD_BLOCKS][stages] = al.allocate<k_tile, LOAD_BLOCKS, stages>();
@@ -112,11 +112,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     load_group::load_async<2, false>(v_smem[loadid][tic], g.Vg, {batch, head, loadid, 0});
 
     // iterate over k, v for these q's that have been loaded
-    for(auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++, tic=(tic+1) % stages) {
+    for(auto kv_idx = 0; kv_idx < kv_iters; kv_idx++, tic=(tic+1) % stages) {
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
 
         // load the next k, v tile if there are more iterations
-        if(kv_idx+1 <= kv_iters) {
+        if(kv_idx+1 < kv_iters) {
             int next_tic = (tic+1) % stages;
             load_group::load_async<2, false>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
             load_group::load_async<2, false>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
@@ -124,6 +124,8 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
         } else {
             load_async_wait();
         }
+
+        __syncthreads();
 
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile)*kv_height < g.seqlen_k; subtile++) {
@@ -170,7 +172,6 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
             mma_AB(o_reg, att_block_mma, v_reg, o_reg);
         }
 
-        // sync threads
         __syncthreads();
     }
 

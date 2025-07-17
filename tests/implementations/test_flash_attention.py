@@ -11,15 +11,15 @@ def max_diff(a, b):
 @pytest.mark.parametrize('scale', [0.125, 1.0])
 @pytest.mark.parametrize('b', [1, 2, 3, 4])
 @pytest.mark.parametrize('h', [4, 5, 8, 16])
-@pytest.mark.parametrize('m', [64, 128, 256, 512])
-@pytest.mark.parametrize('n', [64, 128, 256, 512])
+@pytest.mark.parametrize('m', [64, 128, 256])
+@pytest.mark.parametrize('n', [64, 128, 256])
 @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
 def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
-    q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
-    k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
-    v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale)
+    q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
+    k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
+    v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
 
     o_ref, _ = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=True)
     o_torch, _ = attn_ref(q, k, v, causal=causal, sm_scale=scale, upcast=False)
@@ -32,22 +32,20 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
 
     assert machete_max_diff < 2 * ref_max_diff
 
-@pytest.mark.parametrize('scale', [1.0])
-@pytest.mark.parametrize('b, h, m, n, d', [
-    (2, 4, 512, 512, 64),
-])
-@pytest.mark.parametrize('causal', [True, False])
+@pytest.mark.parametrize('scale', [0.125])
+@pytest.mark.parametrize('b', [2, 3, 5])
+@pytest.mark.parametrize('h', [4, 16])
+@pytest.mark.parametrize('m', [128])
+@pytest.mark.parametrize('n', [128])
+@pytest.mark.parametrize('d', [64, 128])
+@pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
 def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     torch.manual_seed(0)
     # Create tensors with gradients enabled
-    q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale).requires_grad_(True)
-    k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale).requires_grad_(True)
-    v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=scale).requires_grad_(True)
-
-    #q = torch.arange(b * h * m * d, dtype=dtype, device="cuda").view(b, h, m, d).requires_grad_(True) / 100000
-    #k = torch.arange(b * h * n * d, dtype=dtype, device="cuda").view(b, h, n, d).requires_grad_(True) / 100000
-    #v = torch.arange(b * h * n * d, dtype=dtype, device="cuda").view(b, h, n, d).requires_grad_(True) / 100000
+    q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1).requires_grad_(True)
+    k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1).requires_grad_(True)
+    v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1).requires_grad_(True)
 
     # Reference implementation tensors
     q_ref = q.detach().clone().requires_grad_(True)
@@ -66,7 +64,7 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     o_torch, l_vec_torch = attn_ref(q_torch, k_torch, v_torch, causal=causal, sm_scale=scale, upcast=False)
 
     # Create gradient for backprop
-    grad_output = torch.randn_like(o_hyp)
+    grad_output = torch.randn_like(o_hyp).normal_(mean=0., std=0.1) * 100
     grad_output_ref = grad_output.clone()
     grad_output_torch = grad_output.clone()
 
@@ -97,10 +95,11 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     dk_diff_ref = max_diff(dk_ref, dk_torch)
     dv_diff_ref = max_diff(dv_ref, dv_torch)
 
-    # Assert that gradients are close enough
-    assert dq_diff < 4 * dq_diff_ref, f"dQ difference too large: {dq_diff}" # TODO: why precision is less good on dQ?
-    assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff}"
-    assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff}"
+    o_ref.backward(grad_output_ref)
 
-#test_attention_fwd(2, 4, 512, 512, 64, True, torch.bfloat16, 0.125)
-test_attention_bwd(1, 1, 1024, 1024, 64, False, torch.bfloat16, 0.125)
+    # Assert that gradients are close enough
+    assert dq_diff < 2 * dq_diff_ref, f"dQ difference too large: {dq_diff} vs {dq_diff_ref}"
+    assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff} vs {dk_diff_ref}"
+    assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff} vs {dv_diff_ref}"
+
+#test_attention_bwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)

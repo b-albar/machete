@@ -66,14 +66,15 @@ def attn_bwd_ref(q: torch.Tensor,
     # Compute attention scores (needed for softmax backward)
     s = torch.matmul(q, k.transpose(2, 3) * sm_scale)
 
-    if causal:
-        ms = torch.arange(q.shape[2], device=q.device).unsqueeze(-1)
-        ns = torch.arange(k.shape[2], device=q.device)
-        s = torch.where(ms + k.shape[2] - q.shape[2] >= ns, s, float("-inf"))
-
     # Compute attention probabilities using provided l tensor
     # l contains log(sum(exp(s))), so exp(s - l) gives us the probabilities
     prob = torch.exp(s - l).to(og.dtype)
+
+    if causal:
+        # Zero out probabilities for masked positions
+        ms = torch.arange(q.shape[2], device=q.device).unsqueeze(-1)
+        ns = torch.arange(k.shape[2], device=q.device)
+        prob = torch.where(ms >= ns, prob, 0.0)
 
     # Backward pass gradients
     # Gradient w.r.t. v: dv = P^T @ og
@@ -92,7 +93,7 @@ def attn_bwd_ref(q: torch.Tensor,
         ds = torch.where(ms >= ns, ds, 0.0)
 
     # Gradient w.r.t. q: dq = ds @ k * sm_scale
-    dq = torch.matmul(ds, k) * sm_scale
+    dq = torch.matmul(ds, k * sm_scale)
 
     # Gradient w.r.t. k: dk = ds^T @ q * sm_scale
     dk = torch.matmul(ds.transpose(2, 3), q) * sm_scale
