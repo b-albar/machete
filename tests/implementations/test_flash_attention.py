@@ -30,8 +30,8 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
     machete_max_diff = max_diff(o_ref, o_hyp)
     ref_max_diff = max_diff(o_ref, o_torch)
 
-    l_vec_max_diff = max_diff(l_vec_ref, l_vec_hyp)
-    l_vec_ref_max_diff = max_diff(l_vec_ref, l_vec_torch)
+    l_vec_max_diff = max_diff(l_vec_ref.flatten(), l_vec_hyp.flatten())
+    l_vec_ref_max_diff = max_diff(l_vec_ref.flatten(), l_vec_torch.flatten())
 
     assert machete_max_diff < 2 * ref_max_diff
     assert l_vec_max_diff < 2 * l_vec_ref_max_diff
@@ -104,5 +104,5 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff} vs {dk_diff_ref}"
     assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff} vs {dv_diff_ref}"
 
-#test_attention_fwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)
+#test_attention_fwd(4, 16, 128, 128, 64, True, torch.bfloat16, 0.125)
 #test_attention_bwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)
