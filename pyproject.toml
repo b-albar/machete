@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "machete"
+version = "0.1"
+description = "A library of ThunderKittens kernels"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { file = "LICENSE" }
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+include-package-data = false
+# for selective package data see: https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
+
+[tool.setuptools.dynamic]
+dependencies = { file = "requirements.txt" }
+
+[tool.isort]
+line_length = 120
+include_trailing_comma = true
+multi_line_output = 3
+
+[tool.ruff]
+lint.ignore-init-module-imports = true
+line-length = 120
+lint.select = [
+    "E",  # All Errors
+    "W",  # All Warnings
+    "F",  # All Fault
+    "C",  # All Code Conventions
+    "N",  # All check for newlines
+]
+exclude = [
+    "venv/",
+    "__pycache__/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.mypy]
+plugins = [
+  "pydantic.mypy",
+]
+files = ["src/", "tests/"]
+
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+ignore_missing_imports = true
+
+strict_optional = true
+no_implicit_optional = true
+strict_equality = true
+no_implicit_reexport = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+check_untyped_defs = true
+
+exclude = [
+    "^venv.*"
+]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
