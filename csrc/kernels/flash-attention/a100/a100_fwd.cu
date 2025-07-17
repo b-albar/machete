@@ -177,18 +177,18 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
 
     div_row(o_reg, o_reg, norm_vec); // divide by l_i
 
-    if (seq_idx_q < g.Og.rows()) { // write out o.
-        store(o_smem[workerid], o_reg);
-        __syncwarp();
-        store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
-    }
-
     mul(max_vec, max_vec, LN2);
     log(norm_vec, norm_vec);
     add(norm_vec, norm_vec, max_vec);
 
-    store(l_smem[workerid], norm_vec);
-    store(g.Lg, l_smem[workerid], {batch, head, 0, seq_idx});
+    if (seq_idx_q < g.Og.rows()) { // write out o.
+        store(o_smem[workerid], o_reg);
+        __syncwarp();
+        store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
+
+        store(l_smem[workerid], norm_vec);
+        store(g.Lg, l_smem[workerid], {batch, head, 0, seq_idx});
+    }
 }
 
 // Explicit instantiations for D=64

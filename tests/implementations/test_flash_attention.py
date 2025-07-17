@@ -95,8 +95,6 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     dk_diff_ref = max_diff(dk_ref, dk_torch)
     dv_diff_ref = max_diff(dv_ref, dv_torch)
 
-    o_ref.backward(grad_output_ref)
-
     # Assert that gradients are close enough
     assert dq_diff < 2 * dq_diff_ref, f"dQ difference too large: {dq_diff} vs {dq_diff_ref}"
     assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff} vs {dk_diff_ref}"
