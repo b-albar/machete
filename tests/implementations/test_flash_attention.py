@@ -104,5 +104,5 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff} vs {dk_diff_ref}"
     assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff} vs {dv_diff_ref}"
 
-test_attention_fwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)
+#test_attention_fwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)
 #test_attention_bwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)
