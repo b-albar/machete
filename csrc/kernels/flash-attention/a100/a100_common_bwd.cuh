@@ -14,35 +14,21 @@ namespace cg = cooperative_groups;
 constexpr int BWD_PREP_NUM_WORKERS = 4;
 constexpr int BWD_NUM_WORKERS = 4;
 
-// Forward declaration
-template<unsigned int D> struct bwd_prep_ker_tile_dims;
-template<unsigned int D> struct bwd_ker_tile_dims;
-
-// Forward tile dimensions specializations
-
-template<> struct bwd_prep_ker_tile_dims<64> {
-    constexpr static int tile_width = (64);
-    constexpr static int qo_height = (2*kittens::TILE_ROW_DIM<bf16>);
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE> struct bwd_prep_ker_tile_dims {
+    constexpr static int tile_width = (HEAD_DIM);
+    constexpr static int qo_height = (QO_SIZE * kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int kv_height = (KV_SIZE * kittens::TILE_ROW_DIM<bf16>);
 
     using og_tile = st_bf<qo_height, tile_width>;
     using o_tile = st_bf<qo_height, tile_width>;
     using d_tile = col_vec<st_fl<qo_height, tile_width>>;
 };
 
-template<> struct bwd_prep_ker_tile_dims<128> {
-    constexpr static int tile_width = (128);
-    constexpr static int qo_height = (kittens::TILE_ROW_DIM<bf16>);
-
-    using og_tile = st_bf<qo_height, tile_width>;
-    using o_tile = st_bf<qo_height, tile_width>;
-    using d_tile = col_vec<st_fl<qo_height, tile_width>>;
-};
-
-template<> struct bwd_ker_tile_dims<64> {
-    constexpr static int tile_width = (64);
-    constexpr static int qo_height = (1*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int stages = (2);
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE, unsigned int STAGES> struct bwd_ker_tile_dims {
+    constexpr static int tile_width = (HEAD_DIM);
+    constexpr static int qo_height = (QO_SIZE * kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int kv_height = (KV_SIZE * kittens::TILE_ROW_DIM<bf16>);
+    constexpr static int stages = (STAGES);
 
     // input
     using q_tile = st_bf<qo_height, tile_width>;
@@ -59,31 +45,9 @@ template<> struct bwd_ker_tile_dims<64> {
     using d_tile = col_vec<st_fl<qo_height, tile_width>>;
 };
 
-template<> struct bwd_ker_tile_dims<128> {
-    constexpr static int tile_width = (128);
-    constexpr static int qo_height = (1*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int kv_height = (2*kittens::TILE_ROW_DIM<bf16>);
-    constexpr static int stages = (2);
-
-    // input
-    using q_tile = st_bf<qo_height, tile_width>;
-    using k_tile = st_bf<kv_height, tile_width>;
-    using v_tile = st_bf<kv_height, tile_width>;
-    using og_tile = st_bf<qo_height, tile_width>;
-
-    // output
-    using qg_tile = st_bf<qo_height, tile_width>;
-    using kg_tile = st_bf<kv_height, tile_width>;
-    using vg_tile = st_bf<kv_height, tile_width>;
-
-    // vectors
-    using l_tile = col_vec<st_fl<qo_height, kv_height>>;
-    using d_tile = col_vec<st_fl<qo_height, tile_width>>;
-};
-
-template<int D>
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE>
 struct bwd_prep_globals {
-    using ker_tile_dims = bwd_prep_ker_tile_dims<D>;
+    using ker_tile_dims = bwd_prep_ker_tile_dims<HEAD_DIM, QO_SIZE, KV_SIZE>;
 
     using og_tile = ker_tile_dims::og_tile;
     using o_tile = ker_tile_dims::o_tile;
@@ -103,9 +67,9 @@ struct bwd_prep_globals {
     }
 };
 
-template<int D>
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE, unsigned int STAGES>
 struct bwd_globals {
-    using ker_tile_dims = bwd_ker_tile_dims<D>;
+    using ker_tile_dims = bwd_ker_tile_dims<HEAD_DIM, QO_SIZE, KV_SIZE, STAGES>;
 
     // input tiles
     using q_tile = ker_tile_dims::q_tile;
@@ -155,14 +119,15 @@ struct bwd_globals {
     const int num_heads_k;
     const float sm_scale;
 
-    size_t get_smem_size() {
+    template<typename AttentionVariant>
+    size_t get_smem_size(AttentionVariant& av) {
 
         size_t kv_smem_size = BWD_NUM_WORKERS * (sizeof(k_tile) + sizeof(v_tile));
         size_t qo_smem_size = ker_tile_dims::stages * (sizeof(q_tile) + sizeof(og_tile));
         size_t grad_smem_size = ker_tile_dims::stages * sizeof(qg_tile); // kg and vg use the same smem as q/k smem
         size_t vec_smem_size = ker_tile_dims::stages * (sizeof(l_tile) + sizeof(d_tile));
 
-        return kv_smem_size + qo_smem_size + grad_smem_size + vec_smem_size;
+        return kv_smem_size + qo_smem_size + grad_smem_size + vec_smem_size + av.get_smem_size();
     }
 };
 
@@ -188,12 +153,14 @@ stream_tile(auto &reg_tile, auto &smem_vec, int tic, float scale) {
     }
 }
 
-// Forward declarations of kernel functions
-template<int D>
-__global__ void bwd_prep_ker(const __grid_constant__ bwd_prep_globals<D> g);
+{{variant_interface_bwd}}
 
-template<int D, bool IS_CAUSAL>
-__global__ void bwd_attend_ker(const __grid_constant__ bwd_globals<D> g);
+// Forward declarations of kernel functions
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE>
+__global__ void bwd_prep_ker(const __grid_constant__ bwd_prep_globals<HEAD_DIM, QO_SIZE, KV_SIZE> g);
+
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE, unsigned int STAGES, bool IS_CAUSAL, typename AttentionVariant>
+__global__ void bwd_attend_ker(const __grid_constant__ bwd_globals<HEAD_DIM, QO_SIZE, KV_SIZE, STAGES> g, AttentionVariant& variant);
 
 } // namespace fa_a100
 

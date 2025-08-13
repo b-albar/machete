@@ -24,9 +24,9 @@ causal_mask(auto &reg_tile, int q_blk, int k_blk, int seqlen_q, int seqlen_k) {
     }
 }
 
-template<int HEAD_DIM, bool IS_CAUSAL>
+template<unsigned int HEAD_DIM, unsigned int QO_SIZE, unsigned int KV_SIZE, unsigned int STAGES, bool IS_CAUSAL, typename AttentionVariant>
 __global__  __launch_bounds__(FWD_NUM_WORKERS*kittens::WARP_THREADS, 1)
-void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
+void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM, QO_SIZE, KV_SIZE, STAGES> g, AttentionVariant& attention_variant) {
 
     // Shared memory allocation
     extern __shared__ alignment_dummy __shm[];
@@ -42,7 +42,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     const int head = blockIdx.y;
     const int seq_idx = blockIdx.x * FWD_NUM_WORKERS + workerid;
 
-    using ker_tile_dims = fwd_ker_tile_dims<HEAD_DIM>;
+    using ker_tile_dims = fwd_ker_tile_dims<HEAD_DIM, QO_SIZE, KV_SIZE, STAGES>;
     using q_tile = ker_tile_dims::q_tile;
     using k_tile = ker_tile_dims::k_tile;
     using v_tile = ker_tile_dims::v_tile;
@@ -76,10 +76,6 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     // use k_smem for loading Q and O tiles
     q_tile (&q_smem)[FWD_NUM_WORKERS] = reinterpret_cast<q_tile(&)[FWD_NUM_WORKERS]>(k_smem);
     o_tile (&o_smem)[FWD_NUM_WORKERS] = reinterpret_cast<o_tile(&)[FWD_NUM_WORKERS]>(k_smem);
-    l_col_vec (&l_smem)[FWD_NUM_WORKERS] = al.allocate<l_col_vec, FWD_NUM_WORKERS>();
-
-    using att_tile = st_fl<qo_height, kv_height>;
-    att_tile (&att_smem)[FWD_NUM_WORKERS] = reinterpret_cast<att_tile(&)[FWD_NUM_WORKERS]>(k_smem);
 
     // register allocation
     rt_bf<qo_height, HEAD_DIM, row_l> q_reg;
@@ -89,11 +85,21 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     rt_bf<qo_height, kv_height, row_l> att_block_mma;
     rt_fl<qo_height, HEAD_DIM, row_l> o_reg;
 
+    // softmax requires l_i, which is the log of the normalization factor
     col_vec<rt_fl<qo_height, kv_height>> max_vec, norm_vec, max_vec_old;
+    l_col_vec (*l_smem)[FWD_NUM_WORKERS];
+
+    if constexpr (attention_variant.is_softmax) {
+        l_smem = &al.allocate<l_col_vec, FWD_NUM_WORKERS>();
+        // initialize the max and norm vectors
+        neg_infty(max_vec);
+        zero(norm_vec);
+    }
+
+    // initialize the attention variant
+    attention_variant.initialize(g, al);
 
     // initialize some registers
-    neg_infty(max_vec);
-    zero(norm_vec);
     zero(o_reg);
 
     // load the Q tile
@@ -110,6 +116,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
     int tic = 0;
     load_group::load_async<2, false>(k_smem[loadid][tic], g.Kg, {batch, head, loadid, 0});
     load_group::load_async<2, false>(v_smem[loadid][tic], g.Vg, {batch, head, loadid, 0});
+    attention_variant.load_data(g, workerid, tic, batch, head, seq_idx, loadid);
 
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_iters; kv_idx++, tic=(tic+1) % stages) {
@@ -120,6 +127,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
             int next_tic = (tic+1) % stages;
             load_group::load_async<2, false>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
             load_group::load_async<2, false>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
+            attention_variant.load_data(g, workerid, next_tic, batch, head, seq_idx, next_load_idx);
             load_async_wait<1>(); // next k, v can stay in flight.
         } else {
             load_async_wait();
@@ -130,8 +138,14 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile)*kv_height < g.seqlen_k; subtile++) {
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
+
+            attention_variant.qkv_transform(g, q_reg, k_reg, v_reg);
+
             zero(att_block); // zero attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
+
+            // apply the variant transform of the logits
+            attention_variant.logits_transform(g, att_block);
 
             // apply transformation of attention values (i.e. causal mask, bias, etc.)
             if constexpr (IS_CAUSAL) {
@@ -144,24 +158,32 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
                 );
             }
 
-            // save the previous max_vec
-            copy(max_vec_old, max_vec);
-
             // scale by INV_LN2 for using exp2 and sm_scale
-            mul(att_block, att_block, INV_LN2 * g.sm_scale);
+            if constexpr (attention_variant.is_softmax) {
+                mul(att_block, att_block, INV_LN2 * g.sm_scale);
+            } else {
+                mul(att_block, att_block, g.sm_scale);
+            }
 
-            // compute the max of the attention block - already scaled
-            row_max(max_vec, att_block, max_vec);
+            if constexpr (attention_variant.is_softmax) {
+                // save the previous max_vec
+                copy(max_vec_old, max_vec);
 
-            // compute exp2(S - m_i)
-            sub_row(att_block, att_block, max_vec);
-            exp2(att_block, att_block);
+                // compute the max of the attention block - already scaled
+                row_max(max_vec, att_block, max_vec);
 
-            // compute l_i = exp(m_prev - m_i) * l_i + rowsum(S)
-            sub(max_vec_old, max_vec_old, max_vec);
-            exp2(max_vec_old, max_vec_old);
-            mul(norm_vec, norm_vec, max_vec_old);
-            row_sum(norm_vec, att_block, norm_vec);
+                // compute exp2(S - m_i)
+                sub_row(att_block, att_block, max_vec);
+                exp2(att_block, att_block);
+
+                // compute l_i = exp(m_prev - m_i) * l_i + rowsum(S)
+                sub(max_vec_old, max_vec_old, max_vec);
+                exp2(max_vec_old, max_vec_old);
+                mul(norm_vec, norm_vec, max_vec_old);
+                row_sum(norm_vec, att_block, norm_vec);
+
+               attention_variant.finalize_step(g);
+            }
 
             // copy the attention block from fp32 to bf16 register
             copy(att_block_mma, att_block);
@@ -175,28 +197,27 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM> g) {
         __syncthreads();
     }
 
-    div_row(o_reg, o_reg, norm_vec); // divide by l_i
+    if constexpr (attention_variant.is_softmax) {
+        div_row(o_reg, o_reg, norm_vec); // divide by l_i
 
-    mul(max_vec, max_vec, LN2);
-    log(norm_vec, norm_vec);
-    add(norm_vec, norm_vec, max_vec);
+        mul(max_vec, max_vec, LN2);
+        log(norm_vec, norm_vec);
+        add(norm_vec, norm_vec, max_vec);
+    }
 
     if (seq_idx_q < g.Og.rows()) { // write out o.
         store(o_smem[workerid], o_reg);
         __syncwarp();
         store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
 
-        store(l_smem[workerid], norm_vec);
-        store(g.Lg, l_smem[workerid], {batch, head, 0, seq_idx});
+        if constexpr (attention_variant.is_softmax) {
+            store((*l_smem)[workerid], norm_vec);
+            store(g.Lg, (*l_smem)[workerid], {batch, head, 0, seq_idx});
+        }
     }
+    attention_variant.finalize(g, workerid, batch, head, seq_idx);
 }
 
-// Explicit instantiations for D=64
-template __global__ void fwd_attend_ker<64, true>(const __grid_constant__ fwd_globals<64> g);
-template __global__ void fwd_attend_ker<64, false>(const __grid_constant__ fwd_globals<64> g);
-
-// Explicit instantiations for D=128
-template __global__ void fwd_attend_ker<128, true>(const __grid_constant__ fwd_globals<128> g);
-template __global__ void fwd_attend_ker<128, false>(const __grid_constant__ fwd_globals<128> g);
+{{fwd_explicit_instantiations}}
 
 } // namespace fa_a100
