@@ -57,6 +57,8 @@ def load_cuda_ops(
     elif gpu_target == "5070":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
+    else:
+        raise ValueError(f"GPU target {gpu_target} not supported")
 
     build_directory = JIT_DIR + "/" + name
     os.makedirs(build_directory, exist_ok=True)

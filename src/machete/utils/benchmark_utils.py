@@ -5,6 +5,10 @@ import math
 import torch
 import torch.utils.benchmark as benchmark
 
+# Disable donated buffer
+from torch._functorch import config as functorch_config
+functorch_config.donated_buffer = False
+
 
 def benchmark_forward(
     fn, *inputs, repeats=10, desc="", verbose=True, amp=False, amp_dtype=torch.float16, **kwinputs
@@ -43,6 +47,11 @@ def benchmark_backward(
     if verbose:
         print(desc, "- Backward pass")
     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
+        # Set requires_grad to True for all inputs
+        for x in inputs:
+            if isinstance(x, torch.Tensor):
+                x.requires_grad = True
+
         y = fn(*inputs, **kwinputs)
         if type(y) is tuple:
             y = y[0]

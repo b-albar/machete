@@ -6,7 +6,7 @@ import os
 import numpy as np
 
 from .benchmark_utils import benchmark_forward, benchmark_backward, \
-                            benchmark_memory, benchmark_fwd_bwd, efficiency
+                            benchmark_memory, benchmark_fwd_bwd, benchmark_combined, efficiency
 
 class Benchmark:
     def __init__(self):
@@ -23,7 +23,7 @@ class Benchmark:
             return func
         return decorator
 
-    def _plot_graphics(self, results, path_graphics, key_split, memory=False, is_flops=False):
+    def _plot_graphics(self, results, mode, path_graphics, key_split, memory=False, is_flops=False, bar_labels=True):
 
         dirname = path_graphics if path_graphics is not None else 'benchmark_results'
         os.makedirs(dirname, exist_ok=True)
@@ -41,7 +41,11 @@ class Benchmark:
         param_values.pop(index_split)
         param_names_without_split = [name for name in param_names if name != key_split]
 
-        modes = ['fwd', 'bwd']
+        if mode == "fwd_bwd":
+            modes = ['fwd', 'bwd']
+        else:
+            modes = [mode]
+
         if memory:
             modes.append('memory')
 
@@ -76,7 +80,8 @@ class Benchmark:
                 for attribute, measurement in values_per_func.items():
                     offset = width * multiplier
                     rects = ax.bar(x + offset, measurement, width, label=attribute)
-                    ax.bar_label(rects, padding=3)
+                    if bar_labels:
+                        ax.bar_label(rects, padding=3)
                     multiplier += 1
 
                 # Add some text for labels, title and custom x-axis tick labels, etc.
@@ -112,7 +117,8 @@ class Benchmark:
             export_csv: bool = True,
             export_graphics: bool = False,
             key_split: Optional[str] = None,
-            path_graphics: Optional[str] = None):
+            path_graphics: Optional[str] = None,
+            **plot_graphics_kwargs):
         param_names = list(self.parameters.keys())
         param_values = list(self.parameters.values())
 
@@ -133,14 +139,15 @@ class Benchmark:
                         results[str(params)][func_name]["fwd"] = efficiency(flops_op, result[1].mean)
                     else:
                         results[str(params)][func_name]["fwd"] = result[1].mean * 1000
-                    result = benchmark_backward(func, backward=True, verbose=False)
+                elif mode == "bwd":
+                    result = benchmark_backward(func, verbose=False)
                     if flops is not None:
                         flops_op = flops(**params, mode=mode)
                         results[str(params)][func_name]["bwd"] = efficiency(flops_op, result[1].mean)
                     else:
                         results[str(params)][func_name]["bwd"] = result[1].mean * 1000
                 elif mode == "fwd_bwd":
-                    result = benchmark_fwd_bwd(func, verbose=False)
+                    result = benchmark_combined(func, verbose=False)
                     if flops is not None:
                         flops_fwd = flops(**params, mode="fwd")
                         flops_bwd = flops(**params, mode="bwd")
@@ -157,6 +164,14 @@ class Benchmark:
                     results[str(params)][func_name]["memory"] = result * 1024
 
         if export_graphics:
-            self._plot_graphics(results, path_graphics, key_split=key_split, memory=memory, is_flops=flops is not None)
+            self._plot_graphics(
+                results,
+                mode,
+                path_graphics,
+                key_split=key_split,
+                memory=memory,
+                is_flops=flops is not None,
+                **plot_graphics_kwargs
+            )
 
         return results

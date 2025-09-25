@@ -14,7 +14,7 @@ CUDA_CFLAGS = [
     "-Xptxas=--warn-on-spills --verbose",
     "-MD", "-MT", "-MF",
     "-x", "cu",
-    "-w"
+    "-w", "--extended-lambda"
 ]
 
 LD_FLAGS = [
