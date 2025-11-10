@@ -15,9 +15,9 @@ causal_mask(auto &reg_tile, int q_blk, int k_blk, int seqlen_q, int seqlen_k) {
             auto &attn_subtile = reinterpret_cast<rt_fl<kittens::TILE_ROW_DIM<float>, kittens::TILE_COL_DIM<float>>&>(reg_tile.tiles[i][j]);
 
             if (k_idx > q_idx || q_idx >= seqlen_q || k_idx >= seqlen_k) {
-                neg_infty(attn_subtile);
+                warp::neg_infty(attn_subtile);
             } else if (k_idx == q_idx) {
-                make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::neg_infty());
+                warp::make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::neg_infty());
             }
             __syncwarp();
         }
@@ -92,23 +92,23 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM, QO_SIZE, KV_SI
     if constexpr (attention_variant.is_softmax) {
         l_smem = &al.allocate<l_col_vec, FWD_NUM_WORKERS>();
         // initialize the max and norm vectors
-        neg_infty(max_vec);
-        zero(norm_vec);
+        warp::neg_infty(max_vec);
+        warp::zero(norm_vec);
     }
 
     // initialize the attention variant
     attention_variant.initialize(g, al);
 
     // initialize some registers
-    zero(o_reg);
+    warp::zero(o_reg);
 
     // load the Q tile
     if (seq_idx_q < g.Qg.rows()) {
         // going through shared memory improves coalescing of dram reads.
-        load<2, false>(q_smem[workerid], g.Qg, {batch, head, seq_idx, 0});
+        warp::load<2, false>(q_smem[workerid], g.Qg, {batch, head, seq_idx, 0});
         __syncwarp();
         // load the Q tile into the register
-        load(q_reg, q_smem[workerid]);
+        warp::load(q_reg, q_smem[workerid]);
     }
     __syncthreads();
 
@@ -137,12 +137,16 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM, QO_SIZE, KV_SI
 
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile)*kv_height < g.seqlen_k; subtile++) {
-            load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
+
+            // initialize the attention variant for the current step
+            attention_variant.initialize_step(g, workerid, tic, batch, head, seq_idx, (kv_idx*LOAD_BLOCKS + subtile));
+
+            warp::load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
 
             attention_variant.qkv_transform(g, q_reg, k_reg, v_reg);
 
-            zero(att_block); // zero attention tile
-            mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
+            warp::zero(att_block); // zero attention tile
+            warp::mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
 
             // apply the variant transform of the logits
             attention_variant.logits_transform(g, att_block);
@@ -160,59 +164,59 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<HEAD_DIM, QO_SIZE, KV_SI
 
             // scale by INV_LN2 for using exp2 and sm_scale
             if constexpr (attention_variant.is_softmax) {
-                mul(att_block, att_block, INV_LN2 * g.sm_scale);
+                warp::mul(att_block, att_block, INV_LN2 * g.sm_scale);
             } else {
-                mul(att_block, att_block, g.sm_scale);
+                warp::mul(att_block, att_block, g.sm_scale);
             }
 
             if constexpr (attention_variant.is_softmax) {
                 // save the previous max_vec
-                copy(max_vec_old, max_vec);
+                warp::copy(max_vec_old, max_vec);
 
                 // compute the max of the attention block - already scaled
-                row_max(max_vec, att_block, max_vec);
+                warp::row_max(max_vec, att_block, max_vec);
 
                 // compute exp2(S - m_i)
-                sub_row(att_block, att_block, max_vec);
-                exp2(att_block, att_block);
+                warp::sub_row(att_block, att_block, max_vec);
+                warp::exp2(att_block, att_block);
 
                 // compute l_i = exp(m_prev - m_i) * l_i + rowsum(S)
-                sub(max_vec_old, max_vec_old, max_vec);
-                exp2(max_vec_old, max_vec_old);
-                mul(norm_vec, norm_vec, max_vec_old);
-                row_sum(norm_vec, att_block, norm_vec);
+                warp::sub(max_vec_old, max_vec_old, max_vec);
+                warp::exp2(max_vec_old, max_vec_old);
+                warp::mul(norm_vec, norm_vec, max_vec_old);
+                warp::row_sum(norm_vec, att_block, norm_vec);
 
                attention_variant.finalize_step(g);
             }
 
             // copy the attention block from fp32 to bf16 register
-            copy(att_block_mma, att_block);
+            warp::copy(att_block_mma, att_block);
 
             // load values and multiply by them
-            load(v_reg, v_smem[subtile][tic]);
-            mul_row(o_reg, o_reg, max_vec_old);
-            mma_AB(o_reg, att_block_mma, v_reg, o_reg);
+            warp::load(v_reg, v_smem[subtile][tic]);
+            warp::mul_row(o_reg, o_reg, max_vec_old);
+            warp::mma_AB(o_reg, att_block_mma, v_reg, o_reg);
         }
 
         __syncthreads();
     }
 
     if constexpr (attention_variant.is_softmax) {
-        div_row(o_reg, o_reg, norm_vec); // divide by l_i
+        warp::div_row(o_reg, o_reg, norm_vec); // divide by l_i
 
-        mul(max_vec, max_vec, LN2);
-        log(norm_vec, norm_vec);
-        add(norm_vec, norm_vec, max_vec);
+        warp::mul(max_vec, max_vec, LN2);
+        warp::log(norm_vec, norm_vec);
+        warp::add(norm_vec, norm_vec, max_vec);
     }
 
     if (seq_idx_q < g.Og.rows()) { // write out o.
-        store(o_smem[workerid], o_reg);
+        warp::store(o_smem[workerid], o_reg);
         __syncwarp();
-        store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
+        warp::store<2, false>(g.Og, o_smem[workerid], {batch, head, seq_idx, 0});
 
         if constexpr (attention_variant.is_softmax) {
-            store((*l_smem)[workerid], norm_vec);
-            store(g.Lg, (*l_smem)[workerid], {batch, head, 0, seq_idx});
+            warp::store((*l_smem)[workerid], norm_vec);
+            warp::store(g.Lg, (*l_smem)[workerid], {batch, head, 0, seq_idx});
         }
     }
     attention_variant.finalize(g, workerid, batch, head, seq_idx);

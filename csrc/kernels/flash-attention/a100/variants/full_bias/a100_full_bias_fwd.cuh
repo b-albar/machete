@@ -1,4 +1,4 @@
-struct AttentionDefaultBwd {
+struct AttentionDefaultFwd {
 
     constexpr static bool is_softmax = true;
 

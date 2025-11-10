@@ -1,14 +1,20 @@
 struct AttentionDefaultFwd {
 
     constexpr static bool is_softmax = true;
+    
 
     template<typename Params, typename SharedAllocator>
     __device__ static inline void initialize(Params& params, SharedAllocator& al) {
-        // do nothing
+        
     }
 
     template<typename Params>
     __device__ static inline void load_data(Params& params, int workerid, int tic, int batch, int head, int idx_q, int idx_k) {
+        // do nothing
+    }
+
+    template<typename Params>
+    __device__ static inline void initialize_step(Params& params, int workerid, int tic, int batch, int head, int idx_q, int idx_k) {
         // do nothing
     }
 
