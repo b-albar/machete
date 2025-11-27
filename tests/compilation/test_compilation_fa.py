@@ -1,9 +1,10 @@
 import pytest
+from typing import Any
 from machete.jit.jit import load_cuda_ops
 from machete.jit.jit_env import ROOT_DIR
 
 @pytest.fixture
-def flash_attention_op():
+def flash_attention_op() -> Any:
 
     # Load CUDA operations
     op = load_cuda_ops(
@@ -17,7 +18,7 @@ def flash_attention_op():
     )
     return op
 
-def test_flash_attention_compilation(flash_attention_op):
+def test_flash_attention_compilation(flash_attention_op: Any) -> None:
     # Test that the forward operation exists
     assert hasattr(flash_attention_op, "fwd")
 

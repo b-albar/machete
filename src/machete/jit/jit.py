@@ -7,10 +7,12 @@ import os
 from filelock import FileLock
 from .jit_env import CFLAGS, CUDA_CFLAGS, LD_FLAGS, JIT_DIR, TK_INCLUDE_DIR, MACHETE_INCLUDE_DIR
 
-def get_cuda_arch() -> str:
+def get_cuda_arch() -> Optional[str]:
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
-        arch = re.search(r"compute_(\d+)", cuda_arch_flags).group(1)
-        return arch
+        arch = re.search(r"compute_(\d+)", cuda_arch_flags)
+        if arch is not None:
+            return arch.group(1)
+    return None
 
 def get_gpu_device(device_id: int) -> str:
     return torch.cuda.get_device_name(device_id)
@@ -47,16 +49,19 @@ def load_cuda_ops(
     if gpu_target == "4090":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
+            cuda_cflags.append("-DKITTENS_ARCH=890")
     elif gpu_target == "a100":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
+        cuda_cflags.append("-DKITTENS_ARCH=800")
     elif gpu_target == "h100":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
-        cuda_cflags.append("-DKITTENS_HOPPER")
+        cuda_cflags.append("-DKITTENS_ARCH=900")
     elif gpu_target == "5070":
         if os.environ.get("TORCH_CUDA_ARCH_LIST") is None:
             os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0"
+        cuda_cflags.append("-DKITTENS_ARCH=1000")
 
     build_directory = JIT_DIR + "/" + name
     os.makedirs(build_directory, exist_ok=True)
@@ -64,8 +69,8 @@ def load_cuda_ops(
     if extra_include_paths is None:
         extra_include_paths = []
     extra_include_paths += [
-        TK_INCLUDE_DIR,
-        MACHETE_INCLUDE_DIR
+        str(TK_INCLUDE_DIR),
+        str(MACHETE_INCLUDE_DIR)
     ]
 
     lock = FileLock(JIT_DIR + "/" + f"{name}.lock")
@@ -84,4 +89,4 @@ def load_cuda_ops(
         )
 
     print(f"Finished loading JIT ops: {name}")
-    return mod
+    return mod  # type: ignore

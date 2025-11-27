@@ -1,11 +1,11 @@
 import torch
 import pytest
-from machete.kernels.flash_attention import flash_attention
+from machete.kernels.flash_attention_tk import flash_attention
 from machete.utils.references.attention.attention_ref import attn_ref, attn_bwd_ref
 
 #from flash_attn import flash_attn_func
 
-def max_diff(a, b):
+def max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a - b).abs().max().item()
 
 @pytest.mark.parametrize('scale', [0.125, 1.0])
@@ -16,7 +16,7 @@ def max_diff(a, b):
 @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize('causal', [True, False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
-def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
+def test_attention_fwd(b: int, h: int, m: int, n: int, d: int, causal: bool, dtype: torch.dtype, scale: float) -> None:
     q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
     k = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
     v = torch.empty((b, h, n, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1)
@@ -44,7 +44,7 @@ def test_attention_fwd(b, h, m, n, d, causal, dtype, scale):
 @pytest.mark.parametrize('d', [64, 128])
 @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
-def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
+def test_attention_bwd(b: int, h: int, m: int, n: int, d: int, causal: bool, dtype: torch.dtype, scale: float) -> None:
     torch.manual_seed(0)
     # Create tensors with gradients enabled
     q = torch.empty((b, h, m, d), dtype=dtype, device="cuda").normal_(mean=0., std=0.1).requires_grad_(True)
@@ -104,5 +104,5 @@ def test_attention_bwd(b, h, m, n, d, causal, dtype, scale):
     assert dk_diff < 2 * dk_diff_ref, f"dK difference too large: {dk_diff} vs {dk_diff_ref}"
     assert dv_diff < 2 * dv_diff_ref, f"dV difference too large: {dv_diff} vs {dv_diff_ref}"
 
-#test_attention_fwd(4, 16, 128, 128, 64, True, torch.bfloat16, 0.125)
+test_attention_fwd(4, 16, 128, 128, 64, True, torch.bfloat16, 0.125)
 #test_attention_bwd(3, 16, 128, 128, 64, False, torch.bfloat16, 0.125)

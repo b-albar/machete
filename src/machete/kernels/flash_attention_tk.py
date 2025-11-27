@@ -1,16 +1,16 @@
 import torch
 from machete.jit.jit import load_cuda_ops
-from typing import Optional, Callable
+from typing import Optional, Any
 
-from machete.jit.jit import get_cuda_arch, get_gpu_device
+from machete.jit.jit import get_gpu_device
 from machete.jit.jit_env import ROOT_DIR
 from machete.utils.utils import maybe_contiguous
 
 
 # Global variable to store the flash attention ops
-_flash_attention_ops: Optional[Callable] = None
+_flash_attention_ops: Optional[Any] = None
 
-def _get_flash_attention_ops():
+def _get_flash_attention_ops() -> Any:
     global _flash_attention_ops
 
     if _flash_attention_ops is None:
@@ -63,7 +63,7 @@ def _flash_attn_forward(q: torch.Tensor,
 
     return o, l_vec
 
-@torch.library.register_fake("machete::flash_attention_fwd")
+@torch.library.register_fake("machete::flash_attention_fwd") # type: ignore
 def _flash_attn_forward_fake(q: torch.Tensor,
                             k: torch.Tensor,
                             v: torch.Tensor,
@@ -89,9 +89,9 @@ def _flash_attn_backward(do:torch.Tensor,
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     func_op = _get_flash_attention_ops()
 
-    return func_op.bwd(q, k, v, o, l_vec, do, causal, sm_scale)
+    return func_op.bwd(q, k, v, o, l_vec, do, causal, sm_scale) # type: ignore
 
-@torch.library.register_fake("machete::flash_attention_bwd")
+@torch.library.register_fake("machete::flash_attention_bwd") # type: ignore
 def _flash_attn_backward_fake(do: torch.Tensor,
                               o: torch.Tensor,
                               q: torch.Tensor,
@@ -111,7 +111,12 @@ def _flash_attn_backward_fake(do: torch.Tensor,
 class FlashAttention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale):
+    def forward(ctx: Any,
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                causal: bool,
+                sm_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
         if sm_scale is None:
             sm_scale = q.size(-1) ** (-0.5)
 
@@ -124,13 +129,16 @@ class FlashAttention(torch.autograd.Function):
         return o, l_vec
 
     @staticmethod
-    def backward(ctx, do, dl_vec=None):
+    def backward(ctx: Any,
+                 do: torch.Tensor,
+                 dl_vec: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         q, k, v, o, l_vec = ctx.saved_tensors
         causal = ctx.causal
         sm_scale = ctx.sm_scale
 
-        # Placeholder for backward implementation
-        dq, dk, dv = torch.ops.machete.flash_attention_bwd(do.clone(), o.clone(), q.clone(), k.clone(), v.clone(), l_vec.clone(), causal, sm_scale)
+        dq, dk, dv = torch.ops.machete.flash_attention_bwd(
+            do.clone(), o.clone(), q.clone(), k.clone(), v.clone(), l_vec.clone(), causal, sm_scale
+        )
 
         return dq, dk, dv, None, None
 

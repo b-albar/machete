@@ -16,9 +16,9 @@ using namespace kittens;
                 auto &attn_subtile = reinterpret_cast<rt_fl<kittens::TILE_ROW_DIM<float>, kittens::TILE_COL_DIM<float>>&>(reg_tile.tiles[i][j]);
 
                 if (k_idx > q_idx || q_idx >= seqlen_q || k_idx >= seqlen_k) {
-                    zero(attn_subtile);
+                    warp::zero(attn_subtile);
                 } else if (k_idx == q_idx) {
-                    make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::zero());
+                    warp::make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::zero());
                 }
                 __syncwarp();
             }
@@ -50,21 +50,21 @@ using namespace kittens;
         col_vec<rt_fl<ker_tile_dims::qo_height, ker_tile_dims::tile_width>> d_reg;
 
         // load the og and o tiles
-        load<2, false>(o_smem[workerid], g.o, {batch, head, seq_idx, 0});
-        load<2, false>(og_smem[workerid], g.og, {batch, head, seq_idx, 0});
+        warp::load<2, false>(o_smem[workerid], g.o, {batch, head, seq_idx, 0});
+        warp::load<2, false>(og_smem[workerid], g.og, {batch, head, seq_idx, 0});
 
         // load the o, og tiles in registers
-        load(o_reg, o_smem[workerid]);
-        load(og_reg, og_smem[workerid]);
+        warp::load(o_reg, o_smem[workerid]);
+        warp::load(og_reg, og_smem[workerid]);
 
         // compute the og * o tile
-        mul(og_reg, og_reg, o_reg);
-        row_sum(d_reg, og_reg);
+        warp::mul(og_reg, og_reg, o_reg);
+        warp::row_sum(d_reg, og_reg);
         __syncthreads();
 
-        store(d_smem[workerid], d_reg);
+        warp::store(d_smem[workerid], d_reg);
         __syncwarp();
-        store(g.d, d_smem[workerid], {batch, head, 0, seq_idx});
+        warp::store(g.d, d_smem[workerid], {batch, head, 0, seq_idx});
     }
 
     template <int HEAD_DIM, bool IS_CAUSAL>
@@ -142,21 +142,21 @@ using namespace kittens;
         // load the K/V tiles
         // going through shared memory
         if (seq_idx_k < g.Kg.rows()) {
-            load<2, false>(k_smem[workerid], g.Kg, {batch, head, seq_idx, 0});
-            load<2, false>(v_smem[workerid], g.Vg, {batch, head, seq_idx, 0});
+            warp::load<2, false>(k_smem[workerid], g.Kg, {batch, head, seq_idx, 0});
+            warp::load<2, false>(v_smem[workerid], g.Vg, {batch, head, seq_idx, 0});
             __syncwarp();
             // load the K/V tiles into the register
-            load(k_reg, k_smem[workerid]);
-            load(v_reg, v_smem[workerid]);
+            warp::load(k_reg, k_smem[workerid]);
+            warp::load(v_reg, v_smem[workerid]);
 
             // multiply the k by the sm_scale before matrix product
-            mul(k_reg, k_reg, __float2bfloat16(g.sm_scale));
+            warp::mul(k_reg, k_reg, __float2bfloat16(g.sm_scale));
         }
         __syncthreads();
 
         // zero the blocks kg_reg and vg_reg
-        zero(kg_reg);
-        zero(vg_reg);
+        warp::zero(kg_reg);
+        warp::zero(vg_reg);
 
         int tic = 0;
         // load the first tile
@@ -181,17 +181,17 @@ using namespace kittens;
             __syncthreads();
 
 
-            load(q_reg, q_smem[tic]);
+            warp::load(q_reg, q_smem[tic]);
 
             //zero the s_block
             stream_tile(s_block, l_smem, tic, -1.0f);
 
             // compute the s block and accumulate the result into s_block_t
             // result is P_i = S_ij - L_i
-            mma_ABt(s_block, q_reg, k_reg, s_block);
+            warp::mma_ABt(s_block, q_reg, k_reg, s_block);
 
-            mul(s_block, s_block, INV_LN2);
-            exp2(s_block, s_block);
+            warp::mul(s_block, s_block, INV_LN2);
+            warp::exp2(s_block, s_block);
 
             // apply the causal mask
             if constexpr (IS_CAUSAL) {
@@ -199,13 +199,13 @@ using namespace kittens;
             }
 
             // load the og tile and compute the dp block
-            load(og_reg, og_smem[tic]);
+            warp::load(og_reg, og_smem[tic]);
 
             // initialize the ds_block with the d vector
             stream_tile(ds_block, d_smem, tic, -1.0f);
-            mma_ABt(ds_block, og_reg, v_reg, ds_block);
+            warp::mma_ABt(ds_block, og_reg, v_reg, ds_block);
 
-            mul(ds_block, s_block, ds_block);
+            warp::mul(ds_block, s_block, ds_block);
 
             // apply the causal mask
             if constexpr (IS_CAUSAL) {
@@ -213,20 +213,20 @@ using namespace kittens;
             }
 
             // compute the dv block
-            copy(s_block_mma, s_block);
-            swap_layout(og_reg_col, og_reg);
-            swap_layout(s_block_mma_col, s_block_mma);
-            mma_AtB(vg_reg, s_block_mma_col, og_reg_col, vg_reg);
+            warp::copy(s_block_mma, s_block);
+            warp::swap_layout(og_reg_col, og_reg);
+            warp::swap_layout(s_block_mma_col, s_block_mma);
+            warp::mma_AtB(vg_reg, s_block_mma_col, og_reg_col, vg_reg);
 
             // copy the ds_block to the ds_block_mma (bf16)
-            copy(ds_block_mma, ds_block);
+            warp::copy(ds_block_mma, ds_block);
 
             // compute dq as P * k * sm_scale - sm_scale is already applied to k
-            zero(qg_reg);
-            swap_layout(k_reg_col, k_reg);
-            mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
+            warp::zero(qg_reg);
+            warp::swap_layout(k_reg_col, k_reg);
+            warp::mma_AB(qg_reg, ds_block_mma, k_reg_col, qg_reg);
             if (seq_idx_k < g.Kg.rows()) {
-                atomic_add(g.QGg, qg_reg, {batch, head, qo_idx, 0});
+                warp::atomic_add(g.QGg, qg_reg, {batch, head, qo_idx, 0});
             }
 
             // implementation of atomic add in smem - need to have a lock to sync blocks
@@ -251,21 +251,21 @@ using namespace kittens;
             }*/
 
             // compute dk as P^T * q * sm_scale
-            swap_layout(q_reg_col, q_reg);
-            swap_layout(ds_block_mma_col, ds_block_mma);
-            mma_AtB(kg_reg, ds_block_mma_col, q_reg_col, kg_reg);
+            warp::swap_layout(q_reg_col, q_reg);
+            warp::swap_layout(ds_block_mma_col, ds_block_mma);
+            warp::mma_AtB(kg_reg, ds_block_mma_col, q_reg_col, kg_reg);
         }
 
         // store the kg and vg tiles
         if (seq_idx_k < g.Kg.rows()) {
             // store the kg and vg tiles
-            mul(kg_reg, kg_reg, g.sm_scale);
-            store(kg_smem[workerid], kg_reg);
-            store(vg_smem[workerid], vg_reg);
+            warp::mul(kg_reg, kg_reg, g.sm_scale);
+            warp::store(kg_smem[workerid], kg_reg);
+            warp::store(vg_smem[workerid], vg_reg);
             __syncwarp();
 
-            store(g.KGg, kg_smem[workerid], {batch, head, seq_idx, 0});
-            store(g.VGg, vg_smem[workerid], {batch, head, seq_idx, 0});
+            warp::store(g.KGg, kg_smem[workerid], {batch, head, seq_idx, 0});
+            warp::store(g.VGg, vg_smem[workerid], {batch, head, seq_idx, 0});
         }
     }
 

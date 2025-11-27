@@ -2,18 +2,26 @@
 """ Useful functions for writing test code. """
 
 import math
+from typing import Callable, Any, Optional
 import torch
 import torch.utils.benchmark as benchmark
 
 
 def benchmark_forward(
-    fn, *inputs, repeats=10, desc="", verbose=True, amp=False, amp_dtype=torch.float16, **kwinputs
-):
+    fn: Callable,
+    *inputs: Any,
+    repeats: int = 10,
+    desc: str = "",
+    verbose: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    **kwinputs: Any) -> tuple[benchmark.Timer, benchmark.Measurement]:
+
     """Use Pytorch Benchmark on the forward pass of an arbitrary function."""
     if verbose:
         print(desc, "- Forward pass")
 
-    def amp_wrapper(*inputs, **kwinputs):
+    def amp_wrapper(*inputs: Any, **kwinputs: Any) -> None:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
             fn(*inputs, **kwinputs)
 
@@ -25,20 +33,21 @@ def benchmark_forward(
     m = t.timeit(repeats)
     if verbose:
         print(m)
+
     return t, m
 
 
 def benchmark_backward(
-    fn,
-    *inputs,
-    grad=None,
-    repeats=10,
-    desc="",
-    verbose=True,
-    amp=False,
-    amp_dtype=torch.float16,
-    **kwinputs,
-):
+    fn: Callable,
+    *inputs: Any,
+    grad: Optional[torch.Tensor] = None,
+    repeats: int = 10,
+    desc: str = "",
+    verbose: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    **kwinputs: Any) -> tuple[benchmark.Timer, benchmark.Measurement]:
+
     """Use Pytorch Benchmark on the backward pass of an arbitrary function."""
     if verbose:
         print(desc, "- Backward pass")
@@ -52,12 +61,12 @@ def benchmark_backward(
         if grad.shape != y.shape:
             raise RuntimeError("Grad shape does not match output shape")
 
-    def f(*inputs, y, grad):
+    def f(*inputs: Any, y: torch.Tensor, grad: torch.Tensor) -> None:
         # Set .grad to None to avoid extra operation of gradient accumulation
         for x in inputs:
             if isinstance(x, torch.Tensor):
                 x.grad = None
-        y.backward(grad, retain_graph=True)
+        y.backward(grad, retain_graph=True) # type: ignore
 
     t = benchmark.Timer(
         stmt="f(*inputs, y=y, grad=grad)",
@@ -71,16 +80,16 @@ def benchmark_backward(
 
 
 def benchmark_combined(
-    fn,
-    *inputs,
-    grad=None,
-    repeats=10,
-    desc="",
-    verbose=True,
-    amp=False,
-    amp_dtype=torch.float16,
-    **kwinputs,
-):
+    fn: Callable,
+    *inputs: Any,
+    grad: Optional[torch.Tensor] = None,
+    repeats: int = 10,
+    desc: str = "",
+    verbose: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    **kwinputs: Any) -> tuple[benchmark.Timer, benchmark.Measurement]:
+
     """Use Pytorch Benchmark on the forward+backward pass of an arbitrary function."""
     if verbose:
         print(desc, "- Forward + Backward pass")
@@ -94,7 +103,7 @@ def benchmark_combined(
         if grad.shape != y.shape:
             raise RuntimeError("Grad shape does not match output shape")
 
-    def f(grad, *inputs, **kwinputs):
+    def f(grad: torch.Tensor, *inputs: Any, **kwinputs: Any) -> None:
         for x in inputs:
             if isinstance(x, torch.Tensor):
                 x.grad = None
@@ -116,16 +125,17 @@ def benchmark_combined(
 
 
 def benchmark_fwd_bwd(
-    fn,
-    *inputs,
-    grad=None,
-    repeats=10,
-    desc="",
-    verbose=True,
-    amp=False,
-    amp_dtype=torch.float16,
-    **kwinputs,
-):
+    fn: Callable,
+    *inputs: Any,
+    grad: Optional[torch.Tensor] = None,
+    repeats: int = 10,
+    desc: str = "",
+    verbose: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    **kwinputs: Any) -> tuple[tuple[benchmark.Timer, benchmark.Measurement],
+    tuple[benchmark.Timer, benchmark.Measurement]]:
+
     """Use Pytorch Benchmark on the forward+backward pass of an arbitrary function."""
     return (
         benchmark_forward(
@@ -153,16 +163,18 @@ def benchmark_fwd_bwd(
 
 
 def benchmark_all(
-    fn,
-    *inputs,
-    grad=None,
-    repeats=10,
-    desc="",
-    verbose=True,
-    amp=False,
-    amp_dtype=torch.float16,
-    **kwinputs,
-):
+    fn: Callable,
+    *inputs: Any,
+    grad: Optional[torch.Tensor] = None,
+    repeats: int = 10,
+    desc: str = "",
+    verbose: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    **kwinputs: Any) -> tuple[tuple[benchmark.Timer, benchmark.Measurement],
+    tuple[benchmark.Timer, benchmark.Measurement],
+    tuple[benchmark.Timer, benchmark.Measurement]]:
+
     """Use Pytorch Benchmark on the forward+backward pass of an arbitrary function."""
     return (
         benchmark_forward(
@@ -201,16 +213,16 @@ def benchmark_all(
 
 
 def pytorch_profiler(
-    fn,
-    *inputs,
-    trace_filename=None,
-    backward=False,
-    amp=False,
-    amp_dtype=torch.float16,
-    cpu=False,
-    verbose=True,
-    **kwinputs,
-):
+    fn: Callable,
+    *inputs: Any,
+    trace_filename: Optional[str] = None,
+    backward: bool = False,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+    cpu: bool = False,
+    verbose: bool = True,
+    **kwinputs: Any) -> None:
+
     """Wrap benchmark functions in Pytorch profiler to see CUDA information."""
     if backward:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
@@ -255,7 +267,7 @@ def pytorch_profiler(
     if trace_filename is not None:
         prof.export_chrome_trace(trace_filename)
 
-def benchmark_memory(fn, *inputs, desc="", verbose=True, **kwinputs):
+def benchmark_memory(fn: Callable, *inputs: Any, desc: str = "", verbose: bool = True, **kwinputs: Any) -> float:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -267,5 +279,5 @@ def benchmark_memory(fn, *inputs, desc="", verbose=True, **kwinputs):
     torch.cuda.empty_cache()
     return mem
 
-def efficiency(flop, time):
+def efficiency(flop: float, time: float) -> float:
     return (flop / time / 10**12) if not math.isnan(time) else 0.0

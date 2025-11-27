@@ -9,7 +9,7 @@ def attn_ref(q: torch.Tensor,
              sm_scale: Optional[float] = None,
              dropout_p: float = 0.0,
              causal: bool = False,
-             upcast: bool = False) -> torch.Tensor:
+             upcast: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
         if b is not None:
@@ -53,7 +53,7 @@ def attn_bwd_ref(q: torch.Tensor,
                  b: Optional[torch.Tensor] = None,
                  sm_scale: Optional[float] = None,
                  causal: bool = False,
-                 upcast: bool = False) -> torch.Tensor:
+                 upcast: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     if upcast:
         q, k, v, o, og = q.float(), k.float(), v.float(), o.float(), og.float()
