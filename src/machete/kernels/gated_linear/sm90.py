@@ -99,23 +99,102 @@ class GatedLinearSM90Impl:
 
                 tCgC[i][v] = (gate * b_val).to(mC.element_type)
 
+    @cute.jit
+    def backward(
+        self,
+        mdc: cute.Tensor,
+        ma: cute.Tensor,
+        mb: cute.Tensor,
+        mda: cute.Tensor,
+        mdb: cute.Tensor,
+        n_cols: Int32,
+        stream: cuda.CUstream,
+    ):
+        cluster_size = 4
+        num_threads = 128
+
+        grid = [ma.shape[0], 1, 1]
+        block = [num_threads, 1, 1]
+        cluster = [cluster_size, 1, 1]
+
+        self.backward_kernel(mdc, ma, mb, mda, mdb, n_cols).launch(
+            grid=grid, block=block, cluster=cluster, stream=stream
+        )
+
+    @cute.kernel
+    def backward_kernel(
+        self,
+        mdc: cute.Tensor,
+        ma: cute.Tensor,
+        mb: cute.Tensor,
+        mda: cute.Tensor,
+        mdb: cute.Tensor,
+        n_cols: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        num_threads, _, _ = cute.arch.block_dim()
+
+        # 128-bit vectorized copy atom
+        copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), ma.element_type, num_bits_per_copy=128)
+        vec_size = const_expr(128 // ma.element_type.width)
+
+        tcopy = cute.make_tiled_copy_tv(
+            copy_atom,
+            cute.make_layout(num_threads),  # 1D threads
+            cute.make_layout(vec_size),  # 1D vector
+        )
+
+        thr_copy = tcopy.get_slice(tidx)
+
+        # mdc, ma, mb are sources
+        row_dc = mdc[bidx, :]
+        row_a = ma[bidx, :]
+        row_b = mb[bidx, :]
+
+        # mda, mdb are destinations
+        row_da = mda[bidx, :]
+        row_db = mdb[bidx, :]
+
+        tdc_gdc = thr_copy.partition_S(row_dc)
+        ta_ga = thr_copy.partition_S(row_a)
+        tb_gb = thr_copy.partition_S(row_b)
+
+        tda_gda = thr_copy.partition_D(row_da)
+        tdb_gdb = thr_copy.partition_D(row_db)
+
+        for i in range(cute.size(ta_ga)):
+            dc_vec = tdc_gdc[i]
+            a_vec = ta_ga[i]
+            b_vec = tb_gb[i]
+
+            for v in range(cute.size(a_vec)):
+                dc_val = dc_vec[v].to(Float32)
+                a_val = a_vec[v].to(Float32)
+                b_val = b_vec[v].to(Float32)
+
+                if const_expr(self.act_type == "gelu"):
+                    da_val, db_val, _ = quack_act.dgeglu(a_val, b_val, dc_val)
+                elif const_expr(self.act_type == "silu"):
+                    da_val, db_val, _ = quack_act.dswiglu(a_val, b_val, dc_val)
+                elif const_expr(self.act_type == "relu"):
+                    da_val, db_val, _ = quack_act.dreglu(a_val, b_val, dc_val)
+                else:
+                    da_val = dc_val * b_val
+                    db_val = dc_val * a_val
+
+                tda_gda[i][v] = da_val.to(mda.element_type)
+                tdb_gdb[i][v] = db_val.to(mdb.element_type)
+
 
 class GatedLinearSM90(torch.autograd.Function):
     _compile_cache = {}
 
     @staticmethod
     def forward(ctx, a, b, act_type="silu"):
-        """
-        SM90-optimized Forward pass.
-        Optimizations:
-        1. 128-bit Vectorized Memory Access (LDG.128/STG.128)
-        2. Threadblock Clusters for L2 Cache persistence
-        3. Fused Activation and Gating
-        """
         ori_shape = a.shape
         n_cols = ori_shape[-1]
 
-        # Ensure input is suitable for vectorized access (aligned and contiguous)
         if not a.is_contiguous():
             a = a.contiguous()
         if not b.is_contiguous():
@@ -143,7 +222,49 @@ class GatedLinearSM90(torch.autograd.Function):
             )
 
         GatedLinearSM90._compile_cache[compile_key](a_flat, b_flat, c_flat, n_cols)
+        ctx.save_for_backward(a, b)
+        ctx.act_type = act_type
+        ctx.n_cols = n_cols
+
         return c_flat.view(*ori_shape)
+
+    @staticmethod
+    def backward(ctx, dc):
+        a, b = ctx.saved_tensors
+        act_type = ctx.act_type
+        n_cols = ctx.n_cols
+
+        if not dc.is_contiguous():
+            dc = dc.contiguous()
+
+        dc_flat = dc.reshape(-1, n_cols)
+        a_flat = a.reshape(-1, n_cols)
+        b_flat = b.reshape(-1, n_cols)
+
+        da_flat = torch.empty_like(a_flat)
+        db_flat = torch.empty_like(b_flat)
+
+        dtype = a.dtype
+        cute_dtype = torch2cute_dtype_map[dtype]
+
+        compile_key = (dtype, n_cols, act_type, "backward")
+        if compile_key not in GatedLinearSM90._compile_cache:
+            m_sym = cute.sym_int()
+            impl = GatedLinearSM90Impl(cute_dtype, act_type)
+            GatedLinearSM90._compile_cache[compile_key] = cute.compile(
+                impl.backward,
+                fake_tensor(cute_dtype, (m_sym, n_cols)),
+                fake_tensor(cute_dtype, (m_sym, n_cols)),
+                fake_tensor(cute_dtype, (m_sym, n_cols)),
+                fake_tensor(cute_dtype, (m_sym, n_cols)),
+                fake_tensor(cute_dtype, (m_sym, n_cols)),
+                Int32(n_cols),
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--enable-tvm-ffi",
+            )
+
+        GatedLinearSM90._compile_cache[compile_key](dc_flat, a_flat, b_flat, da_flat, db_flat, n_cols)
+        return da_flat.view_as(a), db_flat.view_as(b), None
 
 
 def gated_linear_sm90(a: Tensor, b: Tensor, act_type: str = "silu") -> Tensor:

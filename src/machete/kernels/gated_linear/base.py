@@ -99,8 +99,8 @@ class GatedLinearImpl:
                 da_val = dc_val * b_val
                 db_val = dc_val * a_val
 
-            mdA[row, col] = da_val.to(mdA.element_type)
-            mdB[row, col] = db_val.to(mdB.element_type)
+            mdA[row, col] = Float32(da_val).to(mdA.element_type)
+            mdB[row, col] = Float32(db_val).to(mdB.element_type)
 
 
 class GatedLinear(torch.autograd.Function):

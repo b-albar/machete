@@ -13,14 +13,10 @@ class GatedLinear:
     @staticmethod
     def apply(a: torch.Tensor, b: torch.Tensor, act_type: str = "gelu") -> torch.Tensor:
         major, _ = get_gpu_capability()
-        if major == 9:
+        if major == 9 or major == 10:
             from .sm90 import GatedLinearSM90
 
             return GatedLinearSM90.apply(a, b, act_type)
-        elif major == 10:
-            from .sm100 import GatedLinearSM100
-
-            return GatedLinearSM100.apply(a, b, act_type)
 
         return GatedLinearBase.apply(a, b, act_type)
 
