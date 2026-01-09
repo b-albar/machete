@@ -6,17 +6,8 @@ from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-
-import quack.activation as qact
-import quack.gemm_act
-import quack.gemm_sm90
-import quack.gemm_sm100
-import quack.gemm_default_epi
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from cutlass import Float32, const_expr
-from cutlass.cutlass_dsl import dsl_user_op
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
+from typing import Tuple, Optional
+from functools import partial
 
 import quack.activation as qact
 import quack.gemm_act
@@ -25,9 +16,6 @@ import quack.gemm_sm100
 import quack.gemm_default_epi
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
-
-from typing import Tuple, Optional
-from functools import partial
 
 
 # Helper to adapter tuple input for SwiGLU
@@ -89,39 +77,39 @@ act_fn_map["geglu"] = geglu_tuple_dupe
 
 
 def machete_gemm_act(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    d: Optional[torch.Tensor],
-    c: Optional[torch.Tensor],
-    post_act_tensor: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: Optional[torch.Tensor],
+    C: Optional[torch.Tensor],
+    PostAct: torch.Tensor,
     tile_count_semaphore: Optional[torch.Tensor],
     activation: Optional[str],
-    tile_m: int,
-    tile_n: int,
-    cluster_m: int,
-    cluster_n: int,
+    tile_M: int,
+    tile_N: int,
+    cluster_M: int,
+    cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[torch.Tensor] = None,
     colvec_bias: Optional[torch.Tensor] = None,
     cu_seqlens_m: Optional[torch.Tensor] = None,
-    a_idx: Optional[torch.Tensor] = None,
+    A_idx: Optional[torch.Tensor] = None,
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
-        assert a.stride(-1) == 1, "varlen_m requires a to be k-major"
-        if d is not None:
-            assert d.stride(-1) == 1, "varlen_m requires d to be n-major"
-        assert post_act_tensor.stride(-1) == 1, "varlen_m requires post_act_tensor to be n-major"
-    gather_a = a_idx is not None
-    if gather_a:
-        assert cu_seqlens_m is not None, "gather_a requires varlen (cu_seqlens_m must be specified)"
-        assert cluster_n == 1, "gather_a requires cluster_n=1"
+        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
+        if D is not None:
+            assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
+        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
+    gather_A = A_idx is not None
+    if gather_A:
+        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
+        assert cluster_N == 1, "gather_A requires cluster_N=1"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
-    l_dim, m_dim, k_dim, n_dim, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        a, b, d, c, additional_tensors={"PostAct": post_act_tensor}, cu_seqlens_m=cu_seqlens_m, A_idx=a_idx
+    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
     )
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
@@ -134,18 +122,17 @@ def machete_gemm_act(
     }
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
-    device_capacity = get_device_capacity(a.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    gemm_cls = MacheteGemmActSm100 if device_capacity[0] > 9 else MacheteGemmActSm90
+    device_capacity = get_device_capacity(A.device)
+    GemmCls = MacheteGemmActSm100 if device_capacity[0] > 9 else MacheteGemmActSm90
 
     acc_dtype = Float32
-    tile_shape_mn = (tile_m, tile_n)
-    cluster_shape_mnk = (cluster_m, cluster_n, 1)
+    tile_shape_mn = (tile_M, tile_N)
+    cluster_shape_mnk = (cluster_M, cluster_N, 1)
 
-    max_active_clusters = get_max_active_clusters(cluster_m * cluster_n) if persistent else 0
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = act_fn_map[activation]
-    epi_args = gemm_cls.EpilogueArguments(
+    epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
         mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
@@ -164,11 +151,11 @@ def machete_gemm_act(
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
-        a_idx,
+        A_idx,
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
-        gemm_cls.num_epi_tensormaps,
+        GemmCls.num_epi_tensormaps,
         pingpong,
     )
 
@@ -186,19 +173,19 @@ def machete_gemm_act(
         rowvec_bias.dtype if rowvec_bias is not None else None,
         colvec_bias.dtype if colvec_bias is not None else None,
         cu_seqlens_m is not None,
-        a_idx is not None,
+        A_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = machete_gemm_act.compile_cache
     if compile_key not in cache:
         if device_capacity[0] == 9:
-            gemm_cls = partial(gemm_cls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = gemm_cls(
+            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            gather_A=gather_a,
+            gather_A=gather_A,
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
