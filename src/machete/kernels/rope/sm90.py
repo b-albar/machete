@@ -41,7 +41,6 @@ class RopeSM90Impl:
         cluster = [cluster_size, 1, 1]  # Share across sequence dimension or head dimension
 
         # RoPE usually processes half_head_dim pairs
-        half_d = const_expr(self.head_dim // 2)
         vec_size = const_expr(128 // mcos.element_type.width)
 
         # Pre-construct tiled copies in JIT context so layouts are static
@@ -88,9 +87,9 @@ class RopeSM90Impl:
         row_pos = bidx % seqlen
 
         thr_copy_cs = tcopy_cs.get_slice(tidx)
-        tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos, :])
+        tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos])
         tcs_scos = thr_copy_cs.partition_D(scos)
-        tcs_gsin = thr_copy_cs.partition_S(msin[row_pos, :])
+        tcs_gsin = thr_copy_cs.partition_S(msin[row_pos])
         tcs_ssin = thr_copy_cs.partition_D(ssin)
 
         # Vectorized load of Cos/Sin
@@ -107,12 +106,12 @@ class RopeSM90Impl:
         thr_copy_q = tcopy_q.get_slice(tidx)
 
         # Partitions for Q1 [0:half_d] and Q2 [half_d:D]
-        tqgq1 = thr_copy_q.partition_S(mq[bidx, head_idx, 0:half_d])
-        tqgq2 = thr_copy_q.partition_S(mq[bidx, head_idx, half_d : self.head_dim])
+        tqgq1 = thr_copy_q.partition_S(mq[bidx, head_idx, :half_d])
+        tqgq2 = thr_copy_q.partition_S(mq[bidx, head_idx, half_d:])
 
         # We'll write back in-place
-        tqgout1 = thr_copy_q.partition_D(mq[bidx, head_idx, 0:half_d])
-        tqgout2 = thr_copy_q.partition_D(mq[bidx, head_idx, half_d : self.head_dim])
+        tqgout1 = thr_copy_q.partition_D(mq[bidx, head_idx, :half_d])
+        tqgout2 = thr_copy_q.partition_D(mq[bidx, head_idx, half_d:])
 
         # Partition Smem Cos/Sin for the arithmetic part
         tqscos = thr_copy_cs.partition_S(scos)
