@@ -1,11 +1,8 @@
-# Copyright (c) 2025, Machete Authors
 import torch
-from torch import Tensor
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 import cuda.bindings.driver as cuda
-from typing import Dict, Tuple
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -25,9 +22,9 @@ class RopeSM90Impl:
     @cute.jit
     def forward(
         self,
-        mQ: cute.Tensor,
-        mCos: cute.Tensor,
-        mSin: cute.Tensor,
+        mq: cute.Tensor,
+        mcos: cute.Tensor,
+        msin: cute.Tensor,
         seqlen: Int32,
         stream: cuda.CUstream,
     ):
@@ -39,79 +36,79 @@ class RopeSM90Impl:
 
         # Grid: [TotalRows, Heads / HeadsPerBlock, 1]
         # For simplicity: [TotalRows, Heads, 1]
-        grid = [mQ.shape[0], mQ.shape[1], 1]
+        grid = [mq.shape[0], mq.shape[1], 1]
         block = [num_threads, 1, 1]
         cluster = [cluster_size, 1, 1]  # Share across sequence dimension or head dimension
 
-        self.kernel(mQ, mCos, mSin, seqlen).launch(grid=grid, block=block, cluster=cluster, stream=stream)
+        self.kernel(mq, mcos, msin, seqlen).launch(grid=grid, block=block, cluster=cluster, stream=stream)
 
     @cute.kernel
-    def kernel(self, mQ: cute.Tensor, mCos: cute.Tensor, mSin: cute.Tensor, seqlen: Int32):
+    def kernel(self, mq: cute.Tensor, mcos: cute.Tensor, msin: cute.Tensor, seqlen: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, head_idx, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
         # RoPE usually processes half_head_dim pairs
-        half_D = const_expr(self.head_dim // 2)
+        half_d = const_expr(self.head_dim // 2)
 
         # 1. Shared Memory for Cos/Sin to avoid repeated L1/L2 hits
         # In a cluster, we could use DSMEM to share this, but here we just use it
         # as a fast cache for the current block.
         smem = cutlass.utils.SmemAllocator()
-        sCos = smem.allocate_tensor(Float32, cute.make_layout(half_D))
-        sSin = smem.allocate_tensor(Float32, cute.make_layout(half_D))
+        scos = smem.allocate_tensor(Float32, cute.make_layout(half_d))
+        ssin = smem.allocate_tensor(Float32, cute.make_layout(half_d))
 
         row_pos = bidx % seqlen
 
         # Load Cos/Sin for this sequence position into SMEM (Vectorized)
-        vec_size = const_expr(128 // mCos.element_type.width)
+        vec_size = const_expr(128 // mcos.element_type.width)
         tcopy_cs = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mCos.element_type, num_bits_per_copy=128),
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mcos.element_type, num_bits_per_copy=128),
             cute.make_layout(num_threads),
             cute.make_layout(vec_size),
         )
 
         thr_copy_cs = tcopy_cs.get_slice(tidx)
-        tCs_gCos = thr_copy_cs.partition_S(mCos[row_pos, :])
-        tCs_sCos = thr_copy_cs.partition_D(sCos)
-        tCs_gSin = thr_copy_cs.partition_S(mSin[row_pos, :])
-        tCs_sSin = thr_copy_cs.partition_D(sSin)
+        tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos, :])
+        tcs_scos = thr_copy_cs.partition_D(scos)
+        tcs_gsin = thr_copy_cs.partition_S(msin[row_pos, :])
+        tcs_ssin = thr_copy_cs.partition_D(ssin)
 
         # Vectorized load of Cos/Sin
-        for i in range(cute.size(tCs_gCos)):
-            tCs_sCos[i] = tCs_gCos[i].to(Float32)
-            tCs_sSin[i] = tCs_gSin[i].to(Float32)
+        for i in range(cute.size(tcs_gcos)):
+            tcs_scos[i] = tcs_gcos[i].to(Float32)
+            tcs_ssin[i] = tcs_gsin[i].to(Float32)
 
         cute.arch.cp_async_wait_all()  # Ensure Cos/Sin are in SMEM
         cute.arch.sync_threads()
 
         # 2. Process Q (Vectorized)
         # Q resides in (Row, Head, Dim)
-        # We split Dim into [0:half_D] and [half_D:D]
+        # We split Dim into [0:half_d] and [half_d:D]
         tcopy_q = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mQ.element_type, num_bits_per_copy=128),
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mq.element_type, num_bits_per_copy=128),
             cute.make_layout(num_threads),
             cute.make_layout(vec_size),
         )
         thr_copy_q = tcopy_q.get_slice(tidx)
 
-        # Partitions for Q1 [0:half_D] and Q2 [half_D:D]
-        tQgQ1 = thr_copy_q.partition_S(mQ[bidx, head_idx, 0:half_D])
-        tQgQ2 = thr_copy_q.partition_S(mQ[bidx, head_idx, half_D : self.head_dim])
+        # Partitions for Q1 [0:half_d] and Q2 [half_d:D]
+        tqgq1 = thr_copy_q.partition_S(mq[bidx, head_idx, 0:half_d])
+        tqgq2 = thr_copy_q.partition_S(mq[bidx, head_idx, half_d : self.head_dim])
 
         # We'll write back in-place
-        tQgOut1 = thr_copy_q.partition_D(mQ[bidx, head_idx, 0:half_D])
-        tQgOut2 = thr_copy_q.partition_D(mQ[bidx, head_idx, half_D : self.head_dim])
+        tqgout1 = thr_copy_q.partition_D(mq[bidx, head_idx, 0:half_d])
+        tqgout2 = thr_copy_q.partition_D(mq[bidx, head_idx, half_d : self.head_dim])
 
         # Partition Smem Cos/Sin for the arithmetic part
-        tQsCos = thr_copy_cs.partition_S(sCos)
-        tQsSin = thr_copy_cs.partition_S(sSin)
+        tqscos = thr_copy_cs.partition_S(scos)
+        tqssin = thr_copy_cs.partition_S(ssin)
 
-        for i in range(cute.size(tQgQ1)):
-            q1_vec = tQgQ1[i]
-            q2_vec = tQgQ2[i]
-            cos_vec = tQsCos[i]
-            sin_vec = tQsSin[i]
+        for i in range(cute.size(tqgq1)):
+            q1_vec = tqgq1[i]
+            q2_vec = tqgq2[i]
+            cos_vec = tqscos[i]
+            sin_vec = tqssin[i]
 
             for v in range(cute.size(q1_vec)):
                 q1 = q1_vec[v].to(Float32)
@@ -126,15 +123,15 @@ class RopeSM90Impl:
                 out1 = q1 * c - q2 * s
                 out2 = q2 * c + q1 * s
 
-                tQgOut1[i][v] = out1.to(mQ.element_type)
-                tQgOut2[i][v] = out2.to(mQ.element_type)
+                tqgout1[i][v] = out1.to(mq.element_type)
+                tqgout2[i][v] = out2.to(mq.element_type)
 
 
 class RopeSM90(torch.autograd.Function):
     _compile_cache = {}
 
     @staticmethod
-    def forward(ctx, q, cos, sin):
+    def forward(ctx, q, cos, sin, backward=False):
         """
         SM90-optimized Forward pass.
         Optimizations:
@@ -156,11 +153,11 @@ class RopeSM90(torch.autograd.Function):
 
         seqlen = cos.shape[0]
 
-        compile_key = (dtype, head_dim, "forward")
+        compile_key = (dtype, head_dim, backward)
         if compile_key not in RopeSM90._compile_cache:
             m_sym = cute.sym_int()
             num_heads = q.shape[-2]
-            impl = RopeSM90Impl(cute_dtype, head_dim)
+            impl = RopeSM90Impl(cute_dtype, head_dim, backward=bool(backward))
             RopeSM90._compile_cache[compile_key] = cute.compile(
                 impl.forward,
                 fake_tensor(cute_dtype, (m_sym, num_heads, head_dim)),
