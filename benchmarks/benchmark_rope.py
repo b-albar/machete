@@ -63,18 +63,14 @@ def main():
 
     # --- RoPE Benchmark ---
     h, d = 32, 128
-    rope_configs = {
-        "BS=1, S=2048": (
-            torch.randn(1, 2048, h, d, device=device, dtype=dtype),
-            torch.randn(2048, d, device=device, dtype=dtype),
-            torch.randn(2048, d, device=device, dtype=dtype),
-        ),
-        "BS=4, S=4096": (
-            torch.randn(4, 4096, h, d, device=device, dtype=dtype),
-            torch.randn(4096, d, device=device, dtype=dtype),
-            torch.randn(4096, d, device=device, dtype=dtype),
-        ),
-    }
+    rope_configs = {}
+    for S in [2048, 4096, 8192, 16384, 32768, 65536, 131072]:
+        B = 1
+        rope_configs[f"BS={B}, S={S}"] = (
+            torch.randn(B, S, h, d, device=device, dtype=dtype),
+            torch.randn(S, d, device=device, dtype=dtype),
+            torch.randn(S, d, device=device, dtype=dtype),
+        )
 
     rope_inst = Rope(dtype=dtype, head_dim=d)
 
@@ -99,7 +95,7 @@ def main():
         {
             "PyTorch": rope_pytorch,
             "Triton": rope_triton,
-            "cuteDSL": lambda q, c, s: rope_inst(q.clone(), c, s),
+            "cuteDSL": lambda q, c, s: rope_inst(q, c, s),
         },
         rope_numel_provider,
     )

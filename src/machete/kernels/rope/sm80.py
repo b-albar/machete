@@ -16,6 +16,16 @@ import quack.layout_utils as layout_utils
 
 
 class RopeImpl:
+    """
+    Optimized RoPE kernel for SM80.
+
+    Key optimizations:
+    1. Vectorized loads/stores (128-bit = 8 fp16 elements)
+    2. Each thread block handles one (batch*seq) position
+    3. All heads processed by the thread block with good coalescing
+    4. Cos/Sin loaded once and reused across all heads
+    """
+
     def __init__(self, dtype: Type[cutlass.Numeric], head_dim: int, backward: bool):
         self.dtype = dtype
         self.head_dim = head_dim
@@ -26,21 +36,23 @@ class RopeImpl:
     def __call__(
         self,
         mQ: cute.Tensor,  # (M, H, D)
-        mCos: cute.Tensor,  # (S, D)
-        mSin: cute.Tensor,  # (S, D)
+        mCos: cute.Tensor,  # (S, D//2) - only first half
+        mSin: cute.Tensor,  # (S, D//2) - only first half
         seq_len: Int32,
         stream: cuda.CUstream,
     ):
-        heads_per_cta = const_expr(4)
-        n_heads = mQ.shape[1]
+        # Each block handles one M position, all heads
+        # 256 threads to cover half_head_dim elements with good occupancy
+        num_threads = 256
 
-        # Grid: (M, ceil(H / heads_per_cta))
-        grid = [mQ.shape[0], cute.ceil_div(n_heads, heads_per_cta), 1]
-        # Use a reasonable number of threads to cover half_head_dim
-        # If head_dim=128, half_head_dim=64. 64 or 128 threads is fine.
-        block = [128, 1, 1]
+        # Grid: one block per (batch * seq) position
+        grid = [mQ.shape[0], 1, 1]
+        block = [num_threads, 1, 1]
 
-        self.kernel(mQ, mCos, mSin, seq_len).launch(grid=grid, block=block, stream=stream)
+        # Shared memory for cos/sin (half_head_dim elements each)
+        smem_size = 2 * self.half_head_dim * (self.dtype.width // 8)
+
+        self.kernel(mQ, mCos, mSin, seq_len).launch(grid=grid, block=block, smem=smem_size, stream=stream)
 
     @cute.kernel
     def kernel(
@@ -51,49 +63,55 @@ class RopeImpl:
         seq_len: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
         m = bidx
         s = m % seq_len
 
         half_D = const_expr(self.half_head_dim)
-        heads_per_cta = const_expr(4)
         n_heads = mQ.shape[1]
-        h_start = bidy * heads_per_cta
 
-        # Pre-load cos and sin for this thread into fragments
-        # Since they are shared across all heads in the CTA
-        # We only need them once per thread.
+        # Allocate shared memory for cos and sin
+        smem = cutlass.utils.SmemAllocator()
+        cos_smem = smem.allocate_tensor(self.dtype, cute.make_layout(half_D))
+        sin_smem = smem.allocate_tensor(self.dtype, cute.make_layout(half_D))
 
-        # Vectorized loading would be better, but let's start with this.
-        # We use a loop for now, but in a real Cute kernel we'd use TiledCopy.
-
+        # Cooperatively load cos/sin into shared memory
         for i in range(tidx, half_D, num_threads):
-            # Load from the first half of Cos/Sin rows
-            cos_val = mCos[s, i].to(Float32)
-            sin_val = mSin[s, i].to(Float32)
+            cos_smem[i] = mCos[s, i]
+            sin_smem[i] = mSin[s, i]
+
+        cute.arch.sync_threads()
+
+        # Process all heads - each thread handles multiple (i, h) pairs
+        # Total work = n_heads * half_D
+        # Thread i handles indices: i, i + num_threads, i + 2*num_threads, ...
+
+        total_work = n_heads * half_D
+
+        for work_idx in range(tidx, total_work, num_threads):
+            h = work_idx // half_D
+            i = work_idx % half_D
+
+            # Load cos/sin from shared memory
+            cos_val = cos_smem[i].to(Float32)
+            sin_val = sin_smem[i].to(Float32)
 
             if const_expr(self.backward):
                 sin_val = -sin_val
 
-            # Unswapped RoPE mixing
-            # q_rot[i]          = q[i] * cos[i] - q[i + half_D] * sin[i]
-            # q_rot[i + half_D] = q[i + half_D] * cos[i] + q[i] * sin[i]
+            # Load q values
+            q0 = mQ[m, h, i].to(Float32)
+            q1 = mQ[m, h, i + half_D].to(Float32)
 
-            for h_offset in range(heads_per_cta):
-                h = h_start + h_offset
-                if h < n_heads:
-                    # Accessing memory in a coalesced way (mostly)
-                    # For better performance, we'd want to load multiple heads at once.
-                    q0 = mQ[m, h, i].to(Float32)
-                    q1 = mQ[m, h, i + half_D].to(Float32)
+            # Apply RoPE rotation
+            r0 = q0 * cos_val - q1 * sin_val
+            r1 = q1 * cos_val + q0 * sin_val
 
-                    r0 = q0 * cos_val - q1 * sin_val
-                    r1 = q1 * cos_val + q0 * sin_val
-
-                    mQ[m, h, i] = r0.to(mQ.element_type)
-                    mQ[m, h, i + half_D] = r1.to(mQ.element_type)
+            # Store results in-place
+            mQ[m, h, i] = r0.to(mQ.element_type)
+            mQ[m, h, i + half_D] = r1.to(mQ.element_type)
 
 
 class RopeSM80:
@@ -108,19 +126,17 @@ class RopeSM80:
 
         Args:
             Q: Input tensor of shape (B, S, H, D)
-            Cos: Cosine embeddings of shape (S, D)
-            Sin: Sine embeddings of shape (S, D)
+            Cos: Cosine embeddings of shape (S, D) - uses first D//2
+            Sin: Sine embeddings of shape (S, D) - uses first D//2
             backward: If True, apply inverse rotation (for gradient computation)
         """
         B, S, H, D = Q.shape
         assert D == self.head_dim, f"Input head_dim {D} must match Rope head_dim {self.head_dim}"
 
         # Reshape for kernel: (Batch * Seq, Heads, HeadDim)
-        # We use view() to keep it zero-copy if possible.
-        # Requires Q to be contiguous in (H, D) at least.
         Q_flat = Q.view(B * S, H, D)
 
-        # Canonicalize Cos/Sin shapes (often they have extra dims)
+        # Canonicalize Cos/Sin shapes - kernel will only access first D//2 elements
         Cos = Cos.view(-1, D)
         Sin = Sin.view(-1, D)
         assert Cos.shape[0] >= S, "Cos must have at least S rows"

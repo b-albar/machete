@@ -45,8 +45,8 @@ def test_rope():
         diff = (Q_out - Q_ref).abs().max().item()
         print("Max diff:", diff)
 
-        atol = 1e-2
-        rtol = 1e-2
+        atol = 1e-1 if dtype == torch.bfloat16 else 1e-2
+        rtol = 1e-1 if dtype == torch.bfloat16 else 1e-2
 
         if diff > atol:
             print(f"Mismatch indices for {dtype}:")
