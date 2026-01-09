@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from machete.utils.testing import benchmark_op, verify_kernel
 from machete.kernels.gated_mlp.triton_impl import gated_mlp_triton
-from machete.kernels.gated_mlp.sm80 import gated_mlp_sm80
+from machete.kernels.gated_mlp import gated_mlp_func
 
 
 class ReferenceGatedMLP(nn.Module):
@@ -68,7 +68,7 @@ def main():
     op_map = {
         "PyTorch": lambda x, w: functional_gated_mlp(x, w),
         "Triton": gated_mlp_triton,
-        "Ampere (SM80)": gated_mlp_sm80,
+        "cuteDSL": gated_mlp_func,
     }
 
     def numel_provider(args):

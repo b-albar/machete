@@ -16,18 +16,16 @@ class GatedMLP:
             major, _ = get_gpu_capability()
 
             if major == 9 or major == 10:
-                # Use SM90 (Hopper) implementation
+                # For now, SM90+ uses SM90 implementation
                 from .sm90 import gated_mlp_sm90
 
-                # Map activation names to SM90 format
                 sm90_act_map = {"silu": "swiglu", "gelu": "geglu"}
                 return gated_mlp_sm90(x, weight, act_type=sm90_act_map.get(act_type, act_type))
 
+            # Use SM80 (Ampere/Ada) implementation
             from .sm80 import gated_mlp_sm80
 
-            # Map activation names to SM80 format
-            sm80_act_map = {"silu": "swiglu", "gelu": "geglu"}
-            return gated_mlp_sm80(x, weight, act_type=sm80_act_map.get(act_type, act_type))
+            return gated_mlp_sm80(x, weight, act_type=act_type)
 
 
 def gated_mlp_func(x: torch.Tensor, weight: torch.Tensor, act_type: str = "silu") -> torch.Tensor:

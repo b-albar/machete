@@ -40,10 +40,37 @@ class RopeSM90Impl:
         block = [num_threads, 1, 1]
         cluster = [cluster_size, 1, 1]  # Share across sequence dimension or head dimension
 
-        self.kernel(mq, mcos, msin, seqlen).launch(grid=grid, block=block, cluster=cluster, stream=stream)
+        # RoPE usually processes half_head_dim pairs
+        half_d = const_expr(self.head_dim // 2)
+        vec_size = const_expr(128 // mcos.element_type.width)
+
+        # Pre-construct tiled copies in JIT context so layouts are static
+        tcopy_cs = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mcos.element_type, num_bits_per_copy=128),
+            cute.make_layout(num_threads),
+            cute.make_layout(vec_size),
+        )
+
+        tcopy_q = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mq.element_type, num_bits_per_copy=128),
+            cute.make_layout(num_threads),
+            cute.make_layout(vec_size),
+        )
+
+        self.kernel(mq, mcos, msin, seqlen, tcopy_cs, tcopy_q).launch(
+            grid=grid, block=block, cluster=cluster, stream=stream
+        )
 
     @cute.kernel
-    def kernel(self, mq: cute.Tensor, mcos: cute.Tensor, msin: cute.Tensor, seqlen: Int32):
+    def kernel(
+        self,
+        mq: cute.Tensor,
+        mcos: cute.Tensor,
+        msin: cute.Tensor,
+        seqlen: Int32,
+        tcopy_cs: cute.TiledCopy,
+        tcopy_q: cute.TiledCopy,
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, head_idx, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
@@ -59,14 +86,6 @@ class RopeSM90Impl:
         ssin = smem.allocate_tensor(Float32, cute.make_layout(half_d))
 
         row_pos = bidx % seqlen
-
-        # Load Cos/Sin for this sequence position into SMEM (Vectorized)
-        vec_size = const_expr(128 // mcos.element_type.width)
-        tcopy_cs = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mcos.element_type, num_bits_per_copy=128),
-            cute.make_layout(num_threads),
-            cute.make_layout(vec_size),
-        )
 
         thr_copy_cs = tcopy_cs.get_slice(tidx)
         tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos, :])
@@ -85,11 +104,6 @@ class RopeSM90Impl:
         # 2. Process Q (Vectorized)
         # Q resides in (Row, Head, Dim)
         # We split Dim into [0:half_d] and [half_d:D]
-        tcopy_q = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mq.element_type, num_bits_per_copy=128),
-            cute.make_layout(num_threads),
-            cute.make_layout(vec_size),
-        )
         thr_copy_q = tcopy_q.get_slice(tidx)
 
         # Partitions for Q1 [0:half_d] and Q2 [half_d:D]
