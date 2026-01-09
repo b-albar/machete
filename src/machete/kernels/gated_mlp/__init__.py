@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-from .base import GatedMLP as GatedMLPBase
 
 
 def get_gpu_capability():
@@ -12,19 +11,23 @@ def get_gpu_capability():
 class GatedMLP:
     @staticmethod
     def apply(x: torch.Tensor, weight: torch.Tensor, act_type: str = "silu") -> torch.Tensor:
-        # Use Triton implementation for GPU if available, else fallback
+        # Use optimized implementations for GPU if available, else fallback to Triton
         if x.is_cuda and weight.is_cuda:
-            cc = get_gpu_capability()
-            if cc >= (9, 0):
-                # Use SM90 implementation
+            major, _ = get_gpu_capability()
+
+            if major == 9 or major == 10:
+                # Use SM90 (Hopper) implementation
                 from .sm90 import gated_mlp_sm90
 
-                return gated_mlp_sm90(x, weight)
+                # Map activation names to SM90 format
+                sm90_act_map = {"silu": "swiglu", "gelu": "geglu"}
+                return gated_mlp_sm90(x, weight, act_type=sm90_act_map.get(act_type, act_type))
 
-            from .triton_impl import gated_mlp_triton
+            from .sm80 import gated_mlp_sm80
 
-            return gated_mlp_triton(x, weight, activation=act_type)
-        return GatedMLPBase.apply(x, weight, act_type)
+            # Map activation names to SM80 format
+            sm80_act_map = {"silu": "swiglu", "gelu": "geglu"}
+            return gated_mlp_sm80(x, weight, act_type=sm80_act_map.get(act_type, act_type))
 
 
 def gated_mlp_func(x: torch.Tensor, weight: torch.Tensor, act_type: str = "silu") -> torch.Tensor:

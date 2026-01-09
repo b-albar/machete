@@ -96,7 +96,7 @@ class RopeImpl:
                     mQ[m, h, i + half_D] = r1.to(mQ.element_type)
 
 
-class Rope:
+class RopeSM80:
     def __init__(self, dtype: torch.dtype, head_dim: int):
         self.torch_dtype = dtype
         self.cute_dtype = torch2cute_dtype_map[dtype]

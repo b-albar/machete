@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-from .base import Rope as RopeBase
+from .sm80 import RopeSM80
 
 
 def get_gpu_capability():
@@ -24,6 +24,6 @@ class Rope:
 
         # Fallback to base implementation
         if self._base_rope is None:
-            self._base_rope = RopeBase(self.dtype, self.head_dim)
+            self._base_rope = RopeSM80(self.dtype, self.head_dim)
 
         return self._base_rope(q, cos, sin, backward=backward)
