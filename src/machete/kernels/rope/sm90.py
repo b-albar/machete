@@ -87,9 +87,9 @@ class RopeSM90Impl:
         row_pos = bidx % seqlen
 
         thr_copy_cs = tcopy_cs.get_slice(tidx)
-        tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos])
+        tcs_gcos = thr_copy_cs.partition_S(mcos[row_pos, 0:half_d])
         tcs_scos = thr_copy_cs.partition_D(scos)
-        tcs_gsin = thr_copy_cs.partition_S(msin[row_pos])
+        tcs_gsin = thr_copy_cs.partition_S(msin[row_pos, 0:half_d])
         tcs_ssin = thr_copy_cs.partition_D(ssin)
 
         # Vectorized load of Cos/Sin
@@ -106,12 +106,15 @@ class RopeSM90Impl:
         thr_copy_q = tcopy_q.get_slice(tidx)
 
         # Partitions for Q1 [0:half_d] and Q2 [half_d:D]
-        tqgq1 = thr_copy_q.partition_S(mq[bidx, head_idx, :half_d])
-        tqgq2 = thr_copy_q.partition_S(mq[bidx, head_idx, half_d:])
+        gq1 = cute.local_tile(mq, (1, 1, half_d), (bidx, head_idx, 0))
+        gq2 = cute.local_tile(mq, (1, 1, half_d), (bidx, head_idx, 1))
+
+        tqgq1 = thr_copy_q.partition_S(gq1)
+        tqgq2 = thr_copy_q.partition_S(gq2)
 
         # We'll write back in-place
-        tqgout1 = thr_copy_q.partition_D(mq[bidx, head_idx, :half_d])
-        tqgout2 = thr_copy_q.partition_D(mq[bidx, head_idx, half_d:])
+        tqgout1 = thr_copy_q.partition_D(gq1)
+        tqgout2 = thr_copy_q.partition_D(gq2)
 
         # Partition Smem Cos/Sin for the arithmetic part
         tqscos = thr_copy_cs.partition_S(scos)
