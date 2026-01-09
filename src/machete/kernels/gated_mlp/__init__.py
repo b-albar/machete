@@ -22,10 +22,7 @@ class GatedMLP:
                 sm90_act_map = {"silu": "swiglu", "gelu": "geglu"}
                 return gated_mlp_sm90(x, weight, act_type=sm90_act_map.get(act_type, act_type))
 
-            # Use SM80 (Ampere/Ada) implementation
-            from .sm80 import gated_mlp_sm80
-
-            return gated_mlp_sm80(x, weight, act_type=act_type)
+            raise ValueError("Not implemented")
 
 
 def gated_mlp_func(x: torch.Tensor, weight: torch.Tensor, act_type: str = "silu") -> torch.Tensor:

@@ -2,8 +2,19 @@
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.cutlass_dsl import if_generate, dsl_user_op
+from cutlass import Float32, const_expr
+from cutlass.cutlass_dsl import dsl_user_op
+import cutlass.torch as cutlass_torch
+from cutlass.cute.runtime import from_dlpack
+
+import quack.activation as qact
+import quack.gemm_act
+import quack.gemm_sm90
+import quack.gemm_sm100
+import quack.gemm_default_epi
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from cutlass import Float32, const_expr
+from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -15,7 +26,7 @@ import quack.gemm_default_epi
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_wrapper_utils import GemmWrapperBase
 
-from typing import Tuple, Optional, Callable
+from typing import Tuple, Optional
 from functools import partial
 
 
@@ -41,26 +52,26 @@ class MacheteGemmActMixin(quack.gemm_act.GemmActMixin):
         self,
         params: quack.gemm_act.GemmActMixin.EpilogueParams,
         epi_loop_tensors: Tuple[cute.Tensor, ...],
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
+        trs_rd: cute.Tensor,
+        trs_rc: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
         # Call GemmDefaultEpiMixin from quack
-        quack.gemm_default_epi.GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
+        quack.gemm_default_epi.GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, trs_rd, trs_rc)
 
         # Apply activation function if provided
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
+            trs_rpostact = cute.make_fragment(trs_rd.layout.shape, self.acc_dtype)
             # Unify epilogue activation loop to use pairwise calls for BOTH SM90 and SM100.
             # This enables gated activations (like SwiGLU) on SM90 by passing pairs of accumulators.
-            for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn((tRS_rD[2 * i], tRS_rD[2 * i + 1]))
+            for i in cutlass.range(cute.size(trs_rpostact) // 2, unroll_full=True):
+                trs_rpostact[2 * i], trs_rpostact[2 * i + 1] = params.act_fn((trs_rd[2 * i], trs_rd[2 * i + 1]))
         else:
-            tRS_rPostAct = tRS_rD
+            trs_rpostact = trs_rd
 
         # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        trs_rpostact_out = cute.make_fragment_like(trs_rpostact, self.postact_dtype)
+        trs_rpostact_out.store(trs_rpostact.load().to(self.postact_dtype))
+        return trs_rpostact_out
 
 
 class MacheteGemmActSm90(MacheteGemmActMixin, quack.gemm_sm90.GemmSm90):
@@ -78,39 +89,39 @@ act_fn_map["geglu"] = geglu_tuple_dupe
 
 
 def machete_gemm_act(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    D: Optional[torch.Tensor],
-    C: Optional[torch.Tensor],
-    PostAct: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: Optional[torch.Tensor],
+    c: Optional[torch.Tensor],
+    post_act_tensor: torch.Tensor,
     tile_count_semaphore: Optional[torch.Tensor],
     activation: Optional[str],
-    tile_M: int,
-    tile_N: int,
-    cluster_M: int,
-    cluster_N: int,
+    tile_m: int,
+    tile_n: int,
+    cluster_m: int,
+    cluster_n: int,
     pingpong: bool = False,
     persistent: bool = True,
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[torch.Tensor] = None,
     colvec_bias: Optional[torch.Tensor] = None,
     cu_seqlens_m: Optional[torch.Tensor] = None,
-    A_idx: Optional[torch.Tensor] = None,
+    a_idx: Optional[torch.Tensor] = None,
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
-        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
-        if D is not None:
-            assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
-        assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
-    if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
-        assert cluster_N == 1, "gather_A requires cluster_N=1"
+        assert a.stride(-1) == 1, "varlen_m requires a to be k-major"
+        if d is not None:
+            assert d.stride(-1) == 1, "varlen_m requires d to be n-major"
+        assert post_act_tensor.stride(-1) == 1, "varlen_m requires post_act_tensor to be n-major"
+    gather_a = a_idx is not None
+    if gather_a:
+        assert cu_seqlens_m is not None, "gather_a requires varlen (cu_seqlens_m must be specified)"
+        assert cluster_n == 1, "gather_a requires cluster_n=1"
     assert activation in act_fn_map, f"Unsupported activation {activation}"
 
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    l_dim, m_dim, k_dim, n_dim, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        a, b, d, c, additional_tensors={"PostAct": post_act_tensor}, cu_seqlens_m=cu_seqlens_m, A_idx=a_idx
     )
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
@@ -123,18 +134,18 @@ def machete_gemm_act(
     }
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
 
-    device_capacity = get_device_capacity(A.device)
+    device_capacity = get_device_capacity(a.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = MacheteGemmActSm100 if device_capacity[0] > 9 else MacheteGemmActSm90
+    gemm_cls = MacheteGemmActSm100 if device_capacity[0] > 9 else MacheteGemmActSm90
 
     acc_dtype = Float32
-    tile_shape_mn = (tile_M, tile_N)
-    cluster_shape_mnk = (cluster_M, cluster_N, 1)
+    tile_shape_mn = (tile_m, tile_n)
+    cluster_shape_mnk = (cluster_m, cluster_n, 1)
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = get_max_active_clusters(cluster_m * cluster_n) if persistent else 0
     GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
     act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(
+    epi_args = gemm_cls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
         mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
@@ -153,11 +164,11 @@ def machete_gemm_act(
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         None,  # cu_seqlens_k
-        A_idx,
+        a_idx,
         max_active_clusters,
         cluster_shape_mnk,
         tensor_infos,
-        GemmCls.num_epi_tensormaps,
+        gemm_cls.num_epi_tensormaps,
         pingpong,
     )
 
@@ -175,19 +186,19 @@ def machete_gemm_act(
         rowvec_bias.dtype if rowvec_bias is not None else None,
         colvec_bias.dtype if colvec_bias is not None else None,
         cu_seqlens_m is not None,
-        A_idx is not None,
+        a_idx is not None,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = machete_gemm_act.compile_cache
     if compile_key not in cache:
         if device_capacity[0] == 9:
-            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = GemmCls(
+            gemm_cls = partial(gemm_cls, pingpong=pingpong, is_persistent=persistent)
+        gemm_obj = gemm_cls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            gather_A=gather_A,
+            gather_A=gather_a,
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
@@ -220,12 +231,13 @@ def gated_mlp_sm90_forward(x, weight, bias=None, act_type="swiglu"):
     Forward pass for Gated MLP on SM90 using local MacheteGemmAct kernel.
     """
     # x shape handling
+    x_orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
-    M, K = x_2d.shape
-    K2, N2 = weight.shape
+    m_dim, k_dim = x_2d.shape
+    k2_dim, n2_dim = weight.shape
 
-    assert K == K2
-    assert N2 % 2 == 0
+    assert k_dim == k2_dim
+    assert n2_dim % 2 == 0
 
     # Check device capability
     if not x.is_cuda:
@@ -234,15 +246,15 @@ def gated_mlp_sm90_forward(x, weight, bias=None, act_type="swiglu"):
     # We output to a buffer of size (M, 2N) because the kernel expects to write back
     # the same number of elements it read for the activation (2 inputs -> 2 outputs).
     # We will slice this buffer later.
-    post_act = torch.empty((M, N2), dtype=x.dtype, device=x.device)
+    post_act = torch.empty((m_dim, n2_dim), dtype=x.dtype, device=x.device)
 
     # Launch local machete_gemm_act kernel
     machete_gemm_act(
-        x_2d.reshape(1, M, K),  # A: (l, m, k)
-        weight.reshape(1, N2, K),  # B: (l, n, k)
+        x_2d.reshape(1, m_dim, k_dim),  # A: (l, m, k)
+        weight.reshape(1, n2_dim, k_dim),  # B: (l, n, k)
         None,  # D
         None,  # C
-        post_act.reshape(1, M, N2),  # PostAct
+        post_act.reshape(1, m_dim, n2_dim),  # PostAct
         None,  # tile_count_semaphore
         act_type,
         tile_M=128,
@@ -252,8 +264,9 @@ def gated_mlp_sm90_forward(x, weight, bias=None, act_type="swiglu"):
     )
 
     # Result is in post_act (M, 2N) where columns 2i and 2i+1 are identical.
-    # We return the first of the pairs.
-    return post_act[:, ::2]
+    # We return the first of the pairs and restore the original shape.
+    res = post_act[:, ::2]
+    return res.reshape(*x_orig_shape[:-1], -1)
 
 
 class GatedMLPSM90Func(torch.autograd.Function):

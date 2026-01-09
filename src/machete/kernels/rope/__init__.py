@@ -17,12 +17,7 @@ class Rope:
         self._base_rope = None
 
     def __call__(self, q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, backward: bool = False):
-        if self.major in (9, 10):
-            from .sm90 import RopeSM90
-
-            return RopeSM90.apply(q, cos, sin, backward)
-
-        # Fallback to base implementation
+        # Fallback to base implementation for all architectures for now
         if self._base_rope is None:
             self._base_rope = RopeSM80(self.dtype, self.head_dim)
 
