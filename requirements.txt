@@ -2,3 +2,8 @@ filelock
 torch>=2.5.0
 ninja
 jinja2
+transformers>=4.40.0
+nvidia-cutlass-dsl>=4.3.4
+flash-attn-cute
+quack-kernels
+accelerate

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "machete"
 version = "0.1"
-description = "A library of ThunderKittens kernels"
+description = "Custom kernels in CuteDSL and applications"
 requires-python = ">=3.10"
 readme = "README.md"
 license = { file = "LICENSE" }
