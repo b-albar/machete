@@ -92,6 +92,9 @@ def make_qwen_attention_forward():
         # We can pass causal=True for generation/prefill usually
 
         attn_output = flash_attn_func(query_states, key_states, value_states, causal=True)
+        # flash_attn_func returns (output, lse, ...), we only need the output
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
 
         # 5. Output Projection
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

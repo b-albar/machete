@@ -84,6 +84,8 @@ def make_attention_forward():
             value_states,
             causal=causal,
         )
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
 
         # Reshape output
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
