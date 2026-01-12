@@ -15,7 +15,7 @@ class GatedMLP:
         if x.is_cuda and weight.is_cuda:
             major, _ = get_gpu_capability()
 
-            if major == 9 or major == 10:
+            if major >= 9:
                 # For now, SM90+ uses SM90 implementation
                 from .sm90 import gated_mlp_sm90
 

@@ -83,12 +83,30 @@ def main():
     dtype = torch.float16
 
     # --- Gated Benchmark (SwiGLU) ---
-    gated_configs = {}
-    for size_name, size in [("4k x 4k", 4096), ("8k x 8k", 8192)]:
-        a = torch.randn(size, size, device=device, dtype=dtype, requires_grad=True)
-        b = torch.randn(size, size, device=device, dtype=dtype, requires_grad=True)
-        dy = torch.randn(size, size, device=device, dtype=dtype)
-        gated_configs[size_name] = (a, b, dy)
+    def get_configs():
+        batch_sizes_k = [1, 2, 4, 8, 16, 32, 64, 128]
+        hidden_dims = [4096, 8192]
+
+        for dim in hidden_dims:
+            dim_name = f"{dim // 1024}k"
+            for k in batch_sizes_k:
+                batch_size = k * 1024
+                name = f"{k}k x {dim_name}"
+                try:
+                    a = torch.randn(batch_size, dim, device=device, dtype=dtype, requires_grad=True)
+                    b = torch.randn(batch_size, dim, device=device, dtype=dtype, requires_grad=True)
+                    dy = torch.randn(batch_size, dim, device=device, dtype=dtype)
+                    yield name, (a, b, dy)
+                    # Explicit cleanup to help memory
+                    del a, b, dy
+                    torch.cuda.empty_cache()
+                except torch.cuda.OutOfMemoryError:
+                    yield name, None
+                    torch.cuda.empty_cache()
+                    break
+                except Exception as e:
+                    print(f"Skipping {name} due to error: {e}")
+                    break
 
     # Forward
     forward_op_map = {
@@ -101,7 +119,7 @@ def main():
         # Forward transfers: a, b (in) -> c (out)
         return args[0].numel() * 3
 
-    benchmark_op("SwiGLU Forward", gated_configs, forward_op_map, fwd_numel_provider)
+    benchmark_op("SwiGLU Forward", get_configs(), forward_op_map, fwd_numel_provider)
 
     # Backward
     def pytorch_bwd(a, b, dy):
@@ -126,7 +144,7 @@ def main():
         # Backward transfers: a, b, dy (in) -> da, db (out)
         return args[0].numel() * 5
 
-    benchmark_op("SwiGLU Backward", gated_configs, backward_op_map, bwd_numel_provider)
+    benchmark_op("SwiGLU Backward", get_configs(), backward_op_map, bwd_numel_provider)
 
 
 if __name__ == "__main__":

@@ -7,10 +7,7 @@ import torch
 
 try:
     from quack.rmsnorm import rmsnorm_fwd
-
-    HAS_QUACK_RMSNORM = True
 except ImportError:
-    HAS_QUACK_RMSNORM = False
     rmsnorm_fwd = None
 
 
@@ -42,7 +39,7 @@ def patch_rmsnorm(module):
 
     No-op if quack is not available.
     """
-    if not HAS_QUACK_RMSNORM:
+    if rmsnorm_fwd is None:
         return  # Quack not available, skip patching
 
     if hasattr(module, "_machete_original_forward"):

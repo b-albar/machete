@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-from .sm80 import GatedLinear
+from .sm80 import GatedLinear as GatedLinearAutograd
 
 
 def get_gpu_capability():
@@ -12,7 +12,7 @@ def get_gpu_capability():
 class GatedLinear:
     @staticmethod
     def apply(a: torch.Tensor, b: torch.Tensor, act_type: str = "gelu") -> torch.Tensor:
-        return GatedLinear.apply(a, b, act_type)
+        return GatedLinearAutograd.apply(a, b, act_type)
 
 
 def geglu_func(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

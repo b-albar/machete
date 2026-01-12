@@ -63,14 +63,31 @@ def main():
 
     # --- RoPE Benchmark ---
     h, d = 32, 128
-    rope_configs = {}
-    for S in [2048, 4096, 8192, 16384, 32768, 65536, 131072]:
-        B = 1
-        rope_configs[f"BS={B}, S={S}"] = (
-            torch.randn(B, S, h, d, device=device, dtype=dtype),
-            torch.randn(S, d, device=device, dtype=dtype),
-            torch.randn(S, d, device=device, dtype=dtype),
-        )
+
+    def get_configs():
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64]
+        seq_lens = [2048, 4096, 8192, 16384, 32768, 65536]
+
+        for S in seq_lens:
+            S_name = f"{S // 1024}k" if S >= 1024 else str(S)
+            for B in batch_sizes:
+                name = f"BS={B}, S={S_name}"
+                try:
+                    q = torch.randn(B, S, h, d, device=device, dtype=dtype)
+                    cos = torch.randn(S, d, device=device, dtype=dtype)
+                    sin = torch.randn(S, d, device=device, dtype=dtype)
+                    yield name, (q, cos, sin)
+                    del q, cos, sin
+                    torch.cuda.empty_cache()
+                except torch.cuda.OutOfMemoryError:
+                    yield name, None
+                    torch.cuda.empty_cache()
+                    break
+                except Exception as e:
+                    print(f"Skipping {name} due to error: {e}")
+                    # Continue to next config instead of breaking group
+                    torch.cuda.empty_cache()
+                    continue
 
     rope_inst = Rope(dtype=dtype, head_dim=d)
 
@@ -91,7 +108,7 @@ def main():
 
     benchmark_op(
         "RoPE Forward",
-        rope_configs,
+        get_configs(),
         {
             "PyTorch": rope_pytorch,
             "Triton": rope_triton,

@@ -4,25 +4,28 @@
 from typing import Optional
 import logging
 
-from machete.patching import llama, qwen
 from machete.patching.ops import unpatch_rmsnorm, patch_cross_entropy_loss
 
 logger = logging.getLogger(__name__)
 
 
 # Mapping of model types to their patching modules and class names
-MODEL_TYPE_MODULES = {
-    "llama": {
-        "module": llama,
-        "attention": llama.ATTENTION_CLASSES,
-        "rmsnorm": llama.RMSNORM_CLASSES,
-    },
-    "qwen2": {
-        "module": qwen,
-        "attention": qwen.ATTENTION_CLASSES,
-        "rmsnorm": qwen.RMSNORM_CLASSES,
-    },
-}
+# We use lazy importing to avoid dependencies during kernel testing
+def _get_model_type_modules():
+    from machete.patching import llama, qwen
+
+    return {
+        "llama": {
+            "module": llama,
+            "attention": llama.ATTENTION_CLASSES,
+            "rmsnorm": llama.RMSNORM_CLASSES,
+        },
+        "qwen2": {
+            "module": qwen,
+            "attention": qwen.ATTENTION_CLASSES,
+            "rmsnorm": qwen.RMSNORM_CLASSES,
+        },
+    }
 
 
 def _detect_model_type(model) -> Optional[str]:
@@ -30,7 +33,8 @@ def _detect_model_type(model) -> Optional[str]:
     # Try from config
     if hasattr(model, "config"):
         model_type = getattr(model.config, "model_type", None)
-        if model_type in MODEL_TYPE_MODULES:
+        model_type_modules = _get_model_type_modules()
+        if model_type in model_type_modules:
             return model_type
         # Handle variations
         if model_type in ("llama", "llama3"):
@@ -65,25 +69,8 @@ def patch(
 
     This function modifies the model in-place, replacing forward methods
     with optimized versions using flash-attn-cute and quack.
-
-    Args:
-        model: A HuggingFace model (e.g., from AutoModelForCausalLM)
-        model_type: Model type ("llama", "qwen2"). Auto-detected if None.
-        patch_attention: Whether to patch attention layers
-        patch_rmsnorm: Whether to patch RMSNorm layers
-        patch_cross_entropy: Whether to patch CrossEntropyLoss
-
-    Example:
-        >>> from transformers import AutoModelForCausalLM
-        >>> import machete
-        >>>
-        >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-        >>> machete.patch(model)
-        >>>
-        >>> # Works with LoRA
-        >>> from peft import get_peft_model, LoraConfig
-        >>> model = get_peft_model(model, LoraConfig(...))
     """
+    model_type_modules = _get_model_type_modules()
     if model_type is None:
         model_type = _detect_model_type(model)
         if model_type is None:
@@ -91,10 +78,10 @@ def patch(
                 "Could not detect model type. Please specify model_type explicitly. Supported types: llama, qwen2"
             )
 
-    if model_type not in MODEL_TYPE_MODULES:
-        raise ValueError(f"Unsupported model type: {model_type}. Supported: {list(MODEL_TYPE_MODULES.keys())}")
+    if model_type not in model_type_modules:
+        raise ValueError(f"Unsupported model type: {model_type}. Supported: {list(model_type_modules.keys())}")
 
-    type_config = MODEL_TYPE_MODULES[model_type]
+    type_config = model_type_modules[model_type]
     model_module = type_config["module"]
     patched_counts = {"attention": 0, "rmsnorm": 0}
 
@@ -128,9 +115,6 @@ def patch(
 def unpatch(model) -> None:
     """
     Remove Machete patches from a model, restoring original forward methods.
-
-    Args:
-        model: A Machete-patched HuggingFace model
     """
     if not getattr(model, "_machete_patched", False):
         logger.warning("Model does not appear to be patched by Machete")
@@ -140,11 +124,12 @@ def unpatch(model) -> None:
     if model_type is None:
         model_type = _detect_model_type(model)
 
-    if model_type not in MODEL_TYPE_MODULES:
+    model_type_modules = _get_model_type_modules()
+    if model_type not in model_type_modules:
         logger.warning(f"Unknown model type: {model_type}, attempting generic unpatch")
         type_config = {"attention": (), "rmsnorm": (), "module": None}
     else:
-        type_config = MODEL_TYPE_MODULES[model_type]
+        type_config = model_type_modules[model_type]
 
     model_module = type_config.get("module")
     unpatched_counts = {"attention": 0, "rmsnorm": 0}

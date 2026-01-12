@@ -191,7 +191,7 @@ def main():
 
     # Benchmark vanilla HuggingFace
     print("-" * 60)
-    print("Benchmarking: Vanilla HuggingFace (SDPA)")
+    print("Benchmarking: Vanilla HuggingFace")
     print("-" * 60)
 
     model.eval()

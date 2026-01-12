@@ -8,10 +8,7 @@ import torch.nn as nn
 
 try:
     from quack.cross_entropy import cross_entropy
-
-    HAS_QUACK_CROSS_ENTROPY = True
 except ImportError:
-    HAS_QUACK_CROSS_ENTROPY = False
     cross_entropy = None
 
 
@@ -36,7 +33,7 @@ class MacheteCrossEntropyLoss(nn.Module):
             raise NotImplementedError("label_smoothing not supported in MacheteCrossEntropyLoss")
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if HAS_QUACK_CROSS_ENTROPY and input.is_cuda:
+        if cross_entropy is not None and input.is_cuda:
             # quack cross_entropy expects (M, N) for input and (M,) for target
             # HF models typically pass (batch * seq, vocab) and (batch * seq,)
             if input.dim() > 2:

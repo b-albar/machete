@@ -20,31 +20,49 @@ def benchmark_op(
     print(f"{'Config':<20} | {'Provider':<15} | {'Speed (GB/s)':<15} | {'Time (ms)':<10} | {'Peak Mem (MB)':<12}")
     print("-" * 85)
 
-    for config_name, args in configs.items():
+    iterator = configs.items() if isinstance(configs, dict) else configs
+    failed_providers = set()
+    for config_name, args in iterator:
+        if args is None:
+            for provider in op_map:
+                print(f"{config_name:<20} | {provider:<15} | {'OOM':<15} | {'-':<10} | {'-':<12}")
+            continue
+
         for provider, func in op_map.items():
+            if provider in failed_providers:
+                print(f"{config_name:<20} | {provider:<15} | {'OOM':<15} | {'-':<10} | {'-':<12}")
+                continue
             # Estimate throughput (GB/s)
             numel = numel_provider(args)
             bytes_transferred = numel * args[0].element_size()
 
-            # Warm up
-            for _ in range(5):
-                func(*args)
+            try:
+                # Warm up
+                for _ in range(5):
+                    func(*args)
 
-            # Time benchmark
-            ms = triton.testing.do_bench(lambda: func(*args))
-            if ms > 0:
-                gbps = bytes_transferred / (ms * 1e-3) / 1e9
-            else:
-                gbps = 0
+                # Time benchmark
+                ms = triton.testing.do_bench(lambda: func(*args))
+                if ms > 0:
+                    gbps = bytes_transferred / (ms * 1e-3) / 1e9
+                else:
+                    gbps = 0
 
-            # Memory benchmark
-            torch.cuda.reset_peak_memory_stats()
-            base_mem = torch.cuda.memory_allocated()
-            _ = func(*args)
-            peak_mem = torch.cuda.max_memory_allocated()
-            peak_delta_mb = (peak_mem - base_mem) / (1024 * 1024)
+                # Memory benchmark
+                torch.cuda.reset_peak_memory_stats()
+                base_mem = torch.cuda.memory_allocated()
+                _ = func(*args)
+                peak_mem = torch.cuda.max_memory_allocated()
+                peak_delta_mb = (peak_mem - base_mem) / (1024 * 1024)
 
-            print(f"{config_name:<20} | {provider:<15} | {gbps:<15.2f} | {ms:<10.4f} | {peak_delta_mb:<12.2f}")
+                print(f"{config_name:<20} | {provider:<15} | {gbps:<15.2f} | {ms:<10.4f} | {peak_delta_mb:<12.2f}")
+            except torch.cuda.OutOfMemoryError:
+                print(f"{config_name:<20} | {provider:<15} | {'OOM':<15} | {'-':<10} | {'-':<12}")
+                failed_providers.add(provider)
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"{config_name:<20} | {provider:<15} | {'Error':<15} | {'-':<10} | {'-':<12}")
+                print(f"Error details: {e}")
 
 
 def verify_kernel(
