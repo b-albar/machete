@@ -80,6 +80,64 @@ def main():
 
         print(f"{config_name:<25} | {'Sequential':<15} | {ms_seq:<10.4f}")
         print(f"{'':<25} | {'Megakernel':<15} | {ms_mk:<10.4f}")
+
+        # Backward Benchmark (Megakernel only for now as Seq backward requires autograd plumbing setup or manual calls)
+        # We can implement Sequential Backward manually easily.
+
+        d_out = torch.randn_like(out)
+        d_a = torch.empty_like(q)
+        d_b = torch.empty_like(gate)
+        d_q = torch.empty_like(q)  # In-place update of d_a in reality
+
+        # Sequential Backward
+        # GL Backward -> d_a, d_b
+        # RoPE Backward -> d_q (from d_a)
+
+        # Need to cast to right shapes
+        # GL Bwd: d_c, a, b, d_a, d_b, n_cols
+        # RoPE Bwd: smem, mq, cos, sin, s
+
+        mk_bwd = Megakernel(f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
+        mk_bwd.add(
+            gl_impl,
+            d_out.view(-1, h * d),
+            q.view(-1, h * d),
+            gate.view(-1, h * d),
+            d_a.view(-1, h * d),
+            d_b.view(-1, h * d),
+            h * d,
+        )
+        mk_bwd.add(rope_impl, d_a.view(-1, h, d), cos, sin, s)
+
+        def run_mk_bwd(mk=mk_bwd, barrier=barrier, grid=grid, block=block):
+            mk.launch(barrier, grid[0], grid, block)
+
+        ms_mk_bwd = do_bench(run_mk_bwd)
+
+        # Sequential Backward (Kernel Launch-based)
+        mk_gl_bwd = Megakernel(f"gl_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
+        mk_gl_bwd.add(
+            gl_impl,
+            d_out.view(-1, h * d),
+            q.view(-1, h * d),
+            gate.view(-1, h * d),
+            d_a.view(-1, h * d),
+            d_b.view(-1, h * d),
+            h * d,
+        )
+
+        mk_rope_bwd = Megakernel(f"rope_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
+        mk_rope_bwd.add(rope_impl, d_a.view(-1, h, d), cos, sin, s)
+
+        def run_seq_bwd(mk1=mk_gl_bwd, mk2=mk_rope_bwd, barrier=barrier, grid=grid, block=block):
+            mk1.launch(barrier, grid[0], grid, block)
+            mk2.launch(barrier, grid[0], grid, block)
+
+        ms_seq_bwd = do_bench(run_seq_bwd)
+
+        print(f"{'':<25} | {'Sequential Bwd':<15} | {ms_seq_bwd:<10.4f}")
+        print(f"{'':<25} | {'Megakernel Bwd':<15} | {ms_mk_bwd:<10.4f}")
+
         print("-" * 60)
 
 

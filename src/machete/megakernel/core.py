@@ -150,6 +150,11 @@ class Megakernel:
 
             unrolled_ops.append(f"        # Operation {i}")
             unrolled_ops.append(f"        {call_str}")
+            # Ensure memory consistency between operations in the fused sequence.
+            # Operations are executed sequentially by threads, but if they interact via
+            # shared or global memory (as they often do in fusion), we need full visibility.
+            # While __syncthreads() is heavy, it provides the required safety for fusion.
+            unrolled_ops.append(f"        cute.arch.sync_threads()")
 
             if inst["needs_sync"]:
                 unrolled_ops.append(f"        # Global Barrier")
