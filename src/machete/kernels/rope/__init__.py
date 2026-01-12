@@ -16,9 +16,9 @@ class Rope:
         self.major, self.minor = get_gpu_capability()
         self._base_rope = None
 
-    def __call__(self, q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, backward: bool = False):
+    def __call__(self, q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         # Fallback to base implementation for all architectures for now
         if self._base_rope is None:
             self._base_rope = RopeSM80(self.dtype, self.head_dim)
 
-        return self._base_rope(q, cos, sin, backward=backward)
+        return self._base_rope(q, cos, sin)

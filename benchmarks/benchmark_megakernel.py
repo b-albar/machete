@@ -1,11 +1,10 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-from typing import Dict, Tuple, Callable
 
 from machete.megakernel.core import Megakernel
-from machete.kernels.gated_linear.sm80 import GatedLinearSM80, GatedLinear as GatedLinearOp
+from machete.kernels.gated_linear.sm80 import GatedLinearSM80
+from machete.kernels.gated_linear import GatedLinear as GatedLinearOp
 from machete.kernels.rope.sm80 import RopeSM80
-from quack.cute_dsl_utils import torch2cute_dtype_map
 
 
 def do_bench(fn, warmup=25, rep=100):
@@ -25,7 +24,6 @@ def do_bench(fn, warmup=25, rep=100):
 def main():
     device = "cuda"
     dtype = torch.float16
-    cute_dtype = torch2cute_dtype_map[dtype]
 
     # --- Config: RoPE + GatedLinear ---
     configs = {}
@@ -60,10 +58,11 @@ def main():
 
         # Sequential
         rope_op = RopeSM80(dtype, d)
+        gl_op = GatedLinearOp(dtype, "silu")
 
         def run_seq(q=q, cos=cos, sin=sin, gate=gate, out=out):
             rope_op(q, cos, sin)
-            GatedLinearOp.apply(q.view(-1, h * d), gate, "silu")
+            gl_op(q.view(-1, h * d), gate)
 
         ms_seq = do_bench(run_seq)
 

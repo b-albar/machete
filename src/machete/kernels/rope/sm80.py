@@ -1,15 +1,14 @@
 # Copyright (c) 2025, Machete Authors
-from typing import Dict, Any
 
 import torch
 from torch import Tensor
-import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.compile_utils import make_fake_tensor as fake_tensor
 from machete.megakernel.interface import machete_op, FusableKernel
+from machete.megakernel.single import SingleKernel
+from machete.megakernel.autograd import MegakernelAutograd
 
 
 class RopeSM80(FusableKernel):
@@ -22,7 +21,9 @@ class RopeSM80(FusableKernel):
         self.cute_dtype = torch2cute_dtype_map[dtype]
         self.head_dim = head_dim
         self.half_head_dim = head_dim // 2
-        self._compile_cache: Dict[bool, Any] = {}
+
+        # Initialize SingleKernel runner
+        self.runner = SingleKernel(self, self.grid_fn, self.block_fn)
 
     @property
     def smem_per_page(self) -> int:
@@ -95,77 +96,20 @@ class RopeSM80(FusableKernel):
             mq[m, h_idx, i_idx] = r0.to(mq.element_type)
             mq[m, h_idx, i_idx + half_d] = r1.to(mq.element_type)
 
-    def __call__(self, q: Tensor, cos: Tensor, sin: Tensor, backward: bool = False):
+    def grid_fn(self, q, cos, sin, seq_len):
+        return [q.shape[0], 1, 1]
+
+    def block_fn(self, q, cos, sin, seq_len):
+        return [256, 1, 1]
+
+    def __call__(self, q: Tensor, cos: Tensor, sin: Tensor):
         b, s, h, d = q.shape
         q_flat = q.view(b * s, h, d)
-        cos = cos.view(-1, d)
-        sin = sin.view(-1, d)
+        cos_flat = cos.view(-1, d)
+        sin_flat = sin.view(-1, d)
 
-        if backward not in self._compile_cache:
-            m_sym = cute.sym_int()
-            s_sym = cute.sym_int()
+        # Inject seq_len required by kernel logic
+        seq_len = s
 
-            num_smem_elements = 2 * self.half_head_dim
-            smem_fake = fake_tensor(self.cute_dtype, (num_smem_elements,))
-            mq_fake = fake_tensor(self.cute_dtype, (m_sym, h, d))
-            m_cos_fake = fake_tensor(self.cute_dtype, (s_sym, d))
-            m_sin_fake = fake_tensor(self.cute_dtype, (s_sym, d))
-
-            entry_point = self.backward if backward else self.forward
-
-            self._compile_cache[backward] = cute.compile(
-                entry_point,
-                smem_fake,
-                mq_fake,
-                m_cos_fake,
-                m_sin_fake,
-                Int32(0),
-                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                options="--enable-tvm-ffi",
-            )
-
-        num_smem_elements = 2 * self.half_head_dim
-        # Pass a typed tensor for smem in standalone
-        smem_dummy = torch.empty(num_smem_elements, dtype=self.torch_dtype, device="cuda")
-        self._compile_cache[backward](smem_dummy, q_flat, cos, sin, s)
-        return q
-
-    @cute.jit
-    def forward(
-        self,
-        smem_page: cute.Tensor,
-        mq: cute.Tensor,
-        m_cos: cute.Tensor,
-        m_sin: cute.Tensor,
-        seq_len: Int32,
-        stream: cuda.CUstream,
-    ):
-        grid = [mq.shape[0], 1, 1]
-        block = [256, 1, 1]
-        self.forward_kernel(smem_page, mq, m_cos, m_sin, seq_len).launch(grid=grid, block=block, stream=stream)
-
-    @cute.jit
-    def backward(
-        self,
-        smem_page: cute.Tensor,
-        mq: cute.Tensor,
-        m_cos: cute.Tensor,
-        m_sin: cute.Tensor,
-        seq_len: Int32,
-        stream: cuda.CUstream,
-    ):
-        grid = [mq.shape[0], 1, 1]
-        block = [256, 1, 1]
-        self.backward_kernel(smem_page, mq, m_cos, m_sin, seq_len).launch(grid=grid, block=block, stream=stream)
-
-    @cute.kernel
-    def forward_kernel(
-        self, smem_page: cute.Tensor, mq: cute.Tensor, m_cos: cute.Tensor, m_sin: cute.Tensor, seq_len: Int32
-    ):
-        self.compute_forward(smem_page, mq, m_cos, m_sin, seq_len)
-
-    @cute.kernel
-    def backward_kernel(
-        self, smem_page: cute.Tensor, mq: cute.Tensor, m_cos: cute.Tensor, m_sin: cute.Tensor, seq_len: Int32
-    ):
-        self.compute_backward(smem_page, mq, m_cos, m_sin, seq_len)
+        out_flat = MegakernelAutograd.apply(self.runner, q_flat, cos_flat, sin_flat, seq_len)
+        return out_flat.view(b, s, h, d)

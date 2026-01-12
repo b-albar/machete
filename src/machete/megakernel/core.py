@@ -13,13 +13,15 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 # Global registry to pass symbols to generated kernels
 MEGAKERNEL_REGISTRY = {}
 
+# Global compilation cache to reuse compiled kernels across Megakernel instances
+_GLOBAL_COMPILE_CACHE = {}
+
 
 class Megakernel:
     def __init__(self, name: str = "megakernel", mode: str = "forward"):
         self.name = name
         self.mode = mode
         self.instructions = []
-        self._compile_cache = {}
         self.gen_dir = os.path.join(os.path.dirname(__file__), ".generated")
         os.makedirs(self.gen_dir, exist_ok=True)
 
@@ -86,10 +88,21 @@ class Megakernel:
         self.instructions = []
 
     def _get_megakernel_class(self, mapping, num_flat_args, op_info_key):
-        data_to_hash = f"{self.name}_{num_flat_args}_{op_info_key}_{id(self.instructions)}"
+        # We rely on op_info_key and structure of instructions, NOT object identity.
+        # This allows different Megakernel instances (and different Op instances)
+        # to collide in the cache if they are structurally identical.
+        data_to_hash = f"{self.name}_{num_flat_args}_{op_info_key}"
         sig_hash = hashlib.md5(data_to_hash.encode()).hexdigest()
 
-        MEGAKERNEL_REGISTRY[sig_hash] = self.instructions
+        # Check if already registered?
+        # If we just overwrite, we might replace 'instructions' list with a new list
+        # which points to new 'compute' method instances.
+        # This is actually GOOD, because if we are compiling a new kernel, we want it to bind
+        # to the current valid instances (if they are not kept alive elsewhere).
+        # However, for global caching, we assume the first-registered instances are representative.
+
+        if sig_hash not in MEGAKERNEL_REGISTRY:
+            MEGAKERNEL_REGISTRY[sig_hash] = self.instructions
 
         gen_filename = f"kernel_{sig_hash}.py"
         gen_path = os.path.join(self.gen_dir, gen_filename)
@@ -151,6 +164,13 @@ class Megakernel:
         bindings_content = "\n".join(module_bindings)
         ops_content = "\n".join(unrolled_ops)
 
+        # Note: We must fetch instructions dynamically in __call__ if we want to support
+        # grid/block updates from the registry, BUT module bindings above (impl_i) are static!
+        # This implies that `impl_i` (the Kernel object) must be consistent / interchangeable.
+        # We assume that creating a new GatedLinearSM80 is fine as long as logic is same.
+        # The grid/block are read from `instructions[0]['grid']` in launch.
+        # We need to make sure `instructions` used in launch is the one in registry.
+
         content = f"""
 import cutlass
 import cutlass.cute as cute
@@ -168,6 +188,8 @@ instructions = MEGAKERNEL_REGISTRY["{sig_hash}"]
 class GeneratedMegakernel:
     @cute.jit
     def __call__(self, barrier_tensor, n_blocks, {all_args_str}, stream: cuda.CUstream):
+        # We launch utilizing grid/block from the registry instructions
+        # This allows the caller to update registry with current grid/block before call.
         self.kernel(barrier_tensor, n_blocks, {all_args_str}).launch(
             grid=instructions[0]['grid'],
             block=instructions[0]['block'],
@@ -188,7 +210,7 @@ class GeneratedMegakernel:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        return module.GeneratedMegakernel()
+        return module.GeneratedMegakernel(), sig_hash
 
     def launch(self, barrier_tensor: torch.Tensor, n_blocks: int, grid, block, stream=None):
         flat_args = []
@@ -234,9 +256,28 @@ class GeneratedMegakernel:
             op_info.append((type(op), type(actual_op), tuple(state.items())))
 
         op_info_key = str(op_info)
-        compile_key = (tuple(op_info), tuple(arg_info), tuple(grid), tuple(block))
+        # Inclusion of self.mode is critical to distinguish fwd/bwd paths
+        compile_key = (self.mode, tuple(op_info), tuple(arg_info), tuple(grid), tuple(block))
 
-        if compile_key not in self._compile_cache:
+        # Calculate hash to find registry entry
+        data_to_hash = f"{self.name}_{num_flat_args}_{op_info_key}"
+        sig_hash = hashlib.md5(data_to_hash.encode()).hexdigest()
+
+        # Ensure registry has the current grid/block/smem values AND current arguments
+        # The generated code reads from MEGAKERNEL_REGISTRY[sig_hash]
+        # We must update that list's dictionaries with our current launch params.
+        if sig_hash in MEGAKERNEL_REGISTRY:
+            # Registry exists, update it with our current environment
+            cached_instrs = MEGAKERNEL_REGISTRY[sig_hash]
+            for i, inst in enumerate(self.instructions):
+                # Update the cached instruction dict in place
+                # Tensors must be updated too because their addresses change!
+                cached_instrs[i].update(inst)
+        else:
+            # Logic inside _get_megakernel_class will populate registry if missing.
+            pass
+
+        if compile_key not in _GLOBAL_COMPILE_CACHE:
             fake_args = []
             for arg in flat_args:
                 if isinstance(arg, torch.Tensor):
@@ -247,9 +288,9 @@ class GeneratedMegakernel:
                     fake_args.append(arg)
 
             barrier_fake = fake_tensor(Int32, (1,))
-            megakernel_obj = self._get_megakernel_class(mapping, num_flat_args, op_info_key)
+            megakernel_obj, _ = self._get_megakernel_class(mapping, num_flat_args, op_info_key)
 
-            self._compile_cache[compile_key] = cute.compile(
+            _GLOBAL_COMPILE_CACHE[compile_key] = cute.compile(
                 megakernel_obj,
                 barrier_fake,
                 Int32(n_blocks),
@@ -258,4 +299,4 @@ class GeneratedMegakernel:
                 options="--enable-tvm-ffi",
             )
 
-        self._compile_cache[compile_key](barrier_tensor, Int32(n_blocks), *flat_args)
+        _GLOBAL_COMPILE_CACHE[compile_key](barrier_tensor, Int32(n_blocks), *flat_args)
