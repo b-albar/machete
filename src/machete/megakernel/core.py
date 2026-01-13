@@ -6,10 +6,14 @@ import os
 import importlib.util
 import hashlib
 from typing import Callable, Union
-from .interface import MegakernelOp, FusableOp, FusableKernel
+from machete.megakernel.interface import FusableKernel, MegakernelOp
+from machete.megakernel.scheduler import NoBubblesScheduler, MicroOpType, MicroOp
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor as fake_tensor
 import tvm_ffi.core
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Workaround for TVM-FFI bug (Python < 3.13) with positional arguments in __init__
 if not hasattr(tvm_ffi.core.Function, "_monkey_patched"):
@@ -36,38 +40,80 @@ _GLOBAL_COMPILE_CACHE = {}
 
 
 class Megakernel:
-    def __init__(self, name: str = "megakernel", mode: str = "forward", paged_pool_bytes: int = 0):
+    def __init__(
+        self,
+        name: str = "megakernel",
+        mode: str = "forward",
+        paged_pool_bytes: int = 0,
+        num_pages: int = 0,
+        page_size: int = 16384,
+    ):
         """
         Args:
             name: Kernel name for caching/debugging.
             mode: "forward" or "backward".
-            paged_pool_bytes: Size of the paged shared memory pool in bytes.
-                              Set to 0 (default) for no pool allocation.
-                              For No Bubbles pipelining, set to the total size needed
-                              for double-buffering across operations (e.g., 2 * max_op_smem).
+            paged_pool_bytes: Total size of the paged shared memory pool in bytes.
+                              Set to 0 (default) for compute-only mode.
+            num_pages: Number of pages for No Bubbles scheduling.
+                       If 0, uses paged_pool_bytes / page_size.
+            page_size: Size of each shared memory page in bytes (default 16KB).
         """
         self.name = name
         self.mode = mode
         self.instructions = []
         self.gen_dir = os.path.join(os.path.dirname(__file__), ".generated")
         os.makedirs(self.gen_dir, exist_ok=True)
-        self.paged_pool_bytes = paged_pool_bytes
+
+        # No Bubbles configuration
+        self.page_size = page_size
+        if num_pages > 0:
+            self.num_pages = num_pages
+            self.paged_pool_bytes = num_pages * page_size
+        elif paged_pool_bytes > 0:
+            self.num_pages = paged_pool_bytes // page_size
+            self.paged_pool_bytes = paged_pool_bytes
+        else:
+            self.num_pages = 0
+            self.paged_pool_bytes = 0
 
     def add(self, op: Union[FusableKernel, MegakernelOp, Callable], *args):
         """Add an operation and its arguments to the megakernel."""
-        if isinstance(op, FusableKernel):
-            if self.mode == "forward":
-                op = op.compute_forward
-            elif self.mode == "backward":
-                op = op.compute_backward
-            else:
-                raise ValueError(f"Unsupported megakernel mode: {self.mode}")
 
+        # Handle FusableKernel - keep reference for L/C/S methods
+        if isinstance(op, FusableKernel):
+            kernel = op
+            if self.mode == "forward":
+                load_fn = kernel.load_forward
+                compute_fn = kernel.compute_forward
+                store_fn = kernel.store_forward
+            else:
+                load_fn = kernel.load_backward
+                compute_fn = kernel.compute_backward
+                store_fn = kernel.store_backward
+
+            smem_dtype = getattr(kernel, "cute_dtype", cute.Uint8)
+
+            self.instructions.append(
+                {
+                    "kernel": kernel,
+                    "load": load_fn,
+                    "compute": compute_fn,
+                    "store": store_fn,
+                    "args": list(args),
+                    "needs_sync": False,
+                    "smem_per_page": kernel.smem_per_page,
+                    "num_pages": kernel.num_pages,
+                    "smem_dtype": smem_dtype,
+                    "op_obj": kernel,
+                }
+            )
+            return
+
+        # Handle MegakernelOp directly
         if isinstance(op, MegakernelOp):
             actual_op = op
         elif hasattr(op, "_machete_is_op"):
-            # Determine shared memory requirements
-            # Prefer dynamic properties from the instance if available
+            # Decorated function - wrap in FusableOp
             smem_per_page = getattr(op, "_machete_smem_per_page", 0)
             num_pages = getattr(op, "_machete_num_pages", 1)
 
@@ -85,23 +131,27 @@ class Megakernel:
                 smem_per_page=smem_per_page,
                 num_pages=num_pages,
             )
+        else:
+            raise TypeError(f"Unsupported operation type: {type(op)}")
+
         smem_dtype = cute.Uint8
         check_op = actual_op
         if isinstance(actual_op, FusableOp):
             check_op = actual_op._compute_func
 
-        # Try to find the object holding the operation state
         obj = getattr(check_op, "__self__", check_op)
         if hasattr(obj, "cute_dtype"):
             smem_dtype = obj.cute_dtype
 
         self.instructions.append(
             {
-                "compute": actual_op.compute,
+                "kernel": None,
                 "load": getattr(actual_op, "load", None),
+                "compute": actual_op.compute,
                 "store": getattr(actual_op, "store", None),
                 "args": list(args),
                 "needs_sync": actual_op.needs_global_sync,
+                "needs_block_sync": getattr(actual_op, "needs_block_sync", True),
                 "smem_per_page": actual_op.smem_per_page,
                 "num_pages": actual_op.num_pages,
                 "smem_dtype": smem_dtype,
@@ -145,65 +195,95 @@ class Megakernel:
 
         # Allocate paged pool for No Bubbles pipelining if requested
         if self.paged_pool_bytes > 0:
-            unrolled_ops.append(f"        # Paged pool for No Bubbles: {self.paged_pool_bytes} bytes")
             unrolled_ops.append(
-                f"        paged_pool = smem_alloc.allocate_tensor(cute.Uint8, cute.make_layout({self.paged_pool_bytes}))"
+                f"        # Paged pool for No Bubbles: {self.paged_pool_bytes} bytes ({self.num_pages} pages)"
             )
+            unrolled_ops.append(
+                f"        paged_pool = smem_alloc.allocate_tensor("
+                f"cute.Uint8, cute.make_layout({self.paged_pool_bytes}))"
+            )
+        else:
+            # Dummy allocation for signature compatibility in compute-only path
+            unrolled_ops.append("        paged_pool = smem_alloc.allocate_tensor(cute.Uint8, cute.make_layout(1))")
+            unrolled_ops.append("        page_idx = Int32(0)")
 
-        # L/C/S execution model
         n_ops = len(self.instructions)
 
-        # Bind all ops
+        # Bind L/C/S functions for each op
         for i in range(n_ops):
             module_bindings.append(f"op_{i} = instructions[{i}]['op_obj']")
+            module_bindings.append(f"op_{i}_load = instructions[{i}]['load']")
+            module_bindings.append(f"op_{i}_compute = instructions[{i}]['compute']")
+            module_bindings.append(f"op_{i}_store = instructions[{i}]['store']")
 
-        # Prologue: Load first operation (if paged pool is available)
-        if self.paged_pool_bytes > 0 and n_ops > 0:
-            indices = mapping[0]
-            args_str = ", ".join([f"arg_{idx}" for idx in indices])
-            unrolled_ops.append("        # Prologue: Load Op 0")
-            unrolled_ops.append("        page_idx = Int32(0)")
-            unrolled_ops.append(f"        op_0.load(paged_pool, page_idx, {args_str})")
-            unrolled_ops.append("        cute.arch.sync_threads()")
-
-        # Main execution loop
+        # Pre-allocate per-op smem tensors (avoids allocation in loop)
         for i, inst in enumerate(self.instructions):
+            if inst["smem_per_page"] > 0:
+                element_width_bytes = inst["smem_dtype"].width // 8
+                elements_per_page = inst["smem_per_page"] // element_width_bytes
+                # If pipelined, ensure we allocate enough pages for double buffering
+                num_pages = max(inst["num_pages"], self.num_pages) if self.paged_pool_bytes > 0 else inst["num_pages"]
+
+                # Use 2D layout (Elements, Pages) if multiple pages
+                if num_pages > 1:
+                    layout_str = (
+                        f"cute.make_layout(({elements_per_page}, {num_pages}), stride=(1, {elements_per_page}))"
+                    )
+                else:
+                    layout_str = f"cute.make_layout({elements_per_page})"
+
+                unrolled_ops.append(
+                    f"        smem_op_{i} = smem_alloc.allocate_tensor(instructions[{i}]['smem_dtype'], {layout_str})"
+                )
+
+        unrolled_ops.append("        # Generate Schedule")
+        scheduler = NoBubblesScheduler()
+        # Use pipeline if paged pool is enabled (No Bubbles mode)
+        scheduler.generate_pipeline_schedule(self.instructions, use_pipeline=(self.paged_pool_bytes > 0))
+
+        # Initialize page_idx for pipelining if enabled
+        if self.paged_pool_bytes > 0:
+            unrolled_ops.append("        page_idx = Int32(0)")
+            unrolled_ops.append("        next_page = Int32(0)")  # Initialize, will be updated
+
+        # Execute Schedule
+        for uop in scheduler.micro_ops:
+            i = uop.op_idx
+
+            # Prepare arguments
             indices = mapping[i]
             args_str = ", ".join([f"arg_{idx}" for idx in indices])
 
-            # Per-op shared memory allocation (if needed)
-            smem_str = ""
-            if inst["smem_per_page"] > 0:
-                element_width_bytes = inst["smem_dtype"].width // 8
-                total_bytes = inst["smem_per_page"] * inst["num_pages"]
-                num_elements = total_bytes // element_width_bytes
-                unrolled_ops.append(
-                    f"        smem_op_{i} = smem_alloc.allocate_tensor("
-                    f"instructions[{i}]['smem_dtype'], cute.make_layout({num_elements}))"
-                )
-                smem_str = f"smem_op_{i}, "
+            # Helper to get smem arg string for a given page variable
+            def get_smem_arg(page_var):
+                if self.instructions[i]["smem_per_page"] > 0:
+                    if self.instructions[i]["num_pages"] > 1:
+                        return f"smem_op_{i}(_, {page_var}), "
+                    else:
+                        return f"smem_op_{i}, "
+                return ""
 
-            unrolled_ops.append(f"        # Op {i}: Compute")
-            unrolled_ops.append(f"        op_{i}.compute({smem_str}{args_str})")
+            if uop.type == MicroOpType.LOAD:
+                target_page = "page_idx"
+                if uop.desc == "Prefetch":
+                    unrolled_ops.append("        next_page = (page_idx + Int32(1)) % Int32(2)")
+                    target_page = "next_page"
 
-            # Pipelined load of next operation (if paged pool available)
-            if self.paged_pool_bytes > 0 and i + 1 < n_ops:
-                next_indices = mapping[i + 1]
-                next_args_str = ", ".join([f"arg_{idx}" for idx in next_indices])
-                unrolled_ops.append(f"        # Overlap: Load Op {i + 1}")
-                unrolled_ops.append("        next_page = (page_idx + Int32(1)) % Int32(2)")
-                unrolled_ops.append(f"        op_{i + 1}.load(paged_pool, next_page, {next_args_str})")
+                smem_str = get_smem_arg(target_page)
+                unrolled_ops.append(f"        op_{i}_load(paged_pool, {target_page}, {smem_str}{args_str})")
 
-            # Store current operation (if paged pool available)
-            if self.paged_pool_bytes > 0:
-                unrolled_ops.append(f"        # Op {i}: Store")
-                unrolled_ops.append(f"        op_{i}.store(paged_pool, page_idx, {args_str})")
-                if i + 1 < n_ops:
-                    unrolled_ops.append("        page_idx = next_page")
+            elif uop.type == MicroOpType.COMPUTE:
+                smem_str = get_smem_arg("page_idx")
+                unrolled_ops.append(f"        op_{i}_compute({smem_str}{args_str})")
 
-            unrolled_ops.append("        cute.arch.sync_threads()")
+            elif uop.type == MicroOpType.STORE:
+                smem_str = get_smem_arg("page_idx")
+                unrolled_ops.append(f"        op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
 
-            if inst["needs_sync"]:
+            elif uop.type == MicroOpType.SYNC_BLOCK:
+                unrolled_ops.append("        cute.arch.sync_threads()")
+
+            elif uop.type == MicroOpType.SYNC_GLOBAL:
                 unrolled_ops.append("        # Global Barrier")
                 unrolled_ops.append("        if tidx == 0:")
                 unrolled_ops.append("            atomic_add_i32(1, barrier_tensor.iterator)")
@@ -212,6 +292,9 @@ class Megakernel:
                 unrolled_ops.append("                pass")
                 unrolled_ops.append("        cute.arch.sync_threads()")
                 unrolled_ops.append("        sync_step = sync_step + Int32(1)")
+
+            elif uop.type == MicroOpType.ADVANCE_PAGE:
+                unrolled_ops.append("        page_idx = next_page")
 
         bindings_content = "\n".join(module_bindings)
         ops_content = "\n".join(unrolled_ops)
@@ -264,10 +347,12 @@ class GeneratedMegakernel:
 
         return module.GeneratedMegakernel(), sig_hash
 
-    def launch(self, barrier_tensor: torch.Tensor, n_blocks: int, grid, block, stream=None):
+    def launch(self, n_blocks: int, grid, block, stream=None):
         flat_args = []
         mapping = []
         curr = 0
+        device = None
+
         for inst in self.instructions:
             args = inst["args"]
             flat_args.extend(args)
@@ -276,12 +361,69 @@ class GeneratedMegakernel:
             inst["grid"] = grid
             inst["block"] = block
 
+            # Identify device from arguments
+            if device is None:
+                for arg in args:
+                    if isinstance(arg, torch.Tensor):
+                        device = arg.device
+                        break
+
         num_flat_args = len(flat_args)
 
-        # Total shared memory = paged pool + per-op allocations
-        total_smem = self.paged_pool_bytes
-        for inst in self.instructions:
-            total_smem += inst["smem_per_page"] * inst["num_pages"]
+        # Ensure device is identified for properties query
+        if device is None:
+            device = torch.device("cuda")
+
+        # Adaptive Shared Memory Reduction
+        props = torch.cuda.get_device_properties(device)
+        # Use opt-in max shared memory if available (for handling >48KB)
+        max_smem = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
+
+        # Reserve some safety margin (e.g., 2KB)
+        limit_smem = max_smem - 2048
+
+        while self.num_pages >= 2:
+            # Recalculate candidate usage
+            candidate_smem = self.paged_pool_bytes
+            for inst in self.instructions:
+                n_pages = inst["num_pages"]
+                if self.paged_pool_bytes > 0 and inst["smem_per_page"] > 0:
+                    n_pages = max(inst["num_pages"], self.num_pages)
+                candidate_smem += inst["smem_per_page"] * n_pages
+            candidate_smem += 1024
+
+            if candidate_smem <= limit_smem:
+                total_smem = candidate_smem
+                break
+
+            # Reduce pages
+            old_pages = self.num_pages
+            self.num_pages -= 1
+            if self.num_pages < 1:
+                self.num_pages = 1
+
+            # Update pool bytes proportionally
+            if old_pages > 0:
+                self.paged_pool_bytes = int(self.paged_pool_bytes * (self.num_pages / old_pages))
+
+            if self.num_pages == old_pages:  # Stuck
+                break
+        else:
+            # Loop finished (num_pages < 2 or break).
+            # Recalculate one last time to be sure
+            total_smem = self.paged_pool_bytes
+            for inst in self.instructions:
+                n_pages = inst["num_pages"]
+                if self.paged_pool_bytes > 0 and inst["smem_per_page"] > 0:
+                    n_pages = max(inst["num_pages"], self.num_pages)
+                total_smem += inst["smem_per_page"] * n_pages
+            total_smem += 1024
+
+        if total_smem > max_smem:
+            # Just warn, as we cannot reduce further
+            logger.critical(
+                f"Warning: Calculated shared memory {total_smem} exceeds device limit {max_smem}. This may fail."
+            )
 
         for inst in self.instructions:
             inst["total_smem"] = total_smem
@@ -309,11 +451,20 @@ class GeneratedMegakernel:
             op_info.append((type(op), type(actual_op), tuple(state.items())))
 
         op_info_key = str(op_info)
-        # Inclusion of self.mode is critical to distinguish fwd/bwd paths
-        compile_key = (self.mode, tuple(op_info), tuple(arg_info), tuple(grid), tuple(block))
+        # Include num_pages and paged_pool_bytes in compilation key to differentiate kernels
+        compile_key = (
+            self.mode,
+            tuple(op_info),
+            tuple(arg_info),
+            tuple(grid),
+            tuple(block),
+            self.num_pages,
+            self.paged_pool_bytes,
+        )
 
         # Calculate hash to find registry entry
-        data_to_hash = f"{self.name}_{num_flat_args}_{op_info_key}"
+        # Include num_pages/pool_bytes in hash too
+        data_to_hash = f"{self.name}_{num_flat_args}_{op_info_key}_{self.num_pages}_{self.paged_pool_bytes}"
         sig_hash = hashlib.md5(data_to_hash.encode()).hexdigest()
 
         # Ensure registry has the current grid/block/smem values AND current arguments
@@ -352,4 +503,7 @@ class GeneratedMegakernel:
                 options="--enable-tvm-ffi",
             )
 
-        _GLOBAL_COMPILE_CACHE[compile_key](barrier_tensor, Int32(n_blocks), *flat_args)
+        # Keep barrier alive in self instance to avoid GC use-after-free during async execution
+        self._barrier = torch.zeros(1, dtype=torch.int32, device=device)
+
+        _GLOBAL_COMPILE_CACHE[compile_key](self._barrier, Int32(n_blocks), *flat_args)

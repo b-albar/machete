@@ -1,4 +1,3 @@
-# Copyright (c) 2025, Machete Authors
 import torch
 import torch.nn.functional as functional
 from machete.kernels.gated_linear import geglu_func, swiglu_func, reglu_func
@@ -32,11 +31,45 @@ def test_gated_linear():
     ]
 
     for dtype in [torch.float16, torch.bfloat16]:
+        print(f"\n{'=' * 20} Testing dtype: {dtype} {'=' * 20}")
         for name, func, ref_func in ops:
-            b, s, d = 2, 128, 1024
-            a = torch.randn((b, s, d), device=device, dtype=dtype, requires_grad=True)
-            b_tensor = torch.randn((b, s, d), device=device, dtype=dtype, requires_grad=True)
-            verify_kernel(name, func, ref_func, (a, b_tensor), dtype)
+            print(f"-- Protocol for {name} --")
+            b_dim, s_dim, d_dim = 2, 128, 1024
+
+            # Inputs
+            a = torch.randn((b_dim, s_dim, d_dim), device=device, dtype=dtype)
+            b_tensor = torch.randn((b_dim, s_dim, d_dim), device=device, dtype=dtype)
+
+            # 1. Compute Golden Reference in FP32
+            a_fp32 = a.float()
+            b_fp32 = b_tensor.float()
+            out_fp32 = ref_func(a_fp32, b_fp32)
+
+            # 2. Compute Reference in Target Precision
+            out_low = ref_func(a, b_tensor)
+
+            # 3. Baseline Quantization Error
+            baseline_diff = (out_fp32.to(dtype) - out_low).abs().max().item()
+            print(f"  Baseline error (FP32 vs {dtype}): {baseline_diff:.6f}")
+
+            # 4. Set tolerance: 2x baseline error (floor at 1e-3)
+            atol = max(2.0 * baseline_diff, 1e-3)
+            print(f"  Setting verif atol = {atol:.6f}")
+
+            # 5. Verify Kernel
+            # Inputs must be new leaves for grad check
+            a_in = a.clone().detach().requires_grad_(True)
+            b_in = b_tensor.clone().detach().requires_grad_(True)
+
+            verify_kernel(
+                name=f"{name}_{dtype}",
+                func=func,
+                ref_func=ref_func,
+                inputs=(a_in, b_in),
+                dtype=dtype,
+                atol=atol,
+                check_grad=True,
+            )
 
 
 if __name__ == "__main__":

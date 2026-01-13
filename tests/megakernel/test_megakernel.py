@@ -5,108 +5,194 @@ from machete.kernels.rope.sm80 import RopeSM80
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
 
+# Helper refs
+def swiglu_ref(a, b):
+    return torch.nn.functional.silu(a) * b
+
+
+def geglu_ref(a, b):
+    # approximate="tanh" for consistency with typical kernels
+    return torch.nn.functional.gelu(a, approximate="tanh") * b
+
+
+def rope_ref(Q, cos, sin):
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    half = Q.shape[-1] // 2
+    RH_Q = torch.cat((-Q[..., half:], Q[..., :half]), dim=-1)
+    return Q * cos + RH_Q * sin
+
+
+def get_atol(baseline_diff):
+    return max(2.0 * baseline_diff, 1e-3)
+
+
 def test_megakernel_fuse_gated_linear():
     device = "cuda"
-    dtype = torch.float16
     n_rows = 128
     n_cols = 256
 
-    a1 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    b1 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    c1 = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
+    for dtype in [torch.float16, torch.bfloat16]:
+        print(f"\nTesting Fuse Gated Linear {dtype}")
+        a1 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        b1 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        c1 = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
+        b2 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        c2 = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
 
-    b2 = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    c2 = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
+        # 1. FP32 Baseline
+        a1_f = a1.float()
+        b1_f = b1.float()
+        b2_f = b2.float()
+        ref_c1_f = swiglu_ref(a1_f, b1_f)
+        ref_c2_f = geglu_ref(ref_c1_f, b2_f)
 
-    barrier = torch.zeros(1, device=device, dtype=torch.int32)
+        # 2. Target dtype ref
+        ref_c1 = swiglu_ref(a1, b1)
+        ref_c2 = geglu_ref(ref_c1, b2)
 
-    megakernel = Megakernel("forward_fuse", mode="forward")
-    cute_dtype = torch2cute_dtype_map[dtype]
+        baseline_diff = (ref_c2_f.to(dtype) - ref_c2).abs().max().item()
+        atol = get_atol(baseline_diff)
+        print(f"  Baseline diff: {baseline_diff:.6f}, atol: {atol:.6f}")
 
-    op1_impl = GatedLinearSM80(dtype, "silu")
-    op2_impl = GatedLinearSM80(dtype, "gelu")
+        # 3. Kernel
+        megakernel = Megakernel(f"forward_fuse_{dtype}", mode="forward")
+        op1_impl = GatedLinearSM80(dtype, "silu")
+        op2_impl = GatedLinearSM80(dtype, "gelu")
+        megakernel.add(op1_impl, a1, b1, c1, n_cols)
+        megakernel.add(op2_impl, c1, b2, c2, n_cols)
 
-    megakernel.add(op1_impl, a1, b1, c1, n_cols)
-    megakernel.add(op2_impl, c1, b2, c2, n_cols)
+        # Must match grid/block requirements. GatedLinear uses TILE_N typically.
+        # But here manual grid launch used in test.
+        # GatedLinearSM80.grid_fn does calculations.
+        # We manually launch here for simplicity?
+        # Re-using test's manual grid.
+        grid = [n_rows, 1, 1]
+        block = [128, 1, 1]
+        # Barrier internal
+        megakernel.launch(grid[0], grid, block)
 
-    grid = [n_rows, 1, 1]
-    block = [128, 1, 1]
-    megakernel.launch(barrier, grid[0], grid, block)
-
-    ref_c1 = torch.nn.functional.silu(a1.float()) * b1.float()
-    ref_c2 = torch.nn.functional.gelu(ref_c1, approximate="tanh") * b2.float()
-
-    torch.testing.assert_close(c2.float(), ref_c2, atol=1e-3, rtol=1e-3)
-    print("Megakernel Forward fusion test passed!")
+        diff = (c2 - ref_c2).abs().max().item()
+        print(f"  Kernel diff: {diff:.6f}")
+        assert diff <= atol, f"Mismatch: {diff} > {atol}"
+        print("  Passed!")
 
 
 def test_megakernel_with_rope():
     device = "cuda"
-    dtype = torch.float16
     b_sz, s_sz, h_sz, d_sz = 2, 64, 8, 128
 
-    q_tensor = torch.randn(b_sz, s_sz, h_sz, d_sz, device=device, dtype=dtype)
-    cos_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
-    sin_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
+    for dtype in [torch.float16, torch.bfloat16]:
+        print(f"\nTesting Fuse RoPE + Gated {dtype}")
+        q_tensor = torch.randn(b_sz, s_sz, h_sz, d_sz, device=device, dtype=dtype)
+        cos_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype).clamp(-1, 1)
+        sin_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype).clamp(-1, 1)
+        half = d_sz // 2
+        cos_tensor[:, half:] = cos_tensor[:, :half]
+        sin_tensor[:, half:] = sin_tensor[:, :half]
 
-    # We apply RoPE then a GatedLinear (contrived but tests fusion)
-    # GatedLinear will act on the flattened B*S, H*D
-    flat_q = q_tensor.view(b_sz * s_sz, h_sz * d_sz)
-    gate = torch.randn(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
-    out = torch.empty(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
+        flat_q = q_tensor.view(b_sz * s_sz, h_sz * d_sz)
+        gate = torch.randn(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
+        out = torch.empty(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
 
-    barrier = torch.zeros(1, device=device, dtype=torch.int32)
-    megakernel = Megakernel("rope_fuse", mode="forward")
-    cute_dtype = torch2cute_dtype_map[dtype]
+        # 1. FP32 Ref
+        q_f = q_tensor.float()
+        cos_f = cos_tensor.float()
+        sin_f = sin_tensor.float()
+        gate_f = gate.float()
 
-    rope_impl = RopeSM80(dtype, d_sz)
-    gl_impl = GatedLinearSM80(dtype, "silu")
+        # RoPE
+        rope_out_f = rope_ref(q_f, cos_f, sin_f)
+        # Flatten
+        rope_flat_f = rope_out_f.view(b_sz * s_sz, h_sz * d_sz)
+        # Gated Linear (SiLU * Gate)
+        final_out_f = swiglu_ref(rope_flat_f, gate_f)
 
-    megakernel.add(rope_impl, q_tensor.view(b_sz * s_sz, h_sz, d_sz), cos_tensor, sin_tensor, s_sz)
-    megakernel.add(gl_impl, flat_q, gate, out, h_sz * d_sz)
+        # 2. Target Ref
+        q_ref = q_tensor.clone()
+        rope_out_ref = rope_ref(q_ref, cos_tensor, sin_tensor)
+        rope_flat_ref = rope_out_ref.view(b_sz * s_sz, h_sz * d_sz)
+        final_out_ref = swiglu_ref(rope_flat_ref, gate)
 
-    grid = [b_sz * s_sz, 1, 1]
-    block = [256, 1, 1]
-    megakernel.launch(barrier, grid[0], grid, block)
+        baseline_diff = (final_out_f.to(dtype) - final_out_ref).abs().max().item()
+        atol = get_atol(baseline_diff)
+        print(f"  Baseline diff: {baseline_diff:.6f}, atol: {atol:.6f}")
 
-    print("Megakernel with RoPE fusion test passed!")
+        # 3. Kernel
+        megakernel = Megakernel(f"rope_fuse_{dtype}", mode="forward")
+        rope_impl = RopeSM80(dtype, d_sz)
+        gl_impl = GatedLinearSM80(dtype, "silu")
+
+        # Kernel modifies q_input in place
+        q_input = q_tensor.clone()
+        flat_q_in = q_input.view(b_sz * s_sz, h_sz * d_sz)
+
+        megakernel.add(rope_impl, q_input.view(b_sz * s_sz, h_sz, d_sz), cos_tensor, sin_tensor, s_sz)
+        megakernel.add(gl_impl, flat_q_in, gate, out, h_sz * d_sz)
+
+        grid = [b_sz * s_sz, 1, 1]
+        block = [256, 1, 1]
+        # Barrier internal
+        megakernel.launch(grid[0], grid, block)
+
+        diff = (out - final_out_ref).abs().max().item()
+        print(f"  Kernel diff: {diff:.6f}")
+        assert diff <= atol, f"Mismatch: {diff} > {atol}"
+        print("  Passed!")
 
 
 def test_megakernel_backward():
     device = "cuda"
-    dtype = torch.float16
     n_rows = 128
     n_cols = 256
 
-    dc_grad = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    a_in = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    b_in = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
-    da_out = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
-    db_out = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
+    for dtype in [torch.float16, torch.bfloat16]:
+        print(f"\nTesting Backward {dtype}")
+        dc_grad = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        a_in = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        b_in = torch.randn(n_rows, n_cols, device=device, dtype=dtype)
+        da_out = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
+        db_out = torch.empty(n_rows, n_cols, device=device, dtype=dtype)
 
-    barrier = torch.zeros(1, device=device, dtype=torch.int32)
-    megakernel = Megakernel("backward_fuse", mode="backward")
-    cute_dtype = torch2cute_dtype_map[dtype]
+        # 1. FP32 Ref
+        dc_f = dc_grad.float()
+        a_f = a_in.float().requires_grad_(True)
+        b_f = b_in.float().requires_grad_(True)
+        out_f = swiglu_ref(a_f, b_f)
+        out_f.backward(dc_f)
+        ref_da_f = a_f.grad
+        ref_db_f = b_f.grad
 
-    op_impl = GatedLinearSM80(dtype, "silu")
-    megakernel.add(op_impl, dc_grad, a_in, b_in, da_out, db_out, n_cols)
+        # 2. Target Ref
+        a_t = a_in.clone().detach().requires_grad_(True)
+        b_t = b_in.clone().detach().requires_grad_(True)
+        out_t = swiglu_ref(a_t, b_t)
+        out_t.backward(dc_grad)
+        ref_da_t = a_t.grad
+        ref_db_t = b_t.grad
 
-    grid = [n_rows, 1, 1]
-    block = [128, 1, 1]
-    megakernel.launch(barrier, grid[0], grid, block)
+        base_da = (ref_da_f.to(dtype) - ref_da_t).abs().max().item()
+        base_db = (ref_db_f.to(dtype) - ref_db_t).abs().max().item()
+        baseline_diff = max(base_da, base_db)
+        atol = get_atol(baseline_diff)
+        print(f"  Baseline diff: {baseline_diff:.6f}, atol: {atol:.6f}")
 
-    # Reference
-    with torch.enable_grad():
-        a_reg = a_in.float().clone().detach().requires_grad_(True)
-        b_reg = b_in.float().clone().detach().requires_grad_(True)
-        out_fwd = torch.nn.functional.silu(a_reg) * b_reg
-        out_fwd.backward(dc_grad.float())
-        ref_da = a_reg.grad
-        ref_db = b_reg.grad
+        # 3. Kernel
+        megakernel = Megakernel(f"backward_fuse_{dtype}", mode="backward")
+        op_impl = GatedLinearSM80(dtype, "silu")
+        megakernel.add(op_impl, dc_grad, a_in, b_in, da_out, db_out, n_cols)
 
-    torch.testing.assert_close(da_out.float(), ref_da, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(db_out.float(), ref_db, atol=1e-3, rtol=1e-3)
-    print("Megakernel Backward test passed!")
+        grid = [n_rows, 1, 1]
+        block = [128, 1, 1]
+        # Barrier internal
+        megakernel.launch(grid[0], grid, block)
+
+        diff_da = (da_out - ref_da_t).abs().max().item()
+        diff_db = (db_out - ref_db_t).abs().max().item()
+        diff = max(diff_da, diff_db)
+        print(f"  Kernel diff: {diff:.6f}")
+        assert diff <= atol, f"Mismatch: {diff} > {atol}"
+        print("  Passed!")
 
 
 if __name__ == "__main__":

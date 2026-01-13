@@ -9,11 +9,22 @@ def get_gpu_capability():
     return torch.cuda.get_device_capability()
 
 
+import functools
+
+# ... imports ...
+
+
+@functools.lru_cache(maxsize=None)
+def _get_kernel(dtype, act_type):
+    return GatedLinearSM80(dtype, act_type)
+
+
 class GatedLinear:
     def __init__(self, dtype: torch.dtype, act_type: str = "gelu"):
         self.dtype = dtype
         self.act_type = act_type
-        self._kernel = GatedLinearSM80(dtype, act_type)
+        # Use cached kernel to avoid memory bloat from repeated megakernel registration
+        self._kernel = _get_kernel(dtype, act_type)
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return self._kernel(a, b)

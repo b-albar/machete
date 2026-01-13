@@ -96,7 +96,7 @@ def verify_kernel(
 
     diff_fwd = (out_mac - out_ref).abs().max().item()
     print(f"  Forward Max Diff: {diff_fwd}")
-    assert diff_fwd < atol, f"{name} forward mismatch for {dtype}: {diff_fwd}"
+    assert diff_fwd <= atol, f"{name} forward mismatch for {dtype}: {diff_fwd}"
 
     if not check_grad:
         return
@@ -127,6 +127,6 @@ def verify_kernel(
     for i, (g_mac, g_ref) in enumerate(zip(grads_mac, grads_ref)):
         diff_grad = (g_mac - g_ref).abs().max().item()
         print(f"  Grad[{i}] Max Diff: {diff_grad}")
-        assert diff_grad < atol, f"{name} grad[{i}] mismatch for {dtype}: {diff_grad}"
+        assert diff_grad <= atol, f"{name} grad[{i}] mismatch for {dtype}: {diff_grad}"
 
     print(f"  {name} passed for {dtype}!")

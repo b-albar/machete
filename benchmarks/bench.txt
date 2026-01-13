@@ -1,0 +1,58 @@
+==================== RoPE + GatedLinear Fusion ====================
+Config                    | Provider        | Time (ms) 
+------------------------------------------------------------
+B=1 S=4096 H=32 D=128     | Sequential      | 0.6716    
+                          | Megakernel      | 0.6063    
+                          | Sequential Bwd  | 0.9569    
+                          | Megakernel Bwd  | 0.6972    
+------------------------------------------------------------
+B=2 S=8192 H=32 D=128     | Sequential      | 2.9066    
+                          | Megakernel      | 2.4445    
+                          | Sequential Bwd  | 4.0417    
+                          | Megakernel Bwd  | 2.8435    
+------------------------------------------------------------
+(venvmachete) [elentir@gullfapython benchmark_^Cgakernel.py 
+(venvmachete) [elentir@gullfaxi benchmarks]$ ^C
+(venvmachete) [elentir@gullfaxi benchmarks]$ ^C
+(venvmachete) [elentir@gullfaxi benchmarks]$ ^C
+(venvmachete) [elentir@gullfaxi benchmarks]$ python benchmark_rope.py 
+
+==================== RoPE Forward ====================
+Config               | Provider        | Speed (GB/s)    | Time (ms)  | Peak Mem (MB)
+-------------------------------------------------------------------------------------
+BS=1, S=2k           | PyTorch         | 63.20           | 0.5475     | 64.00       
+BS=1, S=2k           | Triton          | 133.82          | 0.2586     | 0.00        
+BS=1, S=2k           | cuteDSL         | 173.31          | 0.1997     | 0.00        
+BS=2, S=2k           | PyTorch         | 40.09           | 1.6999     | 128.00      
+BS=2, S=2k           | Triton          | 151.18          | 0.4508     | 0.00        
+BS=2, S=2k           | cuteDSL         | 278.01          | 0.2452     | 0.00        
+BS=4, S=2k           | PyTorch         | 32.55           | 4.1556     | 256.00      
+BS=4, S=2k           | Triton          | 190.97          | 0.7083     | 0.00        
+BS=4, S=2k           | cuteDSL         | 99.01           | 1.3662     | 0.00        
+BS=8, S=2k           | PyTorch         | 39.91           | 6.7523     | 512.00      
+BS=8, S=2k           | Triton          | 189.54          | 1.4217     | 0.00        
+BS=8, S=2k           | cuteDSL         | 211.92          | 1.2717     | 0.00        
+BS=16, S=2k          | PyTorch         | 37.56           | 14.3210    | 1024.00     
+BS=16, S=2k          | Triton          | 178.71          | 3.0100     | 0.00        
+BS=16, S=2k          | cuteDSL         | 315.28          | 1.7062     | 0.00        
+BS=32, S=2k          | PyTorch         | 39.78           | 27.0164    | 2048.00     
+BS=32, S=2k          | Triton          | 168.71          | 6.3705     | 0.00        
+BS=32, S=2k          | cuteDSL         | 209.93          | 5.1196     | 0.00        
+BS=64, S=2k          | PyTorch         | 40.28           | 53.3463    | 4096.00     
+BS=64, S=2k          | Triton          | 183.38          | 11.7163    | 0.00        
+BS=64, S=2k          | cuteDSL         | 224.76          | 9.5591     | 0.00        
+BS=1, S=4k           | PyTorch         | 39.77           | 1.7402     | 128.00      
+BS=1, S=4k           | Triton          | 273.37          | 0.2532     | 0.00        
+BS=1, S=4k           | cuteDSL         | 288.72          | 0.2397     | 0.00        
+BS=2, S=4k           | PyTorch         | 51.06           | 2.6696     | 256.00      
+BS=2, S=4k           | Triton          | 191.50          | 0.7118     | 0.00        
+BS=2, S=4k           | cuteDSL         | 105.14          | 1.2965     | 0.00        
+BS=4, S=4k           | PyTorch         | 38.23           | 7.0770     | 512.00      
+BS=4, S=4k           | Triton          | 169.16          | 1.5993     | 0.00        
+BS=4, S=4k           | cuteDSL         | 196.96          | 1.3735     | 0.00        
+BS=8, S=4k           | PyTorch         | 37.32           | 14.4403    | 1024.00     
+BS=8, S=4k           | Triton          | 193.95          | 2.7788     | 0.00        
+BS=8, S=4k           | cuteDSL         | 250.49          | 2.1517     | 0.00        
+BS=16, S=4k          | PyTorch         | 39.72           | 27.0842    | 2048.00     
+BS=16, S=4k          | Triton          | 169.68          | 6.3404     | 0.00        
+BS=16, S=4k          | cuteDSL         | 209.10          | 5.1450     | 0.00

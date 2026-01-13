@@ -49,10 +49,8 @@ class SingleKernel:
         block = self.block_fn(*args)
         n_blocks = grid[0] * grid[1] * grid[2]
 
-        barrier = torch.zeros(1, dtype=torch.int32, device=args[0].device)
-
         self._update_or_add(self.mk_fwd, args)
-        self.mk_fwd.launch(barrier, n_blocks, grid, block)
+        self.mk_fwd.launch(n_blocks, grid, block)
 
         # Assume first argument is the in-place modified tensor
         return args[0]
@@ -85,10 +83,8 @@ class SingleKernel:
         block = self.block_fn(*args)
         n_blocks = grid[0] * grid[1] * grid[2]
 
-        barrier = torch.zeros(1, dtype=torch.int32, device=main_grad.device)
-
         self._update_or_add(self.mk_bwd, bwd_args)
-        self.mk_bwd.launch(barrier, n_blocks, grid, block)
+        self.mk_bwd.launch(n_blocks, grid, block)
 
         # Return gradients
         # We assume only the first argument (mq) effectively receives a gradient (which is main_grad modified in place).

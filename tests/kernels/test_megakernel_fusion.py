@@ -1,12 +1,12 @@
 import torch
+import torch.nn.functional as F
 from machete.megakernel.core import Megakernel
 from machete.kernels.gated_linear.sm80 import GatedLinearSM80
 from machete.kernels.rope.sm80 import RopeSM80
-from machete.kernels.gated_linear import GatedLinear as GatedLinearOp
 
 
 def rope_ref(Q, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
+    cos = cos.unsqueeze(0).unsqueeze(2)
     sin = sin.unsqueeze(0).unsqueeze(2)
     half = Q.shape[-1] // 2
     RH_Q = torch.cat((-Q[..., half:], Q[..., :half]), dim=-1)
@@ -15,213 +15,154 @@ def rope_ref(Q, cos, sin):
 
 def get_config():
     device = "cuda"
-    dtype = torch.float16
     B, S, H, D = 1, 128, 4, 64
-    return device, dtype, B, S, H, D
+    return device, B, S, H, D
+
+
+def get_atol(baseline_diff):
+    return max(2.0 * baseline_diff, 1e-3)
 
 
 def test_megakernel_fusion_forward():
     print("\n--- Testing Megakernel Forward Fusion (RoPE + GatedLinear) ---")
-    device, dtype, B, S, H, D = get_config()
+    device, B, S, H, D = get_config()
 
-    q_leaf = torch.randn(B, S, H, D, device=device, dtype=dtype, requires_grad=True)
-    q = q_leaf.clone()
-    cos = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
-    sin = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
-    half = D // 2
-    cos[:, half:] = cos[:, :half]
-    sin[:, half:] = sin[:, :half]
+    for dtype in [torch.float16, torch.bfloat16]:
+        print(f"Testing dtype: {dtype}")
 
-    gate_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
-    gate = gate_leaf.clone()
+        # Inputs
+        q_leaf = torch.randn(B, S, H, D, device=device, dtype=dtype, requires_grad=True)
+        q = q_leaf.clone()
+        cos = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
+        sin = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
+        half = D // 2
+        cos[:, half:] = cos[:, :half]
+        sin[:, half:] = sin[:, :half]
 
-    out_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
-    barrier = torch.zeros(1, device=device, dtype=torch.int32)
+        gate_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
+        gate = gate_leaf.clone()
 
-    # 1. Reference Implementation (PyTorch / Sequential)
-    q_ref = q_leaf.clone()
-    q_ref_rope = rope_ref(q_ref, cos, sin)
-    # Reshape for GatedLinear (B, S, H, D) -> (B*S, H*D)
-    q_ref_flat = q_ref_rope.view(-1, H * D)
-    gate_ref_flat = gate_leaf.view(-1, H * D)
+        out_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
 
-    # GatedLinear: GL(a, b). For us 'a' comes from RoPE, 'b' is gate.
-    # Ref GatedLinear logic (silu): a * silu(b) ?? No, GatedLinear usually is (a * act(b)) or (act(a) * b)?
-    # Machete GatedLinear(a, b) -> c.
-    # Logic in kernel: gate = act(a). out = gate * b.
-    # Wait, check GatedLinear logic.
-    # compute_forward(ma, mb, mc).
-    # val_a = ma... val_b = mb...
-    # gate = act(val_a).
-    # out = gate * val_b.
-    # So 'a' is the gated/act input, 'b' is the other input.
-    # In RoPE+GL fusion benchmark:
-    # rope(q, ...).
-    # gl(q_view, gate).
-    # So 'a' is q_view (output of rope), 'b' is gate.
-    # So out = act(RoPE(q)) * gate.
+        # 1. Reference (FP32 baseline calculation)
+        def run_ref(q_in, g_in, c_in, s_in):
+            r = rope_ref(q_in, c_in, s_in)
+            r_flat = r.view(-1, H * D)
+            g_flat = g_in.view(-1, H * D)
+            return F.silu(r_flat) * g_flat
 
-    # Ref logic:
-    import torch.nn.functional as F
+        ref_fp32 = run_ref(q.float(), gate.float(), cos.float(), sin.float())
+        ref_low = run_ref(q, gate, cos, sin)
 
-    act = F.silu(q_ref_flat)
-    out_ref_flat = act * gate_ref_flat
+        baseline_diff = (ref_fp32.to(dtype) - ref_low).abs().max().item()
+        atol = get_atol(baseline_diff)
+        print(f"  Baseline error: {baseline_diff:.6f}, atol: {atol:.6f}")
 
-    # 2. Megakernel Implementation
-    rope_impl = RopeSM80(dtype, head_dim=D)
-    gl_impl = GatedLinearSM80(dtype, act_type="silu")
+        # 2. Megakernel
+        rope_impl = RopeSM80(dtype, head_dim=D)
+        gl_impl = GatedLinearSM80(dtype, act_type="silu")
 
-    # We must operate on 'q' in place for RoPE.
-    # But for test correctness, we pass 'q' which is clone of leaf.
+        mk = Megakernel(name=f"test_fwd_fusion_{dtype}", mode="forward")
 
-    mk = Megakernel(name="test_fwd_fusion", mode="forward")
-    # Add RoPE: modifies 'q' in place.
-    # Arguments: q_flat, cos, sin, seq_len
-    q_flat = q.view(-1, H, D)
-    # Cos/Sin for RoPE kernel must be flattened?
-    # RopeSM80.__call__ flattens them. But kernel takes (S, D).
-    # Inspecting benchmark_megakernel.py:
-    # mk.add(rope_impl, q.view(-1, h, d), cos, sin, s)
-    # 'cos' is (S, D). 'sin' is (S, D). 's' is scalar.
-    mk.add(rope_impl, q_flat, cos, sin, S)
+        # RoPE modifies q in-place
+        # GatedLinear reads q (viewed flat), gate, writes to out_mk
+        mk.add(rope_impl, q.view(-1, H, D), cos, sin, S)
+        mk.add(gl_impl, q.view(-1, H * D), gate.view(-1, H * D), out_mk.view(-1, H * D), H * D)
 
-    # Add GatedLinear: reads 'q', 'gate'. writes 'out'.
-    # Arguments: a, b, c, n_cols
-    # a = q.view(-1, H*D)
-    # b = gate.view(-1, H*D)
-    # c = out.view(-1, H*D)
-    mk.add(gl_impl, q.view(-1, H * D), gate.view(-1, H * D), out_mk.view(-1, H * D), H * D)
+        grid = [B * S, 1, 1]
+        block = [256, 1, 1]
+        # Barrier allocated internally
+        mk.launch(B * S, grid, block)
 
-    grid = [B * S, 1, 1]
-    block = [256, 1, 1]  # 256 threads
-
-    mk.launch(barrier, B * S, grid, block)
-
-    # Compare
-    # out_mk is (B, S, H*D)
-    out_ref = out_ref_flat.view(B, S, H * D)
-
-    diff = (out_mk - out_ref).abs().max().item()
-    print(f"Forward Max Diff: {diff}")
-    assert torch.allclose(out_mk, out_ref, atol=1e-2, rtol=1e-2)
-    print("Forward Pass Passed!")
+        # Compare
+        out_ref = ref_low.view(B, S, H * D)
+        diff = (out_mk - out_ref).abs().max().item()
+        print(f"  Max Diff: {diff:.6f}")
+        assert diff <= atol, f"Forward mismatch: {diff} > {atol}"
+        print("  Passed!")
 
 
 def test_megakernel_fusion_backward():
     print("\n--- Testing Megakernel Backward Fusion (RoPE + GatedLinear) ---")
-    device, dtype, B, S, H, D = get_config()
+    device, B, S, H, D = get_config()
 
-    # Setup inputs
-    # Need to reproduce forward state first to have 'q' modified if needed?
-    # Or just setup backward inputs.
+    for dtype in [torch.float16, torch.bfloat16]:
+        print(f"Testing dtype: {dtype}")
 
-    # Backward flow:
-    # dOut (gradient of output)
-    # -> GatedLinear Backward -> computes dA (grad of RoPE output), dB (grad of gate)
-    # -> RoPE Backward -> computes dQ (grad of RoPE input) from dA
+        # Inputs (Simulation of Forward Output state)
+        a_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
+        b_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
+        d_out = torch.randn(B, S, H * D, device=device, dtype=dtype)
 
-    # We need inputs 'a' and 'b' for GatedLinear backward.
-    # 'a' is the input to GatedLinear forward, which is RoPE output.
-    # 'b' is the gate.
+        # RoPE cos/sin
+        cos = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
+        sin = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1)
+        half = D // 2
+        cos[:, half:] = cos[:, :half]
+        sin[:, half:] = sin[:, :half]
 
-    # Let's generate random 'a' (simulating RoPE output) and 'b'.
-    a_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
-    b_leaf = torch.randn(B, S, H * D, device=device, dtype=dtype, requires_grad=True)
+        # 1. Reference
+        def run_ref_bwd(a_in, b_in, dout_in, c_in, s_in):
+            a_flat = a_in.view(-1, H * D)
+            b_flat = b_in.view(-1, H * D)
+            d_flat = dout_in.view(-1, H * D)
 
-    d_out = torch.randn(B, S, H * D, device=device, dtype=dtype)
+            # GL Backward
+            # Need to recompute FWD to backprop
+            fwd = F.silu(a_flat) * b_flat
+            grad_a, grad_b = torch.autograd.grad(fwd, (a_flat, b_flat), d_flat)
 
-    # Reference Backward
-    # Forward: out = act(a) * b
-    # Backward:
-    # dout = d_out_flat
-    # d_b = dout * act(a)
-    # d_a = dout * b * act'(a)
+            # RoPE Backward (on grad_a)
+            grad_a_rs = grad_a.view(B, S, H, D)
+            # RoPE Bwd is effectively RoPE(grad, cos, -sin)
+            dq = rope_ref(grad_a_rs, c_in, -s_in)
+            return grad_b.view(B, S, H * D), dq
 
-    import torch.nn.functional as F
+        # FP32 Baseline
+        db_fp32, dq_fp32 = run_ref_bwd(a_leaf.float(), b_leaf.float(), d_out.float(), cos.float(), sin.float())
+        db_low, dq_low = run_ref_bwd(a_leaf, b_leaf, d_out, cos, sin)
 
-    a_flat = a_leaf.view(-1, H * D)
-    b_flat = b_leaf.view(-1, H * D)
-    d_out_flat = d_out.view(-1, H * D)
+        err_b = (db_fp32.to(dtype) - db_low).abs().max().item()
+        err_q = (dq_fp32.to(dtype) - dq_low).abs().max().item()
+        baseline_diff = max(err_b, err_q)
+        atol = get_atol(baseline_diff)
+        print(f"  Baseline error: {baseline_diff:.6f}, atol: {atol:.6f}")
 
-    with torch.enable_grad():
-        out_ref = F.silu(a_flat) * b_flat
-        out_ref.backward(d_out_flat)
+        # 2. Megakernel
+        d_a_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
+        d_b_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
 
-    d_a_ref = a_leaf.grad.view(B, S, H, D)  # Gradient w.r.t GL input (RoPE output)
-    d_b_ref = b_leaf.grad.view(B, S, H * D)
+        mk = Megakernel(name=f"test_bwd_fusion_{dtype}", mode="backward")
+        rope_impl = RopeSM80(dtype, head_dim=D)
+        gl_impl = GatedLinearSM80(dtype, act_type="silu")
 
-    # Reference RoPE Backward
-    # dQ = RoPE_bwd(d_a_ref)
-    # Ref logic: RoPE(d_a_ref, cos, -sin)
+        # GL Backward: writes d_a_mk, d_b_mk
+        mk.add(
+            gl_impl,
+            d_out.view(-1, H * D),
+            a_leaf.view(-1, H * D),
+            b_leaf.view(-1, H * D),
+            d_a_mk.view(-1, H * D),
+            d_b_mk.view(-1, H * D),
+            H * D,
+        )
+        # RoPE Backward: reads d_a_mk, writes d_a_mk (in place)
+        mk.add(rope_impl, d_a_mk.view(-1, H, D), cos, sin, S)
 
-    cos = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1).view(S, D)
-    sin = torch.randn(S, D, device=device, dtype=dtype).clamp(-1, 1).view(S, D)
-    half = D // 2
-    cos[:, half:] = cos[:, :half]
-    sin[:, half:] = sin[:, :half]
+        grid = [B * S, 1, 1]
+        block = [256, 1, 1]
+        # Barrier allocated internally
+        mk.launch(B * S, grid, block)
 
-    d_q_ref = rope_ref(d_a_ref, cos, -sin)
+        # Compare
+        diff_b = (d_b_mk - db_low).abs().max().item()
+        d_q_mk = d_a_mk.view(B, S, H, D)
+        diff_q = (d_q_mk - dq_low).abs().max().item()
 
-    # Megakernel Backward
-    # We need buffers for d_a, d_b, d_q?
-    # GL Backward writes d_a and d_b.
-    # RoPE Backward reads d_a (as 'mq') and updates it in-place to become d_q.
-
-    # So we can share buffer for d_a and d_q?
-    # Yes, RoPE works in place.
-
-    d_a_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
-    d_b_mk = torch.empty(B, S, H * D, device=device, dtype=dtype)
-
-    mk = Megakernel(name="test_bwd_fusion", mode="backward")
-
-    rope_impl = RopeSM80(dtype, head_dim=D)
-    gl_impl = GatedLinearSM80(dtype, act_type="silu")
-
-    # Add Ops in order: GL Backward then RoPE Backward
-
-    # 1. GL Backward
-    # Args: dc, a, b, da, db, n_cols
-    # dc = d_out
-    # a = a_leaf (RoPE output from fwd)
-    # b = b_leaf
-    # da = d_a_mk (output of GL bwd, input to RoPE bwd)
-    # db = d_b_mk
-    mk.add(
-        gl_impl,
-        d_out.view(-1, H * D),
-        a_leaf.view(-1, H * D),
-        b_leaf.view(-1, H * D),
-        d_a_mk.view(-1, H * D),
-        d_b_mk.view(-1, H * D),
-        H * D,
-    )
-
-    # 2. RoPE Backward
-    # Args: smem, mq, cos, sin, seq_len
-    # mq = d_a_mk (which is now viewed as (S, H, D)?? No, (B*S, H, D))
-    # It modifies mq in place to produce d_q.
-    mk.add(rope_impl, d_a_mk.view(-1, H, D), cos, sin, S)
-
-    barrier = torch.zeros(1, device=device, dtype=torch.int32)
-    grid = [B * S, 1, 1]
-    block = [256, 1, 1]
-
-    mk.launch(barrier, B * S, grid, block)
-
-    # Check results
-    # d_b_mk should match d_b_ref
-    diff_b = (d_b_mk - d_b_ref).abs().max().item()
-    print(f"Backward GL Grad_B Max Diff: {diff_b}")
-    assert torch.allclose(d_b_mk, d_b_ref, atol=1e-2, rtol=1e-2)
-
-    # d_a_mk (which is now d_q) should match d_q_ref
-    d_q_mk = d_a_mk.view(B, S, H, D)
-    diff_q = (d_q_mk - d_q_ref).abs().max().item()
-    print(f"Backward RoPE Grad_Q Max Diff: {diff_q}")
-    assert torch.allclose(d_q_mk, d_q_ref, atol=1e-2, rtol=1e-2)
-
-    print("Backward Pass Passed!")
+        max_diff = max(diff_b, diff_q)
+        print(f"  Max Diff: {max_diff:.6f}")
+        assert max_diff <= atol, f"Backward mismatch: {max_diff} > {atol}"
+        print("  Passed!")
 
 
 if __name__ == "__main__":

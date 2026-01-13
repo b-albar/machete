@@ -115,8 +115,8 @@ class FusableOp(MegakernelOp):
 
     @cute.jit
     def load(self, paged_pool, page_idx, *args):
-        if self._load_func is not None:
-            self._load_func(paged_pool, page_idx, *args)
+        # Default no-op, subclasses override if needed
+        pass
 
     @cute.jit
     def compute(self, *args, **kwargs):
@@ -124,8 +124,8 @@ class FusableOp(MegakernelOp):
 
     @cute.jit
     def store(self, paged_pool, page_idx, *args):
-        if self._store_func is not None:
-            self._store_func(paged_pool, page_idx, *args)
+        # Default no-op, subclasses override if needed
+        pass
 
     def launch(self, *args, **kwargs):
         if self._launch_func:
