@@ -36,12 +36,22 @@ _GLOBAL_COMPILE_CACHE = {}
 
 
 class Megakernel:
-    def __init__(self, name: str = "megakernel", mode: str = "forward"):
+    def __init__(self, name: str = "megakernel", mode: str = "forward", paged_pool_bytes: int = 0):
+        """
+        Args:
+            name: Kernel name for caching/debugging.
+            mode: "forward" or "backward".
+            paged_pool_bytes: Size of the paged shared memory pool in bytes.
+                              Set to 0 (default) for no pool allocation.
+                              For No Bubbles pipelining, set to the total size needed
+                              for double-buffering across operations (e.g., 2 * max_op_smem).
+        """
         self.name = name
         self.mode = mode
         self.instructions = []
         self.gen_dir = os.path.join(os.path.dirname(__file__), ".generated")
         os.makedirs(self.gen_dir, exist_ok=True)
+        self.paged_pool_bytes = paged_pool_bytes
 
     def add(self, op: Union[FusableKernel, MegakernelOp, Callable], *args):
         """Add an operation and its arguments to the megakernel."""
@@ -88,6 +98,8 @@ class Megakernel:
         self.instructions.append(
             {
                 "compute": actual_op.compute,
+                "load": getattr(actual_op, "load", None),
+                "store": getattr(actual_op, "store", None),
                 "args": list(args),
                 "needs_sync": actual_op.needs_global_sync,
                 "smem_per_page": actual_op.smem_per_page,
@@ -130,54 +142,76 @@ class Megakernel:
             pass  # Keep it for future logic if we want to use sync_needed
 
         unrolled_ops.append("        smem_alloc = cutlass.utils.SmemAllocator()")
-        unrolled_ops.append("        # Semaphores for paged coordination (if needed)")
 
+        # Allocate paged pool for No Bubbles pipelining if requested
+        if self.paged_pool_bytes > 0:
+            unrolled_ops.append(f"        # Paged pool for No Bubbles: {self.paged_pool_bytes} bytes")
+            unrolled_ops.append(
+                f"        paged_pool = smem_alloc.allocate_tensor(cute.Uint8, cute.make_layout({self.paged_pool_bytes}))"
+            )
+
+        # L/C/S execution model
+        n_ops = len(self.instructions)
+
+        # Bind all ops
+        for i in range(n_ops):
+            module_bindings.append(f"op_{i} = instructions[{i}]['op_obj']")
+
+        # Prologue: Load first operation (if paged pool is available)
+        if self.paged_pool_bytes > 0 and n_ops > 0:
+            indices = mapping[0]
+            args_str = ", ".join([f"arg_{idx}" for idx in indices])
+            unrolled_ops.append("        # Prologue: Load Op 0")
+            unrolled_ops.append("        page_idx = Int32(0)")
+            unrolled_ops.append(f"        op_0.load(paged_pool, page_idx, {args_str})")
+            unrolled_ops.append("        cute.arch.sync_threads()")
+
+        # Main execution loop
         for i, inst in enumerate(self.instructions):
             indices = mapping[i]
             args_str = ", ".join([f"arg_{idx}" for idx in indices])
 
+            # Per-op shared memory allocation (if needed)
             smem_str = ""
             if inst["smem_per_page"] > 0:
-                # Calculate number of elements
-                # Assuming cute types have .width in bits
                 element_width_bytes = inst["smem_dtype"].width // 8
                 total_bytes = inst["smem_per_page"] * inst["num_pages"]
                 num_elements = total_bytes // element_width_bytes
-
                 unrolled_ops.append(
-                    f"        # Allocate {inst['num_pages']} pages of {inst['smem_per_page']} bytes for Op {i}"
-                )
-                unrolled_ops.append(
-                    f"        smem_op_{i} = smem_alloc.allocate_tensor(instructions[{i}]['smem_dtype'], cute.make_layout({num_elements}))"
+                    f"        smem_op_{i} = smem_alloc.allocate_tensor("
+                    f"instructions[{i}]['smem_dtype'], cute.make_layout({num_elements}))"
                 )
                 smem_str = f"smem_op_{i}, "
 
-            compute_fn = inst["compute"]
-            if hasattr(compute_fn, "__self__"):
-                module_bindings.append(f"impl_{i} = instructions[{i}]['compute'].__self__")
-                module_bindings.append(f"func_{i} = instructions[{i}]['compute'].__func__")
-                call_str = f"func_{i}(impl_{i}, {smem_str}{args_str})"
-            else:
-                module_bindings.append(f"func_{i} = instructions[{i}]['compute']")
-                call_str = f"func_{i}({smem_str}{args_str})"
+            unrolled_ops.append(f"        # Op {i}: Compute")
+            unrolled_ops.append(f"        op_{i}.compute({smem_str}{args_str})")
 
-            unrolled_ops.append(f"        # Operation {i}")
-            unrolled_ops.append(f"        {call_str}")
-            # Ensure memory consistency between operations in the fused sequence.
-            # Operations are executed sequentially by threads, but if they interact via
-            # shared or global memory (as they often do in fusion), we need full visibility.
-            # While __syncthreads() is heavy, it provides the required safety for fusion.
-            unrolled_ops.append(f"        cute.arch.sync_threads()")
+            # Pipelined load of next operation (if paged pool available)
+            if self.paged_pool_bytes > 0 and i + 1 < n_ops:
+                next_indices = mapping[i + 1]
+                next_args_str = ", ".join([f"arg_{idx}" for idx in next_indices])
+                unrolled_ops.append(f"        # Overlap: Load Op {i + 1}")
+                unrolled_ops.append("        next_page = (page_idx + Int32(1)) % Int32(2)")
+                unrolled_ops.append(f"        op_{i + 1}.load(paged_pool, next_page, {next_args_str})")
+
+            # Store current operation (if paged pool available)
+            if self.paged_pool_bytes > 0:
+                unrolled_ops.append(f"        # Op {i}: Store")
+                unrolled_ops.append(f"        op_{i}.store(paged_pool, page_idx, {args_str})")
+                if i + 1 < n_ops:
+                    unrolled_ops.append("        page_idx = next_page")
+
+            unrolled_ops.append("        cute.arch.sync_threads()")
 
             if inst["needs_sync"]:
-                unrolled_ops.append(f"        # Global Barrier")
-                unrolled_ops.append(f"        if tidx == 0:")
-                unrolled_ops.append(f"            atomic_add_i32(1, barrier_tensor.iterator)")
-                unrolled_ops.append(f"            target = (sync_step + 1) * n_blocks")
-                unrolled_ops.append(f"            while atomic_add_i32(0, barrier_tensor.iterator) < target:")
-                unrolled_ops.append(f"                pass")
-                unrolled_ops.append(f"        cute.arch.sync_threads()")
-                unrolled_ops.append(f"        sync_step = sync_step + Int32(1)")
+                unrolled_ops.append("        # Global Barrier")
+                unrolled_ops.append("        if tidx == 0:")
+                unrolled_ops.append("            atomic_add_i32(1, barrier_tensor.iterator)")
+                unrolled_ops.append("            target = (sync_step + 1) * n_blocks")
+                unrolled_ops.append("            while atomic_add_i32(0, barrier_tensor.iterator) < target:")
+                unrolled_ops.append("                pass")
+                unrolled_ops.append("        cute.arch.sync_threads()")
+                unrolled_ops.append("        sync_step = sync_step + Int32(1)")
 
         bindings_content = "\n".join(module_bindings)
         ops_content = "\n".join(unrolled_ops)
@@ -244,7 +278,8 @@ class GeneratedMegakernel:
 
         num_flat_args = len(flat_args)
 
-        total_smem = 0
+        # Total shared memory = paged pool + per-op allocations
+        total_smem = self.paged_pool_bytes
         for inst in self.instructions:
             total_smem += inst["smem_per_page"] * inst["num_pages"]
 

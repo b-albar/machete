@@ -22,6 +22,11 @@ class MegakernelOp(ABC):
     """
     Base class for operations that can be run either as a simple kernel
     or fused into a megakernel.
+
+    Operations implement Load/Compute/Store phases:
+    - load(): Load data from global memory to shared memory
+    - compute(): Perform computation using shared memory
+    - store(): Store results from shared memory back to global memory
     """
 
     @property
@@ -45,21 +50,25 @@ class MegakernelOp(ABC):
         """Number of pages to allocate for this operation (e.g. 2 for double buffering)."""
         return 1
 
+    @cute.jit
+    def load(self, paged_pool, page_idx, *args):
+        """Load phase: move data from global memory to shared memory."""
+        pass  # Default no-op
+
     @abstractmethod
     @cute.jit
     def compute(self, *args, **kwargs):
-        """
-        The core logic of the operation.
-        If smem_per_page > 0, the first argument (after self) will be a cute.Tensor
-        representing the shared memory page.
-        """
+        """Compute phase: perform the operation logic."""
         pass
+
+    @cute.jit
+    def store(self, paged_pool, page_idx, *args):
+        """Store phase: move results from shared memory to global memory."""
+        pass  # Default no-op
 
     @abstractmethod
     def launch(self, *args, **kwargs):
-        """
-        Launch the operation as a standalone kernel.
-        """
+        """Launch the operation as a standalone kernel."""
         pass
 
 
@@ -75,9 +84,13 @@ class FusableOp(MegakernelOp):
         needs_sync: bool = False,
         smem_per_page: int = 0,
         num_pages: int = 1,
+        load_func: Callable = None,
+        store_func: Callable = None,
         launch_func: Callable = None,
     ):
         self._compute_func = compute_func
+        self._load_func = load_func
+        self._store_func = store_func
         self._num_tensors = num_tensors
         self._needs_sync = needs_sync
         self._smem_per_page = smem_per_page
@@ -101,8 +114,18 @@ class FusableOp(MegakernelOp):
         return self._num_pages
 
     @cute.jit
+    def load(self, paged_pool, page_idx, *args):
+        if self._load_func is not None:
+            self._load_func(paged_pool, page_idx, *args)
+
+    @cute.jit
     def compute(self, *args, **kwargs):
         self._compute_func(*args, **kwargs)
+
+    @cute.jit
+    def store(self, paged_pool, page_idx, *args):
+        if self._store_func is not None:
+            self._store_func(paged_pool, page_idx, *args)
 
     def launch(self, *args, **kwargs):
         if self._launch_func:
@@ -114,7 +137,7 @@ class FusableOp(MegakernelOp):
 class FusableKernel(ABC):
     """
     Abstract base class for kernels that support both forward and backward
-    passes in a megakernel.
+    passes in a megakernel with Load/Compute/Store phases.
     """
 
     @property
@@ -125,14 +148,36 @@ class FusableKernel(ABC):
     def num_pages(self) -> int:
         return 1
 
-    @abstractmethod
+    # ========== Forward Pass L/C/S ==========
+
+    @cute.jit
+    def load_forward(self, paged_pool, page_idx, *args):
+        """Forward load phase (optional)."""
+        pass
+
     @cute.jit
     def compute_forward(self, *args, **kwargs):
         """Forward pass compute logic."""
         pass
 
-    @abstractmethod
+    @cute.jit
+    def store_forward(self, paged_pool, page_idx, *args):
+        """Forward store phase (optional)."""
+        pass
+
+    # ========== Backward Pass L/C/S ==========
+
+    @cute.jit
+    def load_backward(self, paged_pool, page_idx, *args):
+        """Backward load phase (optional)."""
+        pass
+
     @cute.jit
     def compute_backward(self, *args, **kwargs):
         """Backward pass compute logic."""
+        pass
+
+    @cute.jit
+    def store_backward(self, paged_pool, page_idx, *args):
+        """Backward store phase (optional)."""
         pass
