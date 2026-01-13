@@ -9,6 +9,24 @@ from typing import Callable, Union
 from .interface import MegakernelOp, FusableOp, FusableKernel
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor as fake_tensor
+import tvm_ffi.core
+
+# Workaround for TVM-FFI bug (Python < 3.13) with positional arguments in __init__
+if not hasattr(tvm_ffi.core.Function, "_monkey_patched"):
+
+    def _safe_init(self, *args, **kwargs):
+        mro = type(self).mro()
+        try:
+            idx = mro.index(tvm_ffi.core.Function)
+            for i in range(idx + 1, len(mro)):
+                if mro[i].__init__ != object.__init__:
+                    mro[i].__init__(self, *args, **kwargs)
+                    break
+        except Exception:
+            pass
+
+    tvm_ffi.core.Function.__init__ = _safe_init
+    tvm_ffi.core.Function._monkey_patched = True
 
 # Global registry to pass symbols to generated kernels
 MEGAKERNEL_REGISTRY = {}
@@ -45,11 +63,6 @@ class Megakernel:
 
             instance = getattr(op, "__self__", None)
             if instance:
-                # If the method belongs to an object, check if that object requests specific shared memory
-                # But be careful not to pick up base class defaults if they just return 0/1 and decorator specified something else?
-                # Actually, FusableKernel defaults are 0 and 1.
-                # If the class overrides them, we want them.
-                # Since decorator is static, class properties are "truer".
                 if hasattr(instance, "smem_per_page"):
                     smem_per_page = instance.smem_per_page
                 if hasattr(instance, "num_pages"):
