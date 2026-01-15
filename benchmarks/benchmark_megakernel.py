@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Machete Authors
+import argparse
+import os
 import torch
 
 from machete.megakernel.core import Megakernel
@@ -22,116 +24,146 @@ def do_bench(fn, warmup=25, rep=100):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Benchmark Machete Megakernels")
+    parser.add_argument("--trace", action="store_true", help="Enable tracing for the first config")
+    parser.add_argument("--warmup", type=int, default=25, help="Number of warmup iterations")
+    parser.add_argument("--rep", type=int, default=100, help="Number of benchmark iterations")
+    args_cli = parser.parse_args()
+
     device = "cuda"
     dtype = torch.float16
-
-    # --- Config: RoPE + GatedLinear ---
-    configs = {}
-    for b_sz, s_sz, h_sz, d_sz in [(1, 4096, 32, 128), (2, 8192, 32, 128)]:
-        q_tensor = torch.randn(b_sz, s_sz, h_sz, d_sz, device=device, dtype=dtype)
-        cos_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
-        sin_tensor = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
-        gate_tensor = torch.randn(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
-        out_tensor = torch.empty(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
-
-        configs[f"B={b_sz} S={s_sz} H={h_sz} D={d_sz}"] = (
-            q_tensor,
-            cos_tensor,
-            sin_tensor,
-            gate_tensor,
-            out_tensor,
-            s_sz,
-            h_sz,
-            d_sz,
-        )
-
-    rope_impl = RopeSM80(dtype, 128)
-    gl_impl = GatedLinearSM80(dtype, "silu")
 
     print(f"\n{'=' * 20} RoPE + GatedLinear Fusion {'=' * 20}")
     print(f"{'Config':<25} | {'Provider':<15} | {'Time (ms)':<10}")
     print("-" * 60)
 
-    for config_name, args in configs.items():
-        q, cos, sin, gate, out, s, h, d = args
+    config_list = []
+    for b_sz in [1, 2, 4, 8, 16]:
+        for s_sz in [1024, 2048, 4096, 8192]:
+            config_list.append((b_sz, s_sz, 32, 128))
 
-        # Sequential
-        rope_op = RopeSM80(dtype, d)
-        gl_op = GatedLinearOp(dtype, "silu")
+    rope_impl = RopeSM80(dtype, 128)
+    gl_impl = GatedLinearSM80(dtype, "silu")
 
-        def run_seq(q=q, cos=cos, sin=sin, gate=gate, out=out):
-            rope_op(q, cos, sin)
-            gl_op(q.view(-1, h * d), gate)
+    for i, config in enumerate(config_list):
+        b_sz, s_sz, h_sz, d_sz = config
+        config_name = f"B={b_sz} S={s_sz} H={h_sz} D={d_sz}"
 
-        ms_seq = do_bench(run_seq)
+        # Enable tracing only for the first configuration if requested
+        trace_fwd = f"megakernel_fwd_{b_sz}_{s_sz}.nanotrace" if args_cli.trace and i == 0 else None
+        trace_bwd = f"megakernel_bwd_{b_sz}_{s_sz}.nanotrace" if args_cli.trace and i == 0 else None
 
-        # Megakernel (No Bubbles mode with paged pool)
-        mk = Megakernel(
-            f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}",
-            mode="forward",
-            num_pages=0,  # Enable No Bubbles pipelining
-        )
-        mk.add(rope_impl, q.view(-1, h, d), cos, sin, s)
-        mk.add(gl_impl, q.view(-1, h * d), gate, out, h * d)
-        grid = [q.shape[0] * q.shape[1], 1, 1]
-        block = [256, 1, 1]
+        if trace_fwd and os.path.exists(trace_fwd):
+            os.remove(trace_fwd)
+        if trace_bwd and os.path.exists(trace_bwd):
+            os.remove(trace_bwd)
 
-        def run_mk(mk=mk, grid=grid, block=block):
-            mk.launch(grid[0], grid, block)
+        try:
+            # Create tensors inside the loop to save memory
+            q = torch.randn(b_sz, s_sz, h_sz, d_sz, device=device, dtype=dtype)
+            cos = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
+            sin = torch.randn(s_sz, d_sz, device=device, dtype=dtype)
+            gate = torch.randn(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
+            out = torch.empty(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
 
-        ms_mk = do_bench(run_mk)
+            # Sequential
+            rope_op = RopeSM80(dtype, d_sz)
+            gl_op = GatedLinearOp(dtype, "silu")
 
-        print(f"{config_name:<25} | {'Sequential':<15} | {ms_seq:<10.4f}")
-        print(f"{'':<25} | {'Megakernel':<15} | {ms_mk:<10.4f}")
+            def run_seq(q=q, cos=cos, sin=sin, gate=gate, out=out):
+                rope_op(q, cos, sin)
+                gl_op(q.view(-1, h_sz * d_sz), gate)
 
-        # Backward Benchmark (Megakernel only for now as Seq backward requires autograd plumbing setup or manual calls)
-        # We can implement Sequential Backward manually easily.
+            ms_seq = do_bench(run_seq, warmup=args_cli.warmup, rep=args_cli.rep)
 
-        d_out = torch.randn_like(out)
-        d_a = torch.empty_like(q)
-        d_b = torch.empty_like(gate)
-        # d_q is in-place update of d_a
+            # Megakernel (No Bubbles mode with paged pool)
+            mk = Megakernel(
+                f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}",
+                mode="forward",
+                num_pages=0,  # Enable No Bubbles pipelining
+            )
+            mk.add(rope_impl, q.view(-1, h_sz, d_sz), cos, sin, s_sz)
+            mk.add(gl_impl, q.view(-1, h_sz * d_sz), gate, out, h_sz * d_sz)
+            grid = [q.shape[0] * q.shape[1], 1, 1]
+            block = [256, 1, 1]
 
-        mk_bwd = Megakernel(f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
-        mk_bwd.add(
-            gl_impl,
-            d_out.view(-1, h * d),
-            q.view(-1, h * d),
-            gate.view(-1, h * d),
-            d_a.view(-1, h * d),
-            d_b.view(-1, h * d),
-            h * d,
-        )
-        mk_bwd.add(rope_impl, d_a.view(-1, h, d), cos, sin, s)
+            # One launch for tracing if requested
+            if trace_fwd:
+                mk.launch(grid[0], grid, block, trace_file=trace_fwd)
 
-        def run_mk_bwd(mk=mk_bwd, grid=grid, block=block):
-            mk.launch(grid[0], grid, block)
+            def run_mk(mk=mk, grid=grid, block=block):
+                mk.launch(grid[0], grid, block)
 
-        ms_mk_bwd = do_bench(run_mk_bwd)
+            ms_mk = do_bench(run_mk, warmup=args_cli.warmup, rep=args_cli.rep)
 
-        # Sequential Backward (Kernel Launch-based)
-        mk_gl_bwd = Megakernel(f"gl_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
-        mk_gl_bwd.add(
-            gl_impl,
-            d_out.view(-1, h * d),
-            q.view(-1, h * d),
-            gate.view(-1, h * d),
-            d_a.view(-1, h * d),
-            d_b.view(-1, h * d),
-            h * d,
-        )
+            print(f"{config_name:<25} | {'Sequential':<15} | {ms_seq:<10.4f}")
+            print(f"{'':<25} | {'Megakernel':<15} | {ms_mk:<10.4f}")
 
-        mk_rope_bwd = Megakernel(f"rope_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
-        mk_rope_bwd.add(rope_impl, d_a.view(-1, h, d), cos, sin, s)
+            # Backward Benchmark
+            d_out = torch.randn_like(out)
+            d_a = torch.empty_like(q)
+            d_b = torch.empty_like(gate)
 
-        def run_seq_bwd(mk1=mk_gl_bwd, mk2=mk_rope_bwd, grid=grid, block=block):
-            mk1.launch(grid[0], grid, block)
-            mk2.launch(grid[0], grid, block)
+            mk_bwd = Megakernel(f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
+            mk_bwd.add(
+                gl_impl,
+                d_out.view(-1, h_sz * d_sz),
+                q.view(-1, h_sz * d_sz),
+                gate.view(-1, h_sz * d_sz),
+                d_a.view(-1, h_sz * d_sz),
+                d_b.view(-1, h_sz * d_sz),
+                h_sz * d_sz,
+            )
+            mk_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz)
 
-        ms_seq_bwd = do_bench(run_seq_bwd)
+            # One launch for tracing if requested
+            if trace_bwd:
+                mk_bwd.launch(grid[0], grid, block, trace_file=trace_bwd)
 
-        print(f"{'':<25} | {'Sequential Bwd':<15} | {ms_seq_bwd:<10.4f}")
-        print(f"{'':<25} | {'Megakernel Bwd':<15} | {ms_mk_bwd:<10.4f}")
+            def run_mk_bwd(mk=mk_bwd, grid=grid, block=block):
+                mk.launch(grid[0], grid, block)
+
+            ms_mk_bwd = do_bench(run_mk_bwd, warmup=args_cli.warmup, rep=args_cli.rep)
+
+            # Sequential Backward (Kernel Launch-based)
+            mk_gl_bwd = Megakernel(f"gl_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward")
+            mk_gl_bwd.add(
+                gl_impl,
+                d_out.view(-1, h_sz * d_sz),
+                q.view(-1, h_sz * d_sz),
+                gate.view(-1, h_sz * d_sz),
+                d_a.view(-1, h_sz * d_sz),
+                d_b.view(-1, h_sz * d_sz),
+                h_sz * d_sz,
+            )
+
+            mk_rope_bwd = Megakernel(
+                f"rope_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward"
+            )
+            mk_rope_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz)
+
+            def run_seq_bwd(mk1=mk_gl_bwd, mk2=mk_rope_bwd, grid=grid, block=block):
+                mk1.launch(grid[0], grid, block)
+                mk2.launch(grid[0], grid, block)
+
+            ms_seq_bwd = do_bench(run_seq_bwd, warmup=args_cli.warmup, rep=args_cli.rep)
+
+            print(f"{'':<25} | {'Sequential Bwd':<15} | {ms_seq_bwd:<10.4f}")
+            print(f"{'':<25} | {'Megakernel Bwd':<15} | {ms_mk_bwd:<10.4f}")
+
+            if args_cli.trace and i == 0:
+                print(f"\n[TRACE] Forward trace written to: {trace_fwd}")
+                print(f"[TRACE] Backward trace written to: {trace_bwd}")
+                print("[TRACE] Visualize them with local visualizer")
+                print("-" * 60)
+                break
+
+        except torch.OutOfMemoryError:
+            print(f"{config_name:<25} | {'OOM':<15} | {'N/A'}")
+            torch.cuda.empty_cache()
+            import gc
+
+            gc.collect()
 
         print("-" * 60)
 

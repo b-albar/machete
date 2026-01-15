@@ -14,12 +14,12 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from machete.megakernel.interface import machete_op, FusableKernel
+from machete.kernels.utils.smem import MacheteSmemAllocator
+from machete.megakernel.interface import FusableKernel
 from machete.megakernel.single import SingleKernel
-from machete.megakernel.autograd import MegakernelAutograd
 
 
-class RopeSM80(FusableKernel):
+class RopeSM80(SingleKernel, FusableKernel):
     """
     RoPE kernel with proper L/C/S decomposition for No Bubbles pipelining.
 
@@ -35,22 +35,22 @@ class RopeSM80(FusableKernel):
         self.cute_dtype = torch2cute_dtype_map[dtype]
         self.head_dim = head_dim
         self.half_head_dim = head_dim // 2
-        self.runner = SingleKernel(self, self.grid_fn, self.block_fn)
+        SingleKernel.__init__(self, self, self.grid_fn, self.block_fn)
 
     @property
-    def smem_per_page(self):
+    def smem_per_stage(self):
         # We need to store cos/sin in shared memory
-        # 2 elements * half_head_dim * 2 bytes (half)
-        return self.half_head_dim * 2 * 2
+        # 2 elements * half_head_dim * element_size
+        return self.half_head_dim * 2 * (self.cute_dtype.width // 8)
 
     @property
-    def num_pages(self) -> int:
+    def num_stages(self) -> int:
         return 1
 
     @property
     def needs_block_sync(self):
-        # Thread-local operation when fused with element-wise ops
-        return False
+        # We need block sync between Load (collective) and Compute (all threads use cos/sin)
+        return True
 
     # ========== Forward Pass L/C/S ==========
 
@@ -64,9 +64,15 @@ class RopeSM80(FusableKernel):
         s = bidx % seq_len
 
         # Coalesced load of cos/sin
+        # Use simple byte alignment to keep packing tight (matches smem_per_page calc)
+        # In a real kernel we might want 128-bit alignment but that requires padding.
+        alloc = MacheteSmemAllocator(smem)
+        s_cos = alloc.allocate_array(m_cos.element_type, half_d, byte_alignment=1)
+        s_sin = alloc.allocate_array(m_sin.element_type, half_d, byte_alignment=1)
+
         for i in range(tidx, half_d, num_threads):
-            smem[i] = m_cos[s, i]
-            smem[half_d + i] = m_sin[s, i]
+            s_cos[i] = m_cos[s, i]
+            s_sin[i] = m_sin[s, i]
 
     @cute.jit
     def compute_forward(self, smem, mq, m_cos, m_sin, seq_len):
@@ -81,6 +87,10 @@ class RopeSM80(FusableKernel):
         half_d = const_expr(self.half_head_dim)
         n_heads = mq.shape[1]
 
+        alloc = MacheteSmemAllocator(smem)
+        s_cos = alloc.allocate_array(m_cos.element_type, half_d, byte_alignment=1)
+        s_sin = alloc.allocate_array(m_sin.element_type, half_d, byte_alignment=1)
+
         # Compute RoPE rotation in-place
         total_work = n_heads * half_d
         for work_idx in range(tidx, total_work, num_threads):
@@ -88,8 +98,8 @@ class RopeSM80(FusableKernel):
             i_idx = work_idx % half_d
 
             # Read cos/sin from smem (fast)
-            cos_val = smem[i_idx].to(Float32)
-            sin_val = smem[half_d + i_idx].to(Float32)
+            cos_val = s_cos[i_idx].to(Float32)
+            sin_val = s_sin[i_idx].to(Float32)
 
             # Read q values from global
             q0 = mq[m, h_idx, i_idx].to(Float32)
@@ -119,9 +129,13 @@ class RopeSM80(FusableKernel):
         half_d = const_expr(self.half_head_dim)
         s = bidx % seq_len
 
+        alloc = MacheteSmemAllocator(smem)
+        s_cos = alloc.allocate_array(m_cos.element_type, half_d, byte_alignment=1)
+        s_sin = alloc.allocate_array(m_sin.element_type, half_d, byte_alignment=1)
+
         for i in range(tidx, half_d, num_threads):
-            smem[i] = m_cos[s, i]
-            smem[half_d + i] = m_sin[s, i]
+            s_cos[i] = m_cos[s, i]
+            s_sin[i] = m_sin[s, i]
 
     @cute.jit
     def compute_backward(self, smem, mq, m_cos, m_sin, seq_len):
@@ -133,13 +147,17 @@ class RopeSM80(FusableKernel):
         half_d = const_expr(self.half_head_dim)
         n_heads = mq.shape[1]
 
+        alloc = MacheteSmemAllocator(smem)
+        s_cos = alloc.allocate_array(m_cos.element_type, half_d, byte_alignment=1)
+        s_sin = alloc.allocate_array(m_sin.element_type, half_d, byte_alignment=1)
+
         total_work = n_heads * half_d
         for work_idx in range(tidx, total_work, num_threads):
             h_idx = work_idx // half_d
             i_idx = work_idx % half_d
 
-            cos_val = smem[i_idx].to(Float32)
-            sin_val = -smem[half_d + i_idx].to(Float32)  # Negated for inverse
+            cos_val = s_cos[i_idx].to(Float32)
+            sin_val = -s_sin[i_idx].to(Float32)  # Negated for inverse
 
             q0 = mq[m, h_idx, i_idx].to(Float32)
             q1 = mq[m, h_idx, i_idx + half_d].to(Float32)
@@ -168,5 +186,6 @@ class RopeSM80(FusableKernel):
         q_flat = q.view(b * s, h, d)
         cos_flat = cos.view(-1, d)
         sin_flat = sin.view(-1, d)
-        out_flat = MegakernelAutograd.apply(self.runner, q_flat, cos_flat, sin_flat, s)
+        # s passed as seq_len parameter to kernel
+        out_flat = self.apply_autograd(q_flat, cos_flat, sin_flat, s)
         return out_flat.view(b, s, h, d)

@@ -3,16 +3,26 @@ import torch
 from typing import Callable
 from .interface import FusableKernel
 from .core import Megakernel
-from .autograd import MegakernelAutograd
 
 
-class SingleKernel:
+class SingleKernel(torch.autograd.Function):
     def __init__(self, op: FusableKernel, grid_fn: Callable, block_fn: Callable):
         self.op = op
         self.grid_fn = grid_fn
         self.block_fn = block_fn
         self.mk_fwd = Megakernel(name=f"{type(op).__name__}_fwd", mode="forward")
         self.mk_bwd = Megakernel(name=f"{type(op).__name__}_bwd", mode="backward")
+
+    @staticmethod
+    def forward(ctx, runner, *args):
+        ctx.runner = runner
+        return runner.run_forward(ctx, *args)
+
+    @staticmethod
+    def backward(ctx, *grad_args):
+        grads = ctx.runner.run_backward(ctx, *grad_args)
+        # return None for the runner argument, followed by grads for *args
+        return (None,) + grads
 
     def _update_or_add(self, mk: Megakernel, args: tuple):
         """
@@ -90,5 +100,7 @@ class SingleKernel:
         # We assume only the first argument (mq) effectively receives a gradient (which is main_grad modified in place).
         return (main_grad,) + (None,) * (len(args) - 1)
 
-    def apply(self, *args):
-        return MegakernelAutograd.apply(self, *args)
+    def apply_autograd(self, *args):
+        # We must call the classmethod 'apply' from SingleKernel or its subclass.
+        # Since SingleKernel inherits from Function, type(self).apply is the autograd entry point.
+        return self.__class__.apply(self, *args)

@@ -15,7 +15,7 @@ from cutlass import Float32, const_expr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
 import quack.activation as qact
-from machete.megakernel.interface import machete_op, FusableKernel
+from machete.megakernel.interface import FusableKernel
 from machete.megakernel.single import SingleKernel
 
 
@@ -39,7 +39,7 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
         self.vec_size = 8 if dtype == torch.float16 else 4
 
     @property
-    def smem_per_page(self) -> int:
+    def smem_per_stage(self) -> int:
         # A + B + C tiles in shared memory (Backward needs 3: dc, a, b)
         # Forward needs 2: a, b
         # Allocate max (3)
@@ -47,7 +47,7 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
         return self.TILE_N * 3 * element_size
 
     @property
-    def num_pages(self) -> int:
+    def num_stages(self) -> int:
         return 1
 
     @property
@@ -66,16 +66,6 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
 
         row_idx = bidx_x
         col_start = bidx_y * self.TILE_N
-
-        # Manually unroll to encourage vectorized load generation by compiler
-        # Stride = num_threads. We process 8 elements per thread logically if we stride * 8
-        # Or better: standard coalesced loop.
-        # Actually, standard loop (stride = num_threads) is already coalesced.
-        # But to force 128-bit load, we need `Louse` or `float4` pointer cast.
-        # Since I cannot easily cast in Python DSL without docs.
-        # I will revert to standard loop.
-        # The performance gap might be due to loop overhead.
-        # I will try to unroll by 4 manually.
 
         unroll_factor = 4
         stride = num_threads * unroll_factor
@@ -244,11 +234,15 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
                         a_val = smem[off_a + idx].to(Float32)
                         b_val = smem[off_b + idx].to(Float32)
 
-                        if const_expr(self.act_type == "silu"):
+                        if const_expr(self.act_type == "gelu"):
+                            da_val, db_val, _ = qact.dgeglu(a_val, b_val, dc_val)
+                        elif const_expr(self.act_type == "silu"):
                             da_val, db_val, _ = qact.dswiglu(a_val, b_val, dc_val)
+                        elif const_expr(self.act_type == "relu"):
+                            da_val, db_val, _ = qact.dreglu(a_val, b_val, dc_val)
                         else:
                             da_val = dc_val * b_val
-                            db_val = dc_val * a_val  # simplified fallback
+                            db_val = dc_val * a_val
 
                         m_da[row_idx, base + u] = Float32(da_val).to(m_da.element_type)
                         m_db[row_idx, base + u] = Float32(db_val).to(m_db.element_type)
@@ -299,5 +293,5 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
         n_cols = ori_shape[-1]
         a_flat = a.view(-1, n_cols)
         b_flat = b.view(-1, n_cols)
-        c_flat = self.apply(a_flat, b_flat, n_cols)
+        c_flat = self.apply_autograd(a_flat, b_flat, n_cols)
         return c_flat.view(*ori_shape)

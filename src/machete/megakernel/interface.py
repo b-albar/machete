@@ -1,24 +1,29 @@
 # Copyright (c) 2025, Machete Authors
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Callable
 import cutlass.cute as cute
 
+# Re-export dependency decorators for convenience
+from machete.megakernel.scheduler import reads, writes, independent  # noqa: F401
 
-def machete_op(num_tensors: int, needs_global_sync: bool = False, smem_per_page: int = 0, num_pages: int = 1):
+__all__ = ["reads", "writes", "independent", "machete_op", "MegakernelOp", "FusableOp", "FusableKernel"]
+
+
+def machete_op(num_tensors: int, needs_global_sync: bool = False, smem_per_stage: int = 0, num_stages: int = 1):
     """Decorator to mark a function or method as a Machete Megakernel operation."""
 
     def decorator(func):
         func._machete_is_op = True
         func._machete_num_tensors = num_tensors
         func._machete_needs_sync = needs_global_sync
-        func._machete_smem_per_page = smem_per_page
-        func._machete_num_pages = num_pages
+        func._machete_smem_per_stage = smem_per_stage
+        func._machete_num_stages = num_stages
         return func
 
     return decorator
 
 
-class MegakernelOp(ABC):
+class MegakernelOp:
     """
     Base class for operations that can be run either as a simple kernel
     or fused into a megakernel.
@@ -41,12 +46,12 @@ class MegakernelOp(ABC):
         return False
 
     @property
-    def smem_per_page(self) -> int:
+    def smem_per_stage(self) -> int:
         """Shared memory size needed per page in bytes."""
         return 0
 
     @property
-    def num_pages(self) -> int:
+    def num_stages(self) -> int:
         """Number of pages to allocate for this operation (e.g. 2 for double buffering)."""
         return 1
 
@@ -82,8 +87,8 @@ class FusableOp(MegakernelOp):
         compute_func: Callable,
         num_tensors: int,
         needs_sync: bool = False,
-        smem_per_page: int = 0,
-        num_pages: int = 1,
+        smem_per_stage: int = 0,
+        num_stages: int = 1,
         load_func: Callable = None,
         store_func: Callable = None,
         launch_func: Callable = None,
@@ -93,8 +98,8 @@ class FusableOp(MegakernelOp):
         self._store_func = store_func
         self._num_tensors = num_tensors
         self._needs_sync = needs_sync
-        self._smem_per_page = smem_per_page
-        self._num_pages = num_pages
+        self._smem_per_stage = smem_per_stage
+        self._num_stages = num_stages
         self._launch_func = launch_func
 
     @property
@@ -106,12 +111,12 @@ class FusableOp(MegakernelOp):
         return self._needs_sync
 
     @property
-    def smem_per_page(self) -> int:
-        return self._smem_per_page
+    def smem_per_stage(self) -> int:
+        return self._smem_per_stage
 
     @property
-    def num_pages(self) -> int:
-        return self._num_pages
+    def num_stages(self) -> int:
+        return self._num_stages
 
     @cute.jit
     def load(self, paged_pool, page_idx, *args):
@@ -134,18 +139,18 @@ class FusableOp(MegakernelOp):
             raise NotImplementedError("Standalone launch not configured for this FusableOp")
 
 
-class FusableKernel(ABC):
+class FusableKernel:
     """
-    Abstract base class for kernels that support both forward and backward
+    Base class for kernels that support both forward and backward
     passes in a megakernel with Load/Compute/Store phases.
     """
 
     @property
-    def smem_per_page(self) -> int:
+    def smem_per_stage(self) -> int:
         return 0
 
     @property
-    def num_pages(self) -> int:
+    def num_stages(self) -> int:
         return 1
 
     # ========== Forward Pass L/C/S ==========
