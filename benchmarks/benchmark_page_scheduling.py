@@ -71,7 +71,7 @@ def benchmark_page_aware_scheduling():
     # ---------------------------------------------------------------------
     print("\n--- Benchmark (No Tracing) ---")
 
-    mk = Megakernel("page_aware_bench", mode="forward", num_pages=4, page_size=16384)
+    mk = Megakernel("page_aware_bench", mode="forward", num_stages=4, page_size=16384)
     mk.add(gl1, x, gate, out, hidden_dim)
     mk.add(gl2, x2, gate2, out2, hidden_dim)
     mk.add(gl3, x3, gate3, out3, hidden_dim)
@@ -102,7 +102,7 @@ def benchmark_page_aware_scheduling():
     # ---------------------------------------------------------------------
     print("\n--- Generating Trace ---")
 
-    mk_traced = Megakernel("page_aware_traced", mode="forward", num_pages=4, page_size=16384)
+    mk_traced = Megakernel("page_aware_traced", mode="forward", num_stages=4, page_size=16384)
     mk_traced.add(gl1, x, gate, out, hidden_dim)
     mk_traced.add(gl2, x2, gate2, out2, hidden_dim)
     mk_traced.add(gl3, x3, gate3, out3, hidden_dim)

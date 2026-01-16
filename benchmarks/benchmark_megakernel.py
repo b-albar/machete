@@ -80,7 +80,7 @@ def main():
             mk = Megakernel(
                 f"fuse_rope_gl_{config_name.replace('=', '_').replace(' ', '_')}",
                 mode="forward",
-                num_pages=0,  # Enable No Bubbles pipelining
+                num_stages=0,  # Enable No Bubbles pipelining
             )
             mk.add(rope_impl, q.view(-1, h_sz, d_sz), cos, sin, s_sz)
             mk.add(gl_impl, q.view(-1, h_sz * d_sz), gate, out, h_sz * d_sz)

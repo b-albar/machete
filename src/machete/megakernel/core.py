@@ -6,14 +6,14 @@ import os
 import importlib.util
 import hashlib
 from typing import Callable, Union
-from machete.megakernel.interface import FusableKernel, MegakernelOp, FusableOp
+from machete.megakernel.interface import FusableKernel, MegakernelOp, FusableOp, WarpSpecializedKernel
 from machete.megakernel.scheduler import (
-    NoBubblesScheduler,
     NoBubblesConfig,
     PageAwareScheduler,
     MicroOpType,
     OpDescriptor,
     build_op_descriptor_from_kernel,
+    BarrierConfig,
 )
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -35,6 +35,14 @@ PAGE_TRACE_TYPES = {
     "ACQUIRE_WAIT": TraceType("ACQUIRE_WAIT", "AW-{0}", "Waiting for pages (Op {0})", param_count=1),
     "ACQUIRE_DONE": TraceType("ACQUIRE_DONE", "AD-{0},{1}", "Acquired pages {1} for Op {0}", param_count=2),
     "RELEASE": TraceType("RELEASE", "RL-{0},{1}", "Released pages {1} for Op {0}", param_count=2),
+}
+
+# Trace types for fine-grained semaphore synchronization (debugging)
+SYNC_TRACE_TYPES = {
+    "SEM_WAIT_LOAD": TraceType("SEM_WAIT_LOAD", "WL-{0}", "Wait load sem (Op {0})", param_count=1),
+    "SEM_WAIT_COMPUTE": TraceType("SEM_WAIT_COMPUTE", "WC-{0}", "Wait compute sem (Op {0})", param_count=1),
+    "SEM_SIGNAL_LOAD": TraceType("SEM_SIGNAL_LOAD", "SL-{0}", "Signal load done (Op {0})", param_count=1),
+    "SEM_SIGNAL_COMPUTE": TraceType("SEM_SIGNAL_COMPUTE", "SC-{0}", "Signal compute done (Op {0})", param_count=1),
 }
 
 # Workaround for TVM-FFI bug (Python < 3.13) with positional arguments in __init__
@@ -67,7 +75,7 @@ class Megakernel:
         name: str = "megakernel",
         mode: str = "forward",
         paged_pool_bytes: int = 0,
-        num_pages: int = 0,
+        num_stages: int = 0,
         page_size: int = 16384,
     ):
         """
@@ -76,8 +84,8 @@ class Megakernel:
             mode: "forward" or "backward".
             paged_pool_bytes: Total size of the paged shared memory pool in bytes.
                               Set to 0 (default) for compute-only mode.
-            num_pages: Number of pages for No Bubbles scheduling.
-                       If 0, uses paged_pool_bytes / page_size.
+            num_stages: Number of stages (pages) for No Bubbles scheduling.
+                        If 0, uses paged_pool_bytes / page_size.
             page_size: Size of each shared memory page in bytes (default 16KB).
         """
         self.name = name
@@ -88,15 +96,20 @@ class Megakernel:
 
         # No Bubbles configuration
         self.page_size = page_size
-        if num_pages > 0:
-            self.num_stages = num_pages
-            self.paged_pool_bytes = num_pages * page_size
+        if num_stages > 0:
+            self.num_stages = num_stages
+            self.paged_pool_bytes = num_stages * page_size
         elif paged_pool_bytes > 0:
             self.num_stages = paged_pool_bytes // page_size
             self.paged_pool_bytes = paged_pool_bytes
         else:
             self.num_stages = 0
             self.paged_pool_bytes = 0
+
+        # Logical Blocks configuration
+        self._use_logical_blocks = False
+        self._total_logical_blocks = 1
+        self._barrier_config: BarrierConfig = None
 
     def add(self, op: Union[FusableKernel, MegakernelOp, Callable], *args):
         """Add an operation and its arguments to the megakernel."""
@@ -114,13 +127,16 @@ class Megakernel:
                 store_fn = kernel.store_backward
 
             smem_dtype = getattr(kernel, "cute_dtype", cute.Uint8)
-            smem_size = kernel.smem_per_stage
+            smem_size = kernel.smem_size
             logger.debug(
-                "Adding kernel %s with smem_size=%s num_stages=%s",
+                "Adding kernel %s with smem_size=%s",
                 kernel.__class__.__name__,
                 smem_size,
-                kernel.num_stages,
             )
+
+            # Check for warp specialization
+            uses_warp_spec = isinstance(kernel, WarpSpecializedKernel)
+            warp_config = kernel.warp_config if uses_warp_spec else None
 
             self.instructions.append(
                 {
@@ -129,12 +145,11 @@ class Megakernel:
                     "compute": compute_fn,
                     "store": store_fn,
                     "args": list(args),
-                    "needs_sync": False,
-                    "needs_block_sync": True,
                     "smem_size": smem_size,
-                    "num_stages": kernel.num_stages,
                     "smem_dtype": smem_dtype,
                     "op_obj": kernel,
+                    "uses_warp_specialization": uses_warp_spec,
+                    "warp_config": warp_config,
                 }
             )
             return
@@ -144,22 +159,16 @@ class Megakernel:
             actual_op = op
         elif hasattr(op, "_machete_is_op"):
             # Decorated function - wrap in FusableOp
-            smem_per_page = getattr(op, "_machete_smem_per_page", 0)
-            num_pages = getattr(op, "_machete_num_pages", 1)
+            smem_size = getattr(op, "_machete_smem_size", 0)
 
             instance = getattr(op, "__self__", None)
-            if instance:
-                if hasattr(instance, "smem_per_page"):
-                    smem_per_page = instance.smem_per_stage
-                if hasattr(instance, "num_stages"):
-                    num_pages = instance.num_stages
+            if instance and hasattr(instance, "smem_size"):
+                smem_size = instance.smem_size
 
             actual_op = FusableOp(
                 compute_func=op,
                 num_tensors=op._machete_num_tensors,
-                needs_sync=op._machete_needs_sync,
-                smem_per_page=smem_per_page,
-                num_pages=num_pages,
+                smem_size=smem_size,
             )
         else:
             raise TypeError(f"Unsupported operation type: {type(op)}")
@@ -180,10 +189,7 @@ class Megakernel:
                 "compute": actual_op.compute,
                 "store": getattr(actual_op, "store", None),
                 "args": list(args),
-                "needs_sync": actual_op.needs_global_sync,
-                "needs_block_sync": getattr(actual_op, "needs_block_sync", True),
-                "smem_size": actual_op.smem_per_stage,
-                "num_stages": actual_op.num_stages,
+                "smem_size": actual_op.smem_size,
                 "smem_dtype": smem_dtype,
                 "op_obj": actual_op,
             }
@@ -191,6 +197,53 @@ class Megakernel:
 
     def clear(self):
         self.instructions = []
+        self._use_logical_blocks = False
+        self._total_logical_blocks = 1
+        self._barrier_config = None
+
+    def _calculate_logical_blocks(self) -> int:
+        """Calculate TotalLogicalBlocks = max(op.get_logical_grid_size()) across all ops.
+
+        This also configures the barrier tensor size for logical block synchronization.
+
+        Returns:
+            Total logical blocks for the grid dimension
+        """
+        max_logical = 1
+        has_logical_api = False
+
+        for inst in self.instructions:
+            op = inst.get("op_obj")
+            if op and hasattr(op, "get_logical_grid_size"):
+                args = inst.get("args", [])
+                try:
+                    logical_size = op.get_logical_grid_size(*args)
+                    if logical_size > 1:
+                        has_logical_api = True
+                        max_logical = max(max_logical, logical_size)
+                        inst["logical_grid_size"] = logical_size
+                except Exception as e:
+                    logger.warning("Failed to compute logical grid size for %s: %s", type(op).__name__, e)
+                    inst["logical_grid_size"] = 1
+            else:
+                inst["logical_grid_size"] = 1
+
+        self._use_logical_blocks = has_logical_api
+        self._total_logical_blocks = max_logical
+
+        # Configure barrier tensor: (NumOps, TotalLogicalBlocks)
+        if has_logical_api:
+            self._barrier_config = BarrierConfig(
+                num_ops=len(self.instructions),
+                total_logical_blocks=max_logical,
+            )
+            logger.debug(
+                "Logical Blocks enabled: %d total blocks, barrier tensor %s",
+                max_logical,
+                self._barrier_config.tensor_size,
+            )
+
+        return max_logical
 
     def _get_megakernel_class(self, mapping, num_flat_args, op_info_key, arg_info, traced=False):
         """Generate and load the megakernel class for the current configuration."""
@@ -251,11 +304,15 @@ class Megakernel:
         # Per-op smem tensor allocations
         ops.extend(self._generate_smem_allocations())
 
+        # Check if any kernel uses warp specialization
+        uses_warp_spec = any(inst.get("uses_warp_specialization", False) for inst in self.instructions)
+
         # Generate schedule
         ops.append("        # Generate Schedule")
-        use_page_aware = self.paged_pool_bytes > 0 and self.num_stages >= 2
 
-        if use_page_aware:
+        if uses_warp_spec:
+            ops.extend(self._generate_warp_specialized_schedule(mapping, traced))
+        elif self.paged_pool_bytes > 0 and self.num_stages >= 2:
             ops.extend(self._generate_page_aware_schedule(mapping, traced))
         else:
             ops.extend(self._generate_simple_schedule(mapping, traced))
@@ -295,16 +352,16 @@ class Megakernel:
 
         # Dynamically determine pages_per_op:
         # We need enough pages to double buffer the operation with the largest smem requirement.
-        max_smem_per_stage = 0
+        max_op_smem = 0
         for inst in self.instructions:
-            max_smem_per_stage = max(max_smem_per_stage, inst["smem_size"])
+            max_op_smem = max(max_op_smem, inst["smem_size"])
 
-        # pages_per_stage = ceil(smem_per_stage / page_size)
-        pages_per_stage = (max_smem_per_stage + self.page_size - 1) // self.page_size
-        pages_per_stage = max(1, pages_per_stage)
+        # pages_per_buffer = ceil(max_op_smem / page_size)
+        pages_per_buffer = (max_op_smem + self.page_size - 1) // self.page_size
+        pages_per_buffer = max(1, pages_per_buffer)
 
-        # For double buffering, we need 2 * pages_per_stage
-        pages_per_op = 2 * pages_per_stage
+        # For double buffering, we need 2 * pages_per_buffer
+        pages_per_op = 2 * pages_per_buffer
 
         ops.append(f"        # Page-aware scheduling: {self.num_stages} pages, {pages_per_op} per op")
         ops.append("        page_idx = Int32(0)")
@@ -337,7 +394,6 @@ class Megakernel:
                 desc = OpDescriptor(
                     name=f"Op{i}",
                     op_idx=i,
-                    needs_block_sync=inst.get("needs_block_sync", True),
                     needs_global_sync=inst.get("needs_sync", False),
                 )
             op_descs.append(desc)
@@ -482,55 +538,299 @@ class Megakernel:
             "        sync_step = sync_step + Int32(1)",
         ]
 
-    def _generate_simple_schedule(self, mapping, traced: bool) -> list:
-        """Generate simple pipeline scheduling code (legacy mode)."""
+    def _generate_warp_specialized_schedule(self, mapping, traced: bool) -> list:
+        """Generate warp-specialized scheduling code (No Bubbles pattern).
+
+        This generates code that dispatches different L/C/S methods to different warps:
+        - Consumer warps (0 to num_consumer_warps-1): Execute compute
+        - Loader warp: Execute load
+        - Storer warp: Execute store
+        - Controller/Launcher warps: Coordination (future)
+
+        Synchronization uses page semaphores (atomic counters) instead of __syncthreads():
+        - sem_load_done: Loader signals when data is ready in smem
+        - sem_compute_done: Consumer signals when compute is finished
+
+        This allows overlapping of phases across different logical blocks:
+        - While Consumer processes block N, Loader can load block N+1
+        - While Storer writes block N, Consumer processes N+1, Loader loads N+2
+        """
         ops = []
-        scheduler = NoBubblesScheduler()
-        scheduler.generate_pipeline_schedule(self.instructions, use_pipeline=(self.paged_pool_bytes > 0))
+
+        # Get warp config from first warp-specialized kernel
+        warp_config = None
+        for inst in self.instructions:
+            if inst.get("uses_warp_specialization"):
+                warp_config = inst.get("warp_config")
+                break
+
+        if warp_config is None:
+            # Fallback to default config
+            from machete.megakernel.scheduler import WarpConfig
+
+            warp_config = WarpConfig()
+
+        num_consumer = warp_config.num_consumer_warps
+        loader_warp = num_consumer
+        storer_warp = num_consumer + warp_config.num_loader_warps
+        # launcher_warp and controller_warp reserved for future use
+
+        ops.append("        # Warp-Specialized Scheduling (No Bubbles)")
+        ops.append(f"        # Consumer warps: 0-{num_consumer - 1}, Loader: {loader_warp}, Storer: {storer_warp}")
+        ops.append("        warp_id = tidx // Int32(32)")
+        ops.append("        lane_id = tidx % Int32(32)")
+        ops.append("        page_idx = Int32(0)")
+        ops.append("")
+        ops.append("        # Page semaphores in shared memory for inter-warp synchronization")
+        ops.append("        # sem_load_done: Loader signals when smem is ready")
+        ops.append("        # sem_compute_done: Consumer signals when compute is done")
+        ops.append("        sem_load_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
+        ops.append("        sem_compute_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
+        ops.append("")
+        ops.append("        # Initialize semaphores (single thread)")
+        ops.append("        if tidx == 0:")
+        ops.append("            sem_load_done[0] = Int32(0)")
+        ops.append("            sem_compute_done[0] = Int32(0)")
+        ops.append("        cute.arch.sync_threads()  # Ensure semaphores initialized")
+        ops.append("")
+
+        # Generate warp role dispatch - each role runs independently
+        ops.append(f"        if warp_id == Int32({loader_warp}):")
+        ops.append("            # LOADER WARP: Load data to smem, then signal sem_load_done")
+        for i, inst in enumerate(self.instructions):
+            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            get_smem_arg = self._make_smem_arg_getter(i)
+            smem_str = get_smem_arg("page_idx")
+
+            if traced:
+                ops.append("            t_start = cutedsl_trace.device.start()")
+
+            ops.append(f"            op_{i}_load(paged_pool, page_idx, {smem_str}{args_str})")
+
+            if traced:
+                fmt_id = TRACING_PHASES[MicroOpType.LOAD].id
+                ops.append(
+                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
+                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
+                )
+
+        ops.append("            # Signal: load complete")
+        ops.append("            cute.arch.fence_view_async_shared()")
+        ops.append("            if lane_id == 0:")
+        ops.append("                atomic_add_i32(1, sem_load_done.iterator)")
+
+        ops.append("")
+        ops.append(f"        elif warp_id < Int32({num_consumer}):")
+        ops.append("            # CONSUMER WARPS: Wait for load, compute, then signal sem_compute_done")
+        ops.append("            # Spin-wait for load to complete (with nanosleep to reduce power)")
+        ops.append("            while atomic_add_i32(0, sem_load_done.iterator) < Int32(1):")
+        ops.append("                nanosleep(Int32(100))")
+        ops.append("")
+
+        for i, inst in enumerate(self.instructions):
+            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            get_smem_arg = self._make_smem_arg_getter(i)
+            smem_str = get_smem_arg("page_idx")
+
+            if traced:
+                ops.append("            t_start = cutedsl_trace.device.start()")
+
+            ops.append(f"            op_{i}_compute({smem_str}{args_str})")
+
+            if traced:
+                fmt_id = TRACING_PHASES[MicroOpType.COMPUTE].id
+                ops.append(
+                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
+                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
+                )
+
+        ops.append("")
+        ops.append("            # Signal: compute complete (only warp 0 signals to avoid overcounting)")
+        ops.append("            if warp_id == Int32(0) and lane_id == 0:")
+        ops.append("                atomic_add_i32(1, sem_compute_done.iterator)")
+
+        ops.append("")
+        ops.append(f"        elif warp_id == Int32({storer_warp}):")
+        ops.append("            # STORER WARP: Wait for compute, then store")
+        ops.append("            # Spin-wait for compute to complete")
+        ops.append("            while atomic_add_i32(0, sem_compute_done.iterator) < Int32(1):")
+        ops.append("                nanosleep(Int32(100))")
+        ops.append("")
+
+        for i, inst in enumerate(self.instructions):
+            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            get_smem_arg = self._make_smem_arg_getter(i)
+            smem_str = get_smem_arg("page_idx")
+
+            if traced:
+                ops.append("            t_start = cutedsl_trace.device.start()")
+
+            ops.append(f"            op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
+
+            if traced:
+                fmt_id = TRACING_PHASES[MicroOpType.STORE].id
+                ops.append(
+                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
+                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
+                )
+
+        # Controller and launcher warps (currently no-op, for future expansion)
+        ops.append("")
+        ops.append("        else:")
+        ops.append("            # Controller/Launcher warps - no-op (future: instruction scheduling)")
+        ops.append("            pass")
+
+        return ops
+
+    def _emit_trace_start(self, ops: list, indent: str, var: str = "t_start") -> None:
+        """Emit trace start timestamp capture."""
+        ops.append(f"{indent}{var} = cutedsl_trace.device.start()")
+
+    def _emit_trace_end(
+        self, ops: list, indent: str, trace_type_dict, type_key: str, op_idx: int, var: str = "t_start"
+    ) -> None:
+        """Emit trace end event with single parameter."""
+        fmt_id = trace_type_dict[type_key].id
+        ops.append(
+            f"{indent}lane = cutedsl_trace.device.end_event_dynamic_raw_1("
+            f"{var}, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({op_idx}))"
+        )
+
+    def _generate_simple_schedule(self, mapping, traced: bool) -> list:
+        """Generate simple scheduling code with fine-grained semaphore synchronization.
+
+        Simple mode uses the same semaphore-based synchronization as warp-specialized mode,
+        but all threads execute all phases sequentially (no warp specialization).
+
+        This ensures consistent synchronization semantics across all modes:
+        - sem_load_done: Signaled after load completes, waited on before compute
+        - sem_compute_done: Signaled after compute completes, waited on before store
+
+        Key design:
+        - Thread 0 manages semaphore signaling (to avoid overcounting)
+        - All threads participate in L/C/S phases
+        - Semaphores provide fine-grained ordering without full block barriers
+        """
+        ops = []
 
         if self.paged_pool_bytes > 0:
             ops.append("        page_idx = Int32(0)")
             ops.append("        next_page = Int32(0)")
+        else:
+            ops.append("        page_idx = Int32(0)")
 
-        for uop in scheduler.micro_ops:
-            i = uop.op_idx
+        # Check if we have heterogeneous logical grid sizes
+        logical_sizes = [inst.get("logical_grid_size", 1) for inst in self.instructions]
+        has_heterogeneous_grids = len(set(logical_sizes)) > 1
+
+        if has_heterogeneous_grids:
+            ops.append("")
+            ops.append("        # Heterogeneous logical grids - ops check bounds via logical_idx")
+
+        # Allocate semaphores for fine-grained synchronization
+        ops.append("")
+        ops.append("        # Fine-grained synchronization semaphores")
+        ops.append("        sem_load_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
+        ops.append("        sem_compute_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
+        ops.append("")
+        ops.append("        # Initialize semaphores (single thread)")
+        ops.append("        if tidx == 0:")
+        ops.append("            sem_load_done[0] = Int32(0)")
+        ops.append("            sem_compute_done[0] = Int32(0)")
+        ops.append("        cute.arch.sync_threads()  # Ensure semaphores initialized before use")
+        ops.append("")
+
+        # Generate L/C/S for each operation with semaphore-based sync
+        for i, inst in enumerate(self.instructions):
             args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
             get_smem_arg = self._make_smem_arg_getter(i)
+            logical_size = inst.get("logical_grid_size", 1)
 
-            if traced and uop.type in TRACING_PHASES:
-                ops.append("        t_start = cutedsl_trace.device.start()")
+            # For heterogeneous grids, wrap ops in bounds check
+            needs_bounds_check = has_heterogeneous_grids and logical_size < max(logical_sizes)
+            indent = "            " if needs_bounds_check else "        "
 
-            if uop.type == MicroOpType.LOAD:
-                target_page = "page_idx"
-                if uop.desc == "Prefetch":
-                    ops.append("        next_page = (page_idx + Int32(1)) % Int32(2)")
-                    target_page = "next_page"
-                smem_str = get_smem_arg(target_page)
-                ops.append(f"        op_{i}_load(paged_pool, {target_page}, {smem_str}{args_str})")
+            if needs_bounds_check:
+                ops.append(f"        # Op {i}: {logical_size} logical blocks")
+                ops.append(f"        if logical_idx < Int32({logical_size}):")
 
-            elif uop.type == MicroOpType.COMPUTE:
-                smem_str = get_smem_arg("page_idx")
-                ops.append(f"        op_{i}_compute({smem_str}{args_str})")
+            # Reset semaphores for this operation (only for ops after the first)
+            if i > 0:
+                ops.append(f"{indent}# Reset semaphores for Op {i}")
+                ops.append(f"{indent}if tidx == 0:")
+                ops.append(f"{indent}    sem_load_done[0] = Int32(0)")
+                ops.append(f"{indent}    sem_compute_done[0] = Int32(0)")
+                ops.append(f"{indent}cute.arch.fence_view_async_shared()")
+                ops.append("")
 
-            elif uop.type == MicroOpType.STORE:
-                smem_str = get_smem_arg("page_idx")
-                ops.append(f"        op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
+            # LOAD phase
+            if traced:
+                self._emit_trace_start(ops, indent)
 
-            elif uop.type == MicroOpType.SYNC_BLOCK:
-                ops.append("        cute.arch.sync_threads()")
+            smem_str = get_smem_arg("page_idx")
+            ops.append(f"{indent}op_{i}_load(paged_pool, page_idx, {smem_str}{args_str})")
 
-            elif uop.type == MicroOpType.SYNC_GLOBAL:
-                ops.extend(self._gen_global_sync())
+            if traced:
+                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.LOAD, i)
 
-            elif uop.type == MicroOpType.ADVANCE_PAGE:
-                ops.append("        page_idx = next_page")
+            # Signal load complete
+            if traced:
+                self._emit_trace_start(ops, indent, "t_sig")
+            ops.append(f"{indent}cute.arch.fence_view_async_shared()")
+            ops.append(f"{indent}if tidx == 0:")
+            ops.append(f"{indent}    atomic_add_i32(1, sem_load_done.iterator)")
+            if traced:
+                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_SIGNAL_LOAD", i, "t_sig")
+            ops.append("")
 
-            if traced and uop.type in TRACING_PHASES:
-                fmt_id = TRACING_PHASES[uop.type].id
-                ops.append(
-                    f"        lane = cutedsl_trace.device.end_event_dynamic_raw_1("
-                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
-                )
+            # Wait for load to complete before compute
+            ops.append(f"{indent}# Wait for load to complete")
+            if traced:
+                self._emit_trace_start(ops, indent, "t_wait")
+            ops.append(f"{indent}while atomic_add_i32(0, sem_load_done.iterator) < Int32(1):")
+            ops.append(f"{indent}    nanosleep(Int32(100))")
+            if traced:
+                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_WAIT_LOAD", i, "t_wait")
+            ops.append("")
+
+            # COMPUTE phase
+            if traced:
+                self._emit_trace_start(ops, indent)
+
+            ops.append(f"{indent}op_{i}_compute({smem_str}{args_str})")
+
+            if traced:
+                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.COMPUTE, i)
+
+            # Signal compute complete
+            if traced:
+                self._emit_trace_start(ops, indent, "t_sig")
+            ops.append(f"{indent}if tidx == 0:")
+            ops.append(f"{indent}    atomic_add_i32(1, sem_compute_done.iterator)")
+            if traced:
+                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_SIGNAL_COMPUTE", i, "t_sig")
+            ops.append("")
+
+            # Wait for compute to complete before store
+            ops.append(f"{indent}# Wait for compute to complete")
+            if traced:
+                self._emit_trace_start(ops, indent, "t_wait")
+            ops.append(f"{indent}while atomic_add_i32(0, sem_compute_done.iterator) < Int32(1):")
+            ops.append(f"{indent}    nanosleep(Int32(100))")
+            if traced:
+                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_WAIT_COMPUTE", i, "t_wait")
+            ops.append("")
+
+            # STORE phase
+            if traced:
+                self._emit_trace_start(ops, indent)
+
+            ops.append(f"{indent}op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
+
+            if traced:
+                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.STORE, i)
+
+            ops.append("")
 
         return ops
 
@@ -541,7 +841,14 @@ class Megakernel:
         kernel_name = f"kernel_{sig_hash[:8]}"
 
         trace_args = ", trace_buffer, trace_row_stride, trace_num_lanes" if traced else ""
-        bidx_init = "bidx, _, _ = cute.arch.block_idx()" if traced else ""
+
+        # Always get block index for logical blocks support
+        # bidx is the logical block index when using Logical Blocks API
+        bidx_init = "bidx, _, _ = cute.arch.block_idx()"
+
+        # Logical block index: each block gets a unique logical_idx
+        logical_idx_init = "logical_idx = bidx  # Logical block index for coordinate mapping"
+
         trace_init = (
             "is_trace_thread = (tidx % 32 == 0)\n"
             "        lane = cutedsl_trace.device.begin_lane_dynamic_raw("
@@ -562,6 +869,7 @@ import cutedsl_trace
 from cutlass import Int32, const_expr
 from quack.utils import atomic_add_i32
 from machete.megakernel.core import MEGAKERNEL_REGISTRY
+from machete.megakernel.utils import nanosleep
 
 # Retrieve instructions from registry
 instructions = MEGAKERNEL_REGISTRY["{sig_hash}"]
@@ -585,6 +893,7 @@ class GeneratedMegakernel:
         sync_step = Int32(0)
         tidx, _, _ = cute.arch.thread_idx()
         {bidx_init}
+        {logical_idx_init}
         {trace_init}
 {ops_content}
         {trace_finish}
@@ -617,9 +926,39 @@ class GeneratedMegakernel:
 
         return align_elements
 
+    def launch_logical(self, block, stream=None, trace_file=None):
+        """Launch the megakernel using Logical Blocks for grid dimension.
+
+        This method automatically calculates TotalLogicalBlocks from all registered
+        operations and uses it as the grid dimension. Each block will receive a
+        unique logical_idx that can be mapped to kernel-specific coordinates via
+        get_logical_coord().
+
+        Args:
+            block: Block dimensions (threads per block)
+            stream: CUDA stream (optional)
+            trace_file: Path to write trace file (optional)
+
+        Example:
+            mk = Megakernel()
+            mk.add(rope_kernel, q, k, cos, sin, batch=2, seq_len=512, heads=8)
+            mk.add(gated_linear, x, gate, out)
+            mk.launch_logical(block=(256, 1, 1))  # Grid auto-calculated
+        """
+        # Calculate total logical blocks from all operations
+        total_logical = self._calculate_logical_blocks()
+        grid = (total_logical, 1, 1)
+
+        logger.debug("Launching with Logical Blocks: grid=%s, block=%s", grid, block)
+        return self.launch(n_blocks=total_logical, grid=grid, block=block, stream=stream, trace_file=trace_file)
+
     def launch(self, n_blocks: int, grid, block, stream=None, trace_file=None):
         """Launch the megakernel with the given configuration."""
         traced = trace_file is not None
+
+        # Calculate logical blocks if not already done
+        if not self._use_logical_blocks:
+            self._calculate_logical_blocks()
 
         # Prepare arguments and mapping
         flat_args, mapping, device = self._prepare_launch_args(grid, block)
@@ -694,27 +1033,31 @@ class GeneratedMegakernel:
         if not traced:
             return None
         num_lanes = (block[0] * block[1] * block[2] + 31) // 32
-        max_events = len(self.instructions) * 6
+        max_events = len(self.instructions) * 10  # L/C/S + 4 sync events + page events
         return DynamicTraceBuilder(
             num_lanes=num_lanes, max_events_per_lane=max_events, grid_dims=(grid[0], grid[1], grid[2])
         )
 
     def _calculate_smem(self, device) -> int:
-        """Calculate shared memory requirement, reducing pages if needed."""
+        """Calculate shared memory requirement, reducing pages if needed.
+
+        New model: paging is managed at the Megakernel level via self.num_stages.
+        Per-operation smem_size is allocated separately (not part of paged pool).
+        Total smem = paged_pool_bytes + sum(op.smem_size for all ops) + margin.
+        """
         props = torch.cuda.get_device_properties(device)
         max_smem = getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
         limit_smem = max_smem - 2048  # Safety margin
 
         def calc_smem():
+            # Paged pool for No Bubbles (global pool, managed by Megakernel)
             total = self.paged_pool_bytes
+            # Per-operation shared memory (allocated separately, not paged)
             for inst in self.instructions:
-                n_pages = inst["num_stages"]
-                if self.paged_pool_bytes > 0 and inst["smem_size"] > 0:
-                    n_pages = max(inst["num_stages"], self.num_stages)
-                total += inst["smem_size"] * n_pages
-            return total + 1024
+                total += inst["smem_size"]
+            return total + 1024  # Safety margin
 
-        # Adaptive reduction
+        # Adaptive reduction of page count if smem exceeds limit
         while self.num_stages >= 2:
             candidate_smem = calc_smem()
             if candidate_smem <= limit_smem:
@@ -782,7 +1125,11 @@ class GeneratedMegakernel:
     ):
         """Compile the megakernel and cache it."""
         fake_args = self._create_fake_args(flat_args)
-        barrier_fake = fake_tensor(Int32, (1,))
+        if self._barrier_config is not None:
+            barrier_shape = self._barrier_config.tensor_size
+        else:
+            barrier_shape = (1,)
+        barrier_fake = fake_tensor(Int32, barrier_shape)
 
         megakernel_obj, _ = self._get_megakernel_class(mapping, num_flat_args, op_info_key, arg_info, traced=traced)
 
@@ -790,7 +1137,7 @@ class GeneratedMegakernel:
 
         if traced:
             num_lanes = (block[0] * block[1] * block[2] + 31) // 32
-            max_events = len(self.instructions) * 6
+            max_events = len(self.instructions) * 10  # L/C/S + 4 sync events + page events
             row_stride_bytes = (max_events + 1) * 32
             total_blocks = grid[0] * grid[1] * grid[2]
             total_bytes = total_blocks * num_lanes * row_stride_bytes
@@ -828,7 +1175,16 @@ class GeneratedMegakernel:
 
     def _execute_kernel(self, compile_key, n_blocks, flat_args, traced, trace_builder, device):
         """Execute the compiled kernel."""
-        self._barrier = torch.zeros(1, dtype=torch.int32, device=device)
+        # Allocate barrier tensor based on configuration
+        # If using logical blocks: (NumOps, TotalLogicalBlocks) for fine-grained sync
+        # Otherwise: single counter for global sync
+        if self._barrier_config is not None:
+            barrier_shape = self._barrier_config.tensor_size
+            self._barrier = torch.zeros(barrier_shape, dtype=torch.int32, device=device)
+            logger.debug("Allocated logical barrier tensor: %s", barrier_shape)
+        else:
+            self._barrier = torch.zeros(1, dtype=torch.int32, device=device)
+
         wrapped_args = self._wrap_args(flat_args)
 
         launch_args = [self._barrier, Int32(n_blocks), *wrapped_args]
@@ -858,5 +1214,17 @@ class GeneratedMegakernel:
         for pt in PAGE_TRACE_TYPES.values():
             writer.register_trace_type(pt)
 
+        # Register synchronization trace types
+        for pt in SYNC_TRACE_TYPES.values():
+            writer.register_trace_type(pt)
+
         writer.add_tensor(trace_builder)
+
+        # Ensure proper .nanotrace extension
+        if not trace_file.endswith(".nanotrace"):
+            if trace_file.endswith(".json"):
+                trace_file = trace_file[:-5] + ".nanotrace"
+            else:
+                trace_file = trace_file + ".nanotrace"
+
         writer.write(trace_file)

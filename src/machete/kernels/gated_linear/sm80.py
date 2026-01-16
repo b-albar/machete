@@ -39,21 +39,10 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
         self.vec_size = 8 if dtype == torch.float16 else 4
 
     @property
-    def smem_per_stage(self) -> int:
-        # A + B + C tiles in shared memory (Backward needs 3: dc, a, b)
-        # Forward needs 2: a, b
-        # Allocate max (3)
+    def smem_size(self) -> int:
+        """Shared memory for A + B + C tiles (backward needs 3 tiles: dc, a, b)."""
         element_size = 2 if self.torch_dtype in [torch.float16, torch.bfloat16] else 4
         return self.TILE_N * 3 * element_size
-
-    @property
-    def num_stages(self) -> int:
-        return 1
-
-    @property
-    def needs_block_sync(self):
-        # We need sync between load (to smem) and compute (from smem)
-        return True
 
     # ========== Forward Pass L/C/S ==========
 

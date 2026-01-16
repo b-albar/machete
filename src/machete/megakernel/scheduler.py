@@ -8,16 +8,128 @@ This module implements the scheduling infrastructure for the No Bubbles pattern:
 3. Global synchronization via atomic counters
 4. Page request/release coordination
 5. **Dependency-aware scheduling** for optimal load/compute overlap
+6. **Logical Blocks** abstraction for flexible coordinate mapping
 
 Based on: "Look Ma, No Bubbles!" - HazyResearch
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Set, Callable, TypeVar
+from typing import List, Dict, Optional, Set, Callable, TypeVar, Tuple
 from enum import Enum, auto
 from functools import wraps  # noqa: F401 - may be used by decorated functions
 
 F = TypeVar("F", bound=Callable)
+
+
+# ============================================================================
+# Warp Role Definitions (HazyResearch Model)
+# ============================================================================
+
+
+class WarpRole(Enum):
+    """Warp specialization roles for the megakernel.
+
+    Based on HazyResearch's design:
+    - CONSUMER: 12-16 warps for compute (MMA, math operations)
+    - LOADER: 1 warp for async loads (Global -> Shared via TMA/cp.async)
+    - STORER: 1 warp for async stores (Shared -> Global)
+    - LAUNCHER: 1 warp for auxiliary async tasks (K/V cache prefetch, TMA descriptors)
+    - CONTROLLER: 1 warp for instruction fetch/decode and pipeline coordination
+    """
+
+    CONSUMER = auto()  # Math/MMA operations (12-16 warps)
+    LOADER = auto()  # Global -> Shared memory loads (1 warp)
+    STORER = auto()  # Shared -> Global memory stores (1 warp)
+    LAUNCHER = auto()  # Auxiliary async tasks (1 warp)
+    CONTROLLER = auto()  # Instruction fetch/decode (1 warp)
+
+
+@dataclass
+class WarpConfig:
+    """Configuration for warp specialization.
+
+    Typical H100 configuration:
+    - 20 warps total per block (640 threads)
+    - 16 consumer warps (80% of warps)
+    - 4 system warps (controller, launcher, loader, storer)
+    """
+
+    num_consumer_warps: int = 16
+    num_loader_warps: int = 1
+    num_storer_warps: int = 1
+    num_launcher_warps: int = 1
+    num_controller_warps: int = 1
+
+    @property
+    def total_warps(self) -> int:
+        return (
+            self.num_consumer_warps
+            + self.num_loader_warps
+            + self.num_storer_warps
+            + self.num_launcher_warps
+            + self.num_controller_warps
+        )
+
+    @property
+    def total_threads(self) -> int:
+        return self.total_warps * 32
+
+    def get_warp_role(self, warp_id: int) -> WarpRole:
+        """Determine the role of a warp by its ID."""
+        if warp_id < self.num_consumer_warps:
+            return WarpRole.CONSUMER
+        offset = self.num_consumer_warps
+        if warp_id < offset + self.num_loader_warps:
+            return WarpRole.LOADER
+        offset += self.num_loader_warps
+        if warp_id < offset + self.num_storer_warps:
+            return WarpRole.STORER
+        offset += self.num_storer_warps
+        if warp_id < offset + self.num_launcher_warps:
+            return WarpRole.LAUNCHER
+        return WarpRole.CONTROLLER
+
+
+# ============================================================================
+# Logical Block Coordinate Mapping
+# ============================================================================
+
+
+@dataclass
+class LogicalCoord:
+    """A logical coordinate that maps to kernel-specific dimensions.
+
+    This abstracts the physical block index into a logical coordinate system
+    that each kernel can interpret differently (e.g., (batch, seq, head) for RoPE).
+    """
+
+    values: Tuple[int, ...]
+    names: Tuple[str, ...] = ()
+
+    def __getitem__(self, idx: int) -> int:
+        return self.values[idx]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __repr__(self) -> str:
+        if self.names:
+            parts = [f"{n}={v}" for n, v in zip(self.names, self.values)]
+            return f"LogicalCoord({', '.join(parts)})"
+        return f"LogicalCoord{self.values}"
+
+
+@dataclass
+class LogicalGridInfo:
+    """Information about the logical grid for a kernel.
+
+    Each kernel computes its own logical grid size based on the problem shape.
+    The scheduler uses this to determine TotalLogicalBlocks and coordinate mapping.
+    """
+
+    logical_grid_size: int  # Total logical blocks for this kernel
+    coord_names: Tuple[str, ...] = ()  # Names for coordinate dimensions
+    coord_dims: Tuple[int, ...] = ()  # Size of each coordinate dimension
 
 
 # ============================================================================
@@ -85,6 +197,24 @@ def independent() -> Callable[[F], F]:
     return decorator
 
 
+def warp_role(role: WarpRole) -> Callable[[F], F]:
+    """Decorator to annotate which warp role should execute a method.
+
+    Usage:
+        @warp_role(WarpRole.LOADER)
+        @cute.jit
+        def load_forward(self, paged_pool, page_idx, ...):
+            # Only loader warps execute this
+            ...
+    """
+
+    def decorator(func: F) -> F:
+        func._machete_warp_role = role
+        return func
+
+    return decorator
+
+
 def get_method_dependencies(method: Callable) -> tuple[Set[str], Set[str], bool]:
     """Extract dependency info from a decorated L/C/S method.
 
@@ -95,6 +225,11 @@ def get_method_dependencies(method: Callable) -> tuple[Set[str], Set[str], bool]
     writes_set = getattr(method, "_machete_writes", set())
     is_independent = getattr(method, "_machete_independent", False)
     return reads_set, writes_set, is_independent
+
+
+def get_method_warp_role(method: Callable) -> Optional[WarpRole]:
+    """Extract warp role annotation from a method."""
+    return getattr(method, "_machete_warp_role", None)
 
 
 def build_op_descriptor_from_kernel(kernel, op_idx: int, mode: str = "forward") -> "OpDescriptor":
@@ -126,6 +261,10 @@ def build_op_descriptor_from_kernel(kernel, op_idx: int, mode: str = "forward") 
         # Scheduler can now determine that MyKernel doesn't depend on previous ops
         # that write to different tensors
         desc = build_op_descriptor_from_kernel(kernel, 0, "forward")
+
+    Note:
+    Nota:
+        Synchronization between L/C/S phases is now handled via fine-grained semaphores.
     """
     load_method = getattr(kernel, f"load_{mode}", None)
     compute_method = getattr(kernel, f"compute_{mode}", None)
@@ -145,19 +284,24 @@ def build_op_descriptor_from_kernel(kernel, op_idx: int, mode: str = "forward") 
     # Get kernel class name for debugging
     name = getattr(kernel, "__class__", type(kernel)).__name__
 
+    # Extract logical grid info if available
+    logical_grid_size = None
+    if hasattr(kernel, "get_logical_grid_size"):
+        # Defer actual computation to runtime when args are available
+        logical_grid_size = -1  # Sentinel: compute at runtime
+
     return OpDescriptor(
         name=name,
         op_idx=op_idx,
         reads=all_reads,
         writes=all_writes,
-        allow_early_load=is_independent or len(all_reads) > 0,  # Can schedule early if reads are declared
-        needs_block_sync=getattr(kernel, "needs_block_sync", True),
-        needs_global_sync=getattr(kernel, "needs_global_sync", False),
+        allow_early_load=is_independent or len(all_reads) > 0,
+        logical_grid_size=logical_grid_size,
     )
 
 
 class MicroOpType(Enum):
-    # Synchronous operations (legacy)
+    # Synchronous operations (legacy/simple mode)
     LOAD = auto()
     COMPUTE = auto()
     STORE = auto()
@@ -172,6 +316,13 @@ class MicroOpType(Enum):
     WAIT_STORE = auto()  # Wait for async store completion
     COMMIT_GROUP = auto()  # Commit async group (cp.async.commit_group)
     WAIT_GROUP = auto()  # Wait for async group (cp.async.wait_group)
+
+    # Page semaphore operations (No Bubbles pattern)
+    # These use hardware mbarrier for efficient intra-block synchronization
+    PAGE_ACQUIRE = auto()  # Wait for page semaphore (sem_finished from previous user)
+    PAGE_RELEASE = auto()  # Signal page semaphore (sem_arrived for next user)
+    SEM_WAIT = auto()  # Generic semaphore wait
+    SEM_SIGNAL = auto()  # Generic semaphore signal
 
 
 @dataclass
@@ -195,6 +346,9 @@ class OpDescriptor:
 
     This allows the scheduler to determine which operations can run in parallel.
     Operations that read from different memory than others write to can overlap.
+
+    Note: Synchronization between L/C/S phases is now always handled via
+    fine-grained semaphores, not sync_threads().
     """
 
     name: str
@@ -209,16 +363,25 @@ class OpDescriptor:
     # if there's no read-after-write dependency
     allow_early_load: bool = True
 
-    # If True, requires block sync after store (e.g., for shared memory consistency)
-    needs_block_sync: bool = True
-
     # If True, requires global sync (cross-SM barrier)
     needs_global_sync: bool = False
+
+    # Logical grid size for this operation (-1 means compute at runtime)
+    logical_grid_size: Optional[int] = None
+
+    # Logical offset in the unified grid (for operations with different grid sizes)
+    logical_offset: int = 0
+
+    # Number of logical blocks this operation processes
+    logical_count: int = 0
 
 
 @dataclass
 class Instruction:
-    """An instruction for a single SM to execute."""
+    """An instruction for a single SM to execute.
+
+    Extended with logical block information for the No Bubbles pattern.
+    """
 
     opcode: int
     op_idx: int
@@ -227,13 +390,121 @@ class Instruction:
     depends_on: List[int] = field(default_factory=list)
     signals: List[int] = field(default_factory=list)
 
+    # Logical block mapping
+    logical_offset: int = 0  # Starting logical block index for this instruction
+    logical_count: int = 1  # Number of logical blocks this instruction processes
+
 
 @dataclass
 class NoBubblesConfig:
+    """Configuration for the No Bubbles scheduler.
+
+    H100 defaults based on HazyResearch paper:
+    - 13 pages (227KB shared memory / 16KB page size)
+    - 64 sync counters for barrier coordination
+
+    Use from_device_smem() to compute num_pages based on available shared memory.
+    """
+
     num_pages: int = 13
     page_size_bytes: int = 16384
     num_sync_counters: int = 64
     max_instructions_per_sm: int = 256
+
+    # Warp configuration
+    warp_config: WarpConfig = field(default_factory=WarpConfig)
+
+    # Reserved shared memory for non-page uses (semaphores, instruction buffer, etc.)
+    reserved_smem_bytes: int = 4096  # 4KB default
+
+    @classmethod
+    def from_device_smem(
+        cls,
+        device_smem_bytes: int,
+        page_size_bytes: int = 16384,
+        reserved_smem_bytes: int = 4096,
+        warp_config: Optional[WarpConfig] = None,
+    ) -> "NoBubblesConfig":
+        """Create config with num_pages computed from device shared memory.
+
+        Args:
+            device_smem_bytes: Total shared memory available on device (e.g., 227KB for H100)
+            page_size_bytes: Size of each page in bytes (default 16KB)
+            reserved_smem_bytes: Memory reserved for non-page uses (default 4KB)
+            warp_config: Optional warp configuration
+
+        Returns:
+            NoBubblesConfig with num_pages computed from available memory
+
+        Example:
+            # H100 with 227KB shared memory
+            config = NoBubblesConfig.from_device_smem(227 * 1024)
+            # -> num_pages = (227KB - 4KB) / 16KB = 13 pages
+
+            # A100 with 164KB shared memory
+            config = NoBubblesConfig.from_device_smem(164 * 1024)
+            # -> num_pages = (164KB - 4KB) / 16KB = 10 pages
+        """
+        available_smem = device_smem_bytes - reserved_smem_bytes
+        num_pages = available_smem // page_size_bytes
+
+        if num_pages < 2:
+            raise ValueError(
+                f"Not enough shared memory for paging: {device_smem_bytes} bytes "
+                f"with {page_size_bytes} byte pages and {reserved_smem_bytes} reserved"
+            )
+
+        return cls(
+            num_pages=num_pages,
+            page_size_bytes=page_size_bytes,
+            reserved_smem_bytes=reserved_smem_bytes,
+            warp_config=warp_config or WarpConfig(),
+        )
+
+    @property
+    def total_page_smem_bytes(self) -> int:
+        """Total shared memory used by pages."""
+        return self.num_pages * self.page_size_bytes
+
+    @property
+    def total_smem_bytes(self) -> int:
+        """Total shared memory required (pages + reserved)."""
+        return self.total_page_smem_bytes + self.reserved_smem_bytes
+
+
+# ============================================================================
+# Barrier Tensor Configuration for Logical Blocks
+# ============================================================================
+
+
+@dataclass
+class BarrierConfig:
+    """Configuration for the global barrier tensor.
+
+    The barrier tensor is addressed as: Bar[OpIdx][LogicalID]
+    - Producer: atomicAdd(&Bar[op_idx, logical_id], 1) after store
+    - Consumer: while(Bar[dep_op_idx, logical_id] < target) nanosleep()
+
+    This allows fine-grained synchronization where each logical block
+    can proceed as soon as its specific data is ready.
+    """
+
+    num_ops: int  # Number of operations in the megakernel
+    total_logical_blocks: int  # Max logical grid size across all ops
+
+    @property
+    def tensor_size(self) -> Tuple[int, int]:
+        """Size of the barrier tensor: (num_ops, total_logical_blocks)."""
+        return (self.num_ops, self.total_logical_blocks)
+
+    @property
+    def total_counters(self) -> int:
+        """Total number of barrier counters needed."""
+        return self.num_ops * self.total_logical_blocks
+
+    def get_barrier_index(self, op_idx: int, logical_id: int) -> int:
+        """Get the linear index into the barrier tensor."""
+        return op_idx * self.total_logical_blocks + logical_id
 
 
 class NoBubblesScheduler:
@@ -242,6 +513,11 @@ class NoBubblesScheduler:
     The key insight is that Load[i+1] can often start before Compute[i] or Store[i]
     completes, as long as there's no data dependency. This scheduler builds a
     dependency graph and schedules loads as early as possible.
+
+    Extended with Logical Blocks support:
+    - Each operation defines get_logical_grid_size() and get_logical_coord()
+    - The scheduler uses TotalLogicalBlocks = max(op.logical_grid_size) for grid dimension
+    - Barriers are indexed by (OpIdx, LogicalID) for fine-grained sync
     """
 
     def __init__(self, config: Optional[NoBubblesConfig] = None):
@@ -249,6 +525,7 @@ class NoBubblesScheduler:
         self.instructions: List[Instruction] = []
         self.micro_ops: List[MicroOp] = []
         self._next_micro_op_id = 0
+        self.barrier_config: Optional[BarrierConfig] = None
 
     def _new_micro_op(
         self,
@@ -298,6 +575,25 @@ class NoBubblesScheduler:
             return True
         return False
 
+    def calculate_total_logical_blocks(self, ops: List[OpDescriptor]) -> int:
+        """Calculate TotalLogicalBlocks = max(op.logical_grid_size) across all ops.
+
+        For the "No Bubbles" pattern, all operations typically share the same
+        logical grid space (1:1 mapping for producer/consumer).
+        """
+        max_logical = 1
+        for op in ops:
+            if op.logical_grid_size is not None and op.logical_grid_size > 0:
+                max_logical = max(max_logical, op.logical_grid_size)
+        return max_logical
+
+    def configure_barriers(self, num_ops: int, total_logical_blocks: int):
+        """Configure the barrier tensor for logical block synchronization."""
+        self.barrier_config = BarrierConfig(
+            num_ops=num_ops,
+            total_logical_blocks=total_logical_blocks,
+        )
+
     def generate_dependency_aware_schedule(self, ops: List[OpDescriptor]) -> List[MicroOp]:
         """Generate a schedule with explicit dependencies for maximum overlap.
 
@@ -305,7 +601,7 @@ class NoBubblesScheduler:
         dependencies, allowing loads to be scheduled as early as possible.
 
         The schedule structure for maximum overlap:
-        - Load[i] depends on: Store[j] for any j where op[j].writes ∩ op[i].reads ≠ ∅
+        - Load[i] depends on: Store[j] for any j where op[j].writes ∩ op[i].reads != empty
         - Compute[i] depends on: Load[i] (always)
         - Store[i] depends on: Compute[i] (always)
 
@@ -318,6 +614,10 @@ class NoBubblesScheduler:
 
         if n_ops == 0:
             return self.micro_ops
+
+        # Configure barriers based on logical grid
+        total_logical = self.calculate_total_logical_blocks(ops)
+        self.configure_barriers(n_ops, total_logical)
 
         # Track micro-ops by (op_idx, type) for dependency resolution
         load_ops: Dict[int, MicroOp] = {}
@@ -369,15 +669,9 @@ class NoBubblesScheduler:
             store_ops[i] = store_op
 
             # --- SYNC (if needed) ---
-            if op.needs_block_sync:
-                sync_block = self._new_micro_op(
-                    MicroOpType.SYNC_BLOCK,
-                    i,
-                    f"BlockSync[{i}]",
-                    {store_op.id},
-                )
-                sync_ops.append(sync_block)
-
+            # Note: Block sync via sync_threads() is deprecated.
+            # Fine-grained semaphore synchronization is used instead.
+            # Only global sync (cross-SM barrier) is still supported here.
             if op.needs_global_sync:
                 sync_global = self._new_micro_op(
                     MicroOpType.SYNC_GLOBAL,
@@ -390,52 +684,40 @@ class NoBubblesScheduler:
         return self.micro_ops
 
     def generate_pipeline_schedule(self, ops: List[dict], use_pipeline: bool = True):
-        """Generates the main execution loop schedule (legacy interface).
+        """DEPRECATED: Legacy pipeline schedule generator.
 
-        For backward compatibility. Use generate_dependency_aware_schedule()
-        with OpDescriptors for optimal overlap based on actual dependencies.
+        This method is kept for backward compatibility but the generated schedule
+        is no longer used. All scheduling modes now use fine-grained semaphore
+        synchronization implemented directly in the code generator.
+
+        Note: Synchronization between L/C/S phases is handled via atomic semaphores (sem_load_done, sem_compute_done).
         """
         self.micro_ops.clear()
         self._next_micro_op_id = 0
         n_ops = len(ops)
 
         if not use_pipeline:
-            # Serial Schedule: L -> Sync -> C -> S -> Sync
+            # Serial Schedule: L -> C -> S (sync handled via semaphores)
             for i in range(n_ops):
                 self.add_micro_op(MicroOpType.LOAD, i)
-                if ops[i].get("needs_block_sync", True):
-                    self.add_micro_op(MicroOpType.SYNC_BLOCK, i, "Wait for Load")
-
                 self.add_micro_op(MicroOpType.COMPUTE, i)
                 self.add_micro_op(MicroOpType.STORE, i)
-
-                if ops[i].get("needs_block_sync", True):
-                    self.add_micro_op(MicroOpType.SYNC_BLOCK, i, "Wait for Store")
 
                 if ops[i].get("needs_sync", False):
                     self.add_micro_op(MicroOpType.SYNC_GLOBAL, i)
             return
 
-        # No Bubbles Pipeline Schedule
-        # Prologue: Load[0] -> Sync
+        # No Bubbles Pipeline Schedule (legacy structure, sync via semaphores)
         if n_ops > 0:
             self.add_micro_op(MicroOpType.LOAD, 0, "Prologue")
-            self.add_micro_op(MicroOpType.SYNC_BLOCK, 0)
 
         for i in range(n_ops):
-            # Compute[i]
             self.add_micro_op(MicroOpType.COMPUTE, i)
 
-            # Load[i+1] (Overlapped)
             if i + 1 < n_ops:
                 self.add_micro_op(MicroOpType.LOAD, i + 1, "Prefetch")
 
-            # Store[i]
             self.add_micro_op(MicroOpType.STORE, i)
-
-            # Synchronization Logic
-            if i + 1 < n_ops and ops[i].get("needs_block_sync", True):
-                self.add_micro_op(MicroOpType.SYNC_BLOCK, i)
 
             if ops[i].get("needs_sync", False):
                 self.add_micro_op(MicroOpType.SYNC_GLOBAL, i)
@@ -516,12 +798,45 @@ class NoBubblesScheduler:
         lines.append("=" * 60)
         return "\n".join(lines)
 
-    # ... (rest of methods like allocate_pages kept for future use)
-
 
 # ============================================================================
 # Paged Memory Allocator with Acquire/Release Semantics
 # ============================================================================
+
+
+@dataclass
+class PageSemaphoreConfig:
+    """Configuration for page semaphores in shared memory.
+
+    Each page has two semaphores (following HazyResearch design):
+    - sem_arrived: Loader signals when data is ready, Consumer waits
+    - sem_finished: Consumer signals when done, Loader waits before reusing
+
+    This creates a circular buffer where pages can be reused as soon as
+    the consumer is done, even if the storer is still writing to global memory.
+    """
+
+    num_pages: int
+    # Each semaphore is typically 8 bytes (mbarrier on H100)
+    semaphore_size_bytes: int = 8
+
+    @property
+    def total_semaphores(self) -> int:
+        """Two semaphores per page: arrived + finished."""
+        return self.num_pages * 2
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Total shared memory needed for all semaphores."""
+        return self.total_semaphores * self.semaphore_size_bytes
+
+    def get_arrived_semaphore_idx(self, page_id: int) -> int:
+        """Get index of the 'data arrived' semaphore for a page."""
+        return page_id * 2
+
+    def get_finished_semaphore_idx(self, page_id: int) -> int:
+        """Get index of the 'consumer finished' semaphore for a page."""
+        return page_id * 2 + 1
 
 
 @dataclass
@@ -536,7 +851,13 @@ class PageAllocation:
 
 @dataclass
 class PageAwareMicroOp:
-    """A micro-operation with page allocation information."""
+    """A micro-operation with page allocation and semaphore information.
+
+    Supports the No Bubbles paged memory pattern:
+    - Loader: wait(sem_finished[page]) -> load -> signal(sem_arrived[page])
+    - Consumer: wait(sem_arrived[page]) -> compute -> signal(sem_finished[page])
+    - Storer: (runs after compute, uses output page)
+    """
 
     id: int
     type: MicroOpType
@@ -554,6 +875,18 @@ class PageAwareMicroOp:
 
     # Pages released by this micro-op (for STORE operations)
     releases_pages: List[int] = field(default_factory=list)
+
+    # Semaphore operations (No Bubbles pattern)
+    # List of (semaphore_idx, is_signal) tuples
+    # - wait on sem_finished before loading (page is free)
+    # - signal sem_arrived after loading (data ready)
+    # - wait on sem_arrived before compute (data ready)
+    # - signal sem_finished after compute (page can be reused)
+    sem_waits: List[int] = field(default_factory=list)  # Semaphore indices to wait on
+    sem_signals: List[int] = field(default_factory=list)  # Semaphore indices to signal
+
+    # Warp role that should execute this micro-op (None = all warps)
+    warp_role: Optional[WarpRole] = None
 
     def __hash__(self):
         return self.id
@@ -594,9 +927,8 @@ class PagedMemoryAllocator:
         """Calculate how many pages an operation needs.
 
         For now, we use a simple heuristic: 2 pages for double buffering.
-        In practice, this would be based on the operation's smem requirements.
+        In practice, this would be computed from op.smem_size / page_size_bytes.
         """
-        # Could be extended to use op_desc.smem_per_stage / page_size_bytes
         return 2  # Default: double buffering
 
     def try_acquire(self, op_idx: int, num_pages_needed: int) -> Optional[List[int]]:
@@ -655,6 +987,16 @@ class PageAwareScheduler:
 
     This extends the dependency-aware scheduler to also track when pages
     become available, allowing loads to start as early as possible.
+
+    Enhanced with Logical Block support and page semaphores for the No Bubbles pattern.
+
+    Semaphore Protocol (per page):
+    - sem_arrived[page]: Loader signals after load, Consumer waits before compute
+    - sem_finished[page]: Consumer signals after compute, Loader waits before reusing
+
+    This allows:
+    - Load[N+1] to start as soon as Consumer[N] finishes (not waiting for Store[N])
+    - Maximum overlap between Load, Compute, and Store phases
     """
 
     def __init__(self, config: NoBubblesConfig):
@@ -662,6 +1004,12 @@ class PageAwareScheduler:
         self.allocator = PagedMemoryAllocator(config.num_pages, config.page_size_bytes)
         self.micro_ops: List[PageAwareMicroOp] = []
         self._next_id = 0
+        self.barrier_config: Optional[BarrierConfig] = None
+        self.semaphore_config: Optional[PageSemaphoreConfig] = None
+
+        # Initialize semaphore config
+        if config.num_pages > 0:
+            self.semaphore_config = PageSemaphoreConfig(num_pages=config.num_pages)
 
     def _new_micro_op(
         self,
@@ -672,6 +1020,9 @@ class PageAwareScheduler:
         waits_for_pages: Optional[Set[int]] = None,
         acquires_pages: Optional[List[int]] = None,
         releases_pages: Optional[List[int]] = None,
+        sem_waits: Optional[List[int]] = None,
+        sem_signals: Optional[List[int]] = None,
+        warp_role: Optional[WarpRole] = None,
     ) -> PageAwareMicroOp:
         op = PageAwareMicroOp(
             id=self._next_id,
@@ -682,10 +1033,20 @@ class PageAwareScheduler:
             waits_for_pages=waits_for_pages or set(),
             acquires_pages=acquires_pages or [],
             releases_pages=releases_pages or [],
+            sem_waits=sem_waits or [],
+            sem_signals=sem_signals or [],
+            warp_role=warp_role,
         )
         self._next_id += 1
         self.micro_ops.append(op)
         return op
+
+    def configure_barriers(self, num_ops: int, total_logical_blocks: int):
+        """Configure the barrier tensor for logical block synchronization."""
+        self.barrier_config = BarrierConfig(
+            num_ops=num_ops,
+            total_logical_blocks=total_logical_blocks,
+        )
 
     def generate_page_aware_schedule(self, ops: List[OpDescriptor], pages_per_op: int = 2) -> List[PageAwareMicroOp]:
         """Generate a schedule considering both data deps and page availability.
@@ -709,6 +1070,10 @@ class PageAwareScheduler:
         n_ops = len(ops)
         if n_ops == 0:
             return self.micro_ops
+
+        # Configure barriers for logical blocks
+        total_logical = max((op.logical_grid_size or 1) for op in ops)
+        self.configure_barriers(n_ops, total_logical)
 
         # Track micro-ops by (op_idx, type)
         load_ops: Dict[int, PageAwareMicroOp] = {}
@@ -756,17 +1121,11 @@ class PageAwareScheduler:
             load_ops[i] = load_op
             self.allocator.allocations[i] = PageAllocation(op_idx=i, page_ids=pages or [], acquired_at=load_op.id)
 
-            # --- SYNC after LOAD (if needed) ---
-            last_op_before_compute = load_op
-            if op.needs_block_sync:
-                last_op_before_compute = self._new_micro_op(
-                    MicroOpType.SYNC_BLOCK, i, f"LoadSync[{i}]", depends_on={load_op.id}
-                )
+            # Note: Block sync via sync_threads() is deprecated.
+            # Fine-grained semaphore synchronization is used instead.
 
             # --- COMPUTE[i] ---
-            compute_op = self._new_micro_op(
-                MicroOpType.COMPUTE, i, f"Compute[{i}]", depends_on={last_op_before_compute.id}
-            )
+            compute_op = self._new_micro_op(MicroOpType.COMPUTE, i, f"Compute[{i}]", depends_on={load_op.id})
             compute_ops[i] = compute_op
 
             # --- STORE[i] ---
@@ -782,19 +1141,7 @@ class PageAwareScheduler:
             if i in self.allocator.allocations:
                 self.allocator.allocations[i].released_at = store_op.id
 
-            # NOTE: We do NOT release pages here in the simulation.
-            # Pages remain held by this op until a future op needs them,
-            # at which point the future op will add a dependency on this store.
-            # This correctly models the runtime behavior where:
-            # - Pages are acquired at LOAD
-            # - Pages are held through COMPUTE
-            # - Pages are released at STORE completion
-            # - Next op can only acquire once STORE signals completion
-
-            # --- SYNC after STORE (if needed) ---
-            if op.needs_block_sync:
-                self._new_micro_op(MicroOpType.SYNC_BLOCK, i, f"StoreSync[{i}]", depends_on={store_op.id})
-
+            # Only global sync (cross-SM barrier) is still supported
             if op.needs_global_sync:
                 self._new_micro_op(MicroOpType.SYNC_GLOBAL, i, f"GlobalSync[{i}]", depends_on={store_op.id})
 
@@ -922,6 +1269,11 @@ class PageAwareScheduler:
         lines.append("=" * 70)
         lines.append("Page-Aware Schedule (with page acquire/release)")
         lines.append(f"Total pages: {self.config.num_pages}")
+        if self.barrier_config:
+            lines.append(
+                f"Barrier tensor: {self.barrier_config.num_ops} ops x "
+                f"{self.barrier_config.total_logical_blocks} logical blocks"
+            )
         lines.append("=" * 70)
 
         for op in self.micro_ops:
@@ -955,6 +1307,8 @@ class PageAwareScheduler:
         - Issuing all LOADs as early as possible (up to page limit)
         - Interleaving WAIT_LOAD[i] / COMPUTE[i] with LOAD_ASYNC[i+k]
         - Issuing STORE_ASYNC immediately after COMPUTE
+
+        Uses logical block barriers: Bar[OpIdx][LogicalID] for fine-grained sync.
         """
         n_ops = len(ops)
         if n_ops == 0:
@@ -962,6 +1316,10 @@ class PageAwareScheduler:
 
         total_pages = self.config.num_pages
         max_concurrent = total_pages // pages_per_op
+
+        # Configure barriers for logical blocks
+        total_logical = max((op.logical_grid_size or 1) for op in ops)
+        self.configure_barriers(n_ops, total_logical)
 
         # Track operations
         load_async_ops: Dict[int, PageAwareMicroOp] = {}
@@ -985,16 +1343,11 @@ class PageAwareScheduler:
             )
             wait_load_ops[i] = wait_load_op
 
-            last_op_before_compute = wait_load_op
-            if ops[i].needs_block_sync:
-                last_op_before_compute = self._new_micro_op(
-                    MicroOpType.SYNC_BLOCK, i, f"LoadSync[{i}]", depends_on={wait_load_op.id}
-                )
+            # Note: Block sync via sync_threads() is deprecated.
+            # Fine-grained semaphore synchronization is used instead.
 
             # COMPUTE[i]
-            compute_op = self._new_micro_op(
-                MicroOpType.COMPUTE, i, f"Compute[{i}]", depends_on={last_op_before_compute.id}
-            )
+            compute_op = self._new_micro_op(MicroOpType.COMPUTE, i, f"Compute[{i}]", depends_on={wait_load_op.id})
             compute_ops[i] = compute_op
 
             # STORE_ASYNC[i] - Issue async store immediately
@@ -1008,10 +1361,6 @@ class PageAwareScheduler:
             )
             store_async_ops[i] = store_async_op
             self.allocator.release_events[i] = store_async_op.id
-
-            # Sync after store if needed
-            if ops[i].needs_block_sync:
-                self._new_micro_op(MicroOpType.SYNC_BLOCK, i, f"StoreSync[{i}]", depends_on={store_async_op.id})
 
             # Issue next async load if available
             next_idx = i + max_concurrent
@@ -1067,3 +1416,162 @@ class PageAwareScheduler:
         self._new_micro_op(MicroOpType.COMMIT_GROUP, op_idx, f"CommitGroup[{op_idx}]", depends_on={load_op.id})
 
         return load_op
+
+    def generate_warp_specialized_schedule(
+        self, ops: List[OpDescriptor], pages_per_op: int = 2
+    ) -> List[PageAwareMicroOp]:
+        """Generate schedule with warp specialization and page semaphores.
+
+        This implements the full No Bubbles pattern from HazyResearch:
+
+        Warp Roles:
+        - LOADER warp: wait(sem_finished) -> async_load -> signal(sem_arrived)
+        - CONSUMER warps: wait(sem_arrived) -> compute -> signal(sem_finished)
+        - STORER warp: async_store (after compute signals)
+        - CONTROLLER warp: orchestrates instruction flow
+
+        Semaphore Protocol (per page):
+        - sem_arrived[p]: Loader signals, Consumer waits (data is ready)
+        - sem_finished[p]: Consumer signals, Loader waits (page can be reused)
+
+        This allows maximum overlap:
+        - Load[N+1] can start as soon as Compute[N] finishes (not waiting for Store[N])
+        - Store[N] runs in parallel with Load[N+1] and Compute[N+1]
+        """
+        self.micro_ops.clear()
+        self._next_id = 0
+        self.allocator = PagedMemoryAllocator(self.config.num_pages, self.config.page_size_bytes)
+
+        n_ops = len(ops)
+        if n_ops == 0:
+            return self.micro_ops
+
+        total_pages = self.config.num_pages
+        max_concurrent = total_pages // pages_per_op
+
+        # Configure barriers for logical blocks
+        total_logical = max((op.logical_grid_size or 1) for op in ops)
+        self.configure_barriers(n_ops, total_logical)
+
+        # Ensure semaphore config exists
+        if self.semaphore_config is None:
+            self.semaphore_config = PageSemaphoreConfig(num_pages=total_pages)
+
+        # Data dependencies
+        data_deps = self._compute_data_dependencies(ops)
+
+        # Track operations by type
+        load_ops: Dict[int, PageAwareMicroOp] = {}
+        compute_ops: Dict[int, PageAwareMicroOp] = {}
+        store_ops: Dict[int, PageAwareMicroOp] = {}
+
+        for i, op in enumerate(ops):
+            # Determine which pages this op uses (circular allocation)
+            page_start = (i * pages_per_op) % total_pages
+            pages = [(page_start + j) % total_pages for j in range(pages_per_op)]
+
+            # Calculate semaphore indices for these pages
+            sem_arrived = [self.semaphore_config.get_arrived_semaphore_idx(p) for p in pages]
+            sem_finished = [self.semaphore_config.get_finished_semaphore_idx(p) for p in pages]
+
+            # --- LOADER: wait(sem_finished) -> load -> signal(sem_arrived) ---
+            # For first iteration of each page, sem_finished is pre-initialized to 1
+            # For subsequent uses, we wait for the previous consumer to finish
+            load_deps: Set[int] = set()
+
+            # Data dependencies: wait for stores of ops we read from
+            for dep_idx in data_deps.get(i, set()):
+                if dep_idx in store_ops:
+                    load_deps.add(store_ops[dep_idx].id)
+
+            # Page dependency: if pages were used before, wait for that compute to signal sem_finished
+            prev_user = i - max_concurrent
+            if prev_user >= 0 and prev_user in compute_ops:
+                load_deps.add(compute_ops[prev_user].id)
+
+            load_op = self._new_micro_op(
+                MicroOpType.LOAD_ASYNC,
+                i,
+                f"Load[{i}] pages={pages}",
+                depends_on=load_deps,
+                acquires_pages=pages,
+                sem_waits=sem_finished if prev_user >= 0 else [],  # Wait for page to be free
+                sem_signals=sem_arrived,  # Signal data is ready
+                warp_role=WarpRole.LOADER,
+            )
+            load_ops[i] = load_op
+            self.allocator.allocations[i] = PageAllocation(op_idx=i, page_ids=pages, acquired_at=load_op.id)
+
+            # COMMIT_GROUP (loader warp)
+            self._new_micro_op(
+                MicroOpType.COMMIT_GROUP,
+                i,
+                f"CommitGroup[{i}]",
+                depends_on={load_op.id},
+                warp_role=WarpRole.LOADER,
+            )
+
+            # --- CONSUMER: wait(sem_arrived) -> compute -> signal(sem_finished) ---
+            compute_op = self._new_micro_op(
+                MicroOpType.COMPUTE,
+                i,
+                f"Compute[{i}]",
+                depends_on={load_op.id},  # Structural dependency
+                sem_waits=sem_arrived,  # Wait for data to be ready
+                sem_signals=sem_finished,  # Signal page can be reused
+                warp_role=WarpRole.CONSUMER,
+            )
+            compute_ops[i] = compute_op
+
+            # --- STORER: store output to global memory ---
+            store_op = self._new_micro_op(
+                MicroOpType.STORE_ASYNC,
+                i,
+                f"Store[{i}]",
+                depends_on={compute_op.id},
+                releases_pages=pages,
+                warp_role=WarpRole.STORER,
+            )
+            store_ops[i] = store_op
+            self.allocator.release_events[i] = store_op.id
+
+        return self.micro_ops
+
+    def visualize_warp_schedule(self) -> str:
+        """Visualize the warp-specialized schedule."""
+        lines = []
+        lines.append("=" * 80)
+        lines.append("Warp-Specialized Schedule (No Bubbles)")
+        num_sems = self.semaphore_config.total_semaphores if self.semaphore_config else 0
+        lines.append(f"Pages: {self.config.num_pages}, Semaphores: {num_sems}")
+        if self.barrier_config:
+            lines.append(
+                f"Barriers: {self.barrier_config.num_ops} ops x {self.barrier_config.total_logical_blocks} blocks"
+            )
+        lines.append("=" * 80)
+
+        # Group by warp role
+        by_role: Dict[Optional[WarpRole], List[PageAwareMicroOp]] = {}
+        for op in self.micro_ops:
+            role = op.warp_role
+            if role not in by_role:
+                by_role[role] = []
+            by_role[role].append(op)
+
+        for role in [WarpRole.LOADER, WarpRole.CONSUMER, WarpRole.STORER, None]:
+            if role in by_role:
+                role_name = role.name if role else "ALL"
+                lines.append(f"\n--- {role_name} Warp ---")
+                for op in by_role[role]:
+                    sem_str = ""
+                    if op.sem_waits:
+                        sem_str += f" wait({op.sem_waits})"
+                    if op.sem_signals:
+                        sem_str += f" signal({op.sem_signals})"
+                    pages_str = ""
+                    if op.acquires_pages:
+                        pages_str = f" pages={op.acquires_pages}"
+                    lines.append(f"  {op.id}: {op.type.name}[{op.op_idx}]{pages_str}{sem_str}")
+
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)

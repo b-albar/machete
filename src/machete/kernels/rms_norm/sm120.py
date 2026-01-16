@@ -174,11 +174,6 @@ class RMSNormSM120(SingleKernel, FusableKernel):
     def num_pages(self) -> int:
         return 1
 
-    @property
-    def needs_block_sync(self):
-        """Need sync between load and compute for async copy."""
-        return True
-
     # ========== Shared Memory Helper ==========
 
     @cute.jit

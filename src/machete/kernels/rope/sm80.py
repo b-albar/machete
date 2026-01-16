@@ -38,19 +38,9 @@ class RopeSM80(SingleKernel, FusableKernel):
         SingleKernel.__init__(self, self, self.grid_fn, self.block_fn)
 
     @property
-    def smem_per_stage(self):
-        # We need to store cos/sin in shared memory
-        # 2 elements * half_head_dim * element_size
+    def smem_size(self) -> int:
+        """Shared memory for cos/sin values: 2 * half_head_dim * element_size."""
         return self.half_head_dim * 2 * (self.cute_dtype.width // 8)
-
-    @property
-    def num_stages(self) -> int:
-        return 1
-
-    @property
-    def needs_block_sync(self):
-        # We need block sync between Load (collective) and Compute (all threads use cos/sin)
-        return True
 
     # ========== Forward Pass L/C/S ==========
 

@@ -1,4 +1,3 @@
-# Copyright (c) 2023, Tri Dao.
 # Copyright (c) 2025, Machete Authors.
 """
 Benchmark utilities for measuring kernel performance.

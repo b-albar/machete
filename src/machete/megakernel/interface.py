@@ -1,23 +1,68 @@
 # Copyright (c) 2025, Machete Authors
 from abc import abstractmethod
-from typing import Callable
+from typing import Callable, Tuple
 import cutlass.cute as cute
 
-# Re-export dependency decorators for convenience
-from machete.megakernel.scheduler import reads, writes, independent  # noqa: F401
+# Re-export dependency decorators, warp roles, and scheduler config for convenience
+from machete.megakernel.scheduler import (
+    reads,
+    writes,
+    independent,
+    warp_role,
+    WarpRole,
+    WarpConfig,
+    LogicalCoord,
+    LogicalGridInfo,
+    NoBubblesConfig,
+    PageSemaphoreConfig,
+    BarrierConfig,
+)  # noqa: F401
 
-__all__ = ["reads", "writes", "independent", "machete_op", "MegakernelOp", "FusableOp", "FusableKernel"]
+__all__ = [
+    # Dependency decorators
+    "reads",
+    "writes",
+    "independent",
+    "warp_role",
+    # Warp configuration
+    "WarpRole",
+    "WarpConfig",
+    # Logical blocks
+    "LogicalCoord",
+    "LogicalGridInfo",
+    # Scheduler configuration
+    "NoBubblesConfig",
+    "PageSemaphoreConfig",
+    "BarrierConfig",
+    # Operation classes
+    "machete_op",
+    "MegakernelOp",
+    "FusableOp",
+    "FusableKernel",
+    "WarpSpecializedKernel",
+]
 
 
-def machete_op(num_tensors: int, needs_global_sync: bool = False, smem_per_stage: int = 0, num_stages: int = 1):
-    """Decorator to mark a function or method as a Machete Megakernel operation."""
+def machete_op(num_tensors: int, smem_size: int = 0):
+    """Decorator to mark a function or method as a Machete Megakernel operation.
+
+    Args:
+        num_tensors: Number of tensor arguments the operation expects
+        smem_size: Total shared memory size needed by this operation in bytes.
+                   Page management is handled at the Megakernel level.
+
+    Example:
+        class MyKernel:
+            @machete_op(num_tensors=3, smem_size=16384)
+            @cute.jit
+            def compute(self, input, weight, output):
+                ...
+    """
 
     def decorator(func):
         func._machete_is_op = True
         func._machete_num_tensors = num_tensors
-        func._machete_needs_sync = needs_global_sync
-        func._machete_smem_per_stage = smem_per_stage
-        func._machete_num_stages = num_stages
+        func._machete_smem_size = smem_size
         return func
 
     return decorator
@@ -32,6 +77,10 @@ class MegakernelOp:
     - load(): Load data from global memory to shared memory
     - compute(): Perform computation using shared memory
     - store(): Store results from shared memory back to global memory
+
+    Logical Blocks API (optional):
+    - get_logical_grid_size(): Return total logical blocks for this kernel
+    - get_logical_coord(): Map linear logical_idx to kernel-specific coordinates
     """
 
     @property
@@ -41,19 +90,69 @@ class MegakernelOp:
         pass
 
     @property
-    def needs_global_sync(self) -> bool:
-        """Whether this operation needs a global barrier after its execution."""
-        return False
+    def smem_size(self) -> int:
+        """Shared memory size needed by this operation in bytes.
 
-    @property
-    def smem_per_stage(self) -> int:
-        """Shared memory size needed per page in bytes."""
+        The Megakernel's PagedMemoryAllocator will allocate pages to cover this size.
+        Paging is managed at the Megakernel level, not per-operation.
+        """
         return 0
 
-    @property
-    def num_stages(self) -> int:
-        """Number of pages to allocate for this operation (e.g. 2 for double buffering)."""
+    # ========== Logical Blocks API ==========
+
+    def get_logical_grid_size(self, *args) -> int:
+        """Return the total number of logical blocks for this operation.
+
+        This method should be overridden by kernels that want to use the
+        Logical Blocks abstraction. The default returns 1 (single block).
+
+        Args:
+            *args: Same arguments passed to load/compute/store
+
+        Returns:
+            Total number of logical blocks (units of work)
+
+        Example for RoPE:
+            def get_logical_grid_size(self, batch, seq_len, heads, ...):
+                return batch * (seq_len // self.tile_size) * heads
+        """
         return 1
+
+    def get_logical_coord(self, logical_idx: int, *args) -> Tuple[int, ...]:
+        """Map a linear logical block index to kernel-specific coordinates.
+
+        This method should be overridden by kernels that want to use the
+        Logical Blocks abstraction. The default returns (logical_idx,).
+
+        Args:
+            logical_idx: Linear index in [0, get_logical_grid_size())
+            *args: Same arguments passed to load/compute/store
+
+        Returns:
+            Tuple of coordinates specific to this kernel (e.g., (batch, seq, head))
+
+        Example for RoPE:
+            def get_logical_coord(self, logical_idx, batch, seq_len, heads, ...):
+                h = logical_idx % heads
+                s = (logical_idx // heads) % (seq_len // self.tile_size)
+                b = logical_idx // (heads * (seq_len // self.tile_size))
+                return (b, s, h)
+        """
+        return (logical_idx,)
+
+    def get_logical_grid_info(self, *args) -> LogicalGridInfo:
+        """Return full logical grid information including coordinate names.
+
+        Override this for better debugging and tracing support.
+
+        Returns:
+            LogicalGridInfo with grid size and coordinate dimension info
+        """
+        return LogicalGridInfo(
+            logical_grid_size=self.get_logical_grid_size(*args),
+            coord_names=("idx",),
+            coord_dims=(self.get_logical_grid_size(*args),),
+        )
 
     @cute.jit
     def load(self, paged_pool, page_idx, *args):
@@ -86,37 +185,39 @@ class FusableOp(MegakernelOp):
         self,
         compute_func: Callable,
         num_tensors: int,
-        needs_sync: bool = False,
-        smem_per_stage: int = 0,
-        num_stages: int = 1,
+        smem_size: int = 0,
         load_func: Callable = None,
         store_func: Callable = None,
         launch_func: Callable = None,
+        logical_grid_func: Callable = None,
+        logical_coord_func: Callable = None,
     ):
         self._compute_func = compute_func
         self._load_func = load_func
         self._store_func = store_func
         self._num_tensors = num_tensors
-        self._needs_sync = needs_sync
-        self._smem_per_stage = smem_per_stage
-        self._num_stages = num_stages
+        self._smem_size = smem_size
         self._launch_func = launch_func
+        self._logical_grid_func = logical_grid_func
+        self._logical_coord_func = logical_coord_func
 
     @property
     def num_tensors(self) -> int:
         return self._num_tensors
 
     @property
-    def needs_global_sync(self) -> bool:
-        return self._needs_sync
+    def smem_size(self) -> int:
+        return self._smem_size
 
-    @property
-    def smem_per_stage(self) -> int:
-        return self._smem_per_stage
+    def get_logical_grid_size(self, *args) -> int:
+        if self._logical_grid_func:
+            return self._logical_grid_func(*args)
+        return 1
 
-    @property
-    def num_stages(self) -> int:
-        return self._num_stages
+    def get_logical_coord(self, logical_idx: int, *args) -> Tuple[int, ...]:
+        if self._logical_coord_func:
+            return self._logical_coord_func(logical_idx, *args)
+        return (logical_idx,)
 
     @cute.jit
     def load(self, paged_pool, page_idx, *args):
@@ -143,21 +244,103 @@ class FusableKernel:
     """
     Base class for kernels that support both forward and backward
     passes in a megakernel with Load/Compute/Store phases.
+
+    Supports Logical Blocks abstraction:
+    - Override get_logical_grid_size() to define total work units
+    - Override get_logical_coord() to map linear index to coordinates
+    - Coordinates are passed to L/C/S methods instead of raw block indices
     """
 
     @property
-    def smem_per_stage(self) -> int:
+    def smem_size(self) -> int:
+        """Shared memory size needed by this kernel in bytes.
+
+        The Megakernel's PagedMemoryAllocator will allocate pages to cover this size.
+        Paging/double-buffering is managed at the Megakernel level, not per-kernel.
+        """
         return 0
 
-    @property
-    def num_stages(self) -> int:
+    # ========== Logical Blocks API ==========
+
+    def get_logical_grid_size(self, *args) -> int:
+        """Return the total number of logical blocks for this kernel.
+
+        Override this method to enable the Logical Blocks abstraction.
+        The scheduler will launch with grid_size = max(kernel.get_logical_grid_size())
+        across all fused kernels, and each kernel can interpret the logical_idx
+        differently via get_logical_coord().
+
+        Args:
+            *args: Kernel arguments (tensors, scalars) - same as passed to L/C/S
+
+        Returns:
+            Total number of logical blocks (units of work)
+
+        Example:
+            def get_logical_grid_size(self, input, output, batch, seq_len, heads):
+                chunks_per_seq = seq_len // self.tile_size
+                return batch * chunks_per_seq * heads
+        """
         return 1
+
+    def get_logical_coord(self, logical_idx: int, *args) -> Tuple[int, ...]:
+        """Map a linear logical block index to kernel-specific coordinates.
+
+        Override this method along with get_logical_grid_size() to use the
+        Logical Blocks abstraction. The returned coordinates can represent
+        any kernel-specific decomposition (batch, seq, head, etc.).
+
+        Args:
+            logical_idx: Linear index in [0, get_logical_grid_size())
+            *args: Kernel arguments (tensors, scalars) - same as passed to L/C/S
+
+        Returns:
+            Tuple of coordinates (e.g., (batch_idx, seq_chunk_idx, head_idx))
+
+        Example:
+            def get_logical_coord(self, logical_idx, input, output, batch, seq_len, heads):
+                chunks_per_seq = seq_len // self.tile_size
+                h = logical_idx % heads
+                s = (logical_idx // heads) % chunks_per_seq
+                b = logical_idx // (heads * chunks_per_seq)
+                return (b, s, h)
+        """
+        return (logical_idx,)
+
+    def get_logical_coord_names(self) -> Tuple[str, ...]:
+        """Return names for the logical coordinate dimensions.
+
+        Override this for better debugging and trace visualization.
+
+        Returns:
+            Tuple of coordinate names (e.g., ("batch", "seq_chunk", "head"))
+        """
+        return ("idx",)
+
+    def get_logical_grid_info(self, *args) -> LogicalGridInfo:
+        """Return full logical grid information.
+
+        Returns:
+            LogicalGridInfo with grid size and coordinate metadata
+        """
+        grid_size = self.get_logical_grid_size(*args)
+        return LogicalGridInfo(
+            logical_grid_size=grid_size,
+            coord_names=self.get_logical_coord_names(),
+            coord_dims=(grid_size,),  # Default: 1D grid
+        )
 
     # ========== Forward Pass L/C/S ==========
 
     @cute.jit
     def load_forward(self, paged_pool, page_idx, *args):
-        """Forward load phase (optional)."""
+        """Forward load phase (optional).
+
+        When using Logical Blocks, the megakernel will call:
+            coord = self.get_logical_coord(logical_idx, *args)
+        before calling this method. Access logical coordinates via the
+        coord parameter or by calling get_logical_coord() yourself.
+        """
         pass
 
     @cute.jit
@@ -185,4 +368,161 @@ class FusableKernel:
     @cute.jit
     def store_backward(self, paged_pool, page_idx, *args):
         """Backward store phase (optional)."""
+        pass
+
+
+class WarpSpecializedKernel(FusableKernel):
+    """Base class for kernels that use warp specialization (No Bubbles pattern).
+
+    This class extends FusableKernel with explicit support for warp-specialized
+    execution where different warps execute different roles concurrently:
+    - LOADER warps: Execute load_* methods (Global -> Shared)
+    - CONSUMER warps: Execute compute_* methods (math/MMA operations)
+    - STORER warps: Execute store_* methods (Shared -> Global)
+    - CONTROLLER warp: Manages instruction scheduling
+    - LAUNCHER warp: Handles auxiliary async tasks
+
+    Example usage:
+        class MyWarpSpecializedKernel(WarpSpecializedKernel):
+            TILE_M = 128
+            TILE_N = 128
+
+            @property
+            def warp_config(self) -> WarpConfig:
+                return WarpConfig(num_consumer_warps=12)
+
+            @property
+            def smem_size(self) -> int:
+                return self.TILE_M * self.TILE_N * 2  # fp16
+
+            @warp_role(WarpRole.LOADER)
+            @reads("input", "weight")
+            @cute.jit
+            def load_forward(self, paged_pool, page_idx, smem, input, weight, output):
+                # TMA/cp.async loads - executed by loader warps only
+                ...
+
+            @warp_role(WarpRole.CONSUMER)
+            @writes("output")
+            @cute.jit
+            def compute_forward(self, smem, input, weight, output):
+                # MMA operations - executed by consumer warps only
+                ...
+
+            @warp_role(WarpRole.STORER)
+            @cute.jit
+            def store_forward(self, paged_pool, page_idx, smem, input, weight, output):
+                # TMA stores - executed by storer warps only
+                ...
+
+    The Megakernel runtime will:
+    1. Partition warps according to warp_config
+    2. Generate code that dispatches methods based on warp role
+    3. Use page semaphores for synchronization between roles
+    """
+
+    @property
+    def warp_config(self) -> WarpConfig:
+        """Configuration for warp specialization.
+
+        Override this to customize the warp distribution. Default is H100-optimized
+        with 16 consumer warps and 4 system warps (20 total = 640 threads).
+
+        Returns:
+            WarpConfig specifying warp counts per role
+        """
+        return WarpConfig()
+
+    @property
+    def uses_warp_specialization(self) -> bool:
+        """Whether this kernel uses warp specialization.
+
+        This is always True for WarpSpecializedKernel. The Megakernel
+        runtime uses this to determine scheduling strategy.
+        """
+        return True
+
+    # ========== Page Semaphore Configuration ==========
+
+    @property
+    def num_input_pages(self) -> int:
+        """Number of shared memory pages for input data.
+
+        Used for double/triple buffering of input loads.
+        Default is 2 for double buffering.
+        """
+        return 2
+
+    @property
+    def num_output_pages(self) -> int:
+        """Number of shared memory pages for output data.
+
+        Used for double buffering of output stores.
+        Default is 2 for double buffering.
+        """
+        return 2
+
+    def get_page_semaphore_config(self) -> PageSemaphoreConfig:
+        """Get the page semaphore configuration for this kernel.
+
+        Returns:
+            PageSemaphoreConfig with input/output page counts
+        """
+        return PageSemaphoreConfig(
+            num_input_pages=self.num_input_pages,
+            num_output_pages=self.num_output_pages,
+        )
+
+    # ========== Warp-Role Specific Methods ==========
+    # These methods have default implementations that call the standard L/C/S methods.
+    # Override them directly for fine-grained warp-role control.
+
+    @warp_role(WarpRole.LOADER)
+    @cute.jit
+    def loader_main(self, paged_pool, page_idx, smem, *args):
+        """Main loop for loader warps.
+
+        Default implementation calls load_forward. Override for custom
+        loader behavior (e.g., prefetching, TMA descriptor setup).
+        """
+        self.load_forward(paged_pool, page_idx, smem, *args)
+
+    @warp_role(WarpRole.CONSUMER)
+    @cute.jit
+    def consumer_main(self, smem, *args):
+        """Main loop for consumer warps.
+
+        Default implementation calls compute_forward. Override for custom
+        consumer behavior (e.g., warpgroup MMA scheduling).
+        """
+        self.compute_forward(smem, *args)
+
+    @warp_role(WarpRole.STORER)
+    @cute.jit
+    def storer_main(self, paged_pool, page_idx, smem, *args):
+        """Main loop for storer warps.
+
+        Default implementation calls store_forward. Override for custom
+        storer behavior (e.g., TMA stores, reduction across warps).
+        """
+        self.store_forward(paged_pool, page_idx, smem, *args)
+
+    @warp_role(WarpRole.CONTROLLER)
+    @cute.jit
+    def controller_main(self, instruction_buffer, *args):
+        """Main loop for controller warp.
+
+        Default is no-op. Override for custom instruction scheduling
+        or inter-block coordination.
+        """
+        pass
+
+    @warp_role(WarpRole.LAUNCHER)
+    @cute.jit
+    def launcher_main(self, *args):
+        """Main loop for launcher warp.
+
+        Default is no-op. Override for auxiliary async tasks like
+        K/V cache prefetching or TMA descriptor updates.
+        """
         pass
