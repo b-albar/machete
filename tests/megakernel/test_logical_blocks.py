@@ -18,12 +18,10 @@ from machete.megakernel.scheduler import (
     WarpConfig,
     NoBubblesScheduler,
     NoBubblesConfig,
-    PageAwareScheduler,
     OpDescriptor,
     BarrierConfig,
     reads,
     writes,
-    independent,
     warp_role,
     get_method_dependencies,
     get_method_warp_role,
@@ -133,24 +131,23 @@ class TestBarrierConfig:
 
 
 class TestDependencyDecorators:
-    """Test @reads, @writes, @independent, @warp_role decorators."""
+    """Test @reads, @writes, @warp_role decorators."""
 
     def test_reads_decorator(self):
         @reads("input", "weight")
         def my_func():
             pass
 
-        reads_set, writes_set, is_indep = get_method_dependencies(my_func)
+        reads_set, writes_set = get_method_dependencies(my_func)
         assert reads_set == {"input", "weight"}
         assert writes_set == set()
-        assert not is_indep
 
     def test_writes_decorator(self):
         @writes("output")
         def my_func():
             pass
 
-        reads_set, writes_set, is_indep = get_method_dependencies(my_func)
+        reads_set, writes_set = get_method_dependencies(my_func)
         assert reads_set == set()
         assert writes_set == {"output"}
 
@@ -160,17 +157,9 @@ class TestDependencyDecorators:
         def my_func():
             pass
 
-        reads_set, writes_set, is_indep = get_method_dependencies(my_func)
+        reads_set, writes_set = get_method_dependencies(my_func)
         assert reads_set == {"input"}
         assert writes_set == {"output"}
-
-    def test_independent_decorator(self):
-        @independent()
-        def my_func():
-            pass
-
-        reads_set, writes_set, is_indep = get_method_dependencies(my_func)
-        assert is_indep
 
     def test_warp_role_decorator(self):
         @warp_role(WarpRole.LOADER)
@@ -277,12 +266,12 @@ class TestNoBubblesScheduler:
         assert store_0.id in load_1.depends_on
 
 
-class TestPageAwareScheduler:
-    """Test PageAwareScheduler with logical blocks."""
+class TestNoBubblesSchedulerPaging:
+    """Test NoBubblesScheduler paging and async pipeline."""
 
     def test_async_pipeline_with_logical(self):
         config = NoBubblesConfig(num_pages=8)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=50),
@@ -301,13 +290,10 @@ class TestPageAwareScheduler:
     def test_page_reuse(self):
         """Test that pages are reused when operations complete."""
         config = NoBubblesConfig(num_pages=4)  # Only 4 pages
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         # More ops than can fit in pages at once
-        ops = [
-            OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10)
-            for i in range(4)
-        ]
+        ops = [OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10) for i in range(4)]
 
         micro_ops = scheduler.generate_page_aware_schedule(ops, pages_per_op=2)
 
@@ -328,14 +314,14 @@ class MockFusableKernel:
         return self._logical_grid_size
 
     @reads("input", "weight")
-    def load_forward(self, paged_pool, page_idx, *args):
+    def load_forward(self, paged_pool, page_idx, logical_idx, *args):
         pass
 
     @writes("output")
-    def store_forward(self, paged_pool, page_idx, *args):
+    def store_forward(self, paged_pool, page_idx, logical_idx, *args):
         pass
 
-    def compute_forward(self, *args):
+    def compute_forward(self, logical_idx, *args):
         pass
 
 
@@ -350,7 +336,6 @@ class TestBuildOpDescriptor:
         assert "input" in desc.reads
         assert "weight" in desc.reads
         assert "output" in desc.writes
-        assert desc.needs_block_sync is True
         assert desc.needs_global_sync is False
 
     def test_detects_logical_grid(self):

@@ -70,28 +70,25 @@ class SmemDoubleKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_t, output_t, n):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = input_t[idx]
 
     @writes("smem")
     @cute.jit
-    def compute_forward(self, smem, input_t, output_t, n):
+    def compute_forward(self, logical_idx, smem, input_t, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = smem[tidx] + smem[tidx]  # Double
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_t, output_t, n):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             output_t[idx] = smem[tidx]
 
@@ -113,29 +110,26 @@ class SmemAddScalarKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = input_t[idx]
 
     @reads("scalar")
     @writes("smem")
     @cute.jit
-    def compute_forward(self, smem, input_t, scalar, output_t, n):
+    def compute_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = smem[tidx] + scalar[0]
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             output_t[idx] = smem[tidx]
 
@@ -157,29 +151,26 @@ class SmemMulScalarKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = input_t[idx]
 
     @reads("scalar")
     @writes("smem")
     @cute.jit
-    def compute_forward(self, smem, input_t, scalar, output_t, n):
+    def compute_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             smem[tidx] = smem[tidx] * scalar[0]
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * self.TILE_SIZE + tidx
+        idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
             output_t[idx] = smem[tidx]
 
@@ -206,11 +197,10 @@ class WarpSpecSmemKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.LOADER)
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
         lane = tidx % 32
-        base = bidx * self.TILE_SIZE
+        base = logical_idx * self.TILE_SIZE
         # Loader warp loads all elements
         for i in range(self.TILE_SIZE // 32):
             idx = base + lane + i * 32
@@ -222,12 +212,11 @@ class WarpSpecSmemKernel(WarpSpecializedKernel):
     @reads("scalar")
     @writes("smem")
     @cute.jit
-    def compute_forward(self, smem, input_t, scalar, output_t, n):
+    def compute_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
         warp_id = tidx // 32
         lane = tidx % 32
-        base = bidx * self.TILE_SIZE
+        base = logical_idx * self.TILE_SIZE
         # Each consumer warp handles a portion
         elems_per_warp = self.TILE_SIZE // 4
         start = warp_id * elems_per_warp
@@ -240,11 +229,10 @@ class WarpSpecSmemKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.STORER)
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
         lane = tidx % 32
-        base = bidx * self.TILE_SIZE
+        base = logical_idx * self.TILE_SIZE
         # Storer warp writes all elements
         for i in range(self.TILE_SIZE // 32):
             idx = base + lane + i * 32
@@ -416,9 +404,9 @@ class TestLevel4_ThreeKernelsFused:
         y = torch.zeros(n, dtype=torch.float16, device=cuda_device)
 
         mk = Megakernel(name="l4_three_stage")
-        mk.add(SmemDoubleKernel(), x, t1, n)       # t1 = 1*2 = 2
+        mk.add(SmemDoubleKernel(), x, t1, n)  # t1 = 1*2 = 2
         mk.add(SmemAddScalarKernel(), t1, a, t2, n)  # t2 = 2+1 = 3
-        mk.add(SmemMulScalarKernel(), t2, b, y, n)   # y = 3*2 = 6
+        mk.add(SmemMulScalarKernel(), t2, b, y, n)  # y = 3*2 = 6
         mk.launch_logical(block=(256, 1, 1))
 
         expected = torch.full((n,), 6.0, dtype=torch.float16, device=cuda_device)
@@ -439,10 +427,10 @@ class TestLevel4_ThreeKernelsFused:
         y = torch.zeros(n, dtype=torch.float16, device=cuda_device)
 
         mk = Megakernel(name="l4_four_stage")
-        mk.add(SmemDoubleKernel(), x, t1, n)        # t1 = 1*2 = 2
+        mk.add(SmemDoubleKernel(), x, t1, n)  # t1 = 1*2 = 2
         mk.add(SmemMulScalarKernel(), t1, a, t2, n)  # t2 = 2*3 = 6
         mk.add(SmemAddScalarKernel(), t2, b, t3, n)  # t3 = 6+2 = 8
-        mk.add(SmemMulScalarKernel(), t3, c, y, n)   # y = 8*0.5 = 4
+        mk.add(SmemMulScalarKernel(), t3, c, y, n)  # y = 8*0.5 = 4
         mk.launch_logical(block=(256, 1, 1))
 
         expected = torch.full((n,), 4.0, dtype=torch.float16, device=cuda_device)
@@ -587,8 +575,7 @@ class TestLevel7_StressAndRace:
             mk.launch_logical(block=(256, 1, 1))
 
             expected = x * 2 * s[0]
-            torch.testing.assert_close(y, expected, rtol=1e-3, atol=1e-3,
-                                       msg=f"Failed on iteration {i}")
+            torch.testing.assert_close(y, expected, rtol=1e-3, atol=1e-3, msg=f"Failed on iteration {i}")
 
     def test_alternating_kernels(self, cuda_device):
         """Alternate between different kernel types."""
@@ -751,8 +738,7 @@ class TestTraceExport:
         kernel = WarpSpecSmemKernel()
         mk = Megakernel(name="trace_warp_smem")
         mk.add(kernel, x, s, y, n)
-        mk.launch_logical(block=(kernel.warp_config.total_threads, 1, 1),
-                          trace_file=trace_file)
+        mk.launch_logical(block=(kernel.warp_config.total_threads, 1, 1), trace_file=trace_file)
 
         from pathlib import Path
 

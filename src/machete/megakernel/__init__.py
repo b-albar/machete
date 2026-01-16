@@ -45,7 +45,6 @@ from .interface import (
     # Dependency decorators
     reads,
     writes,
-    independent,
     warp_role,
     # Warp configuration
     WarpRole,
@@ -57,6 +56,9 @@ from .interface import (
     NoBubblesConfig,
     PageSemaphoreConfig,
     BarrierConfig,
+    # Scheduling modes for mixed kernel support
+    SchedulingMode,
+    MixedModeScheduler,
 )
 
 # Utilities
@@ -74,7 +76,6 @@ __all__ = [
     # Dependency decorators
     "reads",
     "writes",
-    "independent",
     "warp_role",
     # Warp configuration
     "WarpRole",
@@ -86,6 +87,9 @@ __all__ = [
     "NoBubblesConfig",
     "PageSemaphoreConfig",
     "BarrierConfig",
+    # Scheduling modes for mixed kernel support
+    "SchedulingMode",
+    "MixedModeScheduler",
     # Utilities
     "nanosleep",
 ]

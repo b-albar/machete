@@ -5,25 +5,43 @@ import cutlass.cute as cute
 
 # Re-export dependency decorators, warp roles, and scheduler config for convenience
 from machete.megakernel.scheduler import (
+    # Basic dependency decorators
     reads,
     writes,
-    independent,
     warp_role,
+    # Cross-kernel scheduling decorators
+    async_load,
+    prefetchable,
+    depends_on,
+    # Warp configuration
     WarpRole,
     WarpConfig,
+    # Logical blocks
     LogicalCoord,
     LogicalGridInfo,
+    # Scheduler configuration
     NoBubblesConfig,
     PageSemaphoreConfig,
     BarrierConfig,
+    # Cross-kernel dependency types
+    DependencyGranularity,
+    InterOpDependency,
+    GlobalBarrierTensor,
+    PrefetchDescriptor,
+    # Scheduling modes for mixed kernel support
+    SchedulingMode,
+    MixedModeScheduler,
 )  # noqa: F401
 
 __all__ = [
-    # Dependency decorators
+    # Basic dependency decorators
     "reads",
     "writes",
-    "independent",
     "warp_role",
+    # Cross-kernel scheduling decorators
+    "async_load",
+    "prefetchable",
+    "depends_on",
     # Warp configuration
     "WarpRole",
     "WarpConfig",
@@ -34,6 +52,14 @@ __all__ = [
     "NoBubblesConfig",
     "PageSemaphoreConfig",
     "BarrierConfig",
+    # Cross-kernel dependency types
+    "DependencyGranularity",
+    "InterOpDependency",
+    "GlobalBarrierTensor",
+    "PrefetchDescriptor",
+    # Scheduling modes for mixed kernel support
+    "SchedulingMode",
+    "MixedModeScheduler",
     # Operation classes
     "machete_op",
     "MegakernelOp",
@@ -155,20 +181,39 @@ class MegakernelOp:
         )
 
     @cute.jit
-    def load(self, paged_pool, page_idx, *args):
-        """Load phase: move data from global memory to shared memory."""
-        pass  # Default no-op
+    def load(self, paged_pool, page_idx, logical_idx, *args):
+        """Load phase: move data from global memory to shared memory.
+
+        Args:
+            paged_pool: Shared memory pool
+            page_idx: Index of the current page in the pool
+            logical_idx: The global logical block index (use this for offsets!)
+            *args: Remaining operation arguments
+        """
+        pass
 
     @abstractmethod
     @cute.jit
-    def compute(self, *args, **kwargs):
-        """Compute phase: perform the operation logic."""
+    def compute(self, logical_idx, *args, **kwargs):
+        """Compute phase: perform the operation logic.
+
+        Args:
+            logical_idx: The global logical block index
+            *args: Operation arguments
+        """
         pass
 
     @cute.jit
-    def store(self, paged_pool, page_idx, *args):
-        """Store phase: move results from shared memory to global memory."""
-        pass  # Default no-op
+    def store(self, paged_pool, page_idx, logical_idx, *args):
+        """Store phase: move results from shared memory to global memory.
+
+        Args:
+            paged_pool: Shared memory pool
+            page_idx: Index of the current page
+            logical_idx: Global logical block index
+            *args: Remaining arguments
+        """
+        pass
 
     @abstractmethod
     def launch(self, *args, **kwargs):
@@ -220,16 +265,16 @@ class FusableOp(MegakernelOp):
         return (logical_idx,)
 
     @cute.jit
-    def load(self, paged_pool, page_idx, *args):
+    def load(self, paged_pool, page_idx, logical_idx, *args):
         # Default no-op, subclasses override if needed
         pass
 
     @cute.jit
-    def compute(self, *args, **kwargs):
-        self._compute_func(*args, **kwargs)
+    def compute(self, logical_idx, *args, **kwargs):
+        self._compute_func(logical_idx, *args, **kwargs)
 
     @cute.jit
-    def store(self, paged_pool, page_idx, *args):
+    def store(self, paged_pool, page_idx, logical_idx, *args):
         # Default no-op, subclasses override if needed
         pass
 
@@ -333,40 +378,34 @@ class FusableKernel:
     # ========== Forward Pass L/C/S ==========
 
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, *args):
-        """Forward load phase (optional).
-
-        When using Logical Blocks, the megakernel will call:
-            coord = self.get_logical_coord(logical_idx, *args)
-        before calling this method. Access logical coordinates via the
-        coord parameter or by calling get_logical_coord() yourself.
-        """
+    def load_forward(self, paged_pool, page_idx, logical_idx, *args):
+        """Forward load phase (optional)."""
         pass
 
     @cute.jit
-    def compute_forward(self, *args, **kwargs):
+    def compute_forward(self, logical_idx, *args, **kwargs):
         """Forward pass compute logic."""
         pass
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, *args):
+    def store_forward(self, paged_pool, page_idx, logical_idx, *args):
         """Forward store phase (optional)."""
         pass
 
     # ========== Backward Pass L/C/S ==========
 
     @cute.jit
-    def load_backward(self, paged_pool, page_idx, *args):
+    def load_backward(self, paged_pool, page_idx, logical_idx, *args):
         """Backward load phase (optional)."""
         pass
 
     @cute.jit
-    def compute_backward(self, *args, **kwargs):
+    def compute_backward(self, logical_idx, *args, **kwargs):
         """Backward pass compute logic."""
         pass
 
     @cute.jit
-    def store_backward(self, paged_pool, page_idx, *args):
+    def store_backward(self, paged_pool, page_idx, logical_idx, *args):
         """Backward store phase (optional)."""
         pass
 

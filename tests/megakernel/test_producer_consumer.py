@@ -17,7 +17,7 @@ from machete.megakernel.interface import FusableKernel, reads, writes, LogicalGr
 from machete.megakernel.scheduler import (
     NoBubblesScheduler,
     NoBubblesConfig,
-    PageAwareScheduler,
+    NoBubblesScheduler,
     OpDescriptor,
     MicroOpType,
 )
@@ -133,7 +133,7 @@ class TestProducerConsumerScheduling:
             logical_grid_size=100,
         )
 
-        micro_ops = scheduler.generate_dependency_aware_schedule([producer, consumer])
+        micro_ops = scheduler.generate_page_aware_schedule([producer, consumer])
 
         # Find key operations
         producer_store = next(
@@ -170,7 +170,7 @@ class TestProducerConsumerScheduling:
             logical_grid_size=50,
         )
 
-        micro_ops = scheduler.generate_dependency_aware_schedule([op1, op2])
+        micro_ops = scheduler.generate_page_aware_schedule([op1, op2])
 
         # Get parallelizable groups (waves)
         waves = scheduler.get_parallelizable_groups()
@@ -205,7 +205,7 @@ class TestProducerConsumerScheduling:
             OpDescriptor(name="Op2", op_idx=2, logical_grid_size=75),
         ]
 
-        scheduler.generate_dependency_aware_schedule(ops)
+        scheduler.generate_page_aware_schedule(ops)
 
         # Barrier should be sized for max logical blocks
         assert scheduler.barrier_config is not None
@@ -220,7 +220,7 @@ class TestPagedScheduling:
     def test_async_pipeline_schedule(self):
         """Test async pipeline generates correct micro-ops."""
         config = NoBubblesConfig(num_pages=8)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(
@@ -253,7 +253,7 @@ class TestPagedScheduling:
     def test_page_acquire_release(self):
         """Test that pages are properly acquired and released."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=50),
@@ -277,7 +277,7 @@ class TestPagedScheduling:
     def test_overlapped_schedule(self):
         """Test overlapped scheduling maximizes parallelism."""
         config = NoBubblesConfig(num_pages=6)  # Enough for 3 ops at 2 pages each
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=20)
@@ -331,7 +331,7 @@ class TestMultiOperationPipeline:
             logical_grid_size=100,
         )
 
-        micro_ops = scheduler.generate_dependency_aware_schedule([op_a, op_b, op_c])
+        micro_ops = scheduler.generate_page_aware_schedule([op_a, op_b, op_c])
 
         # Verify dependency chain
         load_b = next(op for op in micro_ops if op.op_idx == 1 and op.type == MicroOpType.LOAD)
@@ -354,7 +354,7 @@ class TestMultiOperationPipeline:
         op_c = OpDescriptor(name="C", op_idx=2, reads={"out_a"}, writes={"out_c"}, logical_grid_size=50)
         op_d = OpDescriptor(name="D", op_idx=3, reads={"out_b", "out_c"}, writes={"final"}, logical_grid_size=50)
 
-        micro_ops = scheduler.generate_dependency_aware_schedule([op_a, op_b, op_c, op_d])
+        micro_ops = scheduler.generate_page_aware_schedule([op_a, op_b, op_c, op_d])
 
         # Find relevant operations
         load_d = next(op for op in micro_ops if op.op_idx == 3 and op.type == MicroOpType.LOAD)
@@ -375,7 +375,7 @@ class TestMultiOperationPipeline:
             OpDescriptor(name="C", op_idx=2, reads={"y"}, writes={"z"}, logical_grid_size=10),
         ]
 
-        scheduler.generate_dependency_aware_schedule(ops)
+        scheduler.generate_page_aware_schedule(ops)
         sorted_ops = scheduler.topological_sort()
 
         # Verify ordering: all dependencies come before dependents
@@ -401,7 +401,7 @@ class TestVisualization:
             OpDescriptor(name="Op1", op_idx=1, reads={"C"}, writes={"D"}, logical_grid_size=10),
         ]
 
-        scheduler.generate_dependency_aware_schedule(ops)
+        scheduler.generate_page_aware_schedule(ops)
         viz = scheduler.visualize_schedule()
 
         assert "Wave" in viz
@@ -412,7 +412,7 @@ class TestVisualization:
     def test_visualize_page_schedule(self):
         """Test page-aware schedule visualization."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10),

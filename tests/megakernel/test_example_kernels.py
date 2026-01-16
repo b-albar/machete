@@ -74,18 +74,17 @@ class AddKernel(FusableKernel):
 
     @reads("input", "bias")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, input_tensor, bias, output_tensor):
+    def load_forward(self, paged_pool, page_idx, logical_idx, input_tensor, bias, output_tensor):
         """Load phase - no-op for this kernel (direct global memory access)."""
         pass
 
     @writes("output")
     @cute.jit
-    def compute_forward(self, input_tensor, bias, output_tensor):
+    def compute_forward(self, logical_idx, input_tensor, bias, output_tensor):
         """Compute: output = input + bias."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
-        tile_start = bidx * self.TILE_SIZE
+        tile_start = logical_idx * self.TILE_SIZE
         elem_idx = tile_start + tidx
 
         total_elements = input_tensor.size()
@@ -95,7 +94,7 @@ class AddKernel(FusableKernel):
             output_tensor[elem_idx] = val + b
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, input_tensor, bias, output_tensor):
+    def store_forward(self, paged_pool, page_idx, logical_idx, input_tensor, bias, output_tensor):
         """Store phase - no-op (results written directly in compute)."""
         pass
 
@@ -144,22 +143,21 @@ class MulKernel(FusableKernel):
 
     @reads("input", "scale")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, input_tensor, scale, output_tensor, batch_size: int = 1):
+    def load_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scale, output_tensor, batch_size: int = 1):
         pass
 
     @writes("output")
     @cute.jit
-    def compute_forward(self, input_tensor, scale, output_tensor, batch_size: int = 1):
+    def compute_forward(self, logical_idx, input_tensor, scale, output_tensor, batch_size: int = 1):
         """Compute: output = input * scale."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
         total_elements = input_tensor.size()
         elements_per_batch = total_elements // batch_size
         chunks_per_batch = (elements_per_batch + self.TILE_SIZE - 1) // self.TILE_SIZE
 
-        batch_idx = bidx // chunks_per_batch
-        chunk_idx = bidx % chunks_per_batch
+        batch_idx = logical_idx // chunks_per_batch
+        chunk_idx = logical_idx % chunks_per_batch
 
         tile_start = batch_idx * elements_per_batch + chunk_idx * self.TILE_SIZE
         elem_idx = tile_start + tidx
@@ -171,7 +169,7 @@ class MulKernel(FusableKernel):
             output_tensor[elem_idx] = val * s
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, input_tensor, scale, output_tensor, batch_size: int = 1):
+    def store_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scale, output_tensor, batch_size: int = 1):
         pass
 
     def grid_fn(self, input_tensor, scale, output_tensor, batch_size: int = 1):
@@ -229,13 +227,23 @@ class RoPEExampleKernel(FusableKernel):
     @reads("cos", "sin")
     @cute.jit
     def load_forward(
-        self, paged_pool, page_idx, smem, q_tensor, k_tensor, cos, sin, batch: int, seq_len: int, num_heads: int
+        self,
+        paged_pool,
+        page_idx,
+        logical_idx,
+        smem,
+        q_tensor,
+        k_tensor,
+        cos,
+        sin,
+        batch: int,
+        seq_len: int,
+        num_heads: int,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
         seq_chunks = (seq_len + self.TILE_SIZE - 1) // self.TILE_SIZE
-        seq_chunk_idx = (bidx // num_heads) % seq_chunks
+        seq_chunk_idx = (logical_idx // num_heads) % seq_chunks
 
         half_dim = self.head_dim // 2
         if tidx < half_dim:
@@ -246,14 +254,15 @@ class RoPEExampleKernel(FusableKernel):
 
     @writes("q", "k")
     @cute.jit
-    def compute_forward(self, smem, q_tensor, k_tensor, cos, sin, batch: int, seq_len: int, num_heads: int):
+    def compute_forward(
+        self, logical_idx, smem, q_tensor, k_tensor, cos, sin, batch: int, seq_len: int, num_heads: int
+    ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
         seq_chunks = (seq_len + self.TILE_SIZE - 1) // self.TILE_SIZE
-        head_idx = bidx % num_heads
-        seq_chunk_idx = (bidx // num_heads) % seq_chunks
-        batch_idx = bidx // (num_heads * seq_chunks)
+        head_idx = logical_idx % num_heads
+        seq_chunk_idx = (logical_idx // num_heads) % seq_chunks
+        batch_idx = logical_idx // (num_heads * seq_chunks)
 
         seq_pos = seq_chunk_idx * self.TILE_SIZE + (tidx // self.head_dim)
         dim_idx = tidx % self.head_dim
@@ -283,7 +292,18 @@ class RoPEExampleKernel(FusableKernel):
 
     @cute.jit
     def store_forward(
-        self, paged_pool, page_idx, smem, q_tensor, k_tensor, cos, sin, batch: int, seq_len: int, num_heads: int
+        self,
+        paged_pool,
+        page_idx,
+        logical_idx,
+        smem,
+        q_tensor,
+        k_tensor,
+        cos,
+        sin,
+        batch: int,
+        seq_len: int,
+        num_heads: int,
     ):
         pass
 
@@ -331,11 +351,10 @@ class WarpSpecializedAddMul(WarpSpecializedKernel):
     @warp_role(WarpRole.LOADER)
     @reads("input", "bias", "scale")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_tensor, bias, scale, output_tensor):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, bias, scale, output_tensor):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
-        tile_start = bidx * self.TILE_SIZE
+        tile_start = logical_idx * self.TILE_SIZE
         lane_in_warp = tidx % 32
 
         elements_per_thread = self.TILE_SIZE // 32
@@ -348,14 +367,13 @@ class WarpSpecializedAddMul(WarpSpecializedKernel):
     @warp_role(WarpRole.CONSUMER)
     @writes("output")
     @cute.jit
-    def compute_forward(self, smem, input_tensor, bias, scale, output_tensor):
+    def compute_forward(self, logical_idx, smem, input_tensor, bias, scale, output_tensor):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
 
         warp_id = tidx // 32
         lane_in_warp = tidx % 32
 
-        tile_start = bidx * self.TILE_SIZE
+        tile_start = logical_idx * self.TILE_SIZE
         total_elements = input_tensor.size()
 
         elements_per_warp = (self.TILE_SIZE + 11) // 12
@@ -373,7 +391,7 @@ class WarpSpecializedAddMul(WarpSpecializedKernel):
 
     @warp_role(WarpRole.STORER)
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_tensor, bias, scale, output_tensor):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, bias, scale, output_tensor):
         pass
 
     def grid_fn(self, input_tensor, bias, scale, output_tensor):

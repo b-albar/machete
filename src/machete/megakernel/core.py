@@ -9,11 +9,19 @@ from typing import Callable, Union
 from machete.megakernel.interface import FusableKernel, MegakernelOp, FusableOp, WarpSpecializedKernel
 from machete.megakernel.scheduler import (
     NoBubblesConfig,
-    PageAwareScheduler,
+    NoBubblesScheduler,
     MicroOpType,
     OpDescriptor,
     build_op_descriptor_from_kernel,
     BarrierConfig,
+    SequentialScheduler,
+    ReductionBarrierConfig,
+    DimensionMapping,
+    InterOpDependency,
+    DependencyGranularity,
+    SchedulingMode,
+    MixedModeScheduler,
+    CodeGenContext,
 )
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -25,24 +33,28 @@ logger = logging.getLogger(__name__)
 
 # TRACING CONFIGURATION - L/C/S phases plus page management
 TRACING_PHASES = {
-    MicroOpType.LOAD: TraceType("LOAD", "L-{0}", "Load phase for Op {0}", param_count=1),
-    MicroOpType.COMPUTE: TraceType("COMPUTE", "C-{0}", "Compute phase for Op {0}", param_count=1),
-    MicroOpType.STORE: TraceType("STORE", "S-{0}", "Store phase for Op {0}", param_count=1),
+    MicroOpType.LOAD: TraceType("LOAD", "LOAD-{0}", "Load phase for Op {0}", param_count=1),
+    MicroOpType.COMPUTE: TraceType("COMPUTE", "COMP-{0}", "Compute phase for Op {0}", param_count=1),
+    MicroOpType.STORE: TraceType("STORE", "STORE-{0}", "Store phase for Op {0}", param_count=1),
 }
 
 # Additional trace types for page management (No Bubbles pattern)
 PAGE_TRACE_TYPES = {
-    "ACQUIRE_WAIT": TraceType("ACQUIRE_WAIT", "AW-{0}", "Waiting for pages (Op {0})", param_count=1),
-    "ACQUIRE_DONE": TraceType("ACQUIRE_DONE", "AD-{0},{1}", "Acquired pages {1} for Op {0}", param_count=2),
-    "RELEASE": TraceType("RELEASE", "RL-{0},{1}", "Released pages {1} for Op {0}", param_count=2),
+    "ACQUIRE_WAIT": TraceType("ACQUIRE_WAIT", "WAIT_PAGE-{0}", "Waiting for pages (Op {0})", param_count=1),
+    "ACQUIRE_DONE": TraceType("ACQUIRE_DONE", "ACQ_PAGE-{0},{1}", "Acquired pages {1} for Op {0}", param_count=2),
+    "RELEASE": TraceType("RELEASE", "REL_PAGE-{0},{1}", "Released pages {1} for Op {0}", param_count=2),
 }
 
 # Trace types for fine-grained semaphore synchronization (debugging)
 SYNC_TRACE_TYPES = {
-    "SEM_WAIT_LOAD": TraceType("SEM_WAIT_LOAD", "WL-{0}", "Wait load sem (Op {0})", param_count=1),
-    "SEM_WAIT_COMPUTE": TraceType("SEM_WAIT_COMPUTE", "WC-{0}", "Wait compute sem (Op {0})", param_count=1),
-    "SEM_SIGNAL_LOAD": TraceType("SEM_SIGNAL_LOAD", "SL-{0}", "Signal load done (Op {0})", param_count=1),
-    "SEM_SIGNAL_COMPUTE": TraceType("SEM_SIGNAL_COMPUTE", "SC-{0}", "Signal compute done (Op {0})", param_count=1),
+    "SEM_WAIT_LOAD": TraceType("SEM_WAIT_LOAD", "WAIT_LOAD-{0}", "Wait load sem (Op {0})", param_count=1),
+    "SEM_WAIT_COMPUTE": TraceType("SEM_WAIT_COMPUTE", "WAIT_COMP-{0}", "Wait compute sem (Op {0})", param_count=1),
+    "SEM_WAIT_FINISHED": TraceType("SEM_WAIT_FINISHED", "WAIT_FIN-{0}", "Wait finished sem (Op {0})", param_count=1),
+    "SEM_SIGNAL_LOAD": TraceType("SEM_SIGNAL_LOAD", "SIG_LOAD-{0}", "Signal load done (Op {0})", param_count=1),
+    "SEM_SIGNAL_COMPUTE": TraceType(
+        "SEM_SIGNAL_COMPUTE", "SIG_COMP-{0}", "Signal compute done (Op {0})", param_count=1
+    ),
+    "SEM_SIGNAL_FINISHED": TraceType("SEM_SIGNAL_FINISHED", "SIG_FIN-{0}", "Signal finished (Op {0})", param_count=1),
 }
 
 # Workaround for TVM-FFI bug (Python < 3.13) with positional arguments in __init__
@@ -110,6 +122,10 @@ class Megakernel:
         self._use_logical_blocks = False
         self._total_logical_blocks = 1
         self._barrier_config: BarrierConfig = None
+
+        # Reduction barrier configuration (for many-to-one dependencies)
+        self._reduction_barrier_config: ReductionBarrierConfig = None
+        self._reduction_barrier = None  # Torch tensor at runtime
 
     def add(self, op: Union[FusableKernel, MegakernelOp, Callable], *args):
         """Add an operation and its arguments to the megakernel."""
@@ -200,6 +216,83 @@ class Megakernel:
         self._use_logical_blocks = False
         self._total_logical_blocks = 1
         self._barrier_config = None
+        self._reduction_barrier_config = None
+        self._reduction_barrier = None
+
+    def add_reduction_dependency(
+        self,
+        producer_op_idx: int,
+        consumer_op_idx: int,
+        producer_dims: tuple,
+        consumer_dims: tuple,
+    ):
+        """Register a reduction dependency between operations.
+
+        This is used when a consumer operation has fewer logical blocks than
+        its producer (many-to-one pattern). The consumer must wait for ALL
+        producer blocks that map to it.
+
+        Args:
+            producer_op_idx: Index of the producer operation
+            consumer_op_idx: Index of the consumer operation
+            producer_dims: Shape of producer's logical grid (e.g., (batch, head, seq))
+            consumer_dims: Shape of consumer's logical grid (e.g., (batch, head))
+
+        Example:
+            # Attention (batch=2, head=8, seq=512) -> Output proj (batch=2, head=8)
+            megakernel.add_reduction_dependency(
+                producer_op_idx=0,  # attention
+                consumer_op_idx=1,  # output_proj
+                producer_dims=(2, 8, 512),
+                consumer_dims=(2, 8),
+            )
+            # Consumer block 0 (batch=0, head=0) waits for 512 producer blocks
+        """
+        if self._reduction_barrier_config is None:
+            self._reduction_barrier_config = ReductionBarrierConfig()
+
+        dim_mapping = DimensionMapping(
+            producer_dims=producer_dims,
+            consumer_dims=consumer_dims,
+        )
+
+        if not dim_mapping.is_reduction:
+            logger.warning(
+                "add_reduction_dependency called but dims don't form a reduction: "
+                "producer=%s, consumer=%s",
+                producer_dims,
+                consumer_dims,
+            )
+            return
+
+        self._reduction_barrier_config.add_reduction(
+            producer_op_idx=producer_op_idx,
+            consumer_op_idx=consumer_op_idx,
+            dim_mapping=dim_mapping,
+        )
+
+        # Store reduction info in instructions for code generation
+        if producer_op_idx < len(self.instructions):
+            self.instructions[producer_op_idx].setdefault("reduction_signals", []).append({
+                "consumer_op_idx": consumer_op_idx,
+                "dim_mapping": dim_mapping,
+            })
+
+        if consumer_op_idx < len(self.instructions):
+            self.instructions[consumer_op_idx]["reduction_wait"] = {
+                "producer_op_idx": producer_op_idx,
+                "dim_mapping": dim_mapping,
+                "wait_count": dim_mapping.blocks_per_consumer,
+            }
+
+        logger.debug(
+            "Added reduction dependency: op[%d] (%s) -> op[%d] (%s), wait_count=%d",
+            producer_op_idx,
+            producer_dims,
+            consumer_op_idx,
+            consumer_dims,
+            dim_mapping.blocks_per_consumer,
+        )
 
     def _calculate_logical_blocks(self) -> int:
         """Calculate TotalLogicalBlocks = max(op.get_logical_grid_size()) across all ops.
@@ -287,14 +380,18 @@ class Megakernel:
         return bindings
 
     def _generate_kernel_ops(self, mapping, traced: bool) -> list:
-        """Generate the kernel operation code (allocations + scheduling)."""
+        """Generate the kernel operation code (allocations + scheduling).
+
+        Uses MixedModeScheduler to handle heterogeneous kernel types,
+        allowing each operation to use its optimal scheduling mode.
+        """
         ops = ["        smem_alloc = cutlass.utils.SmemAllocator()"]
 
         # Paged pool allocation
         if self.paged_pool_bytes > 0:
             ops.append(f"        # Paged pool for No Bubbles: {self.paged_pool_bytes} bytes ({self.num_stages} pages)")
             ops.append(
-                f"        paged_pool = smem_alloc.allocate_tensor("
+                "        paged_pool = smem_alloc.allocate_tensor("
                 f"cute.Uint8, cute.make_layout({self.paged_pool_bytes}))"
             )
         else:
@@ -304,20 +401,59 @@ class Megakernel:
         # Per-op smem tensor allocations
         ops.extend(self._generate_smem_allocations())
 
-        # Check if any kernel uses warp specialization
-        uses_warp_spec = any(inst.get("uses_warp_specialization", False) for inst in self.instructions)
-
-        # Generate schedule
+        # Generate schedule using MixedModeScheduler
         ops.append("        # Generate Schedule")
-
-        if uses_warp_spec:
-            ops.extend(self._generate_warp_specialized_schedule(mapping, traced))
-        elif self.paged_pool_bytes > 0 and self.num_stages >= 2:
-            ops.extend(self._generate_page_aware_schedule(mapping, traced))
-        else:
-            ops.extend(self._generate_simple_schedule(mapping, traced))
+        ops.extend(self._generate_mixed_mode_schedule(mapping, traced))
 
         return ops
+
+    def _generate_mixed_mode_schedule(self, mapping, traced: bool) -> list:
+        """Generate schedule using MixedModeScheduler for heterogeneous kernel support.
+
+        Each operation is scheduled according to its optimal mode:
+        - SEQUENTIAL: Simple L->C->S, all threads participate
+        - ASYNC: Async loads with overlapped phases
+        - WARP_SPECIALIZED: Dedicated warps for L/C/S roles
+
+        Mode transitions are automatically handled with proper synchronization.
+        """
+        # Build operation descriptors with scheduling modes
+        op_descs = self._build_op_descriptors()
+
+        # Check if we have mixed modes or should use legacy path
+        modes = {desc.scheduling_mode for desc in op_descs}
+
+        # For backward compatibility, use legacy generators for single-mode cases
+        # This ensures existing tests pass while we transition
+        if len(modes) == 1:
+            mode = modes.pop()
+            if mode == SchedulingMode.WARP_SPECIALIZED:
+                return self._generate_warp_specialized_schedule(mapping, traced)
+            elif self.paged_pool_bytes > 0 and self.num_stages >= 2:
+                return self._generate_page_aware_schedule(mapping, traced)
+            else:
+                return self._generate_simple_schedule(mapping, traced)
+
+        # Mixed modes: use MixedModeScheduler
+        config = NoBubblesConfig(num_pages=max(1, self.num_stages))
+        scheduler = MixedModeScheduler(config)
+
+        # Create code generation context
+        ctx = CodeGenContext(
+            instructions=self.instructions,
+            mapping=mapping,
+            traced=traced,
+            paged_pool_bytes=self.paged_pool_bytes,
+            num_stages=self.num_stages,
+            make_smem_arg_getter=self._make_smem_arg_getter,
+            emit_trace_start=self._emit_trace_start if traced else None,
+            emit_trace_end=self._emit_trace_end if traced else None,
+            tracing_phases=TRACING_PHASES if traced else None,
+            sync_trace_types=SYNC_TRACE_TYPES if traced else None,
+            reduction_barrier_config=self._reduction_barrier_config,
+        )
+
+        return scheduler.generate_schedule(ctx, op_descs)
 
     def _generate_smem_allocations(self) -> list:
         """Generate per-op shared memory tensor allocations."""
@@ -370,7 +506,7 @@ class Megakernel:
 
         # Build schedule
         config = NoBubblesConfig(num_pages=self.num_stages)
-        page_scheduler = PageAwareScheduler(config)
+        page_scheduler = NoBubblesScheduler(config)
         op_descs = self._build_op_descriptors()
 
         # Use async pipeline if any op supports it, otherwise fallback to standard page-aware
@@ -384,7 +520,11 @@ class Megakernel:
         return ops
 
     def _build_op_descriptors(self) -> list:
-        """Build OpDescriptors from instructions for scheduling."""
+        """Build OpDescriptors from instructions for scheduling.
+
+        Each descriptor includes a scheduling_mode that determines how
+        the operation will be scheduled (sequential, async, warp-specialized).
+        """
         op_descs = []
         for i, inst in enumerate(self.instructions):
             kernel = inst.get("kernel") or inst.get("op_obj")
@@ -396,6 +536,16 @@ class Megakernel:
                     op_idx=i,
                     needs_global_sync=inst.get("needs_sync", False),
                 )
+
+            # Override scheduling mode from instruction if explicitly set
+            if inst.get("uses_warp_specialization", False):
+                desc.uses_warp_specialization = True
+                desc.scheduling_mode = SchedulingMode.WARP_SPECIALIZED
+
+            # Store logical grid size if available
+            if "logical_grid_size" in inst:
+                desc.logical_grid_size = inst["logical_grid_size"]
+
             op_descs.append(desc)
         return op_descs
 
@@ -418,7 +568,7 @@ class Megakernel:
         elif uop.type == MicroOpType.COMMIT_GROUP:
             ops.append("        cute.arch.cp_async_commit_group()")
         elif uop.type == MicroOpType.SYNC_BLOCK:
-            ops.append("        cute.arch.sync_threads()")
+            ops.append("        cute.arch.fence_view_async_shared()")
         elif uop.type == MicroOpType.SYNC_GLOBAL:
             ops.extend(self._gen_global_sync())
 
@@ -433,11 +583,11 @@ class Megakernel:
             if traced:
                 ops.append("        t_acq = cutedsl_trace.device.start()")
             ops.append(f"        # Wait for pages (deps: {sorted(uop.depends_on)})")
-            ops.append("        cute.arch.sync_threads()  # Ensure prior stores visible")
+            ops.append("        cute.arch.fence_view_async_shared()  # Ensure prior stores visible")
             if traced:
                 fmt_id = PAGE_TRACE_TYPES["ACQUIRE_WAIT"].id
                 ops.append(
-                    f"        lane = cutedsl_trace.device.end_event_dynamic_raw_1("
+                    "        lane = cutedsl_trace.device.end_event_dynamic_raw_1("
                     f"t_acq, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({op_idx}))"
                 )
 
@@ -453,8 +603,8 @@ class Megakernel:
             fmt_id = PAGE_TRACE_TYPES["ACQUIRE_DONE"].id
             pages_mask = sum(1 << p for p in acquired)
             ops.append(
-                f"        lane = cutedsl_trace.device.end_event_dynamic_raw_2("
-                f"t_acq_done, trace_buffer, trace_row_stride, lane, "
+                "        lane = cutedsl_trace.device.end_event_dynamic_raw_2("
+                "t_acq_done, trace_buffer, trace_row_stride, lane, "
                 f"Int32({fmt_id}), Int32({op_idx}), Int32({pages_mask}))"
             )
 
@@ -463,7 +613,7 @@ class Megakernel:
             ops.append("        t_start = cutedsl_trace.device.start()")
 
         smem_str = get_smem_arg("page_idx")
-        ops.append(f"        op_{op_idx}_load(paged_pool, page_idx, {smem_str}{args_str})")
+        ops.append(f"        op_{op_idx}_load(paged_pool, page_idx, logical_idx, {smem_str}{args_str})")
 
         if traced:
             fmt_id = TRACING_PHASES[MicroOpType.LOAD].id
@@ -481,7 +631,7 @@ class Megakernel:
             ops.append("        t_start = cutedsl_trace.device.start()")
 
         smem_str = get_smem_arg("page_idx")
-        ops.append(f"        op_{op_idx}_compute({smem_str}{args_str})")
+        ops.append(f"        op_{op_idx}_compute(logical_idx, {smem_str}{args_str})")
 
         if traced:
             fmt_id = TRACING_PHASES[MicroOpType.COMPUTE].id
@@ -498,7 +648,7 @@ class Megakernel:
             ops.append("        t_start = cutedsl_trace.device.start()")
 
         smem_str = get_smem_arg("page_idx")
-        ops.append(f"        op_{op_idx}_store(paged_pool, page_idx, {smem_str}{args_str})")
+        ops.append(f"        op_{op_idx}_store(paged_pool, page_idx, logical_idx, {smem_str}{args_str})")
 
         if traced:
             fmt_id = TRACING_PHASES[MicroOpType.STORE].id
@@ -513,13 +663,13 @@ class Megakernel:
             if traced:
                 ops.append("        t_rel = cutedsl_trace.device.start()")
             ops.append(f"        # Release pages {released}")
-            ops.append("        cute.arch.sync_threads()  # Ensure store complete")
+            ops.append("        cute.arch.fence_view_async_shared()  # Ensure store complete")
             if traced:
                 fmt_id = PAGE_TRACE_TYPES["RELEASE"].id
                 pages_mask = sum(1 << p for p in released)
                 ops.append(
-                    f"        lane = cutedsl_trace.device.end_event_dynamic_raw_2("
-                    f"t_rel, trace_buffer, trace_row_stride, lane, "
+                    "        lane = cutedsl_trace.device.end_event_dynamic_raw_2("
+                    "t_rel, trace_buffer, trace_row_stride, lane, "
                     f"Int32({fmt_id}), Int32({op_idx}), Int32({pages_mask}))"
                 )
 
@@ -534,26 +684,20 @@ class Megakernel:
             "            target = (sync_step + 1) * n_blocks",
             "            while atomic_add_i32(0, barrier_tensor.iterator) < target:",
             "                pass",
-            "        cute.arch.sync_threads()",
+            "        cute.arch.fence_view_async_shared()",
             "        sync_step = sync_step + Int32(1)",
         ]
 
     def _generate_warp_specialized_schedule(self, mapping, traced: bool) -> list:
-        """Generate warp-specialized scheduling code (No Bubbles pattern).
+        """Generate warp-specialized scheduling code (Persistent No Bubbles pattern).
 
-        This generates code that dispatches different L/C/S methods to different warps:
-        - Consumer warps (0 to num_consumer_warps-1): Execute compute
-        - Loader warp: Execute load
-        - Storer warp: Execute store
-        - Controller/Launcher warps: Coordination (future)
+        This generates a persistent grid loop where warps cooperate via a rotating
+        circular buffer of shared memory pages and granular semaphores.
 
-        Synchronization uses page semaphores (atomic counters) instead of __syncthreads():
-        - sem_load_done: Loader signals when data is ready in smem
-        - sem_compute_done: Consumer signals when compute is finished
-
-        This allows overlapping of phases across different logical blocks:
-        - While Consumer processes block N, Loader can load block N+1
-        - While Storer writes block N, Consumer processes N+1, Loader loads N+2
+        Synchronization Protocol (3-stage):
+        1. LOADER: Wait for FINISHED[page] -> LOAD -> Signal LOAD_DONE[page]
+        2. CONSUMER: Wait for LOAD_DONE[page] -> COMPUTE -> Signal COMPUTE_DONE[page]
+        3. STORER: Wait for COMPUTE_DONE[page] -> STORE -> Signal FINISHED[page]
         """
         ops = []
 
@@ -573,114 +717,258 @@ class Megakernel:
         num_consumer = warp_config.num_consumer_warps
         loader_warp = num_consumer
         storer_warp = num_consumer + warp_config.num_loader_warps
-        # launcher_warp and controller_warp reserved for future use
 
-        ops.append("        # Warp-Specialized Scheduling (No Bubbles)")
+        # Configuration
+        num_ops = len(self.instructions)
+        num_stages = max(1, self.num_stages)
+        # Offsets for semaphore types
+        # 0: LOAD_DONE, 1: COMPUTE_DONE, 2: FINISHED (ready to reuse)
+
+        ops.append("        # Warp-Specialized Scheduling (Persistent No Bubbles)")
         ops.append(f"        # Consumer warps: 0-{num_consumer - 1}, Loader: {loader_warp}, Storer: {storer_warp}")
         ops.append("        warp_id = tidx // Int32(32)")
         ops.append("        lane_id = tidx % Int32(32)")
-        ops.append("        page_idx = Int32(0)")
+        if traced:
+            ops.append("        t_wait = cutedsl_trace.device.start()")
+            ops.append("        t_sig = cutedsl_trace.device.start()")
+            ops.append("        t_start = cutedsl_trace.device.start()")
         ops.append("")
-        ops.append("        # Page semaphores in shared memory for inter-warp synchronization")
-        ops.append("        # sem_load_done: Loader signals when smem is ready")
-        ops.append("        # sem_compute_done: Consumer signals when compute is done")
-        ops.append("        sem_load_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
-        ops.append("        sem_compute_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
+        ops.append("        # Page semaphores in shared memory for fine-grained coordination")
+        ops.append(f"        # Array size: {num_stages} stages * {num_ops} ops * 3 types")
+        num_sems = num_stages * num_ops * 3 + 1
+        ops.append(f"        semaphores = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout({num_sems}))")
+        ops.append(f"        init_sem_idx = Int32({num_stages * num_ops * 3})")
         ops.append("")
         ops.append("        # Initialize semaphores (single thread)")
         ops.append("        if tidx == 0:")
-        ops.append("            sem_load_done[0] = Int32(0)")
-        ops.append("            sem_compute_done[0] = Int32(0)")
-        ops.append("        cute.arch.sync_threads()  # Ensure semaphores initialized")
-        ops.append("")
-
-        # Generate warp role dispatch - each role runs independently
-        ops.append(f"        if warp_id == Int32({loader_warp}):")
-        ops.append("            # LOADER WARP: Load data to smem, then signal sem_load_done")
-        for i, inst in enumerate(self.instructions):
-            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
-            get_smem_arg = self._make_smem_arg_getter(i)
-            smem_str = get_smem_arg("page_idx")
-
-            if traced:
-                ops.append("            t_start = cutedsl_trace.device.start()")
-
-            ops.append(f"            op_{i}_load(paged_pool, page_idx, {smem_str}{args_str})")
-
-            if traced:
-                fmt_id = TRACING_PHASES[MicroOpType.LOAD].id
-                ops.append(
-                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
-                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
-                )
-
-        ops.append("            # Signal: load complete")
+        ops.append("            semaphores[init_sem_idx] = Int32(0)")
+        ops.append(f"            for i in range({num_stages * num_ops * 3}):")
+        ops.append("                # Initialize FINISHED (type 2) to 1 (page free), others to 0")
+        ops.append("                if i % 3 == 2:")
+        ops.append("                    semaphores[i] = Int32(1)")
+        ops.append("                else:")
+        ops.append("                    semaphores[i] = Int32(0)")
+        ops.append("            # Signal initialization complete")
         ops.append("            cute.arch.fence_view_async_shared()")
-        ops.append("            if lane_id == 0:")
-        ops.append("                atomic_add_i32(1, sem_load_done.iterator)")
-
+        ops.append("            atomic_add_i32(1, semaphores.iterator + init_sem_idx)")
         ops.append("")
-        ops.append(f"        elif warp_id < Int32({num_consumer}):")
-        ops.append("            # CONSUMER WARPS: Wait for load, compute, then signal sem_compute_done")
-        ops.append("            # Spin-wait for load to complete (with nanosleep to reduce power)")
-        ops.append("            while atomic_add_i32(0, sem_load_done.iterator) < Int32(1):")
-        ops.append("                nanosleep(Int32(100))")
+        ops.append("        # Spin-wait for initialization")
+        ops.append("        if tidx != 0:")
+        ops.append("            while atomic_add_i32(0, semaphores.iterator + init_sem_idx) < Int32(1):")
+        ops.append("                nanosleep(Int32(20))")
+        ops.append("        cute.arch.fence_view_async_shared()  # Ensure all semaphore values are visible")
         ops.append("")
 
-        for i, inst in enumerate(self.instructions):
-            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
-            get_smem_arg = self._make_smem_arg_getter(i)
-            smem_str = get_smem_arg("page_idx")
-
-            if traced:
-                ops.append("            t_start = cutedsl_trace.device.start()")
-
-            ops.append(f"            op_{i}_compute({smem_str}{args_str})")
-
-            if traced:
-                fmt_id = TRACING_PHASES[MicroOpType.COMPUTE].id
-                ops.append(
-                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
-                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
-                )
-
+        # Grid loop for persistent blocks
+        ops.append("        local_block_idx = Int32(0)")
+        ops.append("        persistent_block_idx = bidx")
+        ops.append("        n_blocks_val = n_blocks")
+        ops.append("        g_dim, _, _ = cute.arch.grid_dim()")
         ops.append("")
-        ops.append("            # Signal: compute complete (only warp 0 signals to avoid overcounting)")
-        ops.append("            if warp_id == Int32(0) and lane_id == 0:")
-        ops.append("                atomic_add_i32(1, sem_compute_done.iterator)")
-
-        ops.append("")
-        ops.append(f"        elif warp_id == Int32({storer_warp}):")
-        ops.append("            # STORER WARP: Wait for compute, then store")
-        ops.append("            # Spin-wait for compute to complete")
-        ops.append("            while atomic_add_i32(0, sem_compute_done.iterator) < Int32(1):")
-        ops.append("                nanosleep(Int32(100))")
+        ops.append("        while persistent_block_idx < n_blocks_val:")
+        ops.append(f"            page_idx = local_block_idx % Int32({num_stages})")
+        ops.append(f"            iter_target = local_block_idx // Int32({num_stages}) + Int32(1)")
         ops.append("")
 
-        for i, inst in enumerate(self.instructions):
-            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
-            get_smem_arg = self._make_smem_arg_getter(i)
-            smem_str = get_smem_arg("page_idx")
+        self._emit_warp_spec_loader_role(ops, mapping, loader_warp, num_ops, traced)
+        self._emit_warp_spec_consumer_role(ops, mapping, num_consumer, num_ops, traced)
+        self._emit_warp_spec_storer_role(ops, mapping, storer_warp, num_consumer, num_ops, traced)
 
-            if traced:
-                ops.append("            t_start = cutedsl_trace.device.start()")
+        # Other warps (controller/launcher) - idle in current implementation
+        ops.append("            else:")
+        ops.append("                pass  # Controller/Launcher warps - idle")
 
-            ops.append(f"            op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
-
-            if traced:
-                fmt_id = TRACING_PHASES[MicroOpType.STORE].id
-                ops.append(
-                    f"            lane = cutedsl_trace.device.end_event_dynamic_raw_1("
-                    f"t_start, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({i}))"
-                )
-
-        # Controller and launcher warps (currently no-op, for future expansion)
         ops.append("")
-        ops.append("        else:")
-        ops.append("            # Controller/Launcher warps - no-op (future: instruction scheduling)")
-        ops.append("            pass")
+        ops.append("            # Persistence update")
+        ops.append("            local_block_idx += Int32(1)")
+        ops.append("            persistent_block_idx += g_dim")
+        ops.append("        # End persistent loop")
 
         return ops
+
+    def _emit_warp_spec_initialization(self, ops, num_stages, num_ops, init_sem_idx):
+        """Emit initialization code for warp-specialized schedule."""
+        ops.append("        if tidx == 0:")
+        ops.append("            semaphores[init_sem_idx] = Int32(0)")
+        ops.append(f"            for i in range({num_stages * num_ops * 3}):")
+        ops.append("                if i % 3 == 2:")
+        ops.append("                    semaphores[i] = Int32(1)")
+        ops.append("                else:")
+        ops.append("                    semaphores[i] = Int32(0)")
+        ops.append("            cute.arch.fence_view_async_shared()")
+        ops.append("            atomic_add_i32(1, semaphores.iterator + init_sem_idx)")
+        ops.append("        if tidx != 0:")
+        ops.append("            while atomic_add_i32(0, semaphores.iterator + init_sem_idx) < Int32(1):")
+        ops.append("                nanosleep(Int32(20))")
+
+    def _emit_warp_spec_loader_role(self, ops, mapping, loader_warp, num_ops, traced):
+        """Emit LOADER role code.
+
+        If this operation has a reduction_wait dependency, the loader must wait
+        for ALL producer blocks to complete before loading (many-to-one sync).
+        """
+        ops.append(f"            if warp_id == Int32({loader_warp}):")
+        for i, inst in enumerate(self.instructions):
+            args = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            smem = self._make_smem_arg_getter(i)("page_idx")
+            idx_fin = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(2)"
+            idx_load = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(0)"
+
+            if traced:
+                ops.append("                t_wait = cutedsl_trace.device.start()")
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_start(ops, "                    ", "t_wait")
+            ops.append(f"                while atomic_add_i32(0, semaphores.iterator + {idx_fin}) < iter_target:")
+            ops.append("                    nanosleep(Int32(20))")
+            if traced:
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_WAIT_FINISHED", i, "t_wait")
+
+            # Check for reduction wait dependency (many-to-one)
+            reduction_wait = inst.get("reduction_wait")
+            if reduction_wait and self._reduction_barrier_config:
+                wait_count = reduction_wait["wait_count"]
+                producer_op_idx = reduction_wait["producer_op_idx"]
+                barrier_offset = self._reduction_barrier_config._barrier_offsets.get(i, 0)
+
+                ops.append(f"                # Wait for reduction from producer op {producer_op_idx}")
+                ops.append(f"                # Consumer block waits for {wait_count} producer blocks")
+                red_bar_idx = f"Int32({barrier_offset}) + persistent_block_idx"
+                ops.append(
+                    f"                while atomic_add_i32(0, reduction_barrier.iterator + {red_bar_idx}) "
+                    f"< Int32({wait_count}):"
+                )
+                ops.append("                    nanosleep(Int32(20))")
+
+            if traced:
+                self._emit_trace_start(ops, "                ")
+
+            size = inst.get("logical_grid_size", -1)
+            pref = f"if persistent_block_idx < Int32({size}): " if size != -1 else ""
+            ops.append(f"                {pref}op_{i}_load(paged_pool, page_idx, persistent_block_idx, {smem}{args})")
+
+            if traced:
+                self._emit_trace_end(ops, "                ", TRACING_PHASES, MicroOpType.LOAD, i)
+            # Warp-level sync to ensure all lanes have completed their writes
+            ops.append("                cute.arch.sync_warp()")
+            ops.append("                cute.arch.fence_view_async_shared()")
+            ops.append("                if lane_id == 0:")
+            if traced:
+                ops.append("                    t_sig = cutedsl_trace.device.start()")
+            ops.append(f"                    atomic_add_i32(1, semaphores.iterator + {idx_load})")
+            if traced:
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_SIGNAL_LOAD", i, "t_sig")
+
+    def _emit_warp_spec_consumer_role(self, ops, mapping, num_consumer, num_ops, traced):
+        """Emit CONSUMER role code.
+
+        All consumer warps wait for LOAD_DONE, then compute, then each signals COMPUTE_DONE.
+        The storer waits for all consumer warps to signal (count = iter_target * num_consumer).
+        """
+        ops.append(f"            elif warp_id < Int32({num_consumer}):")
+        for i, inst in enumerate(self.instructions):
+            args = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            smem = self._make_smem_arg_getter(i)("page_idx")
+            idx_load = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(0)"
+            idx_comp = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(1)"
+
+            if traced:
+                ops.append("                t_wait = cutedsl_trace.device.start()")
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_start(ops, "                    ", "t_wait")
+            ops.append(f"                while atomic_add_i32(0, semaphores.iterator + {idx_load}) < iter_target:")
+            ops.append("                    nanosleep(Int32(20))")
+            if traced:
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_WAIT_LOAD", i, "t_wait")
+
+            if traced:
+                self._emit_trace_start(ops, "                ")
+            size = inst.get("logical_grid_size", -1)
+            pref = f"if persistent_block_idx < Int32({size}): " if size != -1 else ""
+            ops.append(f"                {pref}op_{i}_compute(persistent_block_idx, {smem}{args})")
+            if traced:
+                self._emit_trace_end(ops, "                ", TRACING_PHASES, MicroOpType.COMPUTE, i)
+            # Warp-level sync to ensure all lanes have completed their writes
+            ops.append("                cute.arch.sync_warp()")
+            ops.append("                cute.arch.fence_view_async_shared()")
+            # Each consumer warp signals (lane 0 only to avoid intra-warp overcounting)
+            ops.append("                if lane_id == 0:")
+            if traced:
+                ops.append("                    t_sig = cutedsl_trace.device.start()")
+            ops.append(f"                    atomic_add_i32(1, semaphores.iterator + {idx_comp})")
+            if traced:
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_SIGNAL_COMPUTE", i, "t_sig")
+
+    def _emit_warp_spec_storer_role(self, ops, mapping, storer_warp, num_con, num_ops, traced):
+        """Emit STORER role code.
+
+        The storer waits for ALL consumer warps to signal COMPUTE_DONE
+        (count = iter_target * num_consumer_warps), then stores and signals FINISHED.
+
+        If this operation has reduction_signals, also signals the reduction barrier
+        so downstream consumers can track how many producer blocks have completed.
+        """
+        ops.append(f"            elif warp_id == Int32({storer_warp}):")
+        for i, inst in enumerate(self.instructions):
+            args = ", ".join([f"arg_{idx}" for idx in mapping[i]])
+            smem = self._make_smem_arg_getter(i)("page_idx")
+            idx_comp = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(1)"
+            idx_fin = f"(page_idx * Int32({num_ops}) + Int32({i})) * Int32(3) + Int32(2)"
+            # Wait for ALL consumer warps to signal (num_con signals per iteration)
+            target = f"iter_target * Int32({num_con})"
+
+            if traced:
+                ops.append("                t_wait = cutedsl_trace.device.start()")
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_start(ops, "                    ", "t_wait")
+            ops.append(f"                while atomic_add_i32(0, semaphores.iterator + {idx_comp}) < {target}:")
+            ops.append("                    nanosleep(Int32(20))")
+            if traced:
+                ops.append("                if lane_id == 0:")
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_WAIT_COMPUTE", i, "t_wait")
+
+            if traced:
+                self._emit_trace_start(ops, "                ")
+
+            size = inst.get("logical_grid_size", -1)
+            prefix = f"if persistent_block_idx < Int32({size}): " if size != -1 else ""
+            ops.append(
+                f"                {prefix}op_{i}_store(paged_pool, page_idx, persistent_block_idx, {smem}{args})"
+            )
+
+            if traced:
+                self._emit_trace_end(ops, "                ", TRACING_PHASES, MicroOpType.STORE, i)
+            # Warp-level sync to ensure all lanes have completed their writes
+            ops.append("                cute.arch.sync_warp()")
+            ops.append("                cute.arch.fence_view_async_shared()")
+            ops.append("                if lane_id == 0:")
+            if traced:
+                ops.append("                    t_sig = cutedsl_trace.device.start()")
+            ops.append(f"                    atomic_add_i32(1, semaphores.iterator + {idx_fin})")
+            if traced:
+                self._emit_trace_end(ops, "                    ", SYNC_TRACE_TYPES, "SEM_SIGNAL_FINISHED", i, "t_sig")
+
+            # Signal reduction barriers if this operation has downstream reduction consumers
+            reduction_signals = inst.get("reduction_signals", [])
+            for red_sig in reduction_signals:
+                dim_mapping = red_sig["dim_mapping"]
+                consumer_op_idx = red_sig["consumer_op_idx"]
+                blocks_per_consumer = dim_mapping.blocks_per_consumer
+
+                # Compute which consumer logical block this producer block maps to
+                # For trailing-axis reduction: consumer_logical = producer_logical // blocks_per_consumer
+                ops.append(f"                    # Reduction signal to consumer op {consumer_op_idx}")
+                ops.append(
+                    f"                    reduction_consumer_idx = persistent_block_idx // Int32({blocks_per_consumer})"
+                )
+                # Get barrier offset for this consumer
+                if self._reduction_barrier_config:
+                    barrier_offset = self._reduction_barrier_config._barrier_offsets.get(consumer_op_idx, 0)
+                    red_bar_idx = f"Int32({barrier_offset}) + reduction_consumer_idx"
+                    ops.append(
+                        f"                    atomic_add_i32(1, reduction_barrier.iterator + {red_bar_idx})"
+                    )
 
     def _emit_trace_start(self, ops: list, indent: str, var: str = "t_start") -> None:
         """Emit trace start timestamp capture."""
@@ -696,143 +984,81 @@ class Megakernel:
             f"{var}, trace_buffer, trace_row_stride, lane, Int32({fmt_id}), Int32({op_idx}))"
         )
 
+    def _emit_simple_op_phases(self, ops, i, map_idx, inst, traced, sizes, has_het):
+        """Emit L/C/S phases for a single operation in simple schedule."""
+        args_str = ", ".join([f"arg_{idx}" for idx in map_idx])
+        smem_arg = self._make_smem_arg_getter(i)
+        logical_size = inst.get("logical_grid_size", 1)
+        needs_bounds = has_het and logical_size < max(sizes)
+        indent = "            " if needs_bounds else "        "
+
+        if needs_bounds:
+            ops.append(f"        if logical_idx < Int32({logical_size}):")
+
+        if i > 0:
+            ops.append(f"{indent}if tidx == 0:")
+            ops.append(f"{indent}    semaphores[0] = Int32(0)\n{indent}    semaphores[1] = Int32(0)")
+            ops.append(f"{indent}cute.arch.fence_view_async_shared()")
+
+        p_idx = "page_idx"
+        for phase in [MicroOpType.LOAD, MicroOpType.COMPUTE, MicroOpType.STORE]:
+            if phase == MicroOpType.COMPUTE and "compute" not in inst:
+                continue
+
+            # Wait (non-zero threads)
+            if phase != MicroOpType.LOAD:
+                s_idx = 0 if phase == MicroOpType.COMPUTE else 1
+                t_key = "SEM_WAIT_LOAD" if phase == MicroOpType.COMPUTE else "SEM_WAIT_COMPUTE"
+                ops.append(f"{indent}if tidx != 0:")
+                if traced:
+                    self._emit_trace_start(ops, indent + "    ", "t_wait")
+                ops.append(f"{indent}    while atomic_add_i32(0, semaphores.iterator + Int32({s_idx})) < Int32(1):")
+                ops.append(f"{indent}        nanosleep(Int32(20))")
+                if traced:
+                    self._emit_trace_end(ops, indent + "    ", SYNC_TRACE_TYPES, t_key, i, "t_wait")
+
+            if traced:
+                self._emit_trace_start(ops, indent)
+            fn = phase.name.lower()
+            prefix = "paged_pool, page_idx, " if phase != MicroOpType.COMPUTE else ""
+            ops.append(f"{indent}op_{i}_{fn}({prefix}logical_idx, {smem_arg(p_idx)}{args_str})")
+            if traced:
+                self._emit_trace_end(ops, indent, TRACING_PHASES, phase, i)
+
+            # Signal (tidx 0 only)
+            if phase != MicroOpType.STORE:
+                s_idx = 0 if phase == MicroOpType.LOAD else 1
+                ops.append(f"{indent}cute.arch.fence_view_async_shared()")
+                ops.append(f"{indent}if tidx == 0:")
+                if traced:
+                    ops.append(f"{indent}    t_sig = cutedsl_trace.device.start()")
+                ops.append(f"{indent}    atomic_add_i32(1, semaphores.iterator + Int32({s_idx}))")
+                if traced:
+                    self._emit_trace_end(ops, indent + "    ", SYNC_TRACE_TYPES, f"SEM_SIGNAL_{phase.name}", i, "t_sig")
+
     def _generate_simple_schedule(self, mapping, traced: bool) -> list:
         """Generate simple scheduling code with fine-grained semaphore synchronization.
 
-        Simple mode uses the same semaphore-based synchronization as warp-specialized mode,
-        but all threads execute all phases sequentially (no warp specialization).
+        Delegates to SequentialScheduler for cleaner separation of concerns.
 
-        This ensures consistent synchronization semantics across all modes:
+        Simple mode uses semaphore-based synchronization where all threads execute
+        all phases sequentially (no warp specialization). This ensures consistent
+        synchronization semantics:
         - sem_load_done: Signaled after load completes, waited on before compute
         - sem_compute_done: Signaled after compute completes, waited on before store
-
-        Key design:
-        - Thread 0 manages semaphore signaling (to avoid overcounting)
-        - All threads participate in L/C/S phases
-        - Semaphores provide fine-grained ordering without full block barriers
         """
-        ops = []
-
-        if self.paged_pool_bytes > 0:
-            ops.append("        page_idx = Int32(0)")
-            ops.append("        next_page = Int32(0)")
-        else:
-            ops.append("        page_idx = Int32(0)")
-
-        # Check if we have heterogeneous logical grid sizes
-        logical_sizes = [inst.get("logical_grid_size", 1) for inst in self.instructions]
-        has_heterogeneous_grids = len(set(logical_sizes)) > 1
-
-        if has_heterogeneous_grids:
-            ops.append("")
-            ops.append("        # Heterogeneous logical grids - ops check bounds via logical_idx")
-
-        # Allocate semaphores for fine-grained synchronization
-        ops.append("")
-        ops.append("        # Fine-grained synchronization semaphores")
-        ops.append("        sem_load_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
-        ops.append("        sem_compute_done = smem_alloc.allocate_tensor(cute.Int32, cute.make_layout(1))")
-        ops.append("")
-        ops.append("        # Initialize semaphores (single thread)")
-        ops.append("        if tidx == 0:")
-        ops.append("            sem_load_done[0] = Int32(0)")
-        ops.append("            sem_compute_done[0] = Int32(0)")
-        ops.append("        cute.arch.sync_threads()  # Ensure semaphores initialized before use")
-        ops.append("")
-
-        # Generate L/C/S for each operation with semaphore-based sync
-        for i, inst in enumerate(self.instructions):
-            args_str = ", ".join([f"arg_{idx}" for idx in mapping[i]])
-            get_smem_arg = self._make_smem_arg_getter(i)
-            logical_size = inst.get("logical_grid_size", 1)
-
-            # For heterogeneous grids, wrap ops in bounds check
-            needs_bounds_check = has_heterogeneous_grids and logical_size < max(logical_sizes)
-            indent = "            " if needs_bounds_check else "        "
-
-            if needs_bounds_check:
-                ops.append(f"        # Op {i}: {logical_size} logical blocks")
-                ops.append(f"        if logical_idx < Int32({logical_size}):")
-
-            # Reset semaphores for this operation (only for ops after the first)
-            if i > 0:
-                ops.append(f"{indent}# Reset semaphores for Op {i}")
-                ops.append(f"{indent}if tidx == 0:")
-                ops.append(f"{indent}    sem_load_done[0] = Int32(0)")
-                ops.append(f"{indent}    sem_compute_done[0] = Int32(0)")
-                ops.append(f"{indent}cute.arch.fence_view_async_shared()")
-                ops.append("")
-
-            # LOAD phase
-            if traced:
-                self._emit_trace_start(ops, indent)
-
-            smem_str = get_smem_arg("page_idx")
-            ops.append(f"{indent}op_{i}_load(paged_pool, page_idx, {smem_str}{args_str})")
-
-            if traced:
-                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.LOAD, i)
-
-            # Signal load complete
-            if traced:
-                self._emit_trace_start(ops, indent, "t_sig")
-            ops.append(f"{indent}cute.arch.fence_view_async_shared()")
-            ops.append(f"{indent}if tidx == 0:")
-            ops.append(f"{indent}    atomic_add_i32(1, sem_load_done.iterator)")
-            if traced:
-                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_SIGNAL_LOAD", i, "t_sig")
-            ops.append("")
-
-            # Wait for load to complete before compute
-            ops.append(f"{indent}# Wait for load to complete")
-            if traced:
-                self._emit_trace_start(ops, indent, "t_wait")
-            ops.append(f"{indent}while atomic_add_i32(0, sem_load_done.iterator) < Int32(1):")
-            ops.append(f"{indent}    nanosleep(Int32(100))")
-            if traced:
-                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_WAIT_LOAD", i, "t_wait")
-            ops.append("")
-
-            # COMPUTE phase
-            if traced:
-                self._emit_trace_start(ops, indent)
-
-            ops.append(f"{indent}op_{i}_compute({smem_str}{args_str})")
-
-            if traced:
-                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.COMPUTE, i)
-
-            # Signal compute complete
-            if traced:
-                self._emit_trace_start(ops, indent, "t_sig")
-            ops.append(f"{indent}if tidx == 0:")
-            ops.append(f"{indent}    atomic_add_i32(1, sem_compute_done.iterator)")
-            if traced:
-                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_SIGNAL_COMPUTE", i, "t_sig")
-            ops.append("")
-
-            # Wait for compute to complete before store
-            ops.append(f"{indent}# Wait for compute to complete")
-            if traced:
-                self._emit_trace_start(ops, indent, "t_wait")
-            ops.append(f"{indent}while atomic_add_i32(0, sem_compute_done.iterator) < Int32(1):")
-            ops.append(f"{indent}    nanosleep(Int32(100))")
-            if traced:
-                self._emit_trace_end(ops, indent, SYNC_TRACE_TYPES, "SEM_WAIT_COMPUTE", i, "t_wait")
-            ops.append("")
-
-            # STORE phase
-            if traced:
-                self._emit_trace_start(ops, indent)
-
-            ops.append(f"{indent}op_{i}_store(paged_pool, page_idx, {smem_str}{args_str})")
-
-            if traced:
-                self._emit_trace_end(ops, indent, TRACING_PHASES, MicroOpType.STORE, i)
-
-            ops.append("")
-
-        return ops
+        scheduler = SequentialScheduler()
+        return scheduler.generate_schedule_ops(
+            instructions=self.instructions,
+            mapping=mapping,
+            paged_pool_bytes=self.paged_pool_bytes,
+            traced=traced,
+            make_smem_arg_getter=self._make_smem_arg_getter,
+            emit_trace_start=self._emit_trace_start,
+            emit_trace_end=self._emit_trace_end,
+            tracing_phases=TRACING_PHASES,
+            sync_trace_types=SYNC_TRACE_TYPES,
+        )
 
     def _generate_kernel_source(self, sig_hash: str, all_args_str: str, bindings: list, ops: list, traced: bool) -> str:
         """Generate the complete Python source code for the kernel module."""
@@ -841,6 +1067,10 @@ class Megakernel:
         kernel_name = f"kernel_{sig_hash[:8]}"
 
         trace_args = ", trace_buffer, trace_row_stride, trace_num_lanes" if traced else ""
+
+        # Reduction barrier argument (for many-to-one dependencies)
+        has_reduction = self._reduction_barrier_config is not None
+        reduction_arg = ", reduction_barrier" if has_reduction else ""
 
         # Always get block index for logical blocks support
         # bidx is the logical block index when using Logical Blocks API
@@ -879,17 +1109,17 @@ instructions = MEGAKERNEL_REGISTRY["{sig_hash}"]
 
 class GeneratedMegakernel:
     @cute.jit
-    def __call__(self, barrier_tensor, n_blocks, {all_args_str}{trace_args}):
+    def __call__(self, barrier_tensor{reduction_arg}, n_blocks, {all_args_str}{trace_args}):
         # We launch utilizing grid/block from the registry instructions
         # This allows the caller to update registry with current grid/block before call.
-        self.{kernel_name}(barrier_tensor, n_blocks, {all_args_str}{trace_args}).launch(
+        self.{kernel_name}(barrier_tensor{reduction_arg}, n_blocks, {all_args_str}{trace_args}).launch(
             grid=instructions[0]['grid'],
             block=instructions[0]['block'],
             smem=instructions[0]['total_smem']
         )
 
     @cute.kernel
-    def {kernel_name}(self, barrier_tensor, n_blocks, {all_args_str}{trace_args}):
+    def {kernel_name}(self, barrier_tensor{reduction_arg}, n_blocks, {all_args_str}{trace_args}):
         sync_step = Int32(0)
         tidx, _, _ = cute.arch.thread_idx()
         {bidx_init}
@@ -926,7 +1156,7 @@ class GeneratedMegakernel:
 
         return align_elements
 
-    def launch_logical(self, block, stream=None, trace_file=None):
+    def launch_logical(self, block, grid=None, stream=None, trace_file=None):
         """Launch the megakernel using Logical Blocks for grid dimension.
 
         This method automatically calculates TotalLogicalBlocks from all registered
@@ -936,6 +1166,7 @@ class GeneratedMegakernel:
 
         Args:
             block: Block dimensions (threads per block)
+            grid: Grid dimensions (optional). If not provided, uses (total_logical, 1, 1).
             stream: CUDA stream (optional)
             trace_file: Path to write trace file (optional)
 
@@ -947,7 +1178,8 @@ class GeneratedMegakernel:
         """
         # Calculate total logical blocks from all operations
         total_logical = self._calculate_logical_blocks()
-        grid = (total_logical, 1, 1)
+        if grid is None:
+            grid = (total_logical, 1, 1)
 
         logger.debug("Launching with Logical Blocks: grid=%s, block=%s", grid, block)
         return self.launch(n_blocks=total_logical, grid=grid, block=block, stream=stream, trace_file=trace_file)
@@ -1052,6 +1284,10 @@ class GeneratedMegakernel:
         def calc_smem():
             # Paged pool for No Bubbles (global pool, managed by Megakernel)
             total = self.paged_pool_bytes
+            # Semaphore array (3 semaphores per stage per instruction)
+            num_ops = len(self.instructions)
+            stages = max(1, self.num_stages)
+            total += stages * num_ops * 3 * 4
             # Per-operation shared memory (allocated separately, not paged)
             for inst in self.instructions:
                 total += inst["smem_size"]
@@ -1133,7 +1369,15 @@ class GeneratedMegakernel:
 
         megakernel_obj, _ = self._get_megakernel_class(mapping, num_flat_args, op_info_key, arg_info, traced=traced)
 
-        compile_args = [megakernel_obj, barrier_fake, Int32(n_blocks), *fake_args]
+        compile_args = [megakernel_obj, barrier_fake]
+
+        # Add reduction barrier fake arg if we have reduction dependencies
+        if self._reduction_barrier_config is not None:
+            reduction_barrier_shape = self._reduction_barrier_config.shape
+            reduction_barrier_fake = fake_tensor(Int32, reduction_barrier_shape)
+            compile_args.append(reduction_barrier_fake)
+
+        compile_args.extend([Int32(n_blocks), *fake_args])
 
         if traced:
             num_lanes = (block[0] * block[1] * block[2] + 31) // 32
@@ -1185,9 +1429,22 @@ class GeneratedMegakernel:
         else:
             self._barrier = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # Allocate reduction barrier tensor if we have reduction dependencies
+        if self._reduction_barrier_config is not None:
+            reduction_barrier_shape = self._reduction_barrier_config.shape
+            self._reduction_barrier = torch.zeros(reduction_barrier_shape, dtype=torch.int32, device=device)
+            logger.debug("Allocated reduction barrier tensor: %s", reduction_barrier_shape)
+
         wrapped_args = self._wrap_args(flat_args)
 
-        launch_args = [self._barrier, Int32(n_blocks), *wrapped_args]
+        launch_args = [self._barrier]
+
+        # Add reduction barrier if present
+        if self._reduction_barrier_config is not None:
+            launch_args.append(self._reduction_barrier)
+
+        launch_args.extend([Int32(n_blocks), *wrapped_args])
+
         if traced:
             launch_args.extend(
                 [trace_builder._buffer, Int32(trace_builder.row_stride_bytes), Int32(trace_builder.num_lanes)]

@@ -70,21 +70,19 @@ class SimpleAddKernel(FusableKernel):
 
     @reads("input", "scalar")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, input_tensor, scalar, output_tensor, n_elements):
+    def load_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         pass
 
     @writes("output")
     @cute.jit
-    def compute_forward(self, input_tensor, scalar, output_tensor, n_elements):
+    def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
-        elem_idx = bidx * self.TILE_SIZE + tidx
+        elem_idx = logical_idx * self.TILE_SIZE + tidx
         if elem_idx < n_elements:
             output_tensor[elem_idx] = input_tensor[elem_idx] + scalar[0]
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, input_tensor, scalar, output_tensor, n_elements):
+    def store_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         pass
 
     def grid_fn(self, input_tensor, scalar, output_tensor, n_elements):
@@ -118,21 +116,19 @@ class SimpleMulKernel(FusableKernel):
 
     @reads("input", "scalar")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, input_tensor, scalar, output_tensor, n_elements):
+    def load_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         pass
 
     @writes("output")
     @cute.jit
-    def compute_forward(self, input_tensor, scalar, output_tensor, n_elements):
+    def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
-        elem_idx = bidx * self.TILE_SIZE + tidx
+        elem_idx = logical_idx * self.TILE_SIZE + tidx
         if elem_idx < n_elements:
             output_tensor[elem_idx] = input_tensor[elem_idx] * scalar[0]
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, input_tensor, scalar, output_tensor, n_elements):
+    def store_forward(self, paged_pool, page_idx, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         pass
 
     def grid_fn(self, input_tensor, scalar, output_tensor, n_elements):
@@ -170,23 +166,19 @@ class SharedMemKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_tensor, output_tensor, n_elements):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, output_tensor, n_elements):
         """Load data into shared memory."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
-        elem_idx = bidx * self.TILE_SIZE + tidx
+        elem_idx = logical_idx * self.TILE_SIZE + tidx
         if elem_idx < n_elements and tidx < self.TILE_SIZE:
             smem[tidx] = input_tensor[elem_idx]
 
     @writes("output")
     @cute.jit
-    def compute_forward(self, smem, input_tensor, output_tensor, n_elements):
+    def compute_forward(self, logical_idx, smem, input_tensor, output_tensor, n_elements):
         """Read from smem and write to output."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
-        elem_idx = bidx * self.TILE_SIZE + tidx
+        elem_idx = logical_idx * self.TILE_SIZE + tidx
         if elem_idx < n_elements and tidx < self.TILE_SIZE:
             # Read from smem (must be synced after load)
             val = smem[tidx]
@@ -194,7 +186,7 @@ class SharedMemKernel(FusableKernel):
             output_tensor[elem_idx] = val + val
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_tensor, output_tensor, n_elements):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, output_tensor, n_elements):
         pass
 
     def grid_fn(self, input_tensor, output_tensor, n_elements):
@@ -230,13 +222,11 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.LOADER)
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, input_tensor, scalar, output_tensor, n_elements):
+    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, scalar, output_tensor, n_elements):
         """Loader warp loads data to smem."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
         lane = tidx % 32
-        tile_start = bidx * self.TILE_SIZE
+        tile_start = logical_idx * self.TILE_SIZE
 
         # Each thread in loader warp loads multiple elements
         for i in range(self.TILE_SIZE // 32):
@@ -248,14 +238,12 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.CONSUMER)
     @writes("output")
     @cute.jit
-    def compute_forward(self, smem, input_tensor, scalar, output_tensor, n_elements):
+    def compute_forward(self, logical_idx, smem, input_tensor, scalar, output_tensor, n_elements):
         """Consumer warps compute output = smem * scalar."""
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-
         warp_id = tidx // 32
         lane = tidx % 32
-        tile_start = bidx * self.TILE_SIZE
+        tile_start = logical_idx * self.TILE_SIZE
 
         # Each consumer warp handles a portion
         elements_per_warp = self.TILE_SIZE // 4  # 4 consumer warps
@@ -270,7 +258,7 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
 
     @warp_role(WarpRole.STORER)
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, input_tensor, scalar, output_tensor, n_elements):
+    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_tensor, scalar, output_tensor, n_elements):
         pass
 
     def grid_fn(self, input_tensor, scalar, output_tensor, n_elements):
@@ -716,6 +704,7 @@ class TestTraceExport:
 
         expected = torch.full((n,), 8.0, dtype=torch.float16, device=cuda_device)
         torch.testing.assert_close(out, expected)
+
 
 class TestTraceToFixedPath:
     """Test trace export to a fixed path for easy manual inspection.

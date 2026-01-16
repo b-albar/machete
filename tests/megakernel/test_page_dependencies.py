@@ -16,7 +16,7 @@ from typing import List
 
 from machete.megakernel.scheduler import (
     PageSemaphoreConfig,
-    PageAwareScheduler,
+    NoBubblesScheduler,
     PageAwareMicroOp,
     NoBubblesConfig,
     OpDescriptor,
@@ -32,7 +32,7 @@ class TestPageSemaphoreConfig:
     def test_basic_config(self):
         config = PageSemaphoreConfig(num_pages=4)
         assert config.num_pages == 4
-        assert config.total_semaphores == 8  # 2 per page
+        assert config.total_semaphores == 12  # 3 per page (arrived, compute_done, finished)
         assert config.semaphore_size_bytes == 8  # Default mbarrier size
 
     def test_arrived_semaphore_index(self):
@@ -41,31 +41,31 @@ class TestPageSemaphoreConfig:
 
         # sem_arrived for page 0 = 0
         assert config.get_arrived_semaphore_idx(0) == 0
-        # sem_arrived for page 1 = 2
-        assert config.get_arrived_semaphore_idx(1) == 2
-        # sem_arrived for page 2 = 4
-        assert config.get_arrived_semaphore_idx(2) == 4
-        # sem_arrived for page 3 = 6
-        assert config.get_arrived_semaphore_idx(3) == 6
+        # sem_arrived for page 1 = 3
+        assert config.get_arrived_semaphore_idx(1) == 3
+        # sem_arrived for page 2 = 6
+        assert config.get_arrived_semaphore_idx(2) == 6
+        # sem_arrived for page 3 = 9
+        assert config.get_arrived_semaphore_idx(3) == 9
 
     def test_finished_semaphore_index(self):
         """Test sem_finished index calculation."""
         config = PageSemaphoreConfig(num_pages=4)
 
-        # sem_finished for page 0 = 1
-        assert config.get_finished_semaphore_idx(0) == 1
-        # sem_finished for page 1 = 3
-        assert config.get_finished_semaphore_idx(1) == 3
-        # sem_finished for page 2 = 5
-        assert config.get_finished_semaphore_idx(2) == 5
-        # sem_finished for page 3 = 7
-        assert config.get_finished_semaphore_idx(3) == 7
+        # sem_finished for page 0 = 2
+        assert config.get_finished_semaphore_idx(0) == 2
+        # sem_finished for page 1 = 5
+        assert config.get_finished_semaphore_idx(1) == 5
+        # sem_finished for page 2 = 8
+        assert config.get_finished_semaphore_idx(2) == 8
+        # sem_finished for page 3 = 11
+        assert config.get_finished_semaphore_idx(3) == 11
 
     def test_total_size_bytes(self):
         """Test total shared memory needed for semaphores."""
         config = PageSemaphoreConfig(num_pages=8, semaphore_size_bytes=8)
-        # 8 pages * 2 semaphores/page * 8 bytes/semaphore = 128 bytes
-        assert config.total_size_bytes == 128
+        # 8 pages * 3 semaphores/page * 8 bytes/semaphore = 192 bytes
+        assert config.total_size_bytes == 192
 
     def test_semaphore_pairing(self):
         """Test that arrived and finished semaphores are correctly paired."""
@@ -74,8 +74,8 @@ class TestPageSemaphoreConfig:
         for page_id in range(4):
             arrived = config.get_arrived_semaphore_idx(page_id)
             finished = config.get_finished_semaphore_idx(page_id)
-            # finished should be arrived + 1 (they're paired)
-            assert finished == arrived + 1
+            # finished should be arrived + 2 (they're separated by compute_done)
+            assert finished == arrived + 2
 
 
 class TestWarpSpecializedSchedule:
@@ -84,7 +84,7 @@ class TestWarpSpecializedSchedule:
     def test_basic_warp_schedule(self):
         """Test basic warp-specialized schedule generation."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10),
@@ -108,7 +108,7 @@ class TestWarpSpecializedSchedule:
     def test_semaphore_signals_in_schedule(self):
         """Test that semaphores are correctly assigned to micro-ops."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10),
@@ -148,7 +148,7 @@ class TestWarpSpecializedSchedule:
         - Store[N] can run in parallel with Load[N+1]
         """
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         # More ops than can fit in pages at once (4 pages / 2 per op = 2 concurrent)
         ops = [
@@ -177,12 +177,13 @@ class TestWarpSpecializedSchedule:
         assert compute_0 is not None
         assert store_0 is not None
 
-        # Load[2] should depend on Compute[0] (via sem_finished)
-        # Structural dependency is on compute_0.id
-        assert compute_0.id in load_2.depends_on, "Load[2] should depend on Compute[0]"
+        # Load[2] should depend on Store[0] (via sem_finished signaled by Storer)
+        # Structural dependency is on store_0.id
+        assert store_0.id in load_2.depends_on, "Load[2] should depend on Store[0]"
 
-        # Load[2] should NOT directly depend on Store[0]
-        assert store_0.id not in load_2.depends_on, "Load[2] should NOT depend on Store[0]"
+        # Load[2] should NOT directly depend on Compute[0] for page reuse
+        # (It waits for the full L/C/S cycle to finish)
+        assert compute_0.id not in load_2.depends_on, "Load[2] should depend on Store[0], not Compute[0]"
 
         # Load[2] should wait for sem_finished (page freed by Compute[0])
         assert len(load_2.sem_waits) > 0, "Load[2] should wait for sem_finished"
@@ -190,12 +191,9 @@ class TestWarpSpecializedSchedule:
     def test_circular_page_allocation(self):
         """Test that pages are allocated circularly."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
-        ops = [
-            OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10)
-            for i in range(4)
-        ]
+        ops = [OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10) for i in range(4)]
 
         micro_ops = scheduler.generate_warp_specialized_schedule(ops, pages_per_op=2)
 
@@ -217,7 +215,7 @@ class TestWarpSpecializedSchedule:
     def test_semaphore_protocol_correctness(self):
         """Verify the complete semaphore protocol for page reuse."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10),
@@ -232,23 +230,28 @@ class TestWarpSpecializedSchedule:
         assert sem_config is not None
 
         # Op0 uses pages [0, 1]
-        # sem_arrived[0] = 0, sem_arrived[1] = 2
-        # sem_finished[0] = 1, sem_finished[1] = 3
-        sem_arrived_pages_01 = [sem_config.get_arrived_semaphore_idx(0),
-                                sem_config.get_arrived_semaphore_idx(1)]
-        sem_finished_pages_01 = [sem_config.get_finished_semaphore_idx(0),
-                                 sem_config.get_finished_semaphore_idx(1)]
+        sem_arrived_pages_01 = [sem_config.get_arrived_semaphore_idx(0), sem_config.get_arrived_semaphore_idx(1)]
+        sem_compute_done_pages_01 = [
+            sem_config.get_compute_done_semaphore_idx(0),
+            sem_config.get_compute_done_semaphore_idx(1),
+        ]
+        sem_finished_pages_01 = [sem_config.get_finished_semaphore_idx(0), sem_config.get_finished_semaphore_idx(1)]
 
-        # Find Load[0] and Compute[0]
+        # Find Load[0], Compute[0], and Store[0]
         load_0 = next(op for op in micro_ops if op.op_idx == 0 and op.type == MicroOpType.LOAD_ASYNC)
         compute_0 = next(op for op in micro_ops if op.op_idx == 0 and op.type == MicroOpType.COMPUTE)
+        store_0 = next(op for op in micro_ops if op.op_idx == 0 and op.type == MicroOpType.STORE_ASYNC)
 
         # Load[0] signals sem_arrived for pages [0, 1]
         assert set(load_0.sem_signals) == set(sem_arrived_pages_01)
 
-        # Compute[0] waits for sem_arrived and signals sem_finished
+        # Compute[0] waits for sem_arrived and signals sem_compute_done
         assert set(compute_0.sem_waits) == set(sem_arrived_pages_01)
-        assert set(compute_0.sem_signals) == set(sem_finished_pages_01)
+        assert set(compute_0.sem_signals) == set(sem_compute_done_pages_01)
+
+        # Store[0] waits for sem_compute_done and signals sem_finished
+        assert set(store_0.sem_waits) == set(sem_compute_done_pages_01)
+        assert set(store_0.sem_signals) == set(sem_finished_pages_01)
 
         # Op2 reuses pages [0, 1], so Load[2] should wait for sem_finished[0, 1]
         load_2 = next(op for op in micro_ops if op.op_idx == 2 and op.type == MicroOpType.LOAD_ASYNC)
@@ -261,7 +264,7 @@ class TestPageDependencies:
     def test_data_dependency_with_page_reuse(self):
         """Test that data dependencies are respected even with page reuse."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         # Op1 reads what Op0 writes (RAW dependency)
         ops = [
@@ -281,7 +284,7 @@ class TestPageDependencies:
     def test_independent_ops_use_different_pages(self):
         """Test that independent ops can use different pages concurrently."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         # These ops are independent (no data dependencies)
         ops = [
@@ -305,13 +308,10 @@ class TestPageDependencies:
     def test_page_wait_chain(self):
         """Test that page waits form a proper chain for circular buffer."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         # 6 ops with 2 pages each = must reuse pages multiple times
-        ops = [
-            OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10)
-            for i in range(6)
-        ]
+        ops = [OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10) for i in range(6)]
 
         micro_ops = scheduler.generate_warp_specialized_schedule(ops, pages_per_op=2)
 
@@ -321,10 +321,10 @@ class TestPageDependencies:
 
         for i in range(2, 6):
             load_i = next(op for op in micro_ops if op.op_idx == i and op.type == MicroOpType.LOAD_ASYNC)
-            compute_prev = next(op for op in micro_ops if op.op_idx == i - 2 and op.type == MicroOpType.COMPUTE)
+            store_prev = next(op for op in micro_ops if op.op_idx == i - 2 and op.type == MicroOpType.STORE_ASYNC)
 
-            # Load[i] should depend on Compute[i-2] (the one that frees the pages)
-            assert compute_prev.id in load_i.depends_on, f"Load[{i}] should depend on Compute[{i-2}]"
+            # Load[i] should depend on Store[i-2] (the one that frees the pages)
+            assert store_prev.id in load_i.depends_on, f"Load[{i}] should depend on Store[{i - 2}]"
 
 
 class TestDeviceAwarePageCount:
@@ -401,7 +401,7 @@ class TestDeviceAwarePageCount:
         """Test NoBubblesConfig with custom page size."""
         # Smaller pages for smaller operations
         config = NoBubblesConfig(num_pages=26, page_size_bytes=8192)  # 8KB pages
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         assert scheduler.config.num_pages == 26
         assert scheduler.config.page_size_bytes == 8192
@@ -425,7 +425,7 @@ class TestPageScheduleVisualization:
     def test_visualize_warp_schedule(self):
         """Test warp schedule visualization includes all info."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [
             OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10),
@@ -451,7 +451,7 @@ class TestEdgeCases:
     def test_single_operation(self):
         """Test schedule with single operation."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         ops = [OpDescriptor(name="Op0", op_idx=0, logical_grid_size=10)]
 
@@ -470,12 +470,9 @@ class TestEdgeCases:
     def test_many_ops_limited_pages(self):
         """Test many operations with very limited pages."""
         config = NoBubblesConfig(num_pages=2)  # Only 2 pages
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
-        ops = [
-            OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10)
-            for i in range(5)
-        ]
+        ops = [OpDescriptor(name=f"Op{i}", op_idx=i, logical_grid_size=10) for i in range(5)]
 
         # With 2 pages and 2 pages per op, only 1 op at a time
         micro_ops = scheduler.generate_warp_specialized_schedule(ops, pages_per_op=2)
@@ -492,7 +489,7 @@ class TestEdgeCases:
     def test_no_ops(self):
         """Test empty operation list."""
         config = NoBubblesConfig(num_pages=4)
-        scheduler = PageAwareScheduler(config)
+        scheduler = NoBubblesScheduler(config)
 
         micro_ops = scheduler.generate_warp_specialized_schedule([], pages_per_op=2)
         assert len(micro_ops) == 0
