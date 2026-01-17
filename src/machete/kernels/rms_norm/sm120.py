@@ -723,29 +723,6 @@ class RMSNormSM120(SingleKernel, FusableKernel):
 
         return self.apply_autograd(x_2d, weight, out, Float32(eps), Int32(n_rows)).view(orig_shape)
 
-    def backward(self, dout: Tensor, x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
-        # This manual backward call is kept for benchmarking direct kernel performance
-        orig_shape = x.shape
-        dout_2d = dout.reshape(-1, self.n_hidden)
-        x_2d = x.reshape(-1, self.n_hidden)
-        n_rows = x_2d.shape[0]
-
-        dx = torch.empty_like(x_2d)
-
-        # Create dummy weight if not provided
-        if weight is None and self.has_weight:
-            weight = torch.ones(self.n_hidden, dtype=x.dtype, device=x.device)
-
-        args = (dout_2d, x_2d, weight, dx, Float32(eps), Int32(n_rows))
-        grid = self.grid_fn(*args)
-        block = self.block_fn(*args)
-        n_blocks = grid[0] * grid[1] * grid[2]
-
-        self._update_or_add(self.mk_bwd, args)
-        self.mk_bwd.launch(n_blocks, grid, block)
-
-        return dx.view(orig_shape)
-
 
 # Convenience function for direct use
 _kernel_cache: dict[tuple, RMSNormSM120] = {}
