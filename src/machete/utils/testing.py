@@ -10,6 +10,22 @@ except ImportError:
     triton = None
 
 
+def clear_kernel_caches():
+    """
+    Clear all kernel caches to free GPU memory.
+    Call this between benchmark phases or when switching between different kernel sizes.
+    """
+    # Clear GatedLinear kernel cache
+    try:
+        from machete.kernels.gated_linear import clear_kernel_cache as clear_gated_linear
+        clear_gated_linear()
+    except ImportError:
+        pass
+
+    # Clear CUDA cache
+    torch.cuda.empty_cache()
+
+
 def benchmark_op(
     name: str, configs: Dict[str, Tuple], op_map: Dict[str, Callable], numel_provider: Callable[[Tuple], int]
 ):

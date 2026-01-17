@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Machete Authors
 import torch
+from functools import lru_cache
 from .sm80 import GatedLinearSM80
 
 
@@ -9,12 +10,22 @@ def get_gpu_capability():
     return torch.cuda.get_device_capability()
 
 
+# Global LRU cache for kernels to limit memory usage
+# Key: (dtype, act_type, n_rows, n_cols)
+@lru_cache(maxsize=8)
+def _get_kernel(dtype: torch.dtype, act_type: str, n_rows: int, n_cols: int) -> GatedLinearSM80:
+    return GatedLinearSM80(dtype, act_type, n_rows, n_cols)
+
+
+def clear_kernel_cache():
+    """Clear the kernel cache to free GPU memory."""
+    _get_kernel.cache_clear()
+
+
 class GatedLinear:
     def __init__(self, dtype: torch.dtype, act_type: str = "gelu"):
         self.dtype = dtype
         self.act_type = act_type
-        # Cache kernels per (n_rows, n_cols) since shapes are baked into kernel
-        self._kernel_cache: dict[tuple[int, int], GatedLinearSM80] = {}
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         ori_shape = a.shape
@@ -23,12 +34,10 @@ class GatedLinear:
         b_flat = b.view(-1, n_cols)
         n_rows = a_flat.shape[0]
 
-        # Get or create kernel for this shape
-        key = (n_rows, n_cols)
-        if key not in self._kernel_cache:
-            self._kernel_cache[key] = GatedLinearSM80(self.dtype, self.act_type, n_rows, n_cols)
+        # Get kernel from global LRU cache
+        kernel = _get_kernel(self.dtype, self.act_type, n_rows, n_cols)
 
-        c_flat = self._kernel_cache[key](a_flat, b_flat)
+        c_flat = kernel(a_flat, b_flat)
         return c_flat.view(*ori_shape)
 
 

@@ -121,6 +121,10 @@ def main():
 
     benchmark_op("SwiGLU Forward", get_configs(), forward_op_map, fwd_numel_provider)
 
+    # Clear kernel caches between forward and backward benchmarks to free GPU memory
+    from machete.utils.testing import clear_kernel_caches
+    clear_kernel_caches()
+
     # Backward
     def pytorch_bwd(a, b, dy):
         a.grad = b.grad = None
@@ -137,20 +141,15 @@ def main():
                 self.others = []
                 self.layout = []
 
-        # Now uses cached kernel internally via library fix
-        from machete.kernels.gated_linear import GatedLinear
+        # Get kernel from global LRU cache
+        from machete.kernels.gated_linear import _get_kernel
 
-        gated = GatedLinear(a.dtype, "silu")
-        # Get the kernel for this shape
         n_cols = a.shape[-1]
         a_flat = a.view(-1, n_cols)
         b_flat = b.view(-1, n_cols)
         n_rows = a_flat.shape[0]
-        key = (n_rows, n_cols)
-        if key not in gated._kernel_cache:
-            from machete.kernels.gated_linear.sm80 import GatedLinearSM80
-            gated._kernel_cache[key] = GatedLinearSM80(a.dtype, "silu", n_rows, n_cols)
-        kernel = gated._kernel_cache[key]
+
+        kernel = _get_kernel(a.dtype, "silu", n_rows, n_cols)
 
         ctx = MockCtx((a_flat, b_flat))
         kernel.run_backward(ctx, dy.view(-1, n_cols))
