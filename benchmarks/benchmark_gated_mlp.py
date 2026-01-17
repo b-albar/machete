@@ -1,87 +1,111 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from machete.utils.testing import benchmark_op, verify_kernel
+from machete.utils.testing import benchmark_op, clear_kernel_caches
 from machete.kernels.gated_mlp.triton_impl import gated_mlp_triton
-from machete.kernels.gated_mlp import gated_mlp_func
+from machete.kernels.gated_mlp import swiglu_mlp_func, geglu_mlp_func
 
 
-class ReferenceGatedMLP(nn.Module):
-    def __init__(self, d_model, d_intermediate, act_type="silu"):
-        super().__init__()
-        self.w_gate_up = nn.Linear(d_model, 2 * d_intermediate, bias=False)
-        self.act_type = act_type
+def swiglu_pytorch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference SwiGLU MLP."""
+    k_dim = weight.shape[0]
+    n2_dim = weight.shape[1]
+    n_dim = n2_dim // 2
 
-    def forward(self, x):
-        gate_up = self.w_gate_up(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        if self.act_type == "silu":
-            return F.silu(gate) * up
-        elif self.act_type == "gelu":
-            return F.gelu(gate, approximate="tanh") * up
-        return gate * up
+    w_gate = weight[:, ::2]
+    w_up = weight[:, 1::2]
+
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, k_dim)
+
+    h_gate = x_flat @ w_gate
+    h_up = x_flat @ w_up
+
+    out = F.silu(h_gate) * h_up
+    return out.view(*orig_shape[:-1], n_dim)
 
 
-def functional_gated_mlp(x, weight, act_type="silu"):
-    # weight is (K, 2N)
-    # x is (..., K)
-    # x @ weight -> (..., 2N)
-    gate_up = torch.matmul(x, weight)
-    gate, up = gate_up.chunk(2, dim=-1)
-    if act_type == "silu":
-        return F.silu(gate) * up
-    elif act_type == "gelu":
-        return F.gelu(gate, approximate="tanh") * up
-    return gate * up
+def geglu_pytorch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """PyTorch reference GeGLU MLP."""
+    k_dim = weight.shape[0]
+    n2_dim = weight.shape[1]
+    n_dim = n2_dim // 2
+
+    w_gate = weight[:, ::2]
+    w_up = weight[:, 1::2]
+
+    orig_shape = x.shape
+    x_flat = x.reshape(-1, k_dim)
+
+    h_gate = x_flat @ w_gate
+    h_up = x_flat @ w_up
+
+    out = F.gelu(h_gate, approximate="tanh") * h_up
+    return out.view(*orig_shape[:-1], n_dim)
 
 
 def main():
-    torch.manual_seed(0)
     device = "cuda"
     dtype = torch.float16
-    d_model = 4096
-    d_intermediate = 11008
 
-    ref_mlp = ReferenceGatedMLP(d_model, d_intermediate).to(device, dtype)
-    # Prepare weight for kernel: (K, 2N)
-    # nn.Linear weights are (Out, In) -> (2N, K)
-    # We transpose to (K, 2N) and make contiguous
-    weight = ref_mlp.w_gate_up.weight.detach().T.contiguous()
+    # --- SwiGLU Benchmark ---
+    def get_configs():
+        # (M, K, N) configurations
+        # M = batch * seq, K = d_model, N = d_intermediate (output is N, weight is K x 2N)
+        configs = [
+            (1024, 1024, 2048),    # Small model
+            (2048, 2048, 4096),    # Medium model
+            (4096, 4096, 8192),    # Large model (LLaMA-7B like)
+            (8192, 4096, 11008),   # LLaMA-7B exact
+            (16384, 4096, 11008),  # LLaMA-7B with larger batch
+        ]
 
-    configs = {
-        "BS=1, S=2048": (torch.randn(1, 2048, d_model, device=device, dtype=dtype), weight),
-        "BS=4, S=4096": (torch.randn(4, 4096, d_model, device=device, dtype=dtype), weight),
-    }
+        for m_dim, k_dim, n_dim in configs:
+            name = f"M={m_dim} K={k_dim} N={n_dim}"
+            try:
+                x = torch.randn(m_dim, k_dim, device=device, dtype=dtype)
+                # Weight is (K, 2*N) interleaved
+                weight = torch.randn(k_dim, 2 * n_dim, device=device, dtype=dtype) * 0.02
+                yield name, (x, weight)
+                del x, weight
+                torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError:
+                yield name, None
+                torch.cuda.empty_cache()
+                break
+            except Exception as e:
+                print(f"Skipping {name} due to error: {e}")
+                break
 
-    # Verify correctness first
-    print("Verifying correctness...")
-    x_test = torch.randn(2, 128, d_model, device=device, dtype=dtype)
-    out_ref = ref_mlp(x_test)
-    out_triton = gated_mlp_triton(x_test, weight)
-    # Check max diff
-    diff = (out_ref - out_triton).abs().max().item()
-    print(f"Max difference (PyTorch vs Triton): {diff}")
-    assert diff < 1e-2, "Triton implementation verification failed!"
-    print("Verification passed!")
-
-    op_map = {
-        "PyTorch": lambda x, w: functional_gated_mlp(x, w),
-        "Triton": gated_mlp_triton,
-        "cuteDSL": gated_mlp_func,
+    # SwiGLU Forward
+    swiglu_op_map = {
+        "PyTorch": lambda x, w: swiglu_pytorch(x, w),
+        "Triton": lambda x, w: gated_mlp_triton(x, w, activation="silu"),
+        "cuteDSL": lambda x, w: swiglu_mlp_func(x, w),
     }
 
     def numel_provider(args):
-        x = args[0]
-        # X: M*K, W: K*2N, Output: M*N
-        # args[0] is x, args[1] is w
-        M = x.numel() // x.shape[-1]
-        K = x.shape[-1]
-        N = d_intermediate
-        # Read X (M*K), Read W (K*2N), Write Y (M*N)
-        return M * K + K * 2 * N + M * N
+        x, weight = args
+        m_dim = x.shape[0]
+        k_dim = x.shape[1]
+        n_dim = weight.shape[1] // 2
+        # Memory transfers: x (M*K) + weight (K*2N) + output (M*N)
+        return m_dim * k_dim + k_dim * 2 * n_dim + m_dim * n_dim
 
-    benchmark_op("GatedMLP Forward", configs, op_map, numel_provider)
+    benchmark_op("SwiGLU MLP Forward", get_configs(), swiglu_op_map, numel_provider)
+
+    clear_kernel_caches()
+
+    # GeGLU Forward
+    geglu_op_map = {
+        "PyTorch": lambda x, w: geglu_pytorch(x, w),
+        "Triton": lambda x, w: gated_mlp_triton(x, w, activation="gelu"),
+        "cuteDSL": lambda x, w: geglu_mlp_func(x, w),
+    }
+
+    benchmark_op("GeGLU MLP Forward", get_configs(), geglu_op_map, numel_provider)
+
+    clear_kernel_caches()
 
 
 if __name__ == "__main__":

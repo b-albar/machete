@@ -22,6 +22,13 @@ def clear_kernel_caches():
     except ImportError:
         pass
 
+    # Clear GatedMLP kernel cache
+    try:
+        from machete.kernels.gated_mlp import clear_kernel_cache as clear_gated_mlp
+        clear_gated_mlp()
+    except ImportError:
+        pass
+
     # Clear CUDA cache
     torch.cuda.empty_cache()
 
