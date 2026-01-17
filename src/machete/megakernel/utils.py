@@ -12,6 +12,34 @@ from cutlass._mlir.dialects import llvm
 
 
 @dsl_user_op
+def atomic_add_i32(val: Int32, ptr, *, loc=None, ip=None) -> Int32:
+    """Atomic add for signed 32-bit integer.
+
+    Performs an atomic add operation on shared memory and returns
+    the previous value.
+
+    Args:
+        val: Value to add
+        ptr: Pointer to the target address
+
+    Returns:
+        The old value before the add
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [Int32(val).ir_value(loc=loc, ip=ip), ptr.llvm_ptr],
+        "atom.add.u32 $0, [$1], $2;",
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
 def nanosleep(ns: int | Int32, *, loc=None, ip=None) -> None:
     """Sleep for approximately ns nanoseconds.
 

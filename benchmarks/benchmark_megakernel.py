@@ -42,9 +42,6 @@ def main():
         for s_sz in [1024, 2048, 4096, 8192]:
             config_list.append((b_sz, s_sz, 32, 128))
 
-    rope_impl = RopeSM80(dtype, 128)
-    gl_impl = GatedLinearSM80(dtype, "silu")
-
     for i, config in enumerate(config_list):
         b_sz, s_sz, h_sz, d_sz = config
         config_name = f"B={b_sz} S={s_sz} H={h_sz} D={d_sz}"
@@ -66,8 +63,15 @@ def main():
             gate = torch.randn(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
             out = torch.empty(b_sz * s_sz, h_sz * d_sz, device=device, dtype=dtype)
 
+            n_tokens = b_sz * s_sz
+            n_cols_gl = h_sz * d_sz
+
+            # Create kernels with proper shape parameters
+            rope_impl = RopeSM80(dtype, d_sz, h_sz)
+            gl_impl = GatedLinearSM80(dtype, "silu", n_tokens, n_cols_gl)
+
             # Sequential
-            rope_op = RopeSM80(dtype, d_sz)
+            rope_op = RopeSM80(dtype, d_sz, h_sz)
             gl_op = GatedLinearOp(dtype, "silu")
 
             def run_seq(q=q, cos=cos, sin=sin, gate=gate, out=out):
@@ -82,8 +86,8 @@ def main():
                 mode="forward",
                 num_stages=0,  # Enable No Bubbles pipelining
             )
-            mk.add(rope_impl, q.view(-1, h_sz, d_sz), cos, sin, s_sz)
-            mk.add(gl_impl, q.view(-1, h_sz * d_sz), gate, out, h_sz * d_sz)
+            mk.add(rope_impl, q.view(-1, h_sz, d_sz), cos, sin, s_sz, n_tokens)
+            mk.add(gl_impl, q.view(-1, h_sz * d_sz), gate, out)
             grid = [q.shape[0] * q.shape[1], 1, 1]
             block = [256, 1, 1]
 
@@ -112,9 +116,8 @@ def main():
                 gate.view(-1, h_sz * d_sz),
                 d_a.view(-1, h_sz * d_sz),
                 d_b.view(-1, h_sz * d_sz),
-                h_sz * d_sz,
             )
-            mk_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz)
+            mk_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz, n_tokens)
 
             # One launch for tracing if requested
             if trace_bwd:
@@ -134,13 +137,12 @@ def main():
                 gate.view(-1, h_sz * d_sz),
                 d_a.view(-1, h_sz * d_sz),
                 d_b.view(-1, h_sz * d_sz),
-                h_sz * d_sz,
             )
 
             mk_rope_bwd = Megakernel(
                 f"rope_bwd_only_{config_name.replace('=', '_').replace(' ', '_')}", mode="backward"
             )
-            mk_rope_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz)
+            mk_rope_bwd.add(rope_impl, d_a.view(-1, h_sz, d_sz), cos, sin, s_sz, n_tokens)
 
             def run_seq_bwd(mk1=mk_gl_bwd, mk2=mk_rope_bwd, grid=grid, block=block):
                 mk1.launch(grid[0], grid, block)

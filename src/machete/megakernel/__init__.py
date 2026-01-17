@@ -8,8 +8,9 @@ overlap between load, compute, and store phases across fused operations.
 Key Features:
 - Logical Blocks: Abstract block coordinates for flexible kernel decomposition
 - Warp Specialization: Dedicated warps for load, compute, store, and control
-- Paged Shared Memory: Dynamic page allocation with semaphore-based sync
+- Static Shared Memory: Computed from operation graph at compile time
 - Dependency-Aware Scheduling: Optimal overlap based on read/write analysis
+- Mixed Kernel Types: Unified support for LCS and Producer/Consumer patterns
 
 Example:
     from machete.megakernel import Megakernel, FusableKernel, reads, writes
@@ -20,12 +21,12 @@ Example:
 
         @reads("input")
         @cute.jit
-        def load_forward(self, paged_pool, page_idx, *args):
+        def load_forward(self, logical_idx, *args):
             ...
 
         @writes("output")
         @cute.jit
-        def store_forward(self, paged_pool, page_idx, *args):
+        def store_forward(self, logical_idx, *args):
             ...
 
     mk = Megakernel()
@@ -46,19 +47,17 @@ from .interface import (
     reads,
     writes,
     warp_role,
+    async_load,
+    prefetchable,
+    depends_on,
     # Warp configuration
     WarpRole,
     WarpConfig,
     # Logical blocks
     LogicalCoord,
     LogicalGridInfo,
-    # Scheduler configuration
-    NoBubblesConfig,
-    PageSemaphoreConfig,
+    # Barrier config
     BarrierConfig,
-    # Scheduling modes for mixed kernel support
-    SchedulingMode,
-    MixedModeScheduler,
 )
 
 # Utilities
@@ -77,19 +76,17 @@ __all__ = [
     "reads",
     "writes",
     "warp_role",
+    "async_load",
+    "prefetchable",
+    "depends_on",
     # Warp configuration
     "WarpRole",
     "WarpConfig",
     # Logical blocks
     "LogicalCoord",
     "LogicalGridInfo",
-    # Scheduler configuration
-    "NoBubblesConfig",
-    "PageSemaphoreConfig",
+    # Barrier config
     "BarrierConfig",
-    # Scheduling modes for mixed kernel support
-    "SchedulingMode",
-    "MixedModeScheduler",
     # Utilities
     "nanosleep",
 ]

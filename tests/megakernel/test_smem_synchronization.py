@@ -70,7 +70,7 @@ class SmemDoubleKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, output_t, n):
+    def load_forward(self, logical_idx, smem, input_t, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -86,7 +86,7 @@ class SmemDoubleKernel(FusableKernel):
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, output_t, n):
+    def store_forward(self, logical_idx, smem, input_t, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -110,7 +110,7 @@ class SmemAddScalarKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -127,7 +127,7 @@ class SmemAddScalarKernel(FusableKernel):
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -151,7 +151,7 @@ class SmemMulScalarKernel(FusableKernel):
 
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -168,7 +168,7 @@ class SmemMulScalarKernel(FusableKernel):
 
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         idx = logical_idx * self.TILE_SIZE + tidx
         if idx < n and tidx < self.TILE_SIZE:
@@ -197,7 +197,7 @@ class WarpSpecSmemKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.LOADER)
     @reads("input")
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def load_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % 32
         base = logical_idx * self.TILE_SIZE
@@ -229,7 +229,7 @@ class WarpSpecSmemKernel(WarpSpecializedKernel):
     @warp_role(WarpRole.STORER)
     @writes("output")
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, logical_idx, smem, input_t, scalar, output_t, n):
+    def store_forward(self, logical_idx, smem, input_t, scalar, output_t, n):
         tidx, _, _ = cute.arch.thread_idx()
         lane = tidx % 32
         base = logical_idx * self.TILE_SIZE

@@ -132,19 +132,28 @@ def main():
         # Fair benchmark: Execute backward kernel directly without Forward recompute
         # Mock Context
         class MockCtx:
-            def __init__(self, saved, n_cols):
+            def __init__(self, saved):
                 self.saved_tensors = saved
-                self.n_cols = n_cols
                 self.others = []
                 self.layout = []
 
         # Now uses cached kernel internally via library fix
         from machete.kernels.gated_linear import GatedLinear
 
-        kernel = GatedLinear(a.dtype, "silu")._kernel
+        gated = GatedLinear(a.dtype, "silu")
+        # Get the kernel for this shape
+        n_cols = a.shape[-1]
+        a_flat = a.view(-1, n_cols)
+        b_flat = b.view(-1, n_cols)
+        n_rows = a_flat.shape[0]
+        key = (n_rows, n_cols)
+        if key not in gated._kernel_cache:
+            from machete.kernels.gated_linear.sm80 import GatedLinearSM80
+            gated._kernel_cache[key] = GatedLinearSM80(a.dtype, "silu", n_rows, n_cols)
+        kernel = gated._kernel_cache[key]
 
-        ctx = MockCtx((a, b), a.shape[-1])
-        kernel.run_backward(ctx, dy)
+        ctx = MockCtx((a_flat, b_flat))
+        kernel.run_backward(ctx, dy.view(-1, n_cols))
         return None
 
     backward_op_map = {

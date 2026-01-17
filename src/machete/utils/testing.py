@@ -1,7 +1,13 @@
 # Copyright (c) 2025, Machete Authors
 import torch
-import triton
 from typing import Callable, Dict, Tuple
+
+try:
+    import triton
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+    triton = None
 
 
 def benchmark_op(
@@ -16,6 +22,8 @@ def benchmark_op(
         op_map: Dictionary mapping provider names to callable functions.
         numel_provider: Function that takes config arguments and returns total elements transferred.
     """
+    if not HAS_TRITON:
+        raise ImportError("triton is required for benchmarking. Install with: pip install triton")
     print(f"\n{'=' * 20} {name} {'=' * 20}")
     print(f"{'Config':<20} | {'Provider':<15} | {'Speed (GB/s)':<15} | {'Time (ms)':<10} | {'Peak Mem (MB)':<12}")
     print("-" * 85)

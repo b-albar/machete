@@ -166,13 +166,14 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         SingleKernel.__init__(self, self, self.grid_fn, self.block_fn)
 
     @property
-    def smem_per_page(self) -> int:
-        """Shared memory size in bytes."""
+    def smem_size_fwd(self) -> int:
+        """Shared memory size in bytes for forward pass."""
         return self.cfg.smem_size_in_bytes()
 
     @property
-    def num_pages(self) -> int:
-        return 1
+    def smem_size_bwd(self) -> int:
+        """Shared memory size in bytes for backward pass."""
+        return self.cfg.smem_size_in_bytes()
 
     # ========== Shared Memory Helper ==========
 
@@ -226,7 +227,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
     # ========== Forward Pass L/C/S ==========
 
     @cute.jit
-    def load_forward(self, paged_pool, page_idx, smem, m_x, m_w, m_out, eps, n_rows):
+    def load_forward(self, logical_idx, smem, x_ptr, w_ptr, out_ptr, eps, n_rows):
         """
         Load phase: Async copy input x from global to shared memory.
         Also prefetch weight into registers.
@@ -239,18 +240,26 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tv_layout = cute.make_layout(cutlass.const_expr(self.tv_shape), stride=cutlass.const_expr(self.tv_stride))
         tiler_mn = cutlass.const_expr(self.tiler_mn)
 
+        # Create tensor from pointer with static stride to guarantee alignment for async copy
+        # This matches the original CUTLASS pattern
+        N = cutlass.const_expr(cfg.N)
+        mX = cute.make_tensor(
+            x_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
+
         # Use helper for consistent memory layout
-        sX, _ = self._partition_smem_fwd(smem, m_x.element_type)
+        sX, _ = self._partition_smem_fwd(smem, mX.element_type)
 
         # Create identity tensor for bounds checking
-        idX = cute.make_identity_tensor(m_x.shape)
-        gX = cute.local_tile(m_x, tiler_mn, (bidx, 0))
+        idX = cute.make_identity_tensor(mX.shape)
+        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         # Create async copy atom
         copy_atom_load_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
-            m_x.element_type,
+            mX.element_type,
             num_bits_per_copy=RMSNormConfig.COPY_BITS,
         )
         tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
@@ -272,7 +281,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def compute_forward(self, smem, m_x, m_w, m_out, eps, n_rows):
+    def compute_forward(self, logical_idx, smem, x_ptr, w_ptr, out_ptr, eps, n_rows):
         """
         Compute phase: RMS normalization.
         - Wait for async load
@@ -289,24 +298,32 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tiler_mn = cutlass.const_expr(self.tiler_mn)
         threads_per_row = tv_layout.shape[0][0]
 
-        # Use helper for consistent memory layout
-        sX, reduction_buffer = self._partition_smem_fwd(smem, m_x.element_type)
+        # Create tensor from pointer with static stride
+        N = cutlass.const_expr(cfg.N)
+        mX = cute.make_tensor(
+            x_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
 
-        # Weights handling
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
-            mW_expanded_layout = cute.prepend(m_w.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
-            mW_2d = cute.make_tensor(m_w.iterator, mW_expanded_layout)
+        # Use helper for consistent memory layout
+        sX, reduction_buffer = self._partition_smem_fwd(smem, mX.element_type)
+
+        # Weights handling - create tensor from pointer
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
+            mW = cute.make_tensor(w_ptr, cute.make_layout((N,), stride=(1,)))
+            mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
+            mW_2d = cute.make_tensor(w_ptr, mW_expanded_layout)
             gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         # Create copy atoms
         copy_atom_load_W = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
-            m_x.element_type,
+            mX.element_type,
             num_bits_per_copy=RMSNormConfig.COPY_BITS,
         )
         tiled_copy_load = cute.make_tiled_copy(
             cute.make_copy_atom(
-                cute.nvgpu.cpasync.CopyG2SOp(), m_x.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
+                cute.nvgpu.cpasync.CopyG2SOp(), mX.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
             ),
             tv_layout,
             tiler_mn,
@@ -320,7 +337,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tXsX = thr_copy_X.partition_D(sX)
         tXrX = cute.make_fragment_like(tXsX)
 
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
             tXgW = thr_copy_W.partition_S(gW)
             tXrW = cute.make_fragment_like(tXgW)
             tXrW_retiled = thr_copy_X.retile(tXrW)
@@ -329,8 +346,8 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.arch.cp_async_wait_group(0)
 
         # Load weight while waiting for async copy
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
-            idX = cute.make_identity_tensor(m_x.shape)
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
+            idX = cute.make_identity_tensor(mX.shape)
             tXcX_W = thr_copy_W.partition_S(cute.local_tile(idX, tiler_mn, (bidx, 0)))
             tWpW = predicate_k(tXcX_W, limit=cfg.N)
             cute.copy(copy_atom_load_W, tXgW, tXrW, pred=tWpW)
@@ -362,7 +379,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         y_val = x_val * rstd
 
         # Apply weight if present
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
             w = tXrW_retiled.load().to(Float32)
             y_val = y_val * w
 
@@ -371,10 +388,11 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.copy(copy_atom_load_W, tXrX, tXsX)
 
     @cute.jit
-    def store_forward(self, paged_pool, page_idx, smem, m_x, m_w, m_out, eps, n_rows):
+    def store_forward(self, logical_idx, smem, x_ptr, w_ptr, out_ptr, eps, n_rows):
         """
         Store phase: Write the normalized result from shared memory to global memory.
         """
+        cfg = self.cfg
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -382,18 +400,25 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tv_layout = cute.make_layout(cutlass.const_expr(self.tv_shape), stride=cutlass.const_expr(self.tv_stride))
         tiler_mn = cutlass.const_expr(self.tiler_mn)
 
+        # Create tensor from pointer with static stride
+        N = cutlass.const_expr(cfg.N)
+        mO = cute.make_tensor(
+            out_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
+
         # Allocate shared memory with proper alignment (same as compute_forward)
-        sX, _ = self._partition_smem_fwd(smem, m_out.element_type)
+        sX, _ = self._partition_smem_fwd(smem, mO.element_type)
 
         # Create identity tensor and partitions
-        idX = cute.make_identity_tensor(m_out.shape)
-        gO = cute.local_tile(m_out, tiler_mn, (bidx, 0))
+        idX = cute.make_identity_tensor(mO.shape)
+        gO = cute.local_tile(mO, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         # Create store copy atom (Universal)
         copy_atom_store = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
-            m_out.element_type,
+            mO.element_type,
             num_bits_per_copy=RMSNormConfig.COPY_BITS,
         )
         tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
@@ -405,7 +430,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tXcX = thr_copy_O.partition_S(cX)
 
         # Bounds checking
-        tXpX = predicate_k(tXcX, limit=self.cfg.N)
+        tXpX = predicate_k(tXcX, limit=cfg.N)
         row_in_bounds = tXcX[(0, 0), 0, 0][0] < n_rows
 
         # Write from shared memory to global memory
@@ -415,7 +440,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
     # ========== Backward Pass L/C/S ==========
 
     @cute.jit
-    def load_backward(self, paged_pool, page_idx, smem, m_dout, m_x, m_w, m_dx, eps, n_rows):
+    def load_backward(self, logical_idx, smem, dout_ptr, x_ptr, w_ptr, dx_ptr, eps, n_rows):
         """
         Load phase: Async copy dout and x from global to shared memory.
         """
@@ -427,18 +452,29 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tv_layout = cute.make_layout(cutlass.const_expr(self.tv_shape), stride=cutlass.const_expr(self.tv_stride))
         tiler_mn = cutlass.const_expr(self.tiler_mn)
 
-        s_dout, s_x, _ = self._partition_smem_bwd(smem, m_dout.element_type)
+        # Create tensors from pointers with static stride
+        N = cutlass.const_expr(cfg.N)
+        mDout = cute.make_tensor(
+            dout_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
+        mX = cute.make_tensor(
+            x_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
+
+        s_dout, s_x, _ = self._partition_smem_bwd(smem, mDout.element_type)
 
         # Create identity tensor and partitions
-        id_dout = cute.make_identity_tensor(m_dout.shape)
-        g_dout = cute.local_tile(m_dout, tiler_mn, (bidx, 0))
-        g_x = cute.local_tile(m_x, tiler_mn, (bidx, 0))
+        id_dout = cute.make_identity_tensor(mDout.shape)
+        g_dout = cute.local_tile(mDout, tiler_mn, (bidx, 0))
+        g_x = cute.local_tile(mX, tiler_mn, (bidx, 0))
         c_dout = cute.local_tile(id_dout, tiler_mn, (bidx, 0))
 
         # Create async copy atom
         copy_atom_load_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
-            m_dout.element_type,
+            mDout.element_type,
             num_bits_per_copy=RMSNormConfig.COPY_BITS,
         )
         tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
@@ -463,7 +499,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def compute_backward(self, smem, m_dout, m_x, m_w, m_dx, eps, n_rows):
+    def compute_backward(self, logical_idx, smem, dout_ptr, x_ptr, w_ptr, dx_ptr, eps, n_rows):
         """
         Compute phase: Compute dx = (dout * w - x * rstd² * sum(dout * x * w) / N) * rstd
         """
@@ -476,21 +512,29 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tiler_mn = cutlass.const_expr(self.tiler_mn)
         threads_per_row = tv_layout.shape[0][0]
 
-        s_dout, s_x, reduction_buffer = self._partition_smem_bwd(smem, m_dout.element_type)
+        # Create tensor from pointer with static stride
+        N = cutlass.const_expr(cfg.N)
+        mDout = cute.make_tensor(
+            dout_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
 
-        # Weight handling
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
-            mW_expanded_layout = cute.prepend(m_w.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
-            mW_2d = cute.make_tensor(m_w.iterator, mW_expanded_layout)
+        s_dout, s_x, reduction_buffer = self._partition_smem_bwd(smem, mDout.element_type)
+
+        # Weight handling - create tensor from pointer
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
+            mW = cute.make_tensor(w_ptr, cute.make_layout((N,), stride=(1,)))
+            mW_expanded_layout = cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,)))
+            mW_2d = cute.make_tensor(w_ptr, mW_expanded_layout)
             g_w = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         # Create copy atoms
         copy_atom_load_W = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), m_x.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
+            cute.nvgpu.CopyUniversalOp(), mDout.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
         )
         tiled_copy_load = cute.make_tiled_copy(
             cute.make_copy_atom(
-                cute.nvgpu.cpasync.CopyG2SOp(), m_dout.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
+                cute.nvgpu.cpasync.CopyG2SOp(), mDout.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
             ),
             tv_layout,
             tiler_mn,
@@ -508,7 +552,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         t_r_dout = cute.make_fragment_like(t_s_dout)
         t_r_x = cute.make_fragment_like(t_s_x)
 
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
             t_g_w = thr_copy_W.partition_S(g_w)
             t_r_w = cute.make_fragment_like(t_g_w)
             t_r_w_retiled = thr_copy_dout.retile(t_r_w)
@@ -517,8 +561,8 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.arch.cp_async_wait_group(0)
 
         # Load weights while sync is happening if needed
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
-            id_dout = cute.make_identity_tensor(m_dout.shape)
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
+            id_dout = cute.make_identity_tensor(mDout.shape)
             t_c_dout_W = thr_copy_W.partition_S(cute.local_tile(id_dout, tiler_mn, (bidx, 0)))
             t_pred_w = predicate_k(t_c_dout_W, limit=cfg.N)
             cute.copy(copy_atom_load_W, t_g_w, t_r_w, pred=t_pred_w)
@@ -548,7 +592,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
 
         # Term: dout * w
         dw_x = dout_val
-        if cutlass.const_expr(cfg.has_weight and m_w is not None):
+        if cutlass.const_expr(cfg.has_weight and w_ptr is not None):
             w_val = t_r_w_retiled.load().to(Float32)
             dw_x = dout_val * w_val
 
@@ -575,10 +619,11 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         cute.copy(copy_atom_load_W, t_r_dx, t_s_dout)
 
     @cute.jit
-    def store_backward(self, paged_pool, page_idx, smem, m_dout, m_x, m_w, m_dx, eps, n_rows):
+    def store_backward(self, logical_idx, smem, dout_ptr, x_ptr, w_ptr, dx_ptr, eps, n_rows):
         """
         Store phase: Write dx from shared memory to global memory.
         """
+        cfg = self.cfg
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -586,16 +631,23 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         tv_layout = cute.make_layout(cutlass.const_expr(self.tv_shape), stride=cutlass.const_expr(self.tv_stride))
         tiler_mn = cutlass.const_expr(self.tiler_mn)
 
-        s_dx, _, _ = self._partition_smem_bwd(smem, m_dx.element_type)
+        # Create tensor from pointer with static stride
+        N = cutlass.const_expr(cfg.N)
+        mDx = cute.make_tensor(
+            dx_ptr,
+            cute.make_layout((n_rows, N), stride=(N, 1)),
+        )
+
+        s_dx, _, _ = self._partition_smem_bwd(smem, mDx.element_type)
 
         # Create identity tensor and partitions
-        id_dx = cute.make_identity_tensor(m_dx.shape)
-        g_dx = cute.local_tile(m_dx, tiler_mn, (bidx, 0))
+        id_dx = cute.make_identity_tensor(mDx.shape)
+        g_dx = cute.local_tile(mDx, tiler_mn, (bidx, 0))
         c_dx = cute.local_tile(id_dx, tiler_mn, (bidx, 0))
 
         # Create store copy atom
         copy_atom_store = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), m_dx.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
+            cute.nvgpu.CopyUniversalOp(), mDx.element_type, num_bits_per_copy=RMSNormConfig.COPY_BITS
         )
         tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
         thr_copy_dx = tiled_copy_store.get_slice(tidx)
@@ -606,7 +658,7 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         t_c_dx = thr_copy_dx.partition_S(c_dx)
 
         # Bounds checking
-        t_pred = predicate_k(t_c_dx, limit=self.cfg.N)
+        t_pred = predicate_k(t_c_dx, limit=cfg.N)
         row_in_bounds = t_c_dx[(0, 0), 0, 0][0] < n_rows
 
         # Write from shared memory to global memory
@@ -657,7 +709,8 @@ class RMSNormSM120(SingleKernel, FusableKernel):
         # Returns dx, dweight (None for now), out (None), eps (None), n_rows (None)
         return dx, None, None, None, None
 
-    def forward(self, x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
+    def __call__(self, x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
+        """Convenience call for forward pass."""
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.n_hidden)
         n_rows = x_2d.shape[0]
@@ -693,6 +746,17 @@ class RMSNormSM120(SingleKernel, FusableKernel):
 
         return dx.view(orig_shape)
 
-    def __call__(self, x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
-        """Convenience call for forward pass."""
-        return self.forward(x, weight, eps)
+
+# Convenience function for direct use
+_kernel_cache: dict[tuple, RMSNormSM120] = {}
+
+
+def rms_norm_sm120(x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
+    """Convenience function for RMSNorm forward pass."""
+    n_hidden = x.shape[-1]
+    key = (x.dtype, n_hidden, weight is not None)
+
+    if key not in _kernel_cache:
+        _kernel_cache[key] = RMSNormSM120(x.dtype, n_hidden, has_weight=(weight is not None))
+
+    return _kernel_cache[key](x, weight, eps)
