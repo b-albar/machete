@@ -48,16 +48,13 @@ from .interface import (
     writes,
     warp_role,
     async_load,
-    prefetchable,
-    depends_on,
     # Warp configuration
     WarpRole,
     WarpConfig,
-    # Logical blocks
-    LogicalCoord,
-    LogicalGridInfo,
     # Barrier config
     BarrierConfig,
+    # Page config
+    PageConfig,
 )
 
 # Utilities
@@ -77,16 +74,13 @@ __all__ = [
     "writes",
     "warp_role",
     "async_load",
-    "prefetchable",
-    "depends_on",
     # Warp configuration
     "WarpRole",
     "WarpConfig",
-    # Logical blocks
-    "LogicalCoord",
-    "LogicalGridInfo",
     # Barrier config
     "BarrierConfig",
+    # Page config
+    "PageConfig",
     # Utilities
     "nanosleep",
 ]

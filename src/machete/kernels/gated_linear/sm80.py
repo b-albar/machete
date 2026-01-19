@@ -10,12 +10,13 @@ For element-wise operations like GatedLinear:
 
 import torch
 from torch import Tensor
+from typing import List
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
 import quack.activation as qact
-from machete.megakernel.interface import FusableKernel
+from machete.megakernel.interface import FusableKernel, TensorParam
 from machete.megakernel.single import SingleKernel
 
 
@@ -28,6 +29,7 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
     TILE_N = 2048  # Tile size for columns (multiple of 256*8=2048)
 
     def __init__(self, dtype: torch.dtype, act_type: str, n_rows: int, n_cols: int):
+        FusableKernel.__init__(self)
         self.torch_dtype = dtype
         self.cute_dtype = torch2cute_dtype_map[dtype]
         self.act_type = act_type
@@ -39,6 +41,29 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
         # 128 bit / 16 bit = 8
         # 128 bit / 32 bit = 4
         self.vec_size = 8 if dtype == torch.float16 else 4
+
+    @property
+    def tensor_params_fwd(self) -> List[TensorParam]:
+        """Tensor parameters for forward pass: a, b, c.
+
+        Uses index-based shape/stride: (0, 1) means tensor.shape[0], tensor.shape[1]
+        """
+        return [
+            TensorParam("a", shape=(0, 1), stride=(0, 1)),
+            TensorParam("b", shape=(0, 1), stride=(0, 1)),
+            TensorParam("c", shape=(0, 1), stride=(0, 1)),
+        ]
+
+    @property
+    def tensor_params_bwd(self) -> List[TensorParam]:
+        """Tensor parameters for backward pass: dc, a, b, da, db."""
+        return [
+            TensorParam("dc", shape=(0, 1), stride=(0, 1)),
+            TensorParam("a", shape=(0, 1), stride=(0, 1)),
+            TensorParam("b", shape=(0, 1), stride=(0, 1)),
+            TensorParam("da", shape=(0, 1), stride=(0, 1)),
+            TensorParam("db", shape=(0, 1), stride=(0, 1)),
+        ]
 
     @property
     def smem_size_fwd(self) -> int:
@@ -55,25 +80,14 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
     # ========== Forward Pass L/C/S ==========
 
     @cute.jit
-    def load_forward(self, logical_idx, smem, a_ptr, b_ptr, c_ptr):
+    def load_forward(self, logical_idx, smem, m_a, m_b, m_c):
         """Load A and B tiles global memory to shared memory."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx_x, bidx_y, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
-        n_rows = const_expr(self.n_rows)
         n_cols = const_expr(self.n_cols)
         TILE_N = const_expr(self.TILE_N)
-
-        # Create tensors from pointers
-        m_a = cute.make_tensor(
-            a_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
-        m_b = cute.make_tensor(
-            b_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
 
         row_idx = bidx_x
         col_start = bidx_y * TILE_N
@@ -101,21 +115,14 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
                         smem[TILE_N + k + u] = m_b[row_idx, base + u]
 
     @cute.jit
-    def compute_forward(self, logical_idx, smem, a_ptr, b_ptr, c_ptr):
+    def compute_forward(self, logical_idx, smem, m_a, m_b, m_c):
         """Compute."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx_x, bidx_y, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
-        n_rows = const_expr(self.n_rows)
         n_cols = const_expr(self.n_cols)
         TILE_N = const_expr(self.TILE_N)
-
-        # Create tensor from pointer
-        m_c = cute.make_tensor(
-            c_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
 
         row_idx = bidx_x
         col_start = bidx_y * TILE_N
@@ -164,7 +171,7 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
                         m_c[row_idx, base + u] = (gate * b_val).to(self.cute_dtype)
 
     @cute.jit
-    def store_forward(self, logical_idx, smem, a_ptr, b_ptr, c_ptr):
+    def store_forward(self, logical_idx, smem, m_a, m_b, m_c):
         pass
 
     # ========== Backward Pass L/C/S ==========
@@ -172,29 +179,14 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
     # But keep method signature consistent.
 
     @cute.jit
-    def load_backward(self, logical_idx, smem, dc_ptr, a_ptr, b_ptr, da_ptr, db_ptr):
+    def load_backward(self, logical_idx, smem, m_dc, m_a, m_b, m_da, m_db):
         # Load dc, a, b into smem
         tidx, _, _ = cute.arch.thread_idx()
         bidx_x, bidx_y, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
-        n_rows = const_expr(self.n_rows)
         n_cols = const_expr(self.n_cols)
         TILE_N = const_expr(self.TILE_N)
-
-        # Create tensors from pointers
-        m_dc = cute.make_tensor(
-            dc_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
-        m_a = cute.make_tensor(
-            a_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
-        m_b = cute.make_tensor(
-            b_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
 
         row_idx = bidx_x
         col_start = bidx_y * TILE_N
@@ -230,24 +222,13 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
                         smem[off_b + k + u] = m_b[row_idx, base + u]
 
     @cute.jit
-    def compute_backward(self, logical_idx, smem, dc_ptr, a_ptr, b_ptr, da_ptr, db_ptr):
+    def compute_backward(self, logical_idx, smem, m_dc, m_a, m_b, m_da, m_db):
         tidx, _, _ = cute.arch.thread_idx()
         bidx_x, bidx_y, _ = cute.arch.block_idx()
         num_threads, _, _ = cute.arch.block_dim()
 
-        n_rows = const_expr(self.n_rows)
         n_cols = const_expr(self.n_cols)
         TILE_N = const_expr(self.TILE_N)
-
-        # Create output tensors from pointers
-        m_da = cute.make_tensor(
-            da_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
-        m_db = cute.make_tensor(
-            db_ptr,
-            cute.make_layout((n_rows, n_cols), stride=(n_cols, 1)),
-        )
 
         row_idx = bidx_x
         col_start = bidx_y * TILE_N
@@ -301,7 +282,7 @@ class GatedLinearSM80(SingleKernel, FusableKernel):
                         m_db[row_idx, base + u] = Float32(db_val).to(self.cute_dtype)
 
     @cute.jit
-    def store_backward(self, logical_idx, smem, dc_ptr, a_ptr, b_ptr, da_ptr, db_ptr):
+    def store_backward(self, logical_idx, smem, m_dc, m_a, m_b, m_da, m_db):
         pass
 
     # ========== Launch Helpers ==========

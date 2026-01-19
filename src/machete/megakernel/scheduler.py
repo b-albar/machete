@@ -1,58 +1,41 @@
 # Copyright (c) 2025, Machete Authors
-"""
-Operation Graph Scheduler for Megakernels.
+"""Scheduler and data structures for persistent megakernel.
 
-This module implements a simplified scheduling infrastructure:
-1. Operation graph with data dependencies
-2. Static shared memory planning (no dynamic paging)
-3. Schedule optimization (load movement, overlap)
-4. Unified mixed kernel type support (LCS and Producer/Consumer)
-
-Based on: "Look Ma, No Bubbles!" - HazyResearch
+This module provides:
+- WarpRole, WarpConfig: Warp specialization configuration
+- PageConfig: Paged shared memory configuration
+- BarrierConfig: Global scoreboard configuration
+- Instruction: Runtime instruction encoding
+- InstructionScheduler: Dependency-aware scheduling
+- Decorators: @reads, @writes, @warp_role, @async_load
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Set, Callable, TypeVar, Tuple
-from enum import Enum, auto
-from collections import deque
-
-F = TypeVar("F", bound=Callable)
+from enum import IntEnum
+from typing import Tuple, List, Dict, Any, Optional
 
 
-# ============================================================================
-# Warp Role Definitions (HazyResearch Model)
-# ============================================================================
+# ============ Warp Roles ============
 
 
-class WarpRole(Enum):
-    """Warp specialization roles for the megakernel.
+class WarpRole(IntEnum):
+    """Warp specialization roles for the megakernel."""
 
-    Based on HazyResearch's design:
-    - CONSUMER: 12-16 warps for compute (MMA, math operations)
-    - LOADER: 1 warp for async loads (Global -> Shared via TMA/cp.async)
-    - STORER: 1 warp for async stores (Shared -> Global)
-    - LAUNCHER: 1 warp for auxiliary async tasks (K/V cache prefetch, TMA descriptors)
-    - CONTROLLER: 1 warp for instruction fetch/decode and pipeline coordination
-    """
-
-    CONSUMER = auto()  # Math/MMA operations (12-16 warps)
-    LOADER = auto()  # Global -> Shared memory loads (1 warp)
-    STORER = auto()  # Shared -> Global memory stores (1 warp)
-    LAUNCHER = auto()  # Auxiliary async tasks (1 warp)
-    CONTROLLER = auto()  # Instruction fetch/decode (1 warp)
+    CONSUMER = 0  # MMA and math (warps 0 to N-1)
+    LOADER = 1  # Async loads HBM→SMEM
+    STORER = 2  # Stores SMEM→HBM
+    LAUNCHER = 3  # Auxiliary async (TMA prefetch, etc.)
+    CONTROLLER = 4  # Instruction fetch & coordination
 
 
 @dataclass
 class WarpConfig:
-    """Configuration for warp specialization.
+    """Warp specialization configuration.
 
-    Typical H100 configuration:
-    - 20 warps total per block (640 threads)
-    - 16 consumer warps (80% of warps)
-    - 4 system warps (controller, launcher, loader, storer)
+    Layout: [Consumer warps...][Loader][Storer][Launcher][Controller]
     """
 
-    num_consumer_warps: int = 16
+    num_consumer_warps: int = 12
     num_loader_warps: int = 1
     num_storer_warps: int = 1
     num_launcher_warps: int = 1
@@ -72,737 +55,482 @@ class WarpConfig:
     def total_threads(self) -> int:
         return self.total_warps * 32
 
-    def get_warp_role(self, warp_id: int) -> WarpRole:
-        """Determine the role of a warp by its ID."""
+    def get_role(self, warp_id: int) -> WarpRole:
+        """Map warp ID to role."""
         if warp_id < self.num_consumer_warps:
             return WarpRole.CONSUMER
-        offset = self.num_consumer_warps
-        if warp_id < offset + self.num_loader_warps:
+        warp_id -= self.num_consumer_warps
+        if warp_id < self.num_loader_warps:
             return WarpRole.LOADER
-        offset += self.num_loader_warps
-        if warp_id < offset + self.num_storer_warps:
+        warp_id -= self.num_loader_warps
+        if warp_id < self.num_storer_warps:
             return WarpRole.STORER
-        offset += self.num_storer_warps
-        if warp_id < offset + self.num_launcher_warps:
+        warp_id -= self.num_storer_warps
+        if warp_id < self.num_launcher_warps:
             return WarpRole.LAUNCHER
         return WarpRole.CONTROLLER
 
+    @property
+    def loader_warp_start(self) -> int:
+        return self.num_consumer_warps
 
-# ============================================================================
-# Logical Block Coordinate Mapping
-# ============================================================================
+    @property
+    def storer_warp_start(self) -> int:
+        return self.num_consumer_warps + self.num_loader_warps
+
+    @property
+    def launcher_warp_start(self) -> int:
+        return self.storer_warp_start + self.num_storer_warps
+
+    @property
+    def controller_warp_start(self) -> int:
+        return self.launcher_warp_start + self.num_launcher_warps
+
+
+# ============ Logical Grid ============
 
 
 @dataclass
 class LogicalCoord:
-    """A logical coordinate that maps to kernel-specific dimensions.
-
-    This abstracts the physical block index into a logical coordinate system
-    that each kernel can interpret differently (e.g., (batch, seq, head) for RoPE).
-    """
+    """Represents logical coordinates for a work unit."""
 
     values: Tuple[int, ...]
-    names: Tuple[str, ...] = ()
-
-    def __getitem__(self, idx: int) -> int:
-        return self.values[idx]
-
-    def __len__(self) -> int:
-        return len(self.values)
-
-    def __repr__(self) -> str:
-        if self.names:
-            parts = [f"{n}={v}" for n, v in zip(self.names, self.values)]
-            return f"LogicalCoord({', '.join(parts)})"
-        return f"LogicalCoord{self.values}"
 
 
 @dataclass
 class LogicalGridInfo:
-    """Information about the logical grid for a kernel.
+    """Full logical grid information."""
 
-    Each kernel computes its own logical grid size based on the problem shape.
-    The scheduler uses this to determine TotalLogicalBlocks and coordinate mapping.
+    logical_grid_size: int
+    coord_names: Tuple[str, ...] = ("idx",)
+    coord_dims: Tuple[int, ...] = None
+
+
+# ============ Dependencies ============
+
+
+@dataclass
+class TensorDependency:
+    """Tracks tensor read/write for dependency analysis."""
+
+    name: str
+    is_read: bool  # True=@reads, False=@writes
+
+
+@dataclass
+class BarrierConfig:
+    """Global scoreboard configuration: Bar[op_id][chunk_id]."""
+
+    num_ops: int
+    num_chunks: int
+
+    def get_index(self, op_id: int, chunk_id: int) -> int:
+        """Compute flat index into barrier array."""
+        return op_id * self.num_chunks + chunk_id
+
+    @property
+    def total_size(self) -> int:
+        return self.num_ops * self.num_chunks
+
+
+# ============ Paged Memory ============
+
+
+@dataclass
+class PageSemaphores:
+    """Per-page semaphore state for backpressure control.
+
+    Each page has two semaphores:
+    - sem_loaded: Signaled when Loader finishes writing to this page
+    - sem_consumed: Signaled when Consumer finishes reading from this page
+
+    This prevents WAR (Write-After-Read) hazards where the Loader wraps
+    around and overwrites data the Consumer is still processing.
     """
 
-    logical_grid_size: int  # Total logical blocks for this kernel
-    coord_names: Tuple[str, ...] = ()  # Names for coordinate dimensions
-    coord_dims: Tuple[int, ...] = ()  # Size of each coordinate dimension
+    num_pages: int
+
+    def get_sem_loaded_offset(self, page_id: int) -> int:
+        """Offset for sem_loaded[page_id] in semaphore array."""
+        return page_id * 2
+
+    def get_sem_consumed_offset(self, page_id: int) -> int:
+        """Offset for sem_consumed[page_id] in semaphore array."""
+        return page_id * 2 + 1
+
+    @property
+    def total_semaphores(self) -> int:
+        """Total number of semaphores (2 per page)."""
+        return self.num_pages * 2
+
+    @property
+    def smem_size(self) -> int:
+        """Shared memory needed for semaphores (8 bytes each)."""
+        return self.total_semaphores * 8
 
 
-# ============================================================================
-# Dependency Declaration Decorators
-# ============================================================================
+@dataclass
+class PageConfig:
+    """Paged shared memory configuration.
 
+    The number of pages is computed dynamically based on available
+    shared memory on the device. Only page_size is configurable.
 
-def reads(*tensors: str) -> Callable[[F], F]:
-    """Decorator to declare which tensors/memory regions an L/C/S method reads from.
+    Page lifecycle with backpressure:
+    1. Loader waits on sem_consumed[page] (page is free)
+    2. Loader loads data into page
+    3. Loader signals sem_loaded[page]
+    4. Consumer waits on sem_loaded[page]
+    5. Consumer processes data
+    6. Consumer signals sem_consumed[page] (releases page for reuse)
 
-    Usage:
-        @reads("input", "weight")
-        @cute.jit
-        def load_forward(self, logical_idx, input, weight, output):
-            ...
+    Typical shared memory sizes:
+    - H100: ~227KB -> ~14 pages at 16KB
+    - A100: ~164KB -> ~10 pages at 16KB
+    - RTX 4090: ~100KB -> ~6 pages at 16KB
     """
 
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_reads", set())
-        func._machete_reads = existing | set(tensors)
+    page_size: int = 16384  # 16KB per page (configurable)
+    alignment: int = 128  # Alignment for each page
+    reserved_smem: int = 4096  # Reserved for semaphores, ring buffer, etc.
+
+    def get_num_pages(self, total_smem: int) -> int:
+        """Compute number of pages based on available shared memory.
+
+        Args:
+            total_smem: Total shared memory available on device in bytes.
+
+        Returns:
+            Number of pages that fit in available memory.
+        """
+        available = total_smem - self.reserved_smem
+        return max(1, available // self.page_size)
+
+    def get_total_smem_for_pages(self, num_pages: int) -> int:
+        """Get total shared memory used by pages."""
+        return self.page_size * num_pages
+
+    def get_semaphores(self, num_pages: int) -> PageSemaphores:
+        """Create semaphore configuration for given page count."""
+        return PageSemaphores(num_pages=num_pages)
+
+
+# ============ Instructions ============
+
+
+@dataclass
+class Instruction:
+    """Runtime instruction for megakernel interpreter.
+
+    Encoding: [opcode, logical_idx, num_in, in_pages..., num_out, out_pages...,
+               num_wait, wait_bars..., num_signal, signal_bars...]
+
+    Dependencies are classified as:
+    - Local: Same logical_idx, sequential ops within same block (use syncthreads)
+    - Cross-block: Different logical_idx or requiring global coordination (use g_bar)
+
+    For local dependencies, global scoreboard is skipped (redundant).
+    """
+
+    opcode: int  # Operation type (index into op registry)
+    logical_idx: int  # Logical work unit index
+    input_pages: List[int] = field(default_factory=list)  # Logical page IDs for inputs
+    output_pages: List[int] = field(default_factory=list)  # Logical page IDs for outputs
+    wait_barriers: List[int] = field(default_factory=list)  # Cross-block barrier indices to wait on
+    signal_barriers: List[int] = field(default_factory=list)  # Barriers to signal
+    local_deps: List[int] = field(default_factory=list)  # Local op dependencies (same block, use sync)
+    arg_slots: List[int] = field(default_factory=list)  # Indices into global tensor pointer array
+    needs_page_wait: bool = False  # True if must wait for page to be free (backpressure)
+
+    def encode(self) -> List[int]:
+        """Encode instruction as int array for GPU.
+
+        Format: [opcode, logical_idx, flags, num_in, in_pages..., num_out, out_pages...,
+                 num_wait, wait_bars..., num_signal, signal_bars..., num_local, local_deps...]
+
+        Flags byte: bit 0 = needs_page_wait
+        """
+        flags = 1 if self.needs_page_wait else 0
+        data = [self.opcode, self.logical_idx, flags]
+        data.append(len(self.input_pages))
+        data.extend(self.input_pages)
+        data.append(len(self.output_pages))
+        data.extend(self.output_pages)
+        data.append(len(self.wait_barriers))
+        data.extend(self.wait_barriers)
+        data.append(len(self.signal_barriers))
+        data.extend(self.signal_barriers)
+        data.append(len(self.local_deps))
+        data.extend(self.local_deps)
+        data.append(len(self.arg_slots))
+        data.extend(self.arg_slots)
+        return data
+
+    @staticmethod
+    def decode(data: List[int], offset: int = 0) -> Tuple["Instruction", int]:
+        """Decode instruction from int array. Returns (instruction, next_offset)."""
+        opcode = data[offset]
+        logical_idx = data[offset + 1]
+        flags = data[offset + 2]
+        needs_page_wait = bool(flags & 1)
+        pos = offset + 3
+
+        num_in = data[pos]
+        pos += 1
+        input_pages = data[pos : pos + num_in]
+        pos += num_in
+
+        num_out = data[pos]
+        pos += 1
+        output_pages = data[pos : pos + num_out]
+        pos += num_out
+
+        num_wait = data[pos]
+        pos += 1
+        wait_barriers = data[pos : pos + num_wait]
+        pos += num_wait
+
+        num_signal = data[pos]
+        pos += 1
+        signal_barriers = data[pos : pos + num_signal]
+        pos += num_signal
+
+        num_local = data[pos]
+        pos += 1
+        local_deps = data[pos : pos + num_local]
+        pos += num_local
+
+        num_slots = data[pos]
+        pos += 1
+        arg_slots = data[pos : pos + num_slots]
+        pos += num_slots
+
+        return Instruction(
+            opcode=opcode,
+            logical_idx=logical_idx,
+            input_pages=list(input_pages),
+            output_pages=list(output_pages),
+            wait_barriers=list(wait_barriers),
+            signal_barriers=list(signal_barriers),
+            local_deps=list(local_deps),
+            arg_slots=list(arg_slots),
+            needs_page_wait=needs_page_wait,
+        ), pos
+
+
+# ============ Decorators ============
+
+
+def reads(*tensor_names: str):
+    """Mark method as reading from tensors for dependency tracking."""
+
+    def decorator(func):
+        # Store in deps list for scheduler
+        existing = getattr(func, "_machete_deps", [])
+        for name in tensor_names:
+            existing.append(TensorDependency(name=name, is_read=True))
+        func._machete_deps = existing
+        # Also store as set for compatibility
+        func._machete_reads = set(tensor_names)
         return func
 
     return decorator
 
 
-def writes(*tensors: str) -> Callable[[F], F]:
-    """Decorator to declare which tensors/memory regions an L/C/S method writes to.
+def writes(*tensor_names: str):
+    """Mark method as writing to tensors for dependency tracking."""
 
-    Usage:
-        @writes("output")
-        @cute.jit
-        def store_forward(self, logical_idx, input, weight, output):
-            ...
-    """
-
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_writes", set())
-        func._machete_writes = existing | set(tensors)
+    def decorator(func):
+        # Store in deps list for scheduler
+        existing = getattr(func, "_machete_deps", [])
+        for name in tensor_names:
+            existing.append(TensorDependency(name=name, is_read=False))
+        func._machete_deps = existing
+        # Also store as set for compatibility
+        func._machete_writes = set(tensor_names)
         return func
 
     return decorator
 
 
-def warp_role(role: WarpRole) -> Callable[[F], F]:
-    """Decorator to annotate which warp role should execute a method.
+def warp_role(role: WarpRole):
+    """Assign method to specific warp role."""
 
-    Usage:
-        @warp_role(WarpRole.LOADER)
-        @cute.jit
-        def load_forward(self, logical_idx, ...):
-            # Only loader warps execute this
-            ...
-    """
-
-    def decorator(func: F) -> F:
+    def decorator(func):
         func._machete_warp_role = role
         return func
 
     return decorator
 
 
-def async_load() -> Callable[[F], F]:
-    """Decorator to mark a load as async (non-blocking).
+def async_load(func):
+    """Mark load as using async copy (TMA/cp.async)."""
+    func._machete_async_load = True
+    return func
 
-    Async loads can be issued early and overlapped with previous operations.
+
+# ============ Scheduler ============
+
+
+class InstructionScheduler:
+    """Schedules ops into instruction stream with fine-grained dependencies.
+
+    The scheduler:
+    1. Tracks tensor read/write dependencies
+    2. Classifies dependencies as local (same block) or cross-block
+    3. Generates instructions for each (op, chunk) pair
+    4. Computes barrier wait/signal indices for cross-block dependencies
+    5. Allocates logical pages (round-robin) with backpressure tracking
+
+    Dependency Classification:
+    - Local: Producer and consumer process same logical_idx in same block.
+             Use syncthreads() instead of global scoreboard (faster).
+    - Cross-block: Different logical_idx or different blocks.
+             Use global scoreboard (g_bar) for synchronization.
+
+    Backpressure (WAR Protection):
+    - When logical_idx wraps around pages (logical_idx >= num_pages),
+      the Loader must wait for Consumer to release the page.
+    - This prevents overwriting data the Consumer is still processing.
     """
 
-    def decorator(func: F) -> F:
-        func._machete_async_load = True
-        return func
-
-    return decorator
-
-
-def prefetchable(*memory_regions: str) -> Callable[[F], F]:
-    """Decorator to mark which memory regions can be prefetched.
-
-    Prefetchable regions are loaded early (during previous op's compute)
-    to hide memory latency.
-    """
-
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_prefetchable", set())
-        func._machete_prefetchable = existing | set(memory_regions)
-        return func
-
-    return decorator
-
-
-def depends_on(
-    op_name: str,
-    granularity: str = "logical_block",
-    producer_dims: Optional[Tuple[int, ...]] = None,
-    consumer_dims: Optional[Tuple[int, ...]] = None,
-) -> Callable[[F], F]:
-    """Decorator to declare fine-grained dependency on another operation.
-
-    This enables logical block-level synchronization instead of waiting
-    for the entire previous operation to complete.
-
-    Args:
-        op_name: Name of the producer operation to depend on
-        granularity: "kernel", "logical_block", "reduction", or "broadcast"
-        producer_dims: Shape of producer's logical grid
-        consumer_dims: Shape of consumer's logical grid
-    """
-
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_depends_on", [])
-        func._machete_depends_on = existing + [
-            (op_name, granularity, producer_dims, consumer_dims)
-        ]
-        return func
-
-    return decorator
-
-
-# ============================================================================
-# Helper Functions for Extracting Decorator Info
-# ============================================================================
-
-
-def get_method_dependencies(method: Callable) -> Tuple[Set[str], Set[str]]:
-    """Extract dependency info from a decorated L/C/S method.
-
-    Returns:
-        (reads, writes)
-    """
-    reads_set = getattr(method, "_machete_reads", set())
-    writes_set = getattr(method, "_machete_writes", set())
-    return reads_set, writes_set
-
-
-def get_method_warp_role(method: Callable) -> Optional[WarpRole]:
-    """Extract warp role annotation from a method."""
-    return getattr(method, "_machete_warp_role", None)
-
-
-def is_async_load(method: Callable) -> bool:
-    """Check if a method is marked as async load."""
-    return getattr(method, "_machete_async_load", False)
-
-
-def get_prefetchable_regions(method: Callable) -> Set[str]:
-    """Get memory regions that can be prefetched."""
-    return getattr(method, "_machete_prefetchable", set())
-
-
-# ============================================================================
-# Configuration Classes
-# ============================================================================
-
-
-@dataclass
-class BarrierConfig:
-    """Configuration for the global barrier tensor.
-
-    The barrier tensor is addressed as: Bar[OpIdx][LogicalID]
-    - Producer: atomicAdd(&Bar[op_idx, logical_id], 1) after store
-    - Consumer: while(Bar[dep_op_idx, logical_id] < target) nanosleep()
-    """
-
-    num_ops: int
-    total_logical_blocks: int
-
-    @property
-    def tensor_shape(self) -> Tuple[int, int]:
-        """Shape of the barrier tensor: (num_ops, total_logical_blocks)."""
-        return (self.num_ops, self.total_logical_blocks)
-
-    @property
-    def total_counters(self) -> int:
-        """Total number of barrier counters needed."""
-        return self.num_ops * self.total_logical_blocks
-
-
-# ============================================================================
-# Kernel Type for Mixed Mode Support
-# ============================================================================
-
-
-class KernelType(Enum):
-    """Per-operation kernel type.
-
-    Each operation declares its type. The scheduler builds a unified graph
-    where all kernel types coexist.
-    """
-
-    LCS = auto()  # Load/Compute/Store phases (traditional)
-    PRODUCER_CONSUMER = auto()  # Producer/Consumer warp pattern
-
-
-# ============================================================================
-# Operation Graph Data Structures
-# ============================================================================
-
-
-@dataclass
-class OpNode:
-    """A node in the operation graph representing a single operation."""
-
-    op_idx: int
-    name: str
-
-    # Shared memory requirements (bytes) - static, computed from kernel
-    smem_bytes_fwd: int = 0
-    smem_bytes_bwd: int = 0
-
-    # Active smem bytes based on mode (set by graph builder)
-    smem_bytes: int = 0
-
-    # Kernel type (LCS or Producer/Consumer)
-    kernel_type: KernelType = KernelType.LCS
-
-    # Logical grid info
-    logical_grid_size: int = 1
-    coord_dims: Tuple[int, ...] = ()
-
-    # Dependency information (tensor names)
-    reads: Set[str] = field(default_factory=set)
-    writes: Set[str] = field(default_factory=set)
-
-    # Graph edges (indices of dependent operations)
-    depends_on: Set[int] = field(default_factory=set)
-    dependents: Set[int] = field(default_factory=set)
-
-    # Load optimization flags
-    can_early_load: bool = True
-    has_async_load: bool = False
-    prefetchable_regions: Set[str] = field(default_factory=set)
-
-    # For warp specialization
-    uses_warp_specialization: bool = False
-    warp_config: Optional[WarpConfig] = None
-
-
-@dataclass
-class OpEdge:
-    """An edge in the operation graph representing a dependency."""
-
-    producer_idx: int
-    consumer_idx: int
-
-    # What data flows along this edge
-    tensors: Set[str] = field(default_factory=set)
-
-    # Dependency pattern
-    is_reduction: bool = False  # Many-to-one
-    is_broadcast: bool = False  # One-to-many
-
-    # For reduction/broadcast, dimension mapping
-    producer_dims: Tuple[int, ...] = ()
-    consumer_dims: Tuple[int, ...] = ()
-
-    @property
-    def blocks_per_consumer(self) -> int:
-        """For reduction: how many producer blocks per consumer."""
-        if not self.is_reduction:
-            return 1
-        p_total = 1
-        for d in self.producer_dims:
-            p_total *= d
-        c_total = 1
-        for d in self.consumer_dims:
-            c_total *= d
-        return p_total // c_total if c_total > 0 else 1
-
-
-class OperationGraph:
-    """Graph of operations for scheduling and optimization.
-
-    This is the central data structure for the scheduler.
-    It builds a DAG of operations and provides analysis methods.
-    """
-
-    def __init__(self):
-        self.nodes: Dict[int, OpNode] = {}
-        self.edges: List[OpEdge] = []
-        self._total_smem: Optional[int] = None
-        self._topo_order: Optional[List[int]] = None
-
-    def add_node(self, node: OpNode):
-        """Add an operation node to the graph."""
-        self.nodes[node.op_idx] = node
-        self._total_smem = None
-        self._topo_order = None
-
-    def add_edge(self, edge: OpEdge):
-        """Add a dependency edge to the graph."""
-        self.edges.append(edge)
-        if edge.producer_idx in self.nodes:
-            self.nodes[edge.producer_idx].dependents.add(edge.consumer_idx)
-        if edge.consumer_idx in self.nodes:
-            self.nodes[edge.consumer_idx].depends_on.add(edge.producer_idx)
-        self._topo_order = None
-
-    @classmethod
-    def from_instructions(
-        cls, instructions: List[Dict], mode: str = "forward"
-    ) -> "OperationGraph":
-        """Build operation graph from a list of instruction dicts.
-
-        Args:
-            instructions: List of instruction dicts with kernel, load, compute, store
-            mode: "forward" or "backward"
+    def __init__(self, barrier_config: BarrierConfig, page_config: PageConfig, num_pages: int = 8):
+        self.barrier_config = barrier_config
+        self.page_config = page_config
+        self.num_pages = num_pages  # Actual number of pages (computed from device smem)
+        self.ops: List[Dict] = []
+        self.instructions: List[Instruction] = []
+        # Track which op last wrote each tensor
+        self.tensor_producers: Dict[str, int] = {}  # tensor_name -> op_id
+        # Track global tensor registration
+        self.tensor_to_slot: Dict[int, int] = {}  # tensor_id -> slot_index
+        self.unique_tensors: List[Any] = []
+
+    def add_op(
+        self, op_id: int, op: Any, logical_grid_size: int, reads_list: List[str], writes_list: List[str]
+    ) -> None:
+        """Add operation to schedule."""
+        self.ops.append(
+            {
+                "op_id": op_id,
+                "op": op,
+                "logical_grid_size": logical_grid_size,
+                "reads": reads_list,
+                "writes": writes_list,
+                "args": [],  # Filled during registry build
+            }
+        )
+
+    def register_tensor(self, tensor: Any) -> int:
+        """Register a tensor and return its global slot index."""
+        tid = id(tensor)
+        if tid not in self.tensor_to_slot:
+            slot = len(self.unique_tensors)
+            self.tensor_to_slot[tid] = slot
+            self.unique_tensors.append(tensor)
+        return self.tensor_to_slot[tid]
+
+    def _is_local_dependency(self, producer_op: int, consumer_op: int, chunk_id: int) -> bool:
+        """Check if dependency is local (same block, sequential ops).
+
+        Local dependencies occur when:
+        1. Operations are sequential in the op list (producer_op < consumer_op)
+        2. Same logical_idx/chunk_id is being processed
+        3. Single persistent block processes both ops for this chunk
+
+        In the persistent model with warp specialization, ops for the same
+        logical_idx are processed by the same block, so syncthreads() suffices.
+        """
+        # If ops are sequential and processing same chunk, it's local
+        return producer_op < consumer_op
+
+    def schedule(self) -> List[Instruction]:
+        """Generate instruction stream with dependencies.
+
+        Each instruction represents one (op, chunk) pair.
+        Dependencies are classified as local or cross-block.
+        """
+        self.instructions = []
+
+        for op_info in self.ops:
+            op_id = op_info["op_id"]
+            logical_grid_size = op_info["logical_grid_size"]
+            reads_list = op_info["reads"]
+            writes_list = op_info["writes"]
+
+            # Map op arguments to global slots
+            arg_slots = [self.register_tensor(arg) for arg in op_info.get("raw_args", [])]
+
+            for chunk_id in range(logical_grid_size):
+                # Classify dependencies
+                wait_barriers = []  # Cross-block only
+                local_deps = []  # Same block, use syncthreads
+
+                for tensor_name in reads_list:
+                    if tensor_name in self.tensor_producers:
+                        producer_op = self.tensor_producers[tensor_name]
+                        if self._is_local_dependency(producer_op, op_id, chunk_id):
+                            # Local dependency: just need syncthreads between ops
+                            local_deps.append(producer_op)
+                        else:
+                            # Cross-block dependency: need global scoreboard
+                            wait_idx = self.barrier_config.get_index(producer_op, chunk_id)
+                            wait_barriers.append(wait_idx)
+
+                # Compute signal barrier (always signal for potential cross-block consumers)
+                signal_barriers = []
+                signal_idx = self.barrier_config.get_index(op_id, chunk_id)
+                signal_barriers.append(signal_idx)
+
+                # Page allocation: round-robin
+                page_id = chunk_id % self.num_pages
+                input_pages = [page_id]
+                output_pages = [(chunk_id + 1) % self.num_pages]
+
+                # Backpressure: if chunk_id >= num_pages, the page may still be
+                # in use by a previous iteration. Must wait for consumer to release.
+                needs_page_wait = chunk_id >= self.num_pages
+
+                inst = Instruction(
+                    opcode=op_id,
+                    logical_idx=chunk_id,
+                    input_pages=input_pages,
+                    output_pages=output_pages,
+                    wait_barriers=wait_barriers,
+                    signal_barriers=signal_barriers,
+                    local_deps=local_deps,
+                    arg_slots=arg_slots,
+                    needs_page_wait=needs_page_wait,
+                )
+                self.instructions.append(inst)
+
+            # Update producers for next ops
+            for tensor_name in writes_list:
+                self.tensor_producers[tensor_name] = op_id
+
+        return self.instructions
+
+    def get_encoded_instructions(self) -> List[int]:
+        """Get flattened instruction buffer for GPU."""
+        encoded = []
+        for inst in self.instructions:
+            encoded.extend(inst.encode())
+        return encoded
+
+    def analyze_dependencies(self) -> Dict[str, Any]:
+        """Analyze scheduled instructions for debugging.
 
         Returns:
-            OperationGraph with nodes and inferred edges
+            Dict with statistics about local vs cross-block dependencies.
         """
-        graph = cls()
-
-        # First pass: create nodes
-        for i, inst in enumerate(instructions):
-            node = cls._node_from_instruction(inst, i, mode)
-            graph.add_node(node)
-
-        # Second pass: infer edges from reads/writes
-        graph._infer_edges()
-
-        return graph
-
-    @staticmethod
-    def _node_from_instruction(inst: Dict, op_idx: int, mode: str) -> OpNode:
-        """Create an OpNode from an instruction dict."""
-        kernel = inst.get("kernel")
-
-        # Get L/C/S methods
-        load_fn = inst.get("load") or getattr(kernel, f"load_{mode}", None)
-        compute_fn = inst.get("compute") or getattr(kernel, f"compute_{mode}", None)
-        store_fn = inst.get("store") or getattr(kernel, f"store_{mode}", None)
-
-        # Extract reads/writes from decorators
-        all_reads: Set[str] = set()
-        all_writes: Set[str] = set()
-        has_async = False
-        prefetchable: Set[str] = set()
-
-        for fn in [load_fn, compute_fn, store_fn]:
-            if fn:
-                r, w = get_method_dependencies(fn)
-                all_reads |= r
-                all_writes |= w
-                if fn == load_fn:
-                    has_async = is_async_load(fn)
-                    prefetchable |= get_prefetchable_regions(fn)
-
-        # Determine kernel type
-        uses_warp_spec = getattr(kernel, "uses_warp_specialization", False)
-        if uses_warp_spec:
-            kernel_type = KernelType.PRODUCER_CONSUMER
-        else:
-            kernel_type = KernelType.LCS
-
-        # Get smem sizes for forward and backward passes
-        # Priority: instruction dict > kernel property > legacy smem_size
-        smem_bytes_fwd = (
-            inst.get("smem_size_fwd", 0)
-            or getattr(kernel, "smem_size_fwd", 0)
-            or inst.get("smem_size", 0)
-            or getattr(kernel, "smem_size", 0)
-        )
-        smem_bytes_bwd = (
-            inst.get("smem_size_bwd", 0)
-            or getattr(kernel, "smem_size_bwd", 0)
-            or inst.get("smem_size", 0)
-            or getattr(kernel, "smem_size", 0)
-        )
-
-        # Select active smem based on mode
-        smem_bytes = smem_bytes_fwd if mode == "forward" else smem_bytes_bwd
-
-        # Get logical grid size if available
-        logical_grid_size = 1
-        if hasattr(kernel, "get_logical_grid_size"):
-            args = inst.get("args", [])
-            try:
-                logical_grid_size = kernel.get_logical_grid_size(*args)
-            except Exception:
-                logical_grid_size = 1
-
-        return OpNode(
-            op_idx=op_idx,
-            name=type(kernel).__name__ if kernel else f"op_{op_idx}",
-            smem_bytes_fwd=smem_bytes_fwd,
-            smem_bytes_bwd=smem_bytes_bwd,
-            smem_bytes=smem_bytes,
-            kernel_type=kernel_type,
-            logical_grid_size=logical_grid_size,
-            reads=all_reads,
-            writes=all_writes,
-            has_async_load=has_async,
-            prefetchable_regions=prefetchable,
-            uses_warp_specialization=uses_warp_spec,
-            warp_config=getattr(kernel, "warp_config", None) if uses_warp_spec else None,
-        )
-
-    def _infer_edges(self):
-        """Infer dependency edges from reads/writes relationships."""
-        for i, node_i in self.nodes.items():
-            for j, node_j in self.nodes.items():
-                if i >= j:
-                    continue
-
-                # Check if j depends on i
-                # RAW: j reads what i wrote
-                raw = node_j.reads & node_i.writes
-                # WAW: j writes what i wrote
-                waw = node_j.writes & node_i.writes
-                # WAR: j writes what i read
-                war = node_j.writes & node_i.reads
-
-                if raw or waw or war:
-                    edge = OpEdge(
-                        producer_idx=i,
-                        consumer_idx=j,
-                        tensors=raw | waw | war,
-                    )
-                    self.add_edge(edge)
-
-    # ========== Analysis Methods ==========
-
-    def compute_total_smem(self) -> int:
-        """Compute total shared memory needed from graph analysis.
-
-        For sequential execution: max(op.smem_bytes)
-        For overlapped execution: may need sum of overlapping ops
-        """
-        if self._total_smem is not None:
-            return self._total_smem
-
-        # Simple case: max of all ops (sequential execution)
-        max_smem = max((n.smem_bytes for n in self.nodes.values()), default=0)
-        self._total_smem = max_smem
-        return self._total_smem
-
-    def compute_logical_grid_size(self) -> int:
-        """Compute total logical blocks = max across all ops."""
-        return max((n.logical_grid_size for n in self.nodes.values()), default=1)
-
-    def get_topological_order(self) -> List[int]:
-        """Return operation indices in topological order."""
-        if self._topo_order is not None:
-            return self._topo_order
-
-        in_degree = {i: len(n.depends_on) for i, n in self.nodes.items()}
-        queue = deque([i for i, d in in_degree.items() if d == 0])
-        result = []
-
-        while queue:
-            op_idx = queue.popleft()
-            result.append(op_idx)
-            for dep in self.nodes[op_idx].dependents:
-                in_degree[dep] -= 1
-                if in_degree[dep] == 0:
-                    queue.append(dep)
-
-        self._topo_order = result
-        return result
-
-    def can_move_load_early(self, op_idx: int) -> bool:
-        """Check if op's load can be moved earlier (overlap with prev compute).
-
-        A load can be moved early if:
-        1. The op has no dependencies on previous ops (conservative check)
-        2. The op's can_early_load flag is True
-        3. There's enough smem to hold both ops' data
-
-        Note: We use a conservative check (no dependencies at all) because the
-        decorator-based dependency names may not match actual tensor flow.
-        Future improvement: track actual tensor identity instead of names.
-        """
-        node = self.nodes[op_idx]
-        if not node.can_early_load:
-            return False
-
-        # Conservative: if this op depends on ANY previous op, don't move load early
-        # This is safe because we can't reliably detect if the load specifically
-        # depends on the previous op's output without actual tensor tracking
-        if node.depends_on:
-            return False
-
-        return True
-
-
-# ============================================================================
-# Shared Memory Planner
-# ============================================================================
-
-
-@dataclass
-class SmemAllocation:
-    """Describes shared memory allocation for an operation."""
-
-    op_idx: int
-    offset: int  # Byte offset in smem
-    size: int  # Size in bytes
-
-
-class SmemPlanner:
-    """Plans static shared memory allocation from operation graph.
-
-    Unlike legacy paged approach, this computes a fixed allocation
-    at compile time based on graph analysis.
-
-    Supports three allocation modes:
-    1. Sequential (num_stages=1): All ops share one buffer (max size)
-    2. Multi-stage (num_stages>1): Each op gets separate buffer
-    3. Early-load overlap: Ops with overlapping loads get separate buffers
-    """
-
-    def __init__(self, graph: OperationGraph):
-        self.graph = graph
-        self.allocations: Dict[int, SmemAllocation] = {}
-        self._total_bytes: int = 0
-        self._early_load_ops: Set[int] = set()  # Ops that need separate smem for overlap
-
-    def plan(self, num_stages: int = 1, enable_early_load: bool = True) -> int:
-        """Plan smem allocation.
-
-        Args:
-            num_stages: Number of pipeline stages (1 = no buffering, 2 = double buffer)
-            enable_early_load: If True, allocate separate smem for ops that can overlap
-
-        Returns:
-            Total shared memory bytes needed
-        """
-        # First, identify ops that can have their load moved early
-        if enable_early_load:
-            self._identify_early_load_ops()
-
-        max_size = 0
-        current_offset = 0
-        topo_order = self.graph.get_topological_order()
-
-        for op_idx in topo_order:
-            node = self.graph.nodes[op_idx]
-            size = node.smem_bytes
-
-            # Determine if this op needs its own buffer
-            needs_separate = (
-                num_stages > 1 or
-                op_idx in self._early_load_ops
-            )
-
-            if needs_separate:
-                self.allocations[op_idx] = SmemAllocation(
-                    op_idx=op_idx,
-                    offset=current_offset,
-                    size=size,
-                )
-                current_offset += size
-            else:
-                # Share buffer with other sequential ops
-                self.allocations[op_idx] = SmemAllocation(
-                    op_idx=op_idx,
-                    offset=0,
-                    size=size,
-                )
-                max_size = max(max_size, size)
-
-        # Total is sum of separate buffers + max of shared buffers
-        if current_offset > 0:
-            self._total_bytes = current_offset + max_size
-        else:
-            self._total_bytes = max_size
-
-        return self._total_bytes
-
-    def _identify_early_load_ops(self):
-        """Identify ops that can have their load overlapped with previous compute."""
-        self._early_load_ops.clear()
-        topo_order = self.graph.get_topological_order()
-
-        for i, op_idx in enumerate(topo_order):
-            if i == 0:
-                continue  # First op can't be early-loaded
-
-            # Check if this op can be loaded early
-            if self.graph.can_move_load_early(op_idx):
-                node = self.graph.nodes[op_idx]
-                if node.smem_bytes > 0:
-                    # This op needs separate smem because its load overlaps
-                    # with the previous op's compute
-                    self._early_load_ops.add(op_idx)
-
-    @property
-    def total_bytes(self) -> int:
-        return self._total_bytes
-
-    def get_allocation(self, op_idx: int) -> Optional[SmemAllocation]:
-        return self.allocations.get(op_idx)
-
-    def needs_separate_buffer(self, op_idx: int) -> bool:
-        """Check if an op needs its own smem buffer (not shared)."""
-        return op_idx in self._early_load_ops
-
-
-# ============================================================================
-# Schedule Representation
-# ============================================================================
-
-
-@dataclass
-class ScheduleEntry:
-    """A single entry in the execution schedule."""
-
-    op_idx: int
-    phase: str  # "load", "compute", "store", "wait", "signal"
-    warp_role: Optional[WarpRole] = None
-
-    # For load optimization
-    is_prefetch: bool = False
-    prefetch_for: Optional[int] = None
-
-    # For synchronization
-    sem_idx: Optional[int] = None
-
-
-class ScheduleOptimizer:
-    """Optimizes operation schedule for minimal latency.
-
-    Key optimizations:
-    1. Move loads earlier when safe (overlap with previous compute)
-    2. Ensure proper synchronization
-    3. Generate appropriate sync points
-    """
-
-    def __init__(self, graph: OperationGraph, smem_planner: SmemPlanner):
-        self.graph = graph
-        self.smem_planner = smem_planner
-        self.schedule: List[ScheduleEntry] = []
-
-    def optimize(self) -> List[ScheduleEntry]:
-        """Generate optimized unified schedule for all kernel types."""
-        self.schedule = []
-        order = self.graph.get_topological_order()
-
-        for op_idx in order:
-            node = self.graph.nodes[op_idx]
-
-            if node.kernel_type == KernelType.PRODUCER_CONSUMER:
-                # Warp-specialized kernel
-                self._add_producer_consumer_entries(op_idx, node)
-            else:
-                # Traditional L/C/S kernel
-                self._add_lcs_entries(op_idx, node)
-
-        return self.schedule
-
-    def _add_lcs_entries(self, op_idx: int, node: OpNode):
-        """Add schedule entries for LCS kernel."""
-        # Load phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="load"))
-        # Wait for load to complete
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="wait", sem_idx=0))
-        # Compute phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="compute"))
-        # Wait for compute to complete
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="wait", sem_idx=1))
-        # Store phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="store"))
-        # Signal completion
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="signal", sem_idx=2))
-
-    def _add_producer_consumer_entries(self, op_idx: int, node: OpNode):
-        """Add schedule entries for producer/consumer kernel."""
-        # Loader role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="load", warp_role=WarpRole.LOADER)
-        )
-        # Consumer role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="compute", warp_role=WarpRole.CONSUMER)
-        )
-        # Storer role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="store", warp_role=WarpRole.STORER)
-        )
+        total_local = sum(len(inst.local_deps) for inst in self.instructions)
+        total_cross = sum(len(inst.wait_barriers) for inst in self.instructions)
+        total_backpressure = sum(1 for inst in self.instructions if inst.needs_page_wait)
+
+        return {
+            "total_instructions": len(self.instructions),
+            "local_dependencies": total_local,
+            "cross_block_dependencies": total_cross,
+            "backpressure_waits": total_backpressure,
+            "num_pages": self.num_pages,
+        }

@@ -10,12 +10,13 @@ Uses L/C/S pattern for No Bubbles pipelining and tile-based GEMM.
 
 import torch
 from torch import Tensor
+from typing import List
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 import quack.activation as qact
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from machete.megakernel.interface import FusableKernel
+from machete.megakernel.interface import FusableKernel, TensorParam
 from machete.megakernel.single import SingleKernel
 
 
@@ -47,6 +48,7 @@ class GatedMLPSM80(SingleKernel, FusableKernel):
             k_dim: Input dimension (d_model)
             n_dim: Output dimension (half of weight's N dimension)
         """
+        FusableKernel.__init__(self)
         self.torch_dtype = dtype
         self.cute_dtype = torch2cute_dtype_map[dtype]
         self.act_type = act_type
@@ -54,6 +56,15 @@ class GatedMLPSM80(SingleKernel, FusableKernel):
         self.k_dim = k_dim
         self.n_dim = n_dim  # Output dimension (N, not 2N)
         SingleKernel.__init__(self, self, self.grid_fn, self.block_fn)
+
+    @property
+    def tensor_params(self) -> List[TensorParam]:
+        """Declare tensor parameters for automatic shape extraction."""
+        return [
+            TensorParam("x", ("m_dim", "k_dim"), stride=("k_dim", 1)),
+            TensorParam("w", ("k_dim", "n_dim_2"), stride=("n_dim_2", 1)),
+            TensorParam("out", ("m_dim", "n_dim"), stride=("n_dim", 1)),
+        ]
 
     @property
     def smem_size_fwd(self) -> int:

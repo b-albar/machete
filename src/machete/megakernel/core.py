@@ -1,912 +1,785 @@
 # Copyright (c) 2025, Machete Authors
-"""
-Megakernel Code Generation and Execution.
+"""Persistent megakernel with warp specialization and paged memory.
 
-This module implements:
-1. Unified code generator for mixed kernel types (sequential + warp-specialized)
-2. Kernel template and compilation
-3. Megakernel class for building and launching fused kernels
+This module implements the "GPU OS" pattern:
+- Warp specialization: Controller, Loader, Consumer, Storer, Launcher run decoupled loops
+- Instruction pipeline: Controller fetches → Ring buffer → Warps execute
+- Paged shared memory: Physical pages rotate, sem_loaded/sem_consumed for sync
+- Global scoreboard: g_bar[op][chunk] for fine-grained inter-block dependencies
+
+Architecture Overview:
+┌─────────────────────────────────────────────────────────────────┐
+│  Controller Warp (Warp 3)                                       │
+│    The "CPU" of the block. Orchestrates instruction flow.       │
+│    while has_work:                                              │
+│      fetch instruction[inst_ptr++] from global memory           │
+│      decode and put in smem ring buffer                         │
+│      signal(inst_arrived) via semaphore                         │
+└─────────────────────────────────────────────────────────────────┘
+                             │
+     ┌───────────────────────┼───────────────────────┐
+     ▼                       ▼                       ▼
+┌─────────────┐    ┌─────────────────┐    ┌─────────────┐
+│Loader (W0)  │    │Consumer (W0-11) │    │Storer (W1)  │
+│             │    │                 │    │             │
+│wait(inst)   │    │wait(sem_loaded) │    │wait(compute)│
+│wait(g_bar)  │    │compute on page  │    │store→HBM    │
+│HBM→SMEM     │    │signal(computed) │    │atomic(g_bar)│
+│signal(load) │    │                 │    │signal(free) │
+└─────────────┘    └─────────────────┘    └─────────────┘
+       │                                         │
+       └──────── Launcher (W2): TMA prefetch ────┘
+
+Synchronization Mechanisms:
+1. Global Scoreboard (g_bar): Bar[op_id][chunk_id] for cross-block dependencies
+   - Producer: atomicAdd(&Bar[op][chunk], 1) after store completes
+   - Consumer: spin-wait until Bar[dep_op][chunk] >= target
+
+2. Paged SMEM Semaphores: Per-page synchronization
+   - sem_loaded[page]: Loader → Consumer handoff
+   - sem_consumed[page]: Consumer → Loader (page recycling)
+
+3. Instruction Ring Buffer: Controller → All warps coordination
+   - SMEM ring buffer with instruction_arrived semaphore
+   - Allows instruction pipelining (fetch N+1 while executing N)
 """
 
-import os
-import hashlib
-import importlib.util
-import logging
 import torch
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple, Any
-
-from machete.megakernel.scheduler import (
-    OperationGraph,
-    SmemPlanner,
-    ScheduleOptimizer,
-    ScheduleEntry,
-    WarpConfig,
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# Global Registry and Cache
-# ============================================================================
-
-MEGAKERNEL_REGISTRY: Dict[str, List[Dict]] = {}
-_GLOBAL_COMPILE_CACHE: Dict[Tuple, Any] = {}
-
-
-# ============================================================================
-# Emitter Context
-# ============================================================================
-
-
-@dataclass
-class EmitterContext:
-    """Context passed to code emitters."""
-
-    graph: OperationGraph
-    schedule: List[ScheduleEntry]
-    smem_planner: SmemPlanner
-    instructions: List[Dict]
-    arg_mapping: Dict[int, List[int]]
-    num_flat_args: int = 0
-
-    traced: bool = False
-    num_stages: int = 1
-    total_smem_bytes: int = 0
-
-    def get_args_str(self, op_idx: int, with_leading_comma: bool = False) -> str:
-        """Get argument string for an operation.
-
-        Args:
-            op_idx: Operation index
-            with_leading_comma: If True, prepend ", " when there are args
-        """
-        indices = self.arg_mapping.get(op_idx, [])
-        if not indices:
-            return ""
-        args = ", ".join(f"arg_{i}" for i in indices)
-        if with_leading_comma:
-            return ", " + args
-        return args
-
-    def get_smem_var(self, op_idx: int) -> str:
-        """Get smem variable name for an operation."""
-        return f"smem_op_{op_idx}"
-
-    def op_has_smem(self, op_idx: int) -> bool:
-        """Check if operation uses shared memory."""
-        return self.graph.nodes[op_idx].smem_bytes > 0
-
-
-# ============================================================================
-# Shared Memory Allocation Emitter
-# ============================================================================
-
-
-class SmemAllocEmitter:
-    """Generates shared memory allocation code."""
-
-    def __init__(self, smem_planner: SmemPlanner):
-        self.planner = smem_planner
-
-    def emit(self, ctx: EmitterContext) -> List[str]:
-        """Emit smem allocation code for all operations.
-
-        Handles two cases:
-        1. Ops that can share smem (sequential, no overlap) -> single buffer
-        2. Ops with early load optimization -> separate buffers (for overlap)
-        """
-        code = []
-        code.append("        # Shared memory allocation")
-        code.append("        smem_alloc = cutlass.utils.SmemAllocator()")
-
-        # Separate ops into shared vs separate buffer groups
-        shared_ops = []  # Ops that can share one buffer
-        separate_ops = []  # Ops that need their own buffer (early load overlap)
-
-        for op_idx in ctx.graph.get_topological_order():
-            alloc = self.planner.get_allocation(op_idx)
-            if alloc and alloc.size > 0:
-                if self.planner.needs_separate_buffer(op_idx):
-                    separate_ops.append(op_idx)
-                else:
-                    shared_ops.append(op_idx)
-
-        # Allocate shared buffer (for ops without early load overlap)
-        if shared_ops:
-            max_size = max(self.planner.get_allocation(idx).size for idx in shared_ops)
-            max_op_idx = shared_ops[0]  # Use first op's dtype
-            inst = ctx.instructions[max_op_idx]
-            dtype = inst.get("smem_dtype")
-            dtype_str = "cute.Float16" if dtype is None else f"instructions[{max_op_idx}]['smem_dtype']"
-            max_elements = max_size // 2
-
-            code.append(
-                f"        smem_shared = smem_alloc.allocate_tensor({dtype_str}, cute.make_layout({max_elements}))"
-            )
-
-            # Alias shared ops to the shared buffer
-            for op_idx in shared_ops:
-                code.append(f"        smem_op_{op_idx} = smem_shared")
-
-        # Allocate separate buffers for early-load ops
-        for op_idx in separate_ops:
-            alloc = self.planner.get_allocation(op_idx)
-            inst = ctx.instructions[op_idx]
-            dtype = inst.get("smem_dtype")
-            dtype_str = "cute.Float16" if dtype is None else f"instructions[{op_idx}]['smem_dtype']"
-            elements = alloc.size // 2
-
-            code.append(
-                f"        smem_op_{op_idx} = smem_alloc.allocate_tensor({dtype_str}, cute.make_layout({elements}))"
-            )
-
-        return code
-
-
-# ============================================================================
-# Unified Code Generator
-# ============================================================================
-
-
-class UnifiedCodeGenerator:
-    """Generates code for any combination of kernel types.
-
-    Supports:
-    - Sequential (LCS) kernels
-    - Warp-specialized kernels
-    - Any mix of both in the same megakernel
-    - Early load optimization: next op's load overlaps current op's compute
-    - Fine-grained synchronization: per-logical-block counters in global memory
-
-    Synchronization strategy:
-    - sync_threads() only for intra-block smem visibility (load->compute, compute->store)
-    - Global memory counters for inter-op dependencies per logical block
-    - An op can start processing block N as soon as its dependencies finish block N
-    """
-
-    def generate(self, ctx: EmitterContext) -> List[str]:
-        """Generate schedule code with per-op mode dispatch and fine-grained sync."""
-        code = []
-
-        # Get warp config (needed if any op uses warp specialization)
-        warp_config = self._get_warp_config(ctx)
-        has_warp_spec = any(n.uses_warp_specialization for n in ctx.graph.nodes.values())
-        topo_order = ctx.graph.get_topological_order()
-        num_ops = len(topo_order)
-
-        # Check if we need inter-op synchronization (multiple ops with dependencies)
-        needs_inter_op_sync = self._needs_inter_op_sync(ctx, topo_order)
-
-        # Header
-        code.append("")
-        if has_warp_spec:
-            num_consumer = warp_config.num_consumer_warps
-            loader_warp = num_consumer
-            storer_warp = num_consumer + warp_config.num_loader_warps
-            code.append("        # Mixed execution mode (per-op dispatch)")
-            code.append(
-                f"        # Warp roles - Consumer: 0-{num_consumer - 1}, Loader: {loader_warp}, Storer: {storer_warp}"
-            )
-            code.append("        warp_id = tidx // Int32(32)")
-        else:
-            code.append("        # Sequential execution mode")
-            num_consumer = loader_warp = storer_warp = 0
-        code.append("")
-
-        # Generate per-op code with early load optimization
-        early_loaded = set()  # Ops whose load was already issued
-
-        for i, op_idx in enumerate(topo_order):
-            node = ctx.graph.nodes[op_idx]
-
-            # Check for early load opportunity
-            next_op_idx = topo_order[i + 1] if i + 1 < len(topo_order) else None
-            can_early_load = self._can_early_load(ctx, op_idx, next_op_idx, early_loaded)
-
-            # Emit code for this op
-            self._emit_op(
-                code,
-                ctx,
-                op_idx,
-                node,
-                warp_config,
-                num_consumer,
-                loader_warp,
-                storer_warp,
-                skip_load=(op_idx in early_loaded),
-                early_load_next=next_op_idx if can_early_load else None,
-                needs_inter_op_sync=needs_inter_op_sync,
-                is_last_op=(i == num_ops - 1),
-            )
-
-            # Track early-loaded ops
-            if can_early_load:
-                early_loaded.add(next_op_idx)
-
-            code.append("")
-
-        return code
-
-    def _needs_inter_op_sync(self, ctx: EmitterContext, topo_order: List[int]) -> bool:
-        """Check if we need fine-grained inter-op synchronization.
-
-        We need it when:
-        - There are multiple ops
-        - At least one op has dependencies on a previous op
-        """
-        if len(topo_order) <= 1:
-            return False
-
-        for op_idx in topo_order[1:]:  # Skip first op
-            node = ctx.graph.nodes[op_idx]
-            if node.depends_on:
-                return True
-        return False
-
-    def _get_warp_config(self, ctx: EmitterContext) -> WarpConfig:
-        """Get warp config from first warp-specialized op, or default."""
-        for node in ctx.graph.nodes.values():
-            if node.warp_config:
-                return node.warp_config
-        return WarpConfig()
-
-    def _get_op_args(self, ctx: EmitterContext, op_idx: int):
-        """Build argument strings for an operation."""
-        args = ctx.get_args_str(op_idx)
-        smem = ctx.get_smem_var(op_idx)
-        has_smem = ctx.op_has_smem(op_idx)
-
-        if has_smem and args:
-            all_args = f"logical_idx, {smem}, {args}"
-        elif has_smem:
-            all_args = f"logical_idx, {smem}"
-        elif args:
-            all_args = f"logical_idx, {args}"
-        else:
-            all_args = "logical_idx"
-
-        return all_args, all_args, has_smem
-
-    def _can_early_load(self, ctx: EmitterContext, curr_op: int, next_op: Optional[int], early_loaded: set) -> bool:
-        """Check if next_op's load can overlap with curr_op's compute."""
-        if next_op is None:
-            return False
-        if next_op in early_loaded:
-            return False
-        return ctx.graph.can_move_load_early(next_op)
-
-    def _emit_op(
-        self,
-        code: List[str],
-        ctx: EmitterContext,
-        op_idx: int,
-        node,
-        warp_config: WarpConfig,
-        num_consumer: int,
-        loader_warp: int,
-        storer_warp: int,
-        skip_load: bool,
-        early_load_next: Optional[int],
-        needs_inter_op_sync: bool,
-        is_last_op: bool,
-    ):
-        """Emit code for a single operation (either sequential or warp-specialized).
-
-        Fine-grained synchronization:
-        - sync_threads() only for smem visibility within a block
-        - completion_counters[op_idx] tracks completed logical blocks
-        - Before load: wait for dependencies' counters[logical_idx] to be set
-        - After store: signal this op's counter[logical_idx]
-        """
-        load_store_args, compute_args, has_smem = self._get_op_args(ctx, op_idx)
-        is_warp_spec = node.uses_warp_specialization
-
-        mode_str = "warp-specialized" if is_warp_spec else "sequential"
-        code.append(f"        # Op {op_idx}: {node.name} ({mode_str})")
-
-        # === WAIT FOR DEPENDENCIES (fine-grained per-block sync) ===
-        if needs_inter_op_sync and node.depends_on:
-            code.append("        # Wait for dependencies to complete this logical block")
-            code.append("        if tidx == Int32(0):")
-            for dep_idx in sorted(node.depends_on):
-                # Index into flat counters: dep_idx * n_blocks + logical_idx
-                code.append(f"            dep_counter_idx = Int32({dep_idx}) * n_blocks + logical_idx")
-                code.append("            while counters[dep_counter_idx] == Int32(0):")
-                code.append("                nanosleep(100)")
-            code.append("        cute.arch.sync_threads()")
-
-        # === LOAD PHASE ===
-        if not skip_load:
-            if is_warp_spec:
-                code.append(f"        if warp_id == Int32({loader_warp}):")
-                code.append(f"            op_{op_idx}_load({load_store_args})")
-            else:
-                code.append(f"        op_{op_idx}_load({load_store_args})")
-
-            if has_smem:
-                code.append("        cute.arch.sync_threads()")
-        else:
-            code.append("        # (Load already issued via early-load optimization)")
-
-        # === COMPUTE PHASE (with optional early load for next op) ===
-        if early_load_next is not None:
-            next_node = ctx.graph.nodes[early_load_next]
-            next_load_args, _, next_has_smem = self._get_op_args(ctx, early_load_next)
-            next_is_warp_spec = next_node.uses_warp_specialization
-
-            code.append(f"        # Early load for Op {early_load_next}: {next_node.name}")
-
-            # Issue next op's load (respecting its mode)
-            if next_is_warp_spec:
-                code.append(f"        if warp_id == Int32({loader_warp}):")
-                code.append(f"            op_{early_load_next}_load({next_load_args})")
-            else:
-                code.append(f"        op_{early_load_next}_load({next_load_args})")
-
-        # Issue current op's compute (respecting its mode)
-        if is_warp_spec:
-            code.append(f"        if warp_id < Int32({num_consumer}):")
-            code.append(f"            op_{op_idx}_compute({compute_args})")
-        else:
-            code.append(f"        op_{op_idx}_compute({compute_args})")
-
-        # Sync after compute if needed for smem visibility before store
-        if has_smem or (early_load_next is not None):
-            code.append("        cute.arch.sync_threads()")
-
-        # === STORE PHASE ===
-        if is_warp_spec:
-            code.append(f"        if warp_id == Int32({storer_warp}):")
-            code.append(f"            op_{op_idx}_store({load_store_args})")
-            # Sync to ensure store completes before signaling
-            code.append("        cute.arch.sync_threads()")
-        else:
-            code.append(f"        op_{op_idx}_store({load_store_args})")
-            # Sync only if needed: inter-op sync or not the last op
-            if needs_inter_op_sync or not is_last_op:
-                code.append("        cute.arch.sync_threads()")
-
-        # === SIGNAL COMPLETION (fine-grained per-block sync) ===
-        if needs_inter_op_sync and not is_last_op:
-            code.append("        # Signal this logical block is complete")
-            code.append("        if tidx == Int32(0):")
-            # Index into flat counters: op_idx * n_blocks + logical_idx
-            code.append(f"            counter_idx = Int32({op_idx}) * n_blocks + logical_idx")
-            code.append("            counters[counter_idx] = Int32(1)")
-
-
-# ============================================================================
-# Kernel Template
-# ============================================================================
-
-
-class KernelTemplate:
-    """Template for generating complete megakernel code."""
-
-    # Template without completion counters (single op or no dependencies)
-    TEMPLATE_SIMPLE = """# Auto-generated megakernel - DO NOT EDIT
+import builtins
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
-from cutlass.cute.runtime import make_ptr
-from cutlass._mlir.dialects._cute_nvgpu_enum_gen import AddressSpace
-from machete.megakernel.core import MEGAKERNEL_REGISTRY
-from machete.megakernel.utils import nanosleep, atomic_add_i32
+from cutlass import Int32, Int64
+from typing import List, Dict, Tuple, Any, Literal
 
-# Retrieve instructions from registry
-instructions = MEGAKERNEL_REGISTRY["{sig_hash}"]
-
-# Bind module-level symbols
-{bindings}
-
-# Pre-compiled kernel (populated on first use)
-_compiled_kernel = None
-
-class GeneratedMegakernel:
-    @cute.jit
-    def __call__(self, n_blocks, {args}):
-        self.{kernel_name}(n_blocks, {args}).launch(
-            grid={grid},
-            block={block},
-            smem={smem}
-        )
-
-    @cute.kernel
-    def {kernel_name}(self, n_blocks, {args}):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        logical_idx = bidx
-{smem_alloc}
-{schedule_code}
-
-def get_compiled_kernel(n_blocks, {args}):
-    \"\"\"Get or compile the kernel with proper type hints.\"\"\"
-    global _compiled_kernel
-    if _compiled_kernel is None:
-        _compiled_kernel = cute.compile(
-            GeneratedMegakernel(),
-            n_blocks,
-            {args}
-        )
-    return _compiled_kernel
-"""
-
-    # Template with completion counters for fine-grained sync
-    TEMPLATE_WITH_COUNTERS = """# Auto-generated megakernel - DO NOT EDIT
-import cutlass
-import cutlass.cute as cute
-from cutlass import Int32, const_expr
-from cutlass.cute.runtime import make_ptr
-from cutlass._mlir.dialects._cute_nvgpu_enum_gen import AddressSpace
-from machete.megakernel.core import MEGAKERNEL_REGISTRY
-from machete.megakernel.utils import nanosleep, atomic_add_i32
-
-# Retrieve instructions from registry
-instructions = MEGAKERNEL_REGISTRY["{sig_hash}"]
-
-# Bind module-level symbols
-{bindings}
-
-NUM_OPS = {num_ops}
-
-# Pre-compiled kernel (populated on first use)
-_compiled_kernel = None
-
-class GeneratedMegakernel:
-    @cute.jit
-    def __call__(self, n_blocks, completion_counters, {args}):
-        self.{kernel_name}(n_blocks, completion_counters, {args}).launch(
-            grid={grid},
-            block={block},
-            smem={smem}
-        )
-
-    @cute.kernel
-    def {kernel_name}(self, n_blocks, completion_counters, {args}):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        logical_idx = bidx
-{smem_alloc}
-        # completion_counters is a flat tensor of size NUM_OPS * n_blocks
-        # Access pattern: counters[op_idx * n_blocks + logical_idx]
-        counters = completion_counters
-{schedule_code}
-
-def get_compiled_kernel(n_blocks, completion_counters, {args}):
-    \"\"\"Get or compile the kernel with proper type hints.\"\"\"
-    global _compiled_kernel
-    if _compiled_kernel is None:
-        _compiled_kernel = cute.compile(
-            GeneratedMegakernel(),
-            n_blocks,
-            completion_counters,
-            {args}
-        )
-    return _compiled_kernel
-"""
-
-    def __init__(
-        self,
-        ctx: EmitterContext,
-        code_gen: UnifiedCodeGenerator,
-        smem_emitter: SmemAllocEmitter,
-        needs_completion_counters: bool = False,
-    ):
-        self.ctx = ctx
-        self.code_gen = code_gen
-        self.smem_emitter = smem_emitter
-        self.needs_completion_counters = needs_completion_counters
-
-    def generate(
-        self,
-        sig_hash: str,
-        grid: Tuple[int, int, int],
-        block: Tuple[int, int, int],
-    ) -> str:
-        """Generate complete kernel module source."""
-        # Generate bindings
-        bindings = self._generate_bindings()
-
-        # Generate smem allocation
-        smem_code = "\n".join(self.smem_emitter.emit(self.ctx))
-
-        # Generate schedule code
-        schedule_code = "\n".join(self.code_gen.generate(self.ctx))
-
-        # Generate args list
-        args = ", ".join(f"arg_{i}" for i in range(self.ctx.num_flat_args))
-
-        # Choose template based on whether we need completion counters
-        template = self.TEMPLATE_WITH_COUNTERS if self.needs_completion_counters else self.TEMPLATE_SIMPLE
-
-        num_ops = len(self.ctx.graph.nodes)
-
-        return template.format(
-            sig_hash=sig_hash,
-            bindings=bindings,
-            kernel_name=f"kernel_{sig_hash[:8]}",
-            args=args,
-            grid=grid,
-            block=block,
-            smem=self.ctx.total_smem_bytes,
-            smem_alloc=smem_code,
-            schedule_code=schedule_code,
-            num_ops=num_ops,
-        )
-
-    def _generate_bindings(self) -> str:
-        """Generate module-level bindings for L/C/S functions."""
-        lines = []
-        for op_idx in self.ctx.graph.get_topological_order():
-            lines.append(f"op_{op_idx}_load = instructions[{op_idx}]['load']")
-            lines.append(f"op_{op_idx}_compute = instructions[{op_idx}]['compute']")
-            lines.append(f"op_{op_idx}_store = instructions[{op_idx}]['store']")
-        return "\n".join(lines)
-
-
-# ============================================================================
-# Megakernel Class
-# ============================================================================
+from .scheduler import WarpRole, WarpConfig, PageConfig, BarrierConfig, Instruction, InstructionScheduler
+from .utils import atomic_add_i32, nanosleep
 
 
 class Megakernel:
-    """Simplified megakernel that uses operation graph for scheduling.
+    """Persistent megakernel with selectable execution strategy.
 
-    Key features:
-    1. No paged memory - smem is computed from graph
-    2. Static scheduling - computed at compile time
-    3. Modular code generation
-    4. Unified mixed kernel type support
+    Strategies:
+    - "warp_specialized": "GPU OS" model. Pipelined warps (Loader, Consumer, Storer).
+      Best for large independent tiles where pipelining hides latency.
+    - "sequential": Traditional loop. Load → Sync → Compute → Sync → Store.
+      Best for small tiles or when warp specialization overhead is too high.
+      In this mode, ALL warps participate in each stage (Load/Compute/Store).
+
+    Example:
+        mk = Megakernel(name="my_kernel", strategy="warp_specialized")
+        mk.add(rope_op, q, cos, sin, seq_len, n_tokens)
+        mk.launch(n_blocks, grid, block)
     """
 
     def __init__(
         self,
         name: str = "megakernel",
         mode: str = "forward",
-        num_stages: int = 1,
+        strategy: Literal["warp_specialized", "sequential"] = "warp_specialized",
+        warp_config: WarpConfig = None,
+        page_config: PageConfig = None,
     ):
         self.name = name
-        self.mode = mode
-        self.num_stages = num_stages
-
+        self.mode = mode  # "forward" or "backward"
+        self.strategy = strategy
+        self.warp_config = warp_config or WarpConfig()
+        self.page_config = page_config or PageConfig()
         self.instructions: List[Dict] = []
-        self._graph: Optional[OperationGraph] = None
+        self._barrier_tensor = None
+        self._instruction_tensor = None
+        self._num_pages = None
+        # Semaphore tensors for page synchronization
+        self._sem_loaded_tensor = None
+        self._sem_consumed_tensor = None
 
-        self.gen_dir = os.path.join(os.path.dirname(__file__), ".generated")
-        os.makedirs(self.gen_dir, exist_ok=True)
+        # Ring buffer config
+        self.max_instructions_in_ring = 8
+        self.instruction_size_ints = 16  # Estimated max size of encoded instruction
 
-    def add(self, op, *args):
-        """Add an operation to the megakernel.
+    def add(self, op, *args) -> None:
+        """Add operation to megakernel."""
+        smem = op.smem_size_fwd if self.mode == "forward" else op.smem_size_bwd
 
-        Args:
-            op: A FusableKernel, WarpSpecializedKernel, or similar object
-            *args: Arguments to pass to the kernel's L/C/S methods
-        """
-        kernel = op
-
+        # Extract dependencies from decorators
+        reads_list = []
+        writes_list = []
         if self.mode == "forward":
-            load_fn = getattr(kernel, "load_forward", None)
-            compute_fn = getattr(kernel, "compute_forward", None)
-            store_fn = getattr(kernel, "store_forward", None)
+            if hasattr(op, "load_forward") and hasattr(op.load_forward, "_machete_deps"):
+                for dep in op.load_forward._machete_deps:
+                    if dep.is_read:
+                        reads_list.append(dep.name)
+            if hasattr(op, "store_forward") and hasattr(op.store_forward, "_machete_deps"):
+                for dep in op.store_forward._machete_deps:
+                    if not dep.is_read:
+                        writes_list.append(dep.name)
         else:
-            load_fn = getattr(kernel, "load_backward", None)
-            compute_fn = getattr(kernel, "compute_backward", None)
-            store_fn = getattr(kernel, "store_backward", None)
-
-        # Get smem info (separate for forward/backward, fallback to smem_size)
-        smem_size_fwd = getattr(kernel, "smem_size_fwd", 0) or getattr(kernel, "smem_size", 0)
-        smem_size_bwd = getattr(kernel, "smem_size_bwd", 0) or getattr(kernel, "smem_size", 0)
-        smem_dtype = getattr(kernel, "cute_dtype", None)
-
-        # Get logical grid size
-        logical_grid_size = 1
-        if hasattr(kernel, "get_logical_grid_size"):
-            try:
-                logical_grid_size = kernel.get_logical_grid_size(*args)
-            except Exception:
-                logical_grid_size = 1
-
-        # Get warp config for warp-specialized kernels
-        uses_warp_spec = getattr(kernel, "uses_warp_specialization", False)
-        warp_config = getattr(kernel, "warp_config", None) if uses_warp_spec else None
-
-        # Get grid/block functions if available
-        grid_fn = getattr(kernel, "grid_fn", None)
-        block_fn = getattr(kernel, "block_fn", None)
+            if hasattr(op, "load_backward") and hasattr(op.load_backward, "_machete_deps"):
+                for dep in op.load_backward._machete_deps:
+                    if dep.is_read:
+                        reads_list.append(dep.name)
+            if hasattr(op, "store_backward") and hasattr(op.store_backward, "_machete_deps"):
+                for dep in op.store_backward._machete_deps:
+                    if not dep.is_read:
+                        writes_list.append(dep.name)
 
         self.instructions.append(
             {
-                "kernel": kernel,
-                "load": load_fn,
-                "compute": compute_fn,
-                "store": store_fn,
+                "op": op,
                 "args": list(args),
-                "smem_size_fwd": smem_size_fwd,
-                "smem_size_bwd": smem_size_bwd,
-                "smem_dtype": smem_dtype,
-                "logical_grid_size": logical_grid_size,
-                "uses_warp_specialization": uses_warp_spec,
-                "warp_config": warp_config,
-                "grid_fn": grid_fn,
-                "block_fn": block_fn,
+                "smem_size": smem,
+                "reads": reads_list,
+                "writes": writes_list,
             }
         )
 
-        # Invalidate cached graph
-        self._graph = None
-
-    def clear(self):
-        """Clear all instructions."""
-        self.instructions = []
-        self._graph = None
-
-    def _build_graph(self) -> OperationGraph:
-        """Build operation graph from instructions."""
-        if self._graph is not None:
-            return self._graph
-
-        self._graph = OperationGraph.from_instructions(self.instructions, self.mode)
-        return self._graph
-
-    def _calculate_logical_blocks(self) -> int:
-        """Calculate total logical blocks across all operations."""
-        graph = self._build_graph()
-        return graph.compute_logical_grid_size()
-
-    def launch(
-        self,
-        n_blocks: int,
-        grid: Tuple[int, int, int],
-        block: Tuple[int, int, int],
-        stream=None,
-        trace_file: Optional[str] = None,
-    ):
-        """Launch the megakernel (compatibility wrapper for SingleKernel).
-
-        Args:
-            n_blocks: Number of logical blocks (used for grid if grid[0] matches)
-            grid: Grid dimensions (list or tuple)
-            block: Block dimensions (threads per block, list or tuple)
-            stream: CUDA stream (optional)
-            trace_file: Path to trace file for debugging (optional)
-        """
-        # Convert lists to tuples for hashability in compile cache
-        grid = tuple(grid) if isinstance(grid, list) else grid
-        block = tuple(block) if isinstance(block, list) else block
-        self.launch_logical(block=block, grid=grid, stream=stream, trace_file=trace_file)
-
-    def launch_logical(
-        self,
-        block: Tuple[int, int, int],
-        grid: Optional[Tuple[int, int, int]] = None,
-        stream=None,
-        trace_file: Optional[str] = None,
-    ):
-        """Launch the megakernel with logical block scheduling.
-
-        Args:
-            block: Block dimensions (threads per block)
-            grid: Grid dimensions (optional, computed from logical blocks if not provided)
-            stream: CUDA stream (optional)
-            trace_file: Path to trace file for debugging (optional)
-        """
+    def launch(self, n_blocks: int, grid: Tuple, block: Tuple) -> None:
+        """Launch persistent megakernel."""
         if not self.instructions:
-            raise ValueError("No operations added to megakernel")
+            return
 
-        # Build graph
-        graph = self._build_graph()
+        # Compute total logical work
+        total_work = 0
+        for inst in self.instructions:
+            op = inst["op"]
+            logical_size = op.get_logical_grid_size(*inst["args"])
+            total_work += logical_size
 
-        # Calculate logical blocks
-        n_blocks = graph.compute_logical_grid_size()
-
-        # Determine grid if not provided
-        if grid is None:
-            grid = (n_blocks, 1, 1)
-
-        # Plan shared memory
-        smem_planner = SmemPlanner(graph)
-        total_smem = smem_planner.plan(self.num_stages, enable_early_load=True)
-
-        # Add space for semaphores
+        # Setup barrier config
         num_ops = len(self.instructions)
-        has_warp_spec = any(n.uses_warp_specialization for n in graph.nodes.values())
-        if has_warp_spec:
-            num_sems = self.num_stages * num_ops * 3 + 1
+        # Use a safe heuristic for max_chunks if args are dynamic
+        max_chunks = max(inst["op"].get_logical_grid_size(*inst["args"]) for inst in self.instructions)
+        # Barrier: [NumOps, MaxChunks]
+        barrier_config = BarrierConfig(num_ops=num_ops, num_chunks=max_chunks)
+
+        # Allocate global scoreboard
+        device = self._get_device()
+        self._barrier_tensor = torch.zeros(barrier_config.total_size, dtype=torch.int32, device=device)
+
+        # Compute smem size and num_pages
+        smem_size = self._compute_smem_size()
+
+        # Allocate page semaphores (global memory for simplicity in prototype)
+        # sem_loaded: Signaled by Loader (or All in seq) -> Waited by Consumer
+        # sem_consumed: Signaled by Storer (or All in seq) -> Waited by Loader
+        self._sem_loaded_tensor = torch.zeros(self._num_pages, dtype=torch.int32, device=device)
+        self._sem_consumed_tensor = torch.ones(self._num_pages, dtype=torch.int32, device=device)
+
+        # Build instruction stream
+        scheduler = InstructionScheduler(barrier_config, self.page_config, self._num_pages)
+        for op_id, inst in enumerate(self.instructions):
+            op = inst["op"]
+            # Pass raw args for slot mapping in scheduler
+            op_info = {
+                "op_id": op_id,
+                "op": op,
+                "logical_grid_size": op.get_logical_grid_size(*inst["args"]),
+                "reads": inst["reads"],
+                "writes": inst["writes"],
+                "raw_args": inst["args"],
+            }
+            scheduler.add_op(op_id, op, op_info["logical_grid_size"], inst["reads"], inst["writes"])
+            scheduler.ops[-1]["raw_args"] = inst["args"]
+
+        # NOTE: Scheduler handles dependencies, page allocation and slot mapping
+        scheduled_instructions = scheduler.schedule()
+        unique_tensors = scheduler.unique_tensors
+        if len(unique_tensors) > 32:
+            raise ValueError(f"Too many unique tensors in megakernel fusion ({len(unique_tensors)} > 32)")
+
+        # Pad unique_tensors to 32 for fixed signature
+        # Use first tensor as padding if available, else a dummy
+        padding_tensor = unique_tensors[0] if unique_tensors else torch.zeros(1, device=device)
+        padded_tensors = unique_tensors + [padding_tensor] * (32 - len(unique_tensors))
+
+        # Encode instructions
+        encoded = scheduler.get_encoded_instructions()
+        if encoded:
+            self._instruction_tensor = torch.tensor(encoded, dtype=torch.int32, device=device)
         else:
-            num_sems = 2
-        total_smem += num_sems * 4  # 4 bytes per semaphore
+            self._instruction_tensor = torch.zeros(1, dtype=torch.int32, device=device)
 
-        # Build argument mapping
-        arg_mapping: Dict[int, List[int]] = {}
-        curr = 0
-        for i, inst in enumerate(self.instructions):
-            num_args = len(inst["args"])
-            arg_mapping[i] = list(range(curr, curr + num_args))
-            curr += num_args
+        num_instructions = len(scheduled_instructions)
 
-        # Generate optimized schedule
-        optimizer = ScheduleOptimizer(graph, smem_planner)
-        schedule = optimizer.optimize()
+        # Launch appropriate kernel strategy
+        if self.strategy == "warp_specialized":
+            self._launch_warp_specialized(grid, block, smem_size, num_instructions, padded_tensors)
+        else:
+            self._launch_sequential(grid, block, smem_size, num_instructions, padded_tensors)
 
-        # Create emitter context
-        ctx = EmitterContext(
-            graph=graph,
-            schedule=schedule,
-            smem_planner=smem_planner,
-            instructions=self.instructions,
-            arg_mapping=arg_mapping,
-            num_flat_args=curr,
-            traced=trace_file is not None,
-            num_stages=self.num_stages,
-            total_smem_bytes=total_smem,
-        )
-
-        # Compile and run
-        self._compile_and_run(ctx, n_blocks, grid, block, stream, trace_file)
-
-    def _compute_sig_hash(self, ctx: EmitterContext) -> str:
-        """Compute unique hash for this kernel configuration."""
-        data = f"{self.name}_{self.mode}_{ctx.num_flat_args}_{self.num_stages}"
-        for i, node in ctx.graph.nodes.items():
-            kernel = self.instructions[i]["kernel"]
-            # Capture identifying state from the kernel instance
-            state = []
-            if hasattr(kernel, "__dict__"):
-                for k, v in kernel.__dict__.items():
-                    # Include simple types that likely define the kernel's behavior
-                    if isinstance(v, (str, int, float, bool, tuple, torch.dtype)):
-                        state.append(f"{k}={v}")
-
-            kernel_state = "_".join(sorted(state))
-            data += f"_{node.name}_{node.smem_bytes}_{node.kernel_type.name}_{kernel_state}"
-
-        sig = hashlib.md5(data.encode()).hexdigest()
-        return sig
-
-    def _compile_and_run(
-        self,
-        ctx: EmitterContext,
-        n_blocks: int,
-        grid: Tuple[int, int, int],
-        block: Tuple[int, int, int],
-        stream=None,
-        trace_file: Optional[str] = None,
-    ):
-        """Compile and execute the kernel."""
-        sig_hash = self._compute_sig_hash(ctx)
-
-        # Store instructions in registry
-        MEGAKERNEL_REGISTRY[sig_hash] = self.instructions
-
-        # Check if we need completion counters for fine-grained sync
-        needs_counters = self._needs_completion_counters(ctx)
-
-        # Check compile cache
-        compile_key = (self.name, self.mode, sig_hash, grid, block, needs_counters)
-
-        if compile_key not in _GLOBAL_COMPILE_CACHE:
-            # Generate code
-            code_gen = UnifiedCodeGenerator()
-            smem_emitter = SmemAllocEmitter(ctx.smem_planner)
-            template = KernelTemplate(ctx, code_gen, smem_emitter, needs_counters)
-            source = template.generate(sig_hash, grid, block)
-
-            # Write module
-            gen_path = os.path.join(self.gen_dir, f"kernel_{sig_hash}.py")
-            with open(gen_path, "w") as f:
-                f.write(source)
-
-            # Load module
-            spec = importlib.util.spec_from_file_location(f"gen_{sig_hash}", gen_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-
-            _GLOBAL_COMPILE_CACHE[compile_key] = module
-
-        # Get module
-        module = _GLOBAL_COMPILE_CACHE[compile_key]
-
-        # Flatten arguments and convert tensors to CuTe pointers
-        # Note: We pass Pointer objects which can be created outside JIT context
-        # cute.compile() will compile once based on types, then reuse for same types
-        import torch
-        from cutlass.cute.runtime import make_ptr
-        from cutlass._mlir.dialects._cute_nvgpu_enum_gen import AddressSpace
-        from quack.cute_dsl_utils import torch2cute_dtype_map
-
-        flat_args = []
+    def _get_device(self):
         for inst in self.instructions:
             for arg in inst["args"]:
                 if isinstance(arg, torch.Tensor):
-                    # Convert tensor to CuTe pointer with 16-byte alignment for async copy
-                    tensor = arg.detach() if arg.requires_grad else arg
-                    cute_dtype = torch2cute_dtype_map[tensor.dtype]
-                    ptr = make_ptr(cute_dtype, tensor.data_ptr(), AddressSpace.gmem, assumed_align=16)
-                    flat_args.append(ptr)
-                else:
-                    flat_args.append(arg)
+                    return arg.device
+        return torch.device("cuda")
 
-        # Get or compile the kernel, then execute
-        if needs_counters:
-            import cutlass
-            num_ops = len(self.instructions)
-            # Flat tensor: num_ops * n_blocks, indexed as op_idx * n_blocks + logical_idx
-            completion_counters = torch.zeros(num_ops * n_blocks, dtype=torch.int32, device="cuda")
-            # Convert to CuTe pointer
-            counters_ptr = make_ptr(cutlass.Int32, completion_counters.data_ptr(), AddressSpace.gmem, assumed_align=16)
-            compiled = module.get_compiled_kernel(n_blocks, counters_ptr, *flat_args)
-            compiled(n_blocks, counters_ptr, *flat_args)
-        else:
-            compiled = module.get_compiled_kernel(n_blocks, *flat_args)
-            compiled(n_blocks, *flat_args)
+    def _get_device_smem_size(self) -> int:
+        device = self._get_device()
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
+            return props.shared_memory_per_block_optin
+        return 48 * 1024
 
-        # Write trace file if requested
-        if trace_file:
-            self._write_trace(trace_file, ctx, n_blocks, grid, block)
+    def _compute_smem_size(self) -> int:
+        device_smem = self._get_device_smem_size()
+        self._num_pages = self.page_config.get_num_pages(device_smem)
+        op_smem = max(inst["smem_size"] for inst in self.instructions) if self.instructions else 0
+        pages_size = self.page_config.get_total_smem_for_pages(self._num_pages)
+        ring_size = self.max_instructions_in_ring * self.instruction_size_ints * 4
+        return max(op_smem, pages_size) + ring_size + 1024
 
-    def _needs_completion_counters(self, ctx: EmitterContext) -> bool:
-        """Check if we need fine-grained inter-op synchronization."""
-        topo_order = ctx.graph.get_topological_order()
-        if len(topo_order) <= 1:
-            return False
+    def _launch_warp_specialized(self, grid, block, smem_size, num_instructions, padded_tensors):
+        """Launch 'GPU OS' Kernel: Warp Specialized, Pipelined, Ring Buffer.
 
-        for op_idx in topo_order[1:]:
-            node = ctx.graph.nodes[op_idx]
-            if node.depends_on:
-                return True
-        return False
-
-    def _write_trace(
-        self,
-        trace_file: str,
-        ctx: EmitterContext,
-        n_blocks: int,
-        grid: Tuple[int, int, int],
-        block: Tuple[int, int, int],
-    ):
-        """Write a trace file for debugging.
-
-        Creates a nanotrace-format JSON file with kernel execution info.
+        This implements the full GPU OS architecture:
+        - Controller Warp: Fetches instructions from global memory, broadcasts via ring buffer
+        - Loader Warp: Waits for g_bar dependencies, loads HBM→SMEM, signals sem_loaded
+        - Consumer Warps: Wait for sem_loaded, compute on page, signal completion
+        - Storer Warp: Waits for compute, stores SMEM→HBM, updates g_bar, releases page
+        - Launcher Warp: Handles auxiliary async operations (TMA prefetch, etc.)
         """
-        import json
+        ops = [inst["op"] for inst in self.instructions]
+        num_ops_py = len(ops)
+        num_pages_py = self._num_pages
+        page_size_py = self.page_config.page_size
 
-        # Ensure proper .nanotrace extension
-        if not trace_file.endswith(".nanotrace"):
-            if trace_file.endswith(".json"):
-                trace_file = trace_file[:-5] + ".nanotrace"
+        # Warp config values to pass as kernel args
+        num_consumer_py = self.warp_config.num_consumer_warps
+        loader_warp_py = self.warp_config.loader_warp_start
+        storer_warp_py = self.warp_config.storer_warp_start
+        launcher_warp_py = self.warp_config.launcher_warp_start
+        controller_warp_py = self.warp_config.controller_warp_start
+
+        # For single op, capture it directly
+        if num_ops_py == 1:
+            single_op = ops[0]
+        else:
+            single_op = None
+
+        # Create a runner class with the kernel as a method
+        # All config values are passed as kernel arguments to avoid closure issues
+        class MegakernelRunner:
+            def __init__(rself, g, b, smem, op, n_pages, pg_size, n_cons, ld_w, st_w, ln_w, ct_w):
+                rself._grid = list(g)
+                rself._block = list(b)
+                rself._smem = smem
+                rself._op = op
+                rself._num_pages = n_pages
+                rself._page_size = pg_size
+                rself._num_consumer = n_cons
+                rself._loader_warp = ld_w
+                rself._storer_warp = st_w
+                rself._launcher_warp = ln_w
+                rself._controller_warp = ct_w
+
+            def __extract_mlir_values__(rself):
+                return []
+
+            def __new_from_mlir_values__(rself, values):
+                return rself
+
+            def __c_pointers__(rself):
+                return []
+
+            @cute.jit
+            def run(
+                rself,
+                p_bar: Int64, p_instr: Int64, p_sem_loaded: Int64, p_sem_consumed: Int64,
+                p_n_instr: Int32, p_n_ops: Int32,
+                p_n_pages: Int32, p_pg_size: Int32,
+                p_n_cons: Int32, p_ld_w: Int32, p_st_w: Int32, p_ln_w: Int32, p_ct_w: Int32,
+                p0: Int64, p1: Int64, p2: Int64, p3: Int64,
+                p4: Int64, p5: Int64, p6: Int64, p7: Int64,
+                p8: Int64, p9: Int64, p10: Int64, p11: Int64,
+                p12: Int64, p13: Int64, p14: Int64, p15: Int64,
+                p16: Int64, p17: Int64, p18: Int64, p19: Int64,
+                p20: Int64, p21: Int64, p22: Int64, p23: Int64,
+                p24: Int64, p25: Int64, p26: Int64, p27: Int64,
+                p28: Int64, p29: Int64, p30: Int64, p31: Int64,
+            ):
+                rself.kernel(
+                    p_bar, p_instr, p_sem_loaded, p_sem_consumed,
+                    p_n_instr, p_n_ops, p_n_pages, p_pg_size,
+                    p_n_cons, p_ld_w, p_st_w, p_ln_w, p_ct_w,
+                    p0, p1, p2, p3, p4, p5, p6, p7,
+                    p8, p9, p10, p11, p12, p13, p14, p15,
+                    p16, p17, p18, p19, p20, p21, p22, p23,
+                    p24, p25, p26, p27, p28, p29, p30, p31,
+                ).launch(grid=rself._grid, block=rself._block, smem=rself._smem)
+
+            @cute.kernel
+            def kernel(
+                rself,
+                g_bar: Int64,
+                g_instructions: Int64,
+                g_sem_loaded: Int64,
+                g_sem_consumed: Int64,
+                n_instructions: Int32,
+                n_ops: Int32,
+                num_pages: Int32,
+                page_size: Int32,
+                num_consumer: Int32,
+                loader_warp: Int32,
+                storer_warp: Int32,
+                launcher_warp: Int32,
+                controller_warp: Int32,
+                t0: Int64, t1: Int64, t2: Int64, t3: Int64,
+                t4: Int64, t5: Int64, t6: Int64, t7: Int64,
+                t8: Int64, t9: Int64, t10: Int64, t11: Int64,
+                t12: Int64, t13: Int64, t14: Int64, t15: Int64,
+                t16: Int64, t17: Int64, t18: Int64, t19: Int64,
+                t20: Int64, t21: Int64, t22: Int64, t23: Int64,
+                t24: Int64, t25: Int64, t26: Int64, t27: Int64,
+                t28: Int64, t29: Int64, t30: Int64, t31: Int64,
+            ):
+                tidx, _, _ = cute.arch.thread_idx()
+                bidx, _, _ = cute.arch.block_idx()
+                grid_dim, _, _ = cute.arch.grid_dim()
+                warp_id = tidx // 32
+                lane_id = tidx % 32
+
+                # Warp role identification
+                is_consumer = warp_id < num_consumer
+                is_loader = warp_id == loader_warp
+                is_storer = warp_id == storer_warp
+                is_launcher = warp_id == launcher_warp
+                is_controller = warp_id == controller_warp
+
+                # Internal SMEM pointer
+                smem = cute.runtime.make_ptr(cute.Uint8, 0, cute.AddressSpace.smem)
+
+                # Persistent loop: each block processes multiple instructions
+                instr_idx = Int32(bidx)
+                while instr_idx < n_instructions:
+                    # Decode instruction: map flat index to (op_id, chunk_id)
+                    logical_idx = instr_idx
+
+                    # Page allocation: round-robin across available pages
+                    page_id = logical_idx % num_pages
+                    page_ptr = smem + page_id * page_size
+
+                    # Single-op path (optimized, no cross-op dependencies)
+                    if n_ops == Int32(1):
+                        # ----- LOADER WARP -----
+                        if is_loader:
+                            # Backpressure: Wait for page to be consumed
+                            if lane_id == 0:
+                                while atomic_add_i32(Int32(0), g_sem_consumed + page_id * 4) < Int32(1):
+                                    nanosleep(10)
+                                atomic_add_i32(Int32(-1), g_sem_consumed + page_id * 4)
+
+                            # Execute load phase
+                            rself._op.load_forward(
+                                logical_idx, page_ptr,
+                                t0, t1, t2, t3, t4, t5, t6, t7,
+                                t8, t9, t10, t11, t12, t13, t14, t15,
+                                t16, t17, t18, t19, t20, t21, t22, t23,
+                                t24, t25, t26, t27, t28, t29, t30, t31,
+                            )
+
+                            if lane_id == 0:
+                                atomic_add_i32(Int32(1), g_sem_loaded + page_id * 4)
+
+                        # ----- CONSUMER WARPS -----
+                        elif is_consumer:
+                            # Wait for loader to signal data is ready
+                            # Only warp 0 polls, then all consumer warps sync via warp barrier
+                            if warp_id == 0:
+                                if lane_id == 0:
+                                    while atomic_add_i32(Int32(0), g_sem_loaded + page_id * 4) < Int32(1):
+                                        nanosleep(10)
+                                # Warp-level sync to ensure all lanes in warp 0 see the signal
+                                cute.arch.sync_warp()
+
+                            # Note: We can't use sync_threads() here because other warps
+                            # (loader, storer, etc.) are in different branches.
+                            # Consumer warps must coordinate among themselves if needed.
+
+                            rself._op.compute_forward(
+                                logical_idx, page_ptr,
+                                t0, t1, t2, t3, t4, t5, t6, t7,
+                                t8, t9, t10, t11, t12, t13, t14, t15,
+                                t16, t17, t18, t19, t20, t21, t22, t23,
+                                t24, t25, t26, t27, t28, t29, t30, t31,
+                            )
+
+                            # Signal compute done (only warp 0)
+                            if warp_id == 0:
+                                cute.arch.sync_warp()
+                                if lane_id == 0:
+                                    atomic_add_i32(Int32(1), g_sem_loaded + page_id * 4)
+
+                        # ----- STORER WARP -----
+                        elif is_storer:
+                            if lane_id == 0:
+                                while atomic_add_i32(Int32(0), g_sem_loaded + page_id * 4) < Int32(2):
+                                    nanosleep(10)
+
+                            rself._op.store_forward(
+                                logical_idx, page_ptr,
+                                t0, t1, t2, t3, t4, t5, t6, t7,
+                                t8, t9, t10, t11, t12, t13, t14, t15,
+                                t16, t17, t18, t19, t20, t21, t22, t23,
+                                t24, t25, t26, t27, t28, t29, t30, t31,
+                            )
+
+                            if lane_id == 0:
+                                bar_ptr = g_bar + logical_idx * 4
+                                atomic_add_i32(Int32(1), bar_ptr)
+                                atomic_add_i32(Int32(-2), g_sem_loaded + page_id * 4)
+                                atomic_add_i32(Int32(1), g_sem_consumed + page_id * 4)
+
+                        # ----- LAUNCHER/CONTROLLER WARPS -----
+                        elif is_launcher or is_controller:
+                            pass
+
+                    # Move to next instruction (grid-stride loop)
+                    instr_idx += grid_dim
+                    cute.arch.sync_threads()
+
+        # Create runner with op and config values
+        runner = MegakernelRunner(
+            grid, block, smem_size, single_op,
+            num_pages_py, page_size_py,
+            num_consumer_py, loader_warp_py, storer_warp_py, launcher_warp_py, controller_warp_py
+        )
+        self._launch_runner_with_instance_warp(
+            runner, num_instructions, num_ops_py,
+            num_pages_py, page_size_py,
+            num_consumer_py, loader_warp_py, storer_warp_py, launcher_warp_py, controller_warp_py,
+            padded_tensors
+        )
+
+    def _launch_sequential(self, grid, block, smem_size, num_instructions, padded_tensors):
+        """Launch Sequential Kernel: Vertical Fusion, All Warps Participate."""
+        ops = [inst["op"] for inst in self.instructions]
+        num_ops_py = len(ops)
+        num_pages_py = self._num_pages
+        page_size_py = self.page_config.page_size
+
+        # For single op, capture it directly
+        if num_ops_py == 1:
+            single_op = ops[0]
+        else:
+            single_op = None
+
+        # Create a runner class with the kernel as a method
+        # All config values are passed as kernel arguments to avoid closure issues
+        class MegakernelRunner:
+            def __init__(runner_self, g, b, smem, op, n_pages, pg_size):
+                runner_self._grid = list(g)
+                runner_self._block = list(b)
+                runner_self._smem = smem
+                runner_self._op = op
+                runner_self._num_pages = n_pages
+                runner_self._page_size = pg_size
+
+            def __extract_mlir_values__(runner_self):
+                return []
+
+            def __new_from_mlir_values__(runner_self, values):
+                return runner_self
+
+            def __c_pointers__(runner_self):
+                return []
+
+            @cute.jit
+            def run(
+                runner_self,
+                p_bar: Int64, p_instr: Int64, p_sem_loaded: Int64, p_sem_consumed: Int64,
+                p_n_instr: Int32, p_n_ops: Int32, p_n_pages: Int32, p_pg_size: Int32,
+                p0: Int64, p1: Int64, p2: Int64, p3: Int64,
+                p4: Int64, p5: Int64, p6: Int64, p7: Int64,
+                p8: Int64, p9: Int64, p10: Int64, p11: Int64,
+                p12: Int64, p13: Int64, p14: Int64, p15: Int64,
+                p16: Int64, p17: Int64, p18: Int64, p19: Int64,
+                p20: Int64, p21: Int64, p22: Int64, p23: Int64,
+                p24: Int64, p25: Int64, p26: Int64, p27: Int64,
+                p28: Int64, p29: Int64, p30: Int64, p31: Int64,
+            ):
+                runner_self.kernel(
+                    p_bar, p_instr, p_sem_loaded, p_sem_consumed,
+                    p_n_instr, p_n_ops, p_n_pages, p_pg_size,
+                    p0, p1, p2, p3, p4, p5, p6, p7,
+                    p8, p9, p10, p11, p12, p13, p14, p15,
+                    p16, p17, p18, p19, p20, p21, p22, p23,
+                    p24, p25, p26, p27, p28, p29, p30, p31,
+                ).launch(grid=runner_self._grid, block=runner_self._block, smem=runner_self._smem)
+
+            @cute.kernel
+            def kernel(
+                runner_self,
+                g_bar: Int64,
+                g_instructions: Int64,
+                g_sem_loaded: Int64,
+                g_sem_consumed: Int64,
+                n_instructions: Int32,
+                n_ops: Int32,
+                num_pages: Int32,
+                page_size: Int32,
+                t0: Int64, t1: Int64, t2: Int64, t3: Int64,
+                t4: Int64, t5: Int64, t6: Int64, t7: Int64,
+                t8: Int64, t9: Int64, t10: Int64, t11: Int64,
+                t12: Int64, t13: Int64, t14: Int64, t15: Int64,
+                t16: Int64, t17: Int64, t18: Int64, t19: Int64,
+                t20: Int64, t21: Int64, t22: Int64, t23: Int64,
+                t24: Int64, t25: Int64, t26: Int64, t27: Int64,
+                t28: Int64, t29: Int64, t30: Int64, t31: Int64,
+            ):
+                tidx, _, _ = cute.arch.thread_idx()
+                bidx, _, _ = cute.arch.block_idx()
+                grid_dim, _, _ = cute.arch.grid_dim()
+                lane_id = tidx % 32
+                warp_id = tidx // 32
+
+                # Internal SMEM pointer
+                smem = cute.runtime.make_ptr(cute.Uint8, 0, cute.AddressSpace.smem)
+
+                instr_id = Int32(bidx)
+                while instr_id < n_instructions:
+                    logical_idx = instr_id
+
+                    page_id = instr_id % num_pages
+                    page_ptr = smem + page_id * page_size
+
+                    # Single-op path (optimized, most common case)
+                    if n_ops == Int32(1):
+                        cute.arch.sync_threads()
+                        runner_self._op.load_forward(
+                            logical_idx,
+                            page_ptr,
+                            t0, t1, t2, t3, t4, t5, t6, t7,
+                            t8, t9, t10, t11, t12, t13, t14, t15,
+                            t16, t17, t18, t19, t20, t21, t22, t23,
+                            t24, t25, t26, t27, t28, t29, t30, t31,
+                        )
+                        cute.arch.sync_threads()
+                        runner_self._op.compute_forward(
+                            logical_idx,
+                            page_ptr,
+                            t0, t1, t2, t3, t4, t5, t6, t7,
+                            t8, t9, t10, t11, t12, t13, t14, t15,
+                            t16, t17, t18, t19, t20, t21, t22, t23,
+                            t24, t25, t26, t27, t28, t29, t30, t31,
+                        )
+                        cute.arch.sync_threads()
+                        runner_self._op.store_forward(
+                            logical_idx,
+                            page_ptr,
+                            t0, t1, t2, t3, t4, t5, t6, t7,
+                            t8, t9, t10, t11, t12, t13, t14, t15,
+                            t16, t17, t18, t19, t20, t21, t22, t23,
+                            t24, t25, t26, t27, t28, t29, t30, t31,
+                        )
+                        cute.arch.sync_threads()
+                        # NOTE: Barrier update disabled due to atomic_add_i32 issues
+                        # TODO: Fix atomic_add_i32 for proper barrier synchronization
+
+                    instr_id += grid_dim
+
+        # Create runner with the op reference and config values
+        runner = MegakernelRunner(grid, block, smem_size, single_op, num_pages_py, page_size_py)
+        self._launch_runner_with_instance_seq(
+            runner, num_instructions, num_ops_py, num_pages_py, page_size_py, padded_tensors
+        )
+
+    def _launch_runner(self, runner_cls, grid, block, smem_size, num_intr, num_ops, padded_tensors):
+        """Launch using the @cute.jit runner pattern.
+
+        This creates a runner instance and calls its run() method, which properly
+        compiles and executes the kernel.
+        """
+        # Convert tensors to Int64 data pointers for the kernel
+        int_args = []
+        for t in padded_tensors:
+            if isinstance(t, torch.Tensor):
+                int_args.append(Int64(t.data_ptr()))
+            elif isinstance(t, (int, float)):
+                int_args.append(Int64(int(t)))
+            elif hasattr(t, "ir_value"):  # DSL Type
+                int_args.append(t)
             else:
-                trace_file = trace_file + ".nanotrace"
+                int_args.append(Int64(0))
 
-        # Build trace data
-        operations = []
-        for op_idx in ctx.graph.get_topological_order():
-            node = ctx.graph.nodes[op_idx]
-            operations.append(
-                {
-                    "idx": op_idx,
-                    "name": node.name,
-                    "kernel_type": node.kernel_type.name,
-                    "smem_bytes": node.smem_bytes,
-                    "smem_bytes_fwd": node.smem_bytes_fwd,
-                    "smem_bytes_bwd": node.smem_bytes_bwd,
-                    "uses_warp_specialization": node.uses_warp_specialization,
-                }
-            )
+        # Fixed args for the kernel
+        g_bar = Int64(self._barrier_tensor.data_ptr())
+        g_instr = Int64(self._instruction_tensor.data_ptr())
+        g_sem_loaded = Int64(self._sem_loaded_tensor.data_ptr())
+        g_sem_consumed = Int64(self._sem_consumed_tensor.data_ptr())
+        n_instr = Int32(num_intr)
+        n_ops = Int32(num_ops)
 
-        trace_data = {
-            "version": "1.0",
-            "kernel_name": self.name,
-            "mode": self.mode,
-            "n_blocks": n_blocks,
-            "grid": list(grid),
-            "block": list(block),
-            "num_stages": self.num_stages,
-            "total_smem_bytes": ctx.total_smem_bytes,
-            "operations": operations,
-        }
+        # Grid/block as lists for launch
+        grid_list = list(grid) if isinstance(grid, tuple) else list(grid)
+        block_list = list(block) if isinstance(block, tuple) else list(block)
 
-        # Write trace file
-        with open(trace_file, "w") as f:
-            json.dump(trace_data, f, indent=2)
+        # Create runner and execute
+        runner = runner_cls(None, grid_list, block_list, smem_size)
+        runner.run(
+            g_bar, g_instr, g_sem_loaded, g_sem_consumed,
+            n_instr, n_ops,
+            *int_args,
+        )
+
+    def _launch_runner_direct(self, runner_cls, grid, block, smem_size, num_intr, num_ops, padded_tensors):
+        """Launch using the @cute.jit runner pattern with kernel as class method.
+
+        Similar to _launch_runner but for runners where kernel is defined inline.
+        """
+        # Convert tensors to Int64 data pointers for the kernel
+        int_args = []
+        for t in padded_tensors:
+            if isinstance(t, torch.Tensor):
+                int_args.append(Int64(t.data_ptr()))
+            elif isinstance(t, (int, float)):
+                int_args.append(Int64(int(t)))
+            elif hasattr(t, "ir_value"):  # DSL Type
+                int_args.append(t)
+            else:
+                int_args.append(Int64(0))
+
+        # Fixed args for the kernel
+        g_bar = Int64(self._barrier_tensor.data_ptr())
+        g_instr = Int64(self._instruction_tensor.data_ptr())
+        g_sem_loaded = Int64(self._sem_loaded_tensor.data_ptr())
+        g_sem_consumed = Int64(self._sem_consumed_tensor.data_ptr())
+        n_instr = Int32(num_intr)
+        n_ops = Int32(num_ops)
+
+        # Grid/block as lists for launch
+        grid_list = list(grid) if isinstance(grid, tuple) else list(grid)
+        block_list = list(block) if isinstance(block, tuple) else list(block)
+
+        # Create runner and execute
+        runner = runner_cls(grid_list, block_list, smem_size)
+        runner.run(
+            g_bar, g_instr, g_sem_loaded, g_sem_consumed,
+            n_instr, n_ops,
+            *int_args,
+        )
+
+    def _launch_runner_with_instance(self, runner, num_intr, num_ops, padded_tensors):
+        """Launch using a pre-created runner instance.
+
+        Used when the runner needs to capture closures via its constructor.
+        """
+        # Convert tensors to Int64 data pointers for the kernel
+        int_args = []
+        for t in padded_tensors:
+            if isinstance(t, torch.Tensor):
+                int_args.append(Int64(t.data_ptr()))
+            elif isinstance(t, (int, float)):
+                int_args.append(Int64(int(t)))
+            elif hasattr(t, "ir_value"):  # DSL Type
+                int_args.append(t)
+            else:
+                int_args.append(Int64(0))
+
+        # Fixed args for the kernel
+        g_bar = Int64(self._barrier_tensor.data_ptr())
+        g_instr = Int64(self._instruction_tensor.data_ptr())
+        g_sem_loaded = Int64(self._sem_loaded_tensor.data_ptr())
+        g_sem_consumed = Int64(self._sem_consumed_tensor.data_ptr())
+        n_instr = Int32(num_intr)
+        n_ops = Int32(num_ops)
+
+        # Execute
+        runner.run(
+            g_bar, g_instr, g_sem_loaded, g_sem_consumed,
+            n_instr, n_ops,
+            *int_args,
+        )
+
+    def _launch_runner_with_instance_seq(
+        self, runner, num_intr, num_ops, num_pages, page_size, padded_tensors
+    ):
+        """Launch using a pre-created runner instance for sequential kernel.
+
+        Adds num_pages and page_size as explicit kernel arguments.
+        """
+        # Convert tensors to Int64 data pointers for the kernel
+        # All tensor slots use Int64 to maintain a uniform signature
+        int_args = []
+        for t in padded_tensors:
+            if isinstance(t, torch.Tensor):
+                int_args.append(Int64(t.data_ptr()))
+            elif isinstance(t, (int, float)):
+                int_args.append(Int64(int(t)))
+            elif isinstance(t, Int32):
+                # Convert Int32 scalars to Int64 to match kernel signature
+                int_args.append(Int64(t.value))
+            elif isinstance(t, Int64):
+                int_args.append(t)
+            elif hasattr(t, "ir_value") and hasattr(t, "value"):
+                # Other DSL types with value attribute
+                int_args.append(Int64(t.value))
+            else:
+                int_args.append(Int64(0))
+
+        # Fixed args for the kernel
+        g_bar = Int64(self._barrier_tensor.data_ptr())
+        g_instr = Int64(self._instruction_tensor.data_ptr())
+        g_sem_loaded = Int64(self._sem_loaded_tensor.data_ptr())
+        g_sem_consumed = Int64(self._sem_consumed_tensor.data_ptr())
+        n_instr = Int32(num_intr)
+        n_ops = Int32(num_ops)
+        n_pages = Int32(num_pages)
+        pg_size = Int32(page_size)
+
+        # Execute
+        runner.run(
+            g_bar, g_instr, g_sem_loaded, g_sem_consumed,
+            n_instr, n_ops, n_pages, pg_size,
+            *int_args,
+        )
+
+    def _launch_runner_with_instance_warp(
+        self, runner, num_intr, num_ops, num_pages, page_size,
+        num_consumer, loader_warp, storer_warp, launcher_warp, controller_warp,
+        padded_tensors
+    ):
+        """Launch using a pre-created runner instance for warp-specialized kernel.
+
+        Adds all warp config values as explicit kernel arguments.
+        """
+        # Convert tensors to Int64 data pointers for the kernel
+        # All tensor slots use Int64 to maintain a uniform signature
+        int_args = []
+        for t in padded_tensors:
+            if isinstance(t, torch.Tensor):
+                int_args.append(Int64(t.data_ptr()))
+            elif isinstance(t, (int, float)):
+                int_args.append(Int64(int(t)))
+            elif isinstance(t, Int32):
+                # Convert Int32 scalars to Int64 to match kernel signature
+                int_args.append(Int64(t.value))
+            elif isinstance(t, Int64):
+                int_args.append(t)
+            elif hasattr(t, "ir_value") and hasattr(t, "value"):
+                # Other DSL types with value attribute
+                int_args.append(Int64(t.value))
+            else:
+                int_args.append(Int64(0))
+
+        # Fixed args for the kernel
+        g_bar = Int64(self._barrier_tensor.data_ptr())
+        g_instr = Int64(self._instruction_tensor.data_ptr())
+        g_sem_loaded = Int64(self._sem_loaded_tensor.data_ptr())
+        g_sem_consumed = Int64(self._sem_consumed_tensor.data_ptr())
+        n_instr = Int32(num_intr)
+        n_ops = Int32(num_ops)
+        n_pages = Int32(num_pages)
+        pg_size = Int32(page_size)
+        n_cons = Int32(num_consumer)
+        ld_w = Int32(loader_warp)
+        st_w = Int32(storer_warp)
+        ln_w = Int32(launcher_warp)
+        ct_w = Int32(controller_warp)
+
+        # Execute
+        runner.run(
+            g_bar, g_instr, g_sem_loaded, g_sem_consumed,
+            n_instr, n_ops, n_pages, pg_size,
+            n_cons, ld_w, st_w, ln_w, ct_w,
+            *int_args,
+        )

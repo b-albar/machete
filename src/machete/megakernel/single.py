@@ -6,6 +6,17 @@ from .core import Megakernel
 
 
 class SingleKernel(torch.autograd.Function):
+    """Wrapper for running a single kernel through the Megakernel infrastructure.
+
+    This class handles:
+    - Standard L/C/S kernels: load_forward, compute_forward, store_forward
+    - Warp-specialized kernels with setup_host + setup_kernel + L/C/S
+    - Autograd integration for forward/backward passes
+
+    The megakernel core generates a single @cute.kernel that inlines the L/C/S
+    methods with proper warp dispatch for warp-specialized kernels.
+    """
+
     def __init__(self, op: FusableKernel, grid_fn: Callable, block_fn: Callable):
         self.op = op
         self.grid_fn = grid_fn
@@ -31,6 +42,11 @@ class SingleKernel(torch.autograd.Function):
         This avoids clearing and rebuilding the instruction list, which is crucial
         for correct caching and performance.
         """
+        # Ensure shapes are extracted if the op supports it, even before adding to mk
+        if hasattr(self.op, "_extract_shapes") and hasattr(self.op, "tensor_params"):
+            shapes = self.op._extract_shapes(list(args))
+            self.op.shapes = shapes
+
         if not mk.instructions:
             mk.add(self.op, *args)
         else:
@@ -59,6 +75,7 @@ class SingleKernel(torch.autograd.Function):
         block = self.block_fn(*args)
         n_blocks = grid[0] * grid[1] * grid[2]
 
+        # Use megakernel for all kernels (standard L/C/S or warp-specialized)
         self._update_or_add(self.mk_fwd, args)
         self.mk_fwd.launch(n_blocks, grid, block)
 
@@ -89,11 +106,13 @@ class SingleKernel(torch.autograd.Function):
 
         bwd_args = (main_grad,) + args[1:]
 
+        # Update or add MUST happen before grid_fn/block_fn
+        self._update_or_add(self.mk_bwd, bwd_args)
+
         grid = self.grid_fn(*args)
         block = self.block_fn(*args)
         n_blocks = grid[0] * grid[1] * grid[2]
 
-        self._update_or_add(self.mk_bwd, bwd_args)
         self.mk_bwd.launch(n_blocks, grid, block)
 
         # Return gradients

@@ -7,7 +7,8 @@ that can be fused into megakernels.
 """
 
 from abc import abstractmethod
-from typing import Callable, Tuple
+from typing import Callable, Tuple, List, Optional
+from dataclasses import dataclass
 import cutlass.cute as cute
 
 # Re-export dependency decorators, warp roles, and scheduler config for convenience
@@ -17,8 +18,7 @@ from machete.megakernel.scheduler import (
     writes,
     warp_role,
     async_load,
-    prefetchable,
-    depends_on,
+    TensorDependency,
     # Warp configuration
     WarpRole,
     WarpConfig,
@@ -27,6 +27,9 @@ from machete.megakernel.scheduler import (
     LogicalGridInfo,
     # Barrier config
     BarrierConfig,
+    # Page config
+    PageConfig,
+    PageSemaphores,
 )
 
 __all__ = [
@@ -35,8 +38,7 @@ __all__ = [
     "writes",
     "warp_role",
     "async_load",
-    "prefetchable",
-    "depends_on",
+    "TensorDependency",
     # Warp configuration
     "WarpRole",
     "WarpConfig",
@@ -45,6 +47,11 @@ __all__ = [
     "LogicalGridInfo",
     # Barrier config
     "BarrierConfig",
+    # Page config
+    "PageConfig",
+    "PageSemaphores",
+    # Data definitions
+    "TensorParam",
     # Operation classes
     "machete_op",
     "MegakernelOp",
@@ -54,28 +61,32 @@ __all__ = [
 ]
 
 
-def machete_op(num_tensors: int, smem_size: int = 0):
-    """Decorator to mark a function or method as a Machete Megakernel operation.
+@dataclass
+class TensorParam:
+    """Defines a tensor parameter for automatic CuTe tensor creation.
+
+    Uses indices into the PyTorch tensor's shape/stride at runtime.
 
     Args:
-        num_tensors: Number of tensor arguments the operation expects
-        smem_size: Total shared memory size needed by this operation in bytes.
+        name: Name of the tensor parameter (used for generated variable naming)
+        shape: Tuple of indices into tensor.shape (e.g., (0, 1) for 2D tensor)
+        stride: Tuple of indices into tensor.stride() (e.g., (0, 1) for actual strides)
+        dtype_attr: Optional name of kernel attribute containing the CuTe dtype.
+                   If provided, uses getattr(kernel, dtype_attr) for make_tensor.
+                   If None, dtype is inferred from the PyTorch tensor.
 
-    Example:
-        class MyKernel:
-            @machete_op(num_tensors=3, smem_size=16384)
-            @cute.jit
-            def compute(self, input, weight, output):
-                ...
+    Examples:
+        # 2D tensor using dims 0 and 1, dtype inferred from PyTorch tensor
+        TensorParam("a", shape=(0, 1), stride=(0, 1))
+
+        # 3D tensor with explicit dtype from kernel attribute
+        TensorParam("q", shape=(0, 1, 2), stride=(0, 1, 2), dtype_attr="cute_dtype")
     """
 
-    def decorator(func):
-        func._machete_is_op = True
-        func._machete_num_tensors = num_tensors
-        func._machete_smem_size = smem_size
-        return func
-
-    return decorator
+    name: str
+    shape: Tuple[int, ...]
+    stride: Tuple[int, ...]
+    dtype_attr: Optional[str] = None
 
 
 class MegakernelOp:
@@ -92,12 +103,6 @@ class MegakernelOp:
     - get_logical_grid_size(): Return total logical blocks for this kernel
     - get_logical_coord(): Map linear logical_idx to kernel-specific coordinates
     """
-
-    @property
-    @abstractmethod
-    def num_tensors(self) -> int:
-        """Number of tensors this operation expects in its compute method."""
-        pass
 
     @property
     def smem_size_fwd(self) -> int:
@@ -264,6 +269,24 @@ class FusableKernel:
     - Coordinates are passed to L/C/S methods instead of raw block indices
     """
 
+    # ========== CuTe DSL Protocol Methods ==========
+    # These are required for the kernel to be passed through the DSL JIT system.
+    # Defined here so subclasses don't need to implement them.
+
+    def __extract_mlir_values__(self):
+        """Extract MLIR values for DSL serialization."""
+        return []
+
+    def __new_from_mlir_values__(self, values):
+        """Reconstruct from MLIR values."""
+        return self
+
+    def __c_pointers__(self):
+        """Return C pointers for FFI."""
+        return []
+
+    # ========== Shared Memory Configuration ==========
+
     @property
     def smem_size_fwd(self) -> int:
         """Shared memory size needed by this kernel in bytes for forward pass."""
@@ -364,125 +387,47 @@ class FusableKernel:
         pass
 
 
+def machete_op(smem_size: int = 0):
+    """Decorator to mark a function or method as a Machete Megakernel operation.
+
+    Args:
+        smem_size: Total shared memory size needed by this operation in bytes.
+
+    Example:
+        class MyKernel:
+            @machete_op(smem_size=16384)
+            @cute.jit
+            def compute(self, input, weight, output):
+                ...
+    """
+
+    def decorator(func):
+        func._machete_is_op = True
+        func._machete_smem_size = smem_size
+        return func
+
+    return decorator
+
+
 class WarpSpecializedKernel(FusableKernel):
-    """Base class for kernels that use warp specialization (No Bubbles pattern).
+    """Kernel supporting warp specialization.
 
-    This class extends FusableKernel with explicit support for warp-specialized
-    execution where different warps execute different roles concurrently:
-    - LOADER warps: Execute load_* methods (Global -> Shared)
-    - CONSUMER warps: Execute compute_* methods (math/MMA operations)
-    - STORER warps: Execute store_* methods (Shared -> Global)
-    - CONTROLLER warp: Manages instruction scheduling
-    - LAUNCHER warp: Handles auxiliary async tasks
+    Extends FusableKernel with warp role configuration. Override warp_config
+    to customize the warp allocation for your kernel.
 
-    Example usage:
-        class MyWarpSpecializedKernel(WarpSpecializedKernel):
-            TILE_M = 128
-            TILE_N = 128
-
-            @property
-            def warp_config(self) -> WarpConfig:
-                return WarpConfig(num_consumer_warps=12)
-
-            @property
-            def smem_size_fwd(self) -> int:
-                return self.TILE_M * self.TILE_N * 2  # fp16
-
-            @warp_role(WarpRole.LOADER)
-            @reads("input", "weight")
-            @cute.jit
-            def load_forward(self, logical_idx, smem, input, weight, output):
-                # TMA/cp.async loads - executed by loader warps only
-                ...
-
-            @warp_role(WarpRole.CONSUMER)
-            @writes("output")
-            @cute.jit
-            def compute_forward(self, smem, input, weight, output):
-                # MMA operations - executed by consumer warps only
-                ...
-
-            @warp_role(WarpRole.STORER)
-            @cute.jit
-            def store_forward(self, logical_idx, smem, input, weight, output):
-                # TMA stores - executed by storer warps only
-                ...
-
-    The Megakernel runtime will:
-    1. Partition warps according to warp_config
-    2. Generate code that dispatches methods based on warp role
-    3. Use synchronization primitives between roles
+    Warp Layout: [Consumer warps...][Loader][Storer][Launcher][Controller]
     """
 
     @property
-    def warp_config(self) -> WarpConfig:
-        """Configuration for warp specialization.
-
-        Override this to customize the warp distribution. Default is H100-optimized
-        with 16 consumer warps and 4 system warps (20 total = 640 threads).
-
-        Returns:
-            WarpConfig specifying warp counts per role
-        """
-        return WarpConfig()
-
-    @property
     def uses_warp_specialization(self) -> bool:
-        """Whether this kernel uses warp specialization.
-
-        This is always True for WarpSpecializedKernel. The Megakernel
-        runtime uses this to determine scheduling strategy.
-        """
+        """Returns True since this kernel uses warp specialization."""
         return True
 
-    # ========== Warp-Role Specific Methods ==========
+    @property
+    def warp_config(self) -> WarpConfig:
+        """Override to configure warp roles.
 
-    @warp_role(WarpRole.LOADER)
-    @cute.jit
-    def loader_main(self, logical_idx, smem, *args):
-        """Main loop for loader warps.
-
-        Default implementation calls load_forward. Override for custom
-        loader behavior (e.g., prefetching, TMA descriptor setup).
+        Returns:
+            WarpConfig with warp counts for each role.
         """
-        self.load_forward(logical_idx, smem, *args)
-
-    @warp_role(WarpRole.CONSUMER)
-    @cute.jit
-    def consumer_main(self, logical_idx, smem, *args):
-        """Main loop for consumer warps.
-
-        Default implementation calls compute_forward. Override for custom
-        consumer behavior (e.g., warpgroup MMA scheduling).
-        """
-        self.compute_forward(logical_idx, smem, *args)
-
-    @warp_role(WarpRole.STORER)
-    @cute.jit
-    def storer_main(self, logical_idx, smem, *args):
-        """Main loop for storer warps.
-
-        Default implementation calls store_forward. Override for custom
-        storer behavior (e.g., TMA stores, reduction across warps).
-        """
-        self.store_forward(logical_idx, smem, *args)
-
-    @warp_role(WarpRole.CONTROLLER)
-    @cute.jit
-    def controller_main(self, instruction_buffer, *args):
-        """Main loop for controller warp.
-
-        Default is no-op. Override for custom instruction scheduling
-        or inter-block coordination.
-        """
-        pass
-
-    @warp_role(WarpRole.LAUNCHER)
-    @cute.jit
-    def launcher_main(self, *args):
-        """Main loop for launcher warp.
-
-        Default is no-op. Override for auxiliary async tasks like
-        K/V cache prefetching or TMA descriptor updates.
-        """
-        pass
+        return WarpConfig()
