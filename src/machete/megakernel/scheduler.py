@@ -636,6 +636,10 @@ class SmemPlanner:
     1. Sequential (num_stages=1): All ops share one buffer (max size)
     2. Multi-stage (num_stages>1): Each op gets separate buffer
     3. Early-load overlap: Ops with overlapping loads get separate buffers
+
+    Semaphore allocation (for warp-specialized kernels):
+    - Per-op intra-op semaphores: load_done, compute_done (2 per op, 4 bytes each)
+    - Inter-op semaphores: op_done (1 per op, 4 bytes each)
     """
 
     def __init__(self, graph: OperationGraph):
@@ -643,13 +647,22 @@ class SmemPlanner:
         self.allocations: Dict[int, SmemAllocation] = {}
         self._total_bytes: int = 0
         self._early_load_ops: Set[int] = set()  # Ops that need separate smem for overlap
+        self._semaphore_base_offset: int = 0  # Where semaphores start
+        self._use_semaphores: bool = False
+        self._num_ops: int = 0
 
-    def plan(self, num_stages: int = 1, enable_early_load: bool = True) -> int:
+    def plan(
+        self,
+        num_stages: int = 1,
+        enable_early_load: bool = True,
+        use_semaphores: bool = False,
+    ) -> int:
         """Plan smem allocation.
 
         Args:
             num_stages: Number of pipeline stages (1 = no buffering, 2 = double buffer)
             enable_early_load: If True, allocate separate smem for ops that can overlap
+            use_semaphores: If True, allocate semaphores for inter-op overlap
 
         Returns:
             Total shared memory bytes needed
@@ -657,6 +670,9 @@ class SmemPlanner:
         # First, identify ops that can have their load moved early
         if enable_early_load:
             self._identify_early_load_ops()
+
+        self._use_semaphores = use_semaphores
+        self._num_ops = len(self.graph.nodes)
 
         max_size = 0
         current_offset = 0
@@ -690,11 +706,74 @@ class SmemPlanner:
 
         # Total is sum of separate buffers + max of shared buffers
         if current_offset > 0:
-            self._total_bytes = current_offset + max_size
+            data_bytes = current_offset + max_size
         else:
-            self._total_bytes = max_size
+            data_bytes = max_size
+
+        # Record where semaphores start (after data buffers)
+        self._semaphore_base_offset = data_bytes
+
+        # Add semaphore space if needed
+        if use_semaphores:
+            semaphore_bytes = self._calculate_semaphore_bytes()
+            self._total_bytes = data_bytes + semaphore_bytes
+        else:
+            self._total_bytes = data_bytes
 
         return self._total_bytes
+
+    def _calculate_semaphore_bytes(self) -> int:
+        """Calculate bytes needed for semaphores.
+
+        Layout:
+        - Per-op intra-op semaphores: [op0_load_done, op0_compute_done, op1_load_done, ...]
+        - Inter-op semaphores: [op0_done, op1_done, ...]
+
+        Each semaphore is 4 bytes (int32).
+        """
+        num_ops = self._num_ops
+        # 2 intra-op semaphores per op (load_done, compute_done)
+        intra_op_sems = num_ops * 2
+        # 1 inter-op semaphore per op (op_done for dependent ops)
+        inter_op_sems = num_ops
+        total_sems = intra_op_sems + inter_op_sems
+        return total_sems * 4  # 4 bytes per semaphore
+
+    @property
+    def semaphore_base_offset(self) -> int:
+        """Byte offset where semaphores start in shared memory."""
+        return self._semaphore_base_offset
+
+    def get_intra_op_sem_offset(self, op_idx: int, sem_type: str) -> int:
+        """Get byte offset for an intra-op semaphore.
+
+        Args:
+            op_idx: Operation index
+            sem_type: "load_done" or "compute_done"
+
+        Returns:
+            Byte offset from smem base
+        """
+        base = self._semaphore_base_offset
+        if sem_type == "load_done":
+            return base + (op_idx * 2 * 4)
+        elif sem_type == "compute_done":
+            return base + (op_idx * 2 * 4) + 4
+        else:
+            raise ValueError(f"Unknown semaphore type: {sem_type}")
+
+    def get_inter_op_sem_offset(self, op_idx: int) -> int:
+        """Get byte offset for an inter-op semaphore.
+
+        Args:
+            op_idx: Operation index
+
+        Returns:
+            Byte offset from smem base
+        """
+        # Inter-op semaphores come after intra-op semaphores
+        intra_op_bytes = self._num_ops * 2 * 4
+        return self._semaphore_base_offset + intra_op_bytes + (op_idx * 4)
 
     def _identify_early_load_ops(self):
         """Identify ops that can have their load overlapped with previous compute."""

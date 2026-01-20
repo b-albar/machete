@@ -377,6 +377,202 @@ class UnifiedCodeGenerator:
             code.append("            counters[counter_idx] = Int32(1)")
 
 
+class SemaphoreCodeGenerator:
+    """Generates code using semaphore-based synchronization for true inter-op overlap.
+
+    This generator enables the "No Bubbles" pattern across fused operations:
+    - Loader warps can start loading Op N+1's data while consumer warps compute Op N
+    - No global sync_threads() barriers between operations
+    - Uses per-op semaphores in shared memory for fine-grained handoff
+
+    Synchronization strategy:
+    - Intra-op: semaphores between load->compute->store phases
+    - Inter-op: semaphores between Op N store -> Op N+1 load (for dependent ops)
+    - Independent ops: no synchronization needed, full overlap possible
+    """
+
+    def generate(self, ctx: EmitterContext) -> List[str]:
+        """Generate schedule code with semaphore-based synchronization."""
+        code = []
+
+        warp_config = self._get_warp_config(ctx)
+        has_warp_spec = any(n.uses_warp_specialization for n in ctx.graph.nodes.values())
+        topo_order = ctx.graph.get_topological_order()
+        num_ops = len(topo_order)
+
+        # Check if we need inter-op synchronization
+        needs_inter_op_sync = self._needs_inter_op_sync(ctx, topo_order)
+
+        # Header
+        code.append("")
+        if has_warp_spec:
+            num_consumer = warp_config.num_consumer_warps
+            loader_warp = num_consumer
+            storer_warp = num_consumer + warp_config.num_loader_warps
+            code.append("        # Semaphore-based execution (No Bubbles pattern)")
+            code.append(
+                f"        # Warp roles - Consumer: 0-{num_consumer - 1}, Loader: {loader_warp}, Storer: {storer_warp}"
+            )
+            code.append("        warp_id = tidx // Int32(32)")
+            code.append("        lane_id = tidx % Int32(32)")
+        else:
+            code.append("        # Sequential execution mode with semaphores")
+            num_consumer = loader_warp = storer_warp = 0
+        code.append("")
+
+        # Initialize inter-op semaphores if needed
+        if needs_inter_op_sync and num_ops > 1:
+            code.append("        # Initialize inter-op semaphores")
+            code.append("        if tidx == Int32(0):")
+            for i in range(num_ops):
+                code.append(f"            inter_op_sem_{i}[0] = Int32(0)")
+            code.append("        cute.arch.sync_threads()")
+            code.append("")
+
+        # Generate per-op code with overlap
+        for i, op_idx in enumerate(topo_order):
+            node = ctx.graph.nodes[op_idx]
+            is_last = (i == num_ops - 1)
+
+            self._emit_op_semaphore(
+                code,
+                ctx,
+                op_idx,
+                node,
+                warp_config,
+                num_consumer,
+                loader_warp,
+                storer_warp,
+                needs_inter_op_sync=needs_inter_op_sync,
+                is_last_op=is_last,
+                num_ops=num_ops,
+            )
+            code.append("")
+
+        return code
+
+    def _needs_inter_op_sync(self, ctx: EmitterContext, topo_order: List[int]) -> bool:
+        """Check if we need inter-op synchronization."""
+        if len(topo_order) <= 1:
+            return False
+        for op_idx in topo_order[1:]:
+            node = ctx.graph.nodes[op_idx]
+            if node.depends_on:
+                return True
+        return False
+
+    def _get_warp_config(self, ctx: EmitterContext) -> WarpConfig:
+        """Get warp config from first warp-specialized op, or default."""
+        for node in ctx.graph.nodes.values():
+            if node.warp_config:
+                return node.warp_config
+        return WarpConfig()
+
+    def _get_op_args(self, ctx: EmitterContext, op_idx: int):
+        """Build argument strings for an operation."""
+        args = ctx.get_args_str(op_idx)
+        smem = ctx.get_smem_var(op_idx)
+        has_smem = ctx.op_has_smem(op_idx)
+
+        if has_smem and args:
+            all_args = f"logical_idx, {smem}, {args}"
+        elif has_smem:
+            all_args = f"logical_idx, {smem}"
+        elif args:
+            all_args = f"logical_idx, {args}"
+        else:
+            all_args = "logical_idx"
+
+        return all_args, all_args, has_smem
+
+    def _emit_op_semaphore(
+        self,
+        code: List[str],
+        ctx: EmitterContext,
+        op_idx: int,
+        node,
+        warp_config: WarpConfig,
+        num_consumer: int,
+        loader_warp: int,
+        storer_warp: int,
+        needs_inter_op_sync: bool,
+        is_last_op: bool,
+        num_ops: int,
+    ):
+        """Emit code for a single op using semaphore-based synchronization.
+
+        Key difference from _emit_op:
+        - Uses semaphore wait/signal instead of sync_threads() between phases
+        - Allows loader warp to proceed to next op while consumer is still computing
+        - True overlap between operations without global barriers
+        """
+        load_store_args, compute_args, has_smem = self._get_op_args(ctx, op_idx)
+        is_warp_spec = node.uses_warp_specialization
+
+        mode_str = "warp-specialized (semaphore)" if is_warp_spec else "sequential (semaphore)"
+        code.append(f"        # Op {op_idx}: {node.name} ({mode_str})")
+
+        # === WAIT FOR DEPENDENCIES (semaphore-based) ===
+        if needs_inter_op_sync and node.depends_on:
+            code.append("        # Loader: wait for dependencies before loading")
+            if is_warp_spec:
+                code.append(f"        if warp_id == Int32({loader_warp}) and lane_id == Int32(0):")
+            else:
+                code.append("        if tidx == Int32(0):")
+
+            for dep_idx in sorted(node.depends_on):
+                code.append(f"            # Wait for Op {dep_idx} store to complete")
+                code.append(f"            semaphore_wait(inter_op_sem_{dep_idx}, Int32(1))")
+
+        # === LOAD PHASE ===
+        if is_warp_spec:
+            code.append(f"        if warp_id == Int32({loader_warp}):")
+            code.append(f"            op_{op_idx}_load({load_store_args})")
+            code.append(f"            # Signal: load complete for Op {op_idx}")
+            code.append("            if lane_id == Int32(0):")
+            code.append(f"                semaphore_signal(op_{op_idx}_load_done)")
+        else:
+            code.append(f"        op_{op_idx}_load({load_store_args})")
+            if has_smem:
+                code.append("        cute.arch.sync_threads()")
+
+        # === COMPUTE PHASE ===
+        if is_warp_spec:
+            code.append(f"        if warp_id < Int32({num_consumer}):")
+            code.append("            # Consumer: wait for load to complete")
+            code.append("            if lane_id == Int32(0):")
+            code.append(f"                semaphore_wait(op_{op_idx}_load_done, Int32(1))")
+            code.append("            cute.arch.sync_warp()  # Sync within consumer warps")
+            code.append(f"            op_{op_idx}_compute({compute_args})")
+            code.append(f"            # Signal: compute complete for Op {op_idx}")
+            code.append("            if lane_id == Int32(0):")
+            code.append(f"                semaphore_signal(op_{op_idx}_compute_done)")
+        else:
+            code.append(f"        op_{op_idx}_compute({compute_args})")
+            if has_smem:
+                code.append("        cute.arch.sync_threads()")
+
+        # === STORE PHASE ===
+        if is_warp_spec:
+            code.append(f"        if warp_id == Int32({storer_warp}):")
+            code.append("            # Storer: wait for compute to complete")
+            code.append("            if lane_id == Int32(0):")
+            code.append(f"                semaphore_wait(op_{op_idx}_compute_done, Int32(1))")
+            code.append("            cute.arch.sync_warp()")
+            code.append(f"            op_{op_idx}_store({load_store_args})")
+
+            # Signal inter-op completion if needed
+            if needs_inter_op_sync and not is_last_op:
+                code.append(f"            # Signal: Op {op_idx} store complete (for dependent ops)")
+                code.append("            if lane_id == Int32(0):")
+                code.append(f"                semaphore_signal(inter_op_sem_{op_idx})")
+        else:
+            code.append(f"        op_{op_idx}_store({load_store_args})")
+            if needs_inter_op_sync and not is_last_op:
+                code.append("        if tidx == Int32(0):")
+                code.append(f"            semaphore_signal(inter_op_sem_{op_idx})")
+
+
 # ============================================================================
 # Kernel Template
 # ============================================================================

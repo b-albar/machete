@@ -78,8 +78,14 @@ class SimpleAddKernel(FusableKernel):
     def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor views from pointers
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements:
-            output_tensor[elem_idx] = input_tensor[elem_idx] + scalar[0]
+            m_output[elem_idx] = m_input[elem_idx] + m_scalar[0]
 
     @cute.jit
     def store_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
@@ -124,8 +130,14 @@ class SimpleMulKernel(FusableKernel):
     def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor views from pointers
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements:
-            output_tensor[elem_idx] = input_tensor[elem_idx] * scalar[0]
+            m_output[elem_idx] = m_input[elem_idx] * m_scalar[0]
 
     @cute.jit
     def store_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
@@ -170,8 +182,12 @@ class SharedMemKernel(FusableKernel):
         """Load data into shared memory."""
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor view from pointer
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements and tidx < self.TILE_SIZE:
-            smem[tidx] = input_tensor[elem_idx]
+            smem[tidx] = m_input[elem_idx]
 
     @writes("output")
     @cute.jit
@@ -179,11 +195,15 @@ class SharedMemKernel(FusableKernel):
         """Read from smem and write to output."""
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor view from pointer
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements and tidx < self.TILE_SIZE:
             # Read from smem (must be synced after load)
             val = smem[tidx]
             # Double the value to verify we read correct data
-            output_tensor[elem_idx] = val + val
+            m_output[elem_idx] = val + val
 
     @cute.jit
     def store_forward(self, logical_idx, smem, input_tensor, output_tensor, n_elements):
@@ -228,12 +248,15 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
         lane = tidx % 32
         tile_start = logical_idx * self.TILE_SIZE
 
+        # Create 1D tensor view from pointer
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         # Each thread in loader warp loads multiple elements
         for i in range(self.TILE_SIZE // 32):
             elem_idx = tile_start + lane + i * 32
             smem_idx = lane + i * 32
             if elem_idx < n_elements and smem_idx < self.TILE_SIZE:
-                smem[smem_idx] = input_tensor[elem_idx]
+                smem[smem_idx] = m_input[elem_idx]
 
     @warp_role(WarpRole.CONSUMER)
     @writes("output")
@@ -245,6 +268,10 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
         lane = tidx % 32
         tile_start = logical_idx * self.TILE_SIZE
 
+        # Create 1D tensor views from pointers
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         # Each consumer warp handles a portion
         elements_per_warp = self.TILE_SIZE // 4  # 4 consumer warps
         start = warp_id * elements_per_warp
@@ -254,7 +281,7 @@ class WarpSpecializedTestKernel(WarpSpecializedKernel):
             elem_idx = tile_start + local_idx
             if local_idx < start + elements_per_warp and elem_idx < n_elements:
                 val = smem[local_idx]
-                output_tensor[elem_idx] = val * scalar[0]
+                m_output[elem_idx] = val * m_scalar[0]
 
     @warp_role(WarpRole.STORER)
     @cute.jit
@@ -901,8 +928,14 @@ class IndependentAddKernel(FusableKernel):
     def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor views from pointers
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements:
-            output_tensor[elem_idx] = input_tensor[elem_idx] + scalar[0]
+            m_output[elem_idx] = m_input[elem_idx] + m_scalar[0]
 
     @cute.jit
     def store_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
@@ -941,8 +974,14 @@ class IndependentMulKernel(FusableKernel):
     def compute_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
         tidx, _, _ = cute.arch.thread_idx()
         elem_idx = logical_idx * self.TILE_SIZE + tidx
+
+        # Create 1D tensor views from pointers
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         if elem_idx < n_elements:
-            output_tensor[elem_idx] = input_tensor[elem_idx] * scalar[0]
+            m_output[elem_idx] = m_input[elem_idx] * m_scalar[0]
 
     @cute.jit
     def store_forward(self, logical_idx, input_tensor, scalar, output_tensor, n_elements):
@@ -982,11 +1021,14 @@ class WarpSpecIndependentKernel(WarpSpecializedKernel):
         lane = tidx % 32
         tile_start = logical_idx * self.TILE_SIZE
 
+        # Create 1D tensor view from pointer
+        m_input = cute.make_tensor(input_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         for i in range(self.TILE_SIZE // 32):
             elem_idx = tile_start + lane + i * 32
             smem_idx = lane + i * 32
             if elem_idx < n_elements and smem_idx < self.TILE_SIZE:
-                smem[smem_idx] = input_tensor[elem_idx]
+                smem[smem_idx] = m_input[elem_idx]
 
     @warp_role(WarpRole.CONSUMER)
     @writes("warp_output")  # Different output name
@@ -997,6 +1039,10 @@ class WarpSpecIndependentKernel(WarpSpecializedKernel):
         lane = tidx % 32
         tile_start = logical_idx * self.TILE_SIZE
 
+        # Create 1D tensor views from pointers
+        m_scalar = cute.make_tensor(scalar, cute.make_layout((1,), stride=(1,)))
+        m_output = cute.make_tensor(output_tensor, cute.make_layout((n_elements,), stride=(1,)))
+
         elements_per_warp = self.TILE_SIZE // 4
         start = warp_id * elements_per_warp
 
@@ -1005,7 +1051,7 @@ class WarpSpecIndependentKernel(WarpSpecializedKernel):
             elem_idx = tile_start + local_idx
             if local_idx < start + elements_per_warp and elem_idx < n_elements:
                 val = smem[local_idx]
-                output_tensor[elem_idx] = val * scalar[0]
+                m_output[elem_idx] = val * m_scalar[0]
 
     @warp_role(WarpRole.STORER)
     @cute.jit

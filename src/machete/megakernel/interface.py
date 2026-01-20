@@ -367,6 +367,19 @@ class WarpSpecializedKernel(FusableKernel):
     - CONTROLLER warp: Manages instruction scheduling
     - LAUNCHER warp: Handles auxiliary async tasks
 
+    Producer-Consumer Synchronization:
+    Instead of sync_threads() which blocks all warps, this class uses
+    semaphore-based synchronization that allows true concurrent execution:
+
+    - loader_ready[stage]: Loader signals "data loaded into stage"
+    - consumer_done[stage]: Consumer signals "done with stage, can be reused"
+
+    Pipeline Flow (with num_stages=2):
+        Iteration 0: Loader fills stage 0
+        Iteration 1: Loader fills stage 1, Consumer processes stage 0
+        Iteration 2: Loader fills stage 0, Consumer processes stage 1, Storer writes stage 0 result
+        ...
+
     Example usage:
         class MyWarpSpecializedKernel(WarpSpecializedKernel):
             TILE_M = 128
@@ -377,33 +390,40 @@ class WarpSpecializedKernel(FusableKernel):
                 return WarpConfig(num_consumer_warps=12)
 
             @property
-            def smem_size_fwd(self) -> int:
+            def num_stages(self) -> int:
+                return 2  # Double buffering
+
+            @property
+            def page_size(self) -> int:
                 return self.TILE_M * self.TILE_N * 2  # fp16
 
             @warp_role(WarpRole.LOADER)
             @reads("input", "weight")
             @cute.jit
-            def load_forward(self, logical_idx, smem, input, weight, output):
-                # TMA/cp.async loads - executed by loader warps only
+            def load_forward(self, logical_idx, page_ptr, stage, *args):
+                # TMA/cp.async loads into page_ptr
                 ...
 
             @warp_role(WarpRole.CONSUMER)
             @writes("output")
             @cute.jit
-            def compute_forward(self, smem, input, weight, output):
-                # MMA operations - executed by consumer warps only
+            def compute_forward(self, logical_idx, page_ptr, stage, *args):
+                # MMA operations reading from page_ptr
                 ...
 
             @warp_role(WarpRole.STORER)
             @cute.jit
-            def store_forward(self, logical_idx, smem, input, weight, output):
-                # TMA stores - executed by storer warps only
+            def store_forward(self, logical_idx, page_ptr, stage, *args):
+                # Write results to global memory
                 ...
 
     The Megakernel runtime will:
     1. Partition warps according to warp_config
-    2. Generate code that dispatches methods based on warp role
-    3. Use synchronization primitives between roles
+    2. Allocate paged buffers with semaphores in shared memory
+    3. Generate code that:
+       - Dispatches methods based on warp role
+       - Uses semaphore acquire/release instead of sync_threads()
+       - Enables true overlap between load/compute/store phases
     """
 
     @property
@@ -419,6 +439,32 @@ class WarpSpecializedKernel(FusableKernel):
         return WarpConfig()
 
     @property
+    def num_stages(self) -> int:
+        """Number of pipeline stages (buffer slots).
+
+        Override this to enable multi-stage buffering:
+        - 1: No buffering (sequential L->C->S)
+        - 2: Double buffering (recommended)
+        - 3: Triple buffering (for hiding very long latencies)
+
+        Returns:
+            Number of stages (default 2 for double buffering)
+        """
+        return 2
+
+    @property
+    def page_size(self) -> int:
+        """Size of each data page in bytes.
+
+        Override this to specify how much data each stage holds.
+        Should be large enough for one tile of data.
+
+        Returns:
+            Page size in bytes (default 16KB)
+        """
+        return 16384
+
+    @property
     def uses_warp_specialization(self) -> bool:
         """Whether this kernel uses warp specialization.
 
@@ -427,37 +473,149 @@ class WarpSpecializedKernel(FusableKernel):
         """
         return True
 
+    @property
+    def smem_size_fwd(self) -> int:
+        """Total shared memory needed for forward pass.
+
+        Includes paged buffers + semaphores.
+        Override page_size and num_stages instead of this.
+        """
+        # Data pages + semaphores (2 per stage, 4 bytes each)
+        return (self.num_stages * self.page_size) + (self.num_stages * 2 * 4)
+
+    @property
+    def smem_size_bwd(self) -> int:
+        """Total shared memory needed for backward pass."""
+        return self.smem_size_fwd
+
+    # ========== Semaphore Offsets ==========
+
+    @property
+    def _sem_base_offset(self) -> int:
+        """Byte offset to semaphore array in shared memory."""
+        return self.num_stages * self.page_size
+
     # ========== Warp-Role Specific Methods ==========
 
     @warp_role(WarpRole.LOADER)
     @cute.jit
-    def loader_main(self, logical_idx, smem, *args):
-        """Main loop for loader warps.
+    def loader_main(self, logical_idx, smem_base, num_iterations, *args):
+        """Main loop for loader warps with pipelined execution.
 
-        Default implementation calls load_forward. Override for custom
-        loader behavior (e.g., prefetching, TMA descriptor setup).
+        Implements the loader side of the producer-consumer protocol:
+        1. Wait for consumer to release the stage (consumer_done)
+        2. Load data into the stage
+        3. Signal that data is ready (loader_ready)
+
+        Override load_forward() to implement the actual load logic.
+
+        Args:
+            logical_idx: Base logical block index
+            smem_base: Base pointer to shared memory
+            num_iterations: Number of tiles/iterations to process
+            *args: Kernel arguments
         """
-        self.load_forward(logical_idx, smem, *args)
+        from cutlass import Int32, const_expr
+        from machete.megakernel.paged_buffer import (
+            loader_acquire_stage,
+            loader_release_stage,
+            get_page_ptr,
+        )
+
+        num_stages = const_expr(self.num_stages)
+        page_size = const_expr(self.page_size)
+        sem_offset = const_expr(self._sem_base_offset)
+
+        for iteration in range(num_iterations):
+            stage = iteration % num_stages
+
+            # Wait for this stage to be available (consumer finished with it)
+            loader_acquire_stage(smem_base, Int32(stage), Int32(iteration), num_stages, sem_offset)
+
+            # Get pointer to this stage's data page
+            page_ptr = get_page_ptr(smem_base, Int32(stage), page_size, cute.Float16)
+
+            # Perform the actual load
+            self.load_forward(logical_idx + iteration, page_ptr, stage, *args)
+
+            # Signal that data is ready for consumption
+            loader_release_stage(smem_base, Int32(stage), num_stages, sem_offset)
 
     @warp_role(WarpRole.CONSUMER)
     @cute.jit
-    def consumer_main(self, logical_idx, smem, *args):
-        """Main loop for consumer warps.
+    def consumer_main(self, logical_idx, smem_base, num_iterations, *args):
+        """Main loop for consumer warps with pipelined execution.
 
-        Default implementation calls compute_forward. Override for custom
-        consumer behavior (e.g., warpgroup MMA scheduling).
+        Implements the consumer side of the producer-consumer protocol:
+        1. Wait for loader to fill the stage (loader_ready)
+        2. Process the data
+        3. Signal that stage can be reused (consumer_done)
+
+        Override compute_forward() to implement the actual compute logic.
+
+        Args:
+            logical_idx: Base logical block index
+            smem_base: Base pointer to shared memory
+            num_iterations: Number of tiles/iterations to process
+            *args: Kernel arguments
         """
-        self.compute_forward(logical_idx, smem, *args)
+        from cutlass import Int32, const_expr
+        from machete.megakernel.paged_buffer import (
+            consumer_acquire_stage,
+            consumer_release_stage,
+            get_page_ptr,
+        )
+
+        num_stages = const_expr(self.num_stages)
+        page_size = const_expr(self.page_size)
+        sem_offset = const_expr(self._sem_base_offset)
+
+        for iteration in range(num_iterations):
+            stage = iteration % num_stages
+
+            # Wait for loader to fill this stage
+            consumer_acquire_stage(smem_base, Int32(stage), Int32(iteration), num_stages, sem_offset)
+
+            # Get pointer to this stage's data page
+            page_ptr = get_page_ptr(smem_base, Int32(stage), page_size, cute.Float16)
+
+            # Perform the actual computation
+            self.compute_forward(logical_idx + iteration, page_ptr, stage, *args)
+
+            # Signal that we're done with this stage (loader can reuse it)
+            consumer_release_stage(smem_base, Int32(stage), num_stages, sem_offset)
 
     @warp_role(WarpRole.STORER)
     @cute.jit
-    def storer_main(self, logical_idx, smem, *args):
+    def storer_main(self, logical_idx, smem_base, num_iterations, *args):
         """Main loop for storer warps.
 
-        Default implementation calls store_forward. Override for custom
-        storer behavior (e.g., TMA stores, reduction across warps).
+        For kernels with separate store phase, the storer runs one stage
+        behind the consumer. Override store_forward() to implement store logic.
+
+        Note: Many kernels write directly in compute_forward() and don't
+        need a separate storer. In that case, leave store_forward() as no-op.
+
+        Args:
+            logical_idx: Base logical block index
+            smem_base: Base pointer to shared memory
+            num_iterations: Number of tiles/iterations to process
+            *args: Kernel arguments
         """
-        self.store_forward(logical_idx, smem, *args)
+        from cutlass import Int32, const_expr
+        from machete.megakernel.paged_buffer import get_page_ptr
+
+        num_stages = const_expr(self.num_stages)
+        page_size = const_expr(self.page_size)
+
+        for iteration in range(num_iterations):
+            stage = iteration % num_stages
+
+            # Get pointer to this stage's data page
+            page_ptr = get_page_ptr(smem_base, Int32(stage), page_size, cute.Float16)
+
+            # Perform the store
+            self.store_forward(logical_idx + iteration, page_ptr, stage, *args)
 
     @warp_role(WarpRole.CONTROLLER)
     @cute.jit
@@ -478,3 +636,24 @@ class WarpSpecializedKernel(FusableKernel):
         K/V cache prefetching or TMA descriptor updates.
         """
         pass
+
+    # ========== Initialization ==========
+
+    @cute.jit
+    def init_semaphores(self, smem_base):
+        """Initialize semaphores at kernel start.
+
+        Must be called by thread 0 followed by sync_threads() before
+        the main loop begins.
+
+        Args:
+            smem_base: Base pointer to shared memory
+        """
+        from machete.megakernel.paged_buffer import paged_buffer_init_semaphores
+        from cutlass import const_expr
+
+        paged_buffer_init_semaphores(
+            smem_base,
+            const_expr(self.num_stages),
+            const_expr(self._sem_base_offset),
+        )
