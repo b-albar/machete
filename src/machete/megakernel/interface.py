@@ -54,16 +54,15 @@ __all__ = [
 ]
 
 
-def machete_op(num_tensors: int, smem_size: int = 0):
+def machete_op(smem_size: int = 0):
     """Decorator to mark a function or method as a Machete Megakernel operation.
 
     Args:
-        num_tensors: Number of tensor arguments the operation expects
         smem_size: Total shared memory size needed by this operation in bytes.
 
     Example:
         class MyKernel:
-            @machete_op(num_tensors=3, smem_size=16384)
+            @machete_op(smem_size=16384)
             @cute.jit
             def compute(self, input, weight, output):
                 ...
@@ -71,7 +70,6 @@ def machete_op(num_tensors: int, smem_size: int = 0):
 
     def decorator(func):
         func._machete_is_op = True
-        func._machete_num_tensors = num_tensors
         func._machete_smem_size = smem_size
         return func
 
@@ -92,12 +90,6 @@ class MegakernelOp:
     - get_logical_grid_size(): Return total logical blocks for this kernel
     - get_logical_coord(): Map linear logical_idx to kernel-specific coordinates
     """
-
-    @property
-    @abstractmethod
-    def num_tensors(self) -> int:
-        """Number of tensors this operation expects in its compute method."""
-        pass
 
     @property
     def smem_size_fwd(self) -> int:
