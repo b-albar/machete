@@ -43,7 +43,7 @@ class SingleKernel(torch.autograd.Function):
         for correct caching and performance.
         """
         # Ensure shapes are extracted if the op supports it, even before adding to mk
-        if hasattr(self.op, "_extract_shapes") and hasattr(self.op, "tensor_params"):
+        if hasattr(self.op, "_extract_shapes"):
             shapes = self.op._extract_shapes(list(args))
             self.op.shapes = shapes
 

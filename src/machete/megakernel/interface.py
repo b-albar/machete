@@ -52,6 +52,7 @@ __all__ = [
     "PageSemaphores",
     # Data definitions
     "TensorParam",
+    "TensorDef",
     # Operation classes
     "machete_op",
     "MegakernelOp",
@@ -59,6 +60,53 @@ __all__ = [
     "FusableKernel",
     "WarpSpecializedKernel",
 ]
+
+
+@dataclass
+class TensorDef:
+    """Declarative tensor definition for clean kernel interfaces.
+
+    Use TensorDef to define your kernel's tensor inputs. The megakernel will
+    automatically generate a JIT wrapper that:
+    1. Creates CuTe tensors from Int64 pointers
+    2. Inlines your compute_forward body with the tensors ready to use
+    3. Handles the verbose 32-slot signature internally
+
+    Your compute_forward method should NOT have @cute.jit decorator - the
+    wrapper handles JIT compilation. Parameters are: idx (global thread index),
+    then tensors/scalars matching your tensor_defs names.
+
+    For tensors, you specify which dimensions of the PyTorch tensor to use
+    for the CuTe tensor shape and stride.
+
+    Example:
+        class AddKernel(FusableKernel):
+            tensor_defs = [
+                TensorDef("input_t", cute.Float32, shape=(0,), stride=(0,)),
+                TensorDef("bias_t", cute.Float32, shape=(0,), stride=(0,)),
+                TensorDef("output_t", cute.Float32, shape=(0,), stride=(0,)),
+                TensorDef("n_elements", is_scalar=True),
+            ]
+
+            # NO @cute.jit! Parameters: idx, then tensor_defs names
+            def compute_forward(self, idx, input_t, bias_t, output_t, n_elements):
+                if idx < n_elements:
+                    output_t[idx] = input_t[idx] + bias_t[idx]
+
+    Args:
+        name: Variable name for the tensor (passed to compute_forward)
+        dtype: CuTe dtype (e.g., cute.Float32, cute.Float16)
+        shape: Tuple of indices into tensor.shape for CuTe tensor dimensions.
+               E.g., (0,) for 1D using dim 0, (0, 1) for 2D using dims 0 and 1.
+        stride: Tuple of indices into tensor.stride() for CuTe tensor strides.
+                Usually matches shape indices for standard tensors.
+        is_scalar: If True, pass raw Int64 value instead of creating tensor
+    """
+    name: str
+    dtype: any = None  # CuTe dtype like cute.Float32
+    shape: Tuple[int, ...] = None  # Indices into tensor.shape
+    stride: Tuple[int, ...] = None  # Indices into tensor.stride()
+    is_scalar: bool = False
 
 
 @dataclass
@@ -284,6 +332,21 @@ class FusableKernel:
     def __c_pointers__(self):
         """Return C pointers for FFI."""
         return []
+
+    # ========== Execution Configuration ==========
+
+    @property
+    def execution_mode(self) -> str:
+        """Execution mode for this kernel: 'sequential' or 'warp_specialized'.
+
+        Override this to specify how the kernel should be executed:
+        - 'sequential': All warps participate in Load → Sync → Compute → Sync → Store
+        - 'warp_specialized': Different warps handle different phases concurrently
+
+        Returns:
+            'sequential' (default) or 'warp_specialized'
+        """
+        return "sequential"
 
     # ========== Shared Memory Configuration ==========
 

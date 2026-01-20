@@ -59,6 +59,134 @@ def atomic_add_i32(val: Int32, ptr, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def store_i32(val: Int32, ptr, *, loc=None, ip=None) -> None:
+    """Store a 32-bit integer to memory.
+
+    Args:
+        val: Value to store
+        ptr: Pointer to the target address (can be Int64 address, llvm_ptr, or ir_value)
+    """
+    from cutlass._mlir import ir
+    from cutlass import Int64
+
+    # Handle various pointer types
+    if ptr is None:
+        raise TypeError("ptr cannot be None")
+    elif hasattr(ptr, "llvm_ptr"):
+        ptr_val = ptr.llvm_ptr
+    elif hasattr(ptr, "ir_value"):
+        # It has ir_value method - get the raw IR and convert to pointer
+        ptr_ir = ptr.ir_value(loc=loc, ip=ip)
+        ptr_val = llvm.inttoptr(
+            ir.Type.parse("!llvm.ptr"),
+            ptr_ir,
+            loc=loc,
+            ip=ip,
+        )
+    elif isinstance(ptr, Int64):
+        # Raw Int64 address, convert to pointer
+        ptr_ir = ptr.ir_value(loc=loc, ip=ip)
+        ptr_val = llvm.inttoptr(
+            ir.Type.parse("!llvm.ptr"),
+            ptr_ir,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        raise TypeError(f"ptr must be a pointer or Int64, got {type(ptr)}")
+
+    llvm.store(
+        Int32(val).ir_value(loc=loc, ip=ip),
+        ptr_val,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_load_i32(ptr, *, loc=None, ip=None) -> Int32:
+    """Atomic load for signed 32-bit integer.
+
+    Performs an atomic load operation on global memory.
+
+    Args:
+        ptr: Pointer to the target address (can be Int64 address or pointer with llvm_ptr)
+
+    Returns:
+        The loaded value
+    """
+    from cutlass._mlir import ir
+    from cutlass import Int64
+
+    # Handle both pointer types and raw Int64 addresses
+    if hasattr(ptr, "llvm_ptr"):
+        ptr_val = ptr.llvm_ptr
+    elif isinstance(ptr, Int64) or hasattr(ptr, "ir_value"):
+        # It's a raw Int64 address, convert to pointer
+        ptr_ir = ptr.ir_value(loc=loc, ip=ip) if hasattr(ptr, "ir_value") else ptr
+        ptr_val = llvm.inttoptr(
+            ir.Type.parse("!llvm.ptr"),
+            ptr_ir,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        raise TypeError(f"ptr must be a pointer or Int64, got {type(ptr)}")
+
+    # PTX: ld.global.acquire.gpu.b32 for acquire semantics
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [ptr_val],
+        "ld.global.acquire.gpu.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def atomic_store_i32(val: Int32, ptr, *, loc=None, ip=None) -> None:
+    """Atomic store for signed 32-bit integer.
+
+    Performs an atomic store operation on global memory with release semantics.
+
+    Args:
+        val: Value to store
+        ptr: Pointer to the target address (can be Int64 address or pointer with llvm_ptr)
+    """
+    from cutlass._mlir import ir
+    from cutlass import Int64
+
+    # Handle both pointer types and raw Int64 addresses
+    if hasattr(ptr, "llvm_ptr"):
+        ptr_val = ptr.llvm_ptr
+    elif isinstance(ptr, Int64) or hasattr(ptr, "ir_value"):
+        # It's a raw Int64 address, convert to pointer
+        ptr_ir = ptr.ir_value(loc=loc, ip=ip) if hasattr(ptr, "ir_value") else ptr
+        ptr_val = llvm.inttoptr(
+            ir.Type.parse("!llvm.ptr"),
+            ptr_ir,
+            loc=loc,
+            ip=ip,
+        )
+    else:
+        raise TypeError(f"ptr must be a pointer or Int64, got {type(ptr)}")
+
+    # PTX: st.global.release.gpu.b32 for release semantics
+    llvm.inline_asm(
+        None,
+        [ptr_val, Int32(val).ir_value(loc=loc, ip=ip)],
+        "st.global.release.gpu.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def nanosleep(ns: int | Int32, *, loc=None, ip=None) -> None:
     """Sleep for approximately ns nanoseconds.
 

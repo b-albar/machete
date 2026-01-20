@@ -54,16 +54,21 @@ class MacheteSmemAllocator:
 
     def __init__(self, base_tensor=None):
         if base_tensor is not None:
-            # Start from the provided base tensor
-            # We must use Uint8 for byte-level math and alignment
-            self._base = cute.recast_ptr(base_tensor.iterator, dtype=cute.Uint8)
-            # Store capacity for bounds checking if possible
-            self._capacity = cute.size(base_tensor.layout) * (base_tensor.element_type.width // 8)
+            # Check if it's a pointer (from megakernel page_ptr) or a tensor
+            if hasattr(base_tensor, 'iterator'):
+                # It's a tensor - get iterator and recast
+                self._base = cute.recast_ptr(base_tensor.iterator, dtype=cute.Uint8)
+                self._capacity = cute.size(base_tensor.layout) * (base_tensor.element_type.width // 8)
+            else:
+                # It's already a pointer (e.g., from megakernel smem page)
+                # Recast to Uint8 for byte-level allocation
+                self._base = cute.recast_ptr(base_tensor, dtype=cute.Uint8)
+                self._capacity = None
             self._allocated_bytes = 0
         else:
             # Allocate from dynamic shared memory starting at 0
             # Alignment 1024 is the default for SmemAllocator
-            self._base = cute.runtime.make_ptr(cute.Uint8, 0, cute.AddressSpace.shared, assumed_align=1024)
+            self._base = cute.runtime.make_ptr(cute.Uint8, 0, cute.AddressSpace.smem, assumed_align=1024)
             self._capacity = None
 
     def allocate_tensor(self, element_type, layout, byte_alignment=16):
@@ -77,8 +82,13 @@ class MacheteSmemAllocator:
         Returns:
             CuTe tensor backed by shared memory
         """
-        # Align current base pointer
-        self._base = self._base.align(byte_alignment)
+        # Try to align current base pointer if the method is available
+        # Some pointer types (like runtime pointers) don't support .align()
+        if hasattr(self._base, 'align'):
+            try:
+                self._base = self._base.align(byte_alignment)
+            except NotImplementedError:
+                pass  # Skip alignment if not supported
 
         # Record current position as our allocation start
         allocated_ptr = self._base
