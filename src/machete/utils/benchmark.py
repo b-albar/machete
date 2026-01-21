@@ -4,9 +4,10 @@ import copy
 import matplotlib.pyplot as plt
 import os
 import numpy as np
+import torch
 
-from .benchmark_utils import benchmark_forward, benchmark_backward, \
-                            benchmark_memory, benchmark_fwd_bwd, efficiency
+from .benchmark_utils import benchmark_forward, benchmark_backward, benchmark_memory, benchmark_fwd_bwd, efficiency
+
 
 class Benchmark:
     def __init__(self):
@@ -16,16 +17,16 @@ class Benchmark:
     @classmethod
     def parametrize(cls, param_name: str, values: List[Any]):
         def decorator(func):
-            if not hasattr(func, '_benchmark'):
+            if not hasattr(func, "_benchmark"):
                 func._benchmark = cls()
             func._benchmark.parameters[param_name] = values
             func._benchmark.func = func
             return func
+
         return decorator
 
     def _plot_graphics(self, results, path_graphics, key_split, memory=False, is_flops=False):
-
-        dirname = path_graphics if path_graphics is not None else 'benchmark_results'
+        dirname = path_graphics if path_graphics is not None else "benchmark_results"
         os.makedirs(dirname, exist_ok=True)
 
         param_names = list(self.parameters.keys())
@@ -41,14 +42,14 @@ class Benchmark:
         param_values.pop(index_split)
         param_names_without_split = [name for name in param_names if name != key_split]
 
-        modes = ['fwd', 'bwd']
+        modes = ["fwd", "bwd"]
         if memory:
-            modes.append('memory')
+            modes.append("memory")
 
         for mode in modes:
             # compute the max value to set the ylim with a bit of margin
             max_value = max([x[mode] for xs in results.values() for x in xs.values()])
-            max_value += 20/100 * max_value
+            max_value += 20 / 100 * max_value
 
             for combination in itertools.product(*param_values):
                 combination = list(combination)
@@ -71,7 +72,7 @@ class Benchmark:
                 width = 1.0 / (len(names) + len(split_values) - 1)  # the width of the bars
                 multiplier = 0
 
-                fig, ax = plt.subplots(layout='constrained')
+                fig, ax = plt.subplots(layout="constrained")
 
                 for attribute, measurement in values_per_func.items():
                     offset = width * multiplier
@@ -80,81 +81,112 @@ class Benchmark:
                     multiplier += 1
 
                 # Add some text for labels, title and custom x-axis tick labels, etc.
-                string_params = ' '.join([
-                    str(x) + " " + str(combination[i]) for i, x in enumerate(param_names_without_split)
-                    ]
+                string_params = " ".join(
+                    [str(x) + " " + str(combination[i]) for i, x in enumerate(param_names_without_split)]
                 )
-                filename_params_str = ','.join([
-                    str(x) + "-" + str(combination[i]) for i, x in enumerate(param_names_without_split)
-                    ]
+                filename_params_str = ",".join(
+                    [str(x) + "-" + str(combination[i]) for i, x in enumerate(param_names_without_split)]
                 )
-                plt.xlabel('Sequence Length')
-                if mode == 'memory':
-                    plt.ylabel('Memory (MB)')
+                plt.xlabel("Sequence Length")
+                if mode == "memory":
+                    plt.ylabel("Memory (MB)")
                 elif is_flops:
-                    plt.ylabel('TFLOPS')
+                    plt.ylabel("TFLOPS")
                 else:
-                    plt.ylabel('Time (ms)')
-                plt.title(f'{mode.upper()}\n' + string_params, wrap=True)
+                    plt.ylabel("Time (ms)")
+                plt.title(f"{mode.upper()}\n" + string_params, wrap=True)
                 ax.set_xticks(x + width, split_values)
-                ax.legend(loc='upper left', ncols=2)
+                ax.legend(loc="upper left", ncols=2)
                 ax.set_ylim(0, max_value)
 
-
-                filename = dirname + "/" + f'{mode.upper()}' + "-" + filename_params_str + ".png"
+                filename = dirname + "/" + f"{mode.upper()}" + "-" + filename_params_str + ".png"
                 plt.savefig(filename)
                 plt.close()
 
-    def run(self,
-            flops: Optional[Callable] = None,
-            mode: str = "fwd",
-            memory: bool = False,
-            export_csv: bool = True,
-            export_graphics: bool = False,
-            key_split: Optional[str] = None,
-            path_graphics: Optional[str] = None):
+    def run(
+        self,
+        flops: Optional[Callable] = None,
+        mode: str = "fwd",
+        memory: bool = False,
+        export_csv: bool = True,
+        export_graphics: bool = False,
+        key_split: Optional[str] = None,
+        path_graphics: Optional[str] = None,
+    ):
         param_names = list(self.parameters.keys())
         param_values = list(self.parameters.values())
 
         results = {}
 
+        names_seen = set()
+
         for combination in itertools.product(*param_values):
             # get functions list
             params = dict(zip(param_names, combination))
-            funcs = self.func(**params)
+
+            try:
+                funcs = self.func(**params)
+                # Update known names from successful retrieval
+                if funcs and not names_seen:
+                    names_seen = set(funcs.keys())
+            except torch.cuda.OutOfMemoryError:
+                print(f"OOM during setup for params: {params}")
+                torch.cuda.empty_cache()
+                if names_seen:
+                    results[str(params)] = {name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen}
+                continue
+            except Exception as e:
+                print(f"Error during setup for params: {params}, error: {e}")
+                if names_seen:
+                    results[str(params)] = {name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen}
+                continue
+
             for func_name, func in funcs.items():
                 if str(params) not in results:
                     results[str(params)] = {}
                 results[str(params)][func_name] = {}
-                if mode == "fwd":
-                    result = benchmark_forward(func, verbose=False)
-                    if flops is not None:
-                        flops_op = flops(**params, mode=mode)
-                        results[str(params)][func_name]["fwd"] = efficiency(flops_op, result[1].mean)
-                    else:
-                        results[str(params)][func_name]["fwd"] = result[1].mean * 1000
-                    result = benchmark_backward(func, backward=True, verbose=False)
-                    if flops is not None:
-                        flops_op = flops(**params, mode=mode)
-                        results[str(params)][func_name]["bwd"] = efficiency(flops_op, result[1].mean)
-                    else:
-                        results[str(params)][func_name]["bwd"] = result[1].mean * 1000
-                elif mode == "fwd_bwd":
-                    result = benchmark_fwd_bwd(func, verbose=False)
-                    if flops is not None:
-                        flops_fwd = flops(**params, mode="fwd")
-                        flops_bwd = flops(**params, mode="bwd")
-                        results[str(params)][func_name]["fwd"] = efficiency(flops_fwd, result[0][1].mean)
-                        results[str(params)][func_name]["bwd"] = efficiency(flops_bwd, result[1][1].mean)
-                    else:
-                        results[str(params)][func_name]["fwd"] = result[0][1].mean * 1000
-                        results[str(params)][func_name]["bwd"] = result[1][1].mean * 1000
-                else:
-                    raise ValueError(f"Invalid mode: {mode}")
 
-                if memory:
-                    result = benchmark_memory(func, verbose=False)
-                    results[str(params)][func_name]["memory"] = result * 1024
+                try:
+                    if mode == "fwd":
+                        result = benchmark_forward(func, verbose=False)
+                        if flops is not None:
+                            flops_op = flops(**params, mode=mode)
+                            results[str(params)][func_name]["fwd"] = efficiency(flops_op, result[1].mean)
+                        else:
+                            results[str(params)][func_name]["fwd"] = result[1].mean * 1000
+                        result = benchmark_backward(func, backward=True, verbose=False)
+                        if flops is not None:
+                            flops_op = flops(**params, mode=mode)
+                            results[str(params)][func_name]["bwd"] = efficiency(flops_op, result[1].mean)
+                        else:
+                            results[str(params)][func_name]["bwd"] = result[1].mean * 1000
+                    elif mode == "fwd_bwd":
+                        result = benchmark_fwd_bwd(func, verbose=False)
+                        if flops is not None:
+                            flops_fwd = flops(**params, mode="fwd")
+                            flops_bwd = flops(**params, mode="bwd")
+                            results[str(params)][func_name]["fwd"] = efficiency(flops_fwd, result[0][1].mean)
+                            results[str(params)][func_name]["bwd"] = efficiency(flops_bwd, result[1][1].mean)
+                        else:
+                            results[str(params)][func_name]["fwd"] = result[0][1].mean * 1000
+                            results[str(params)][func_name]["bwd"] = result[1][1].mean * 1000
+                    else:
+                        raise ValueError(f"Invalid mode: {mode}")
+
+                    if memory:
+                        result = benchmark_memory(func, verbose=False)
+                        results[str(params)][func_name]["memory"] = result * 1024
+                except torch.cuda.OutOfMemoryError:
+                    print(f"OOM for {func_name} with params: {params}")
+                    torch.cuda.empty_cache()
+                    results[str(params)][func_name]["fwd"] = 0.0
+                    results[str(params)][func_name]["bwd"] = 0.0
+                    results[str(params)][func_name]["memory"] = 0.0
+                except Exception as e:
+                    print(f"Error for {func_name} with params: {params}, error: {e}")
+                    results[str(params)][func_name]["fwd"] = 0.0
+                    results[str(params)][func_name]["bwd"] = 0.0
+                    results[str(params)][func_name]["memory"] = 0.0
 
         if export_graphics:
             self._plot_graphics(results, path_graphics, key_split=key_split, memory=memory, is_flops=flops is not None)
