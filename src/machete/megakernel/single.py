@@ -1,12 +1,12 @@
 # Copyright (c) 2025, Machete Authors
 import torch
 from typing import Callable
-from .interface import FusableKernel
+from .interface import MacheteKernel
 from .core import Megakernel
 
 
 class SingleKernel(torch.autograd.Function):
-    def __init__(self, op: FusableKernel, grid_fn: Callable, block_fn: Callable):
+    def __init__(self, op: MacheteKernel, grid_fn: Callable, block_fn: Callable):
         self.op = op
         self.grid_fn = grid_fn
         self.block_fn = block_fn

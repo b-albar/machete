@@ -15,11 +15,11 @@ from cutlass import Float32, const_expr
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
 import quack.activation as qact
-from machete.megakernel.interface import FusableKernel
+from machete.megakernel.interface import MacheteKernel
 from machete.megakernel.single import SingleKernel
 
 
-class GatedLinearSM80(SingleKernel, FusableKernel):
+class GatedLinearSM80(SingleKernel, MacheteKernel):
     """
     Gated Linear kernel with activation (SiLU, GELU, ReLU).
     Uses shared memory tiling to maximize global memory bandwidth.

@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Boolean, Int32
 
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from machete.megakernel.interface import FusableKernel
+from machete.megakernel.interface import MacheteKernel
 from machete.megakernel.single import SingleKernel
 
 # Import reduction utilities
@@ -136,7 +136,7 @@ class RMSNormConfig:
 # =============================================================================
 
 
-class RMSNormSM120(SingleKernel, FusableKernel):
+class RMSNormSM120(SingleKernel, MacheteKernel):
     """
     RMSNorm kernel with L/C/S decomposition for SM 120 (Blackwell Geforce).
 

@@ -19,8 +19,6 @@ from typing import List, Dict, Optional, Tuple, Any
 from machete.megakernel.scheduler import (
     OperationGraph,
     SmemPlanner,
-    ScheduleOptimizer,
-    ScheduleEntry,
     WarpConfig,
 )
 
@@ -45,7 +43,6 @@ class EmitterContext:
     """Context passed to code emitters."""
 
     graph: OperationGraph
-    schedule: List[ScheduleEntry]
     smem_planner: SmemPlanner
     instructions: List[Dict]
     arg_mapping: Dict[int, List[int]]
@@ -755,6 +752,11 @@ class Megakernel:
     2. Static scheduling - computed at compile time
     3. Modular code generation
     4. Unified mixed kernel type support
+    5. Inline codegen support for MacheteKernel interface
+
+    Codegen Modes:
+    - use_inline_codegen=False (default): Legacy mode using function references
+    - use_inline_codegen=True: New mode using AST-based code inlining
     """
 
     def __init__(
@@ -762,10 +764,12 @@ class Megakernel:
         name: str = "megakernel",
         mode: str = "forward",
         num_stages: int = 1,
+        use_inline_codegen: bool = False,
     ):
         self.name = name
         self.mode = mode
         self.num_stages = num_stages
+        self.use_inline_codegen = use_inline_codegen
 
         self.instructions: List[Dict] = []
         self._graph: Optional[OperationGraph] = None
@@ -777,10 +781,13 @@ class Megakernel:
         """Add an operation to the megakernel.
 
         Args:
-            op: A FusableKernel, WarpSpecializedKernel, or similar object
+            op: A MacheteKernel or similar object with L/C/S methods
             *args: Arguments to pass to the kernel's L/C/S methods
         """
         kernel = op
+
+        # Check if kernel uses new MacheteKernel interface
+        uses_new_interface = getattr(kernel, "uses_new_interface", False)
 
         if self.mode == "forward":
             load_fn = getattr(kernel, "load_forward", None)
@@ -812,6 +819,13 @@ class Megakernel:
         grid_fn = getattr(kernel, "grid_fn", None)
         block_fn = getattr(kernel, "block_fn", None)
 
+        # Get tensor specs if using new interface
+        tensor_specs = None
+        scalar_names = None
+        if uses_new_interface and hasattr(kernel, "declare_tensors"):
+            tensor_specs = kernel.declare_tensors()
+            scalar_names = kernel.declare_scalars() if hasattr(kernel, "declare_scalars") else ()
+
         self.instructions.append(
             {
                 "kernel": kernel,
@@ -827,11 +841,19 @@ class Megakernel:
                 "warp_config": warp_config,
                 "grid_fn": grid_fn,
                 "block_fn": block_fn,
+                # New interface fields
+                "uses_new_interface": uses_new_interface,
+                "tensor_specs": tensor_specs,
+                "scalar_names": scalar_names,
             }
         )
 
         # Invalidate cached graph
         self._graph = None
+
+        # Auto-enable inline codegen if any kernel uses new interface
+        if uses_new_interface:
+            self.use_inline_codegen = True
 
     def clear(self):
         """Clear all instructions."""
@@ -922,14 +944,9 @@ class Megakernel:
             arg_mapping[i] = list(range(curr, curr + num_args))
             curr += num_args
 
-        # Generate optimized schedule
-        optimizer = ScheduleOptimizer(graph, smem_planner)
-        schedule = optimizer.optimize()
-
         # Create emitter context
         ctx = EmitterContext(
             graph=graph,
-            schedule=schedule,
             smem_planner=smem_planner,
             instructions=self.instructions,
             arg_mapping=arg_mapping,
@@ -971,6 +988,117 @@ class Megakernel:
         trace_file: Optional[str] = None,
     ):
         """Compile and execute the kernel."""
+        # Dispatch to appropriate codegen path
+        if self.use_inline_codegen:
+            return self._compile_and_run_inline(ctx, n_blocks, grid, block, stream, trace_file)
+        else:
+            return self._compile_and_run_legacy(ctx, n_blocks, grid, block, stream, trace_file)
+
+    def _compile_and_run_inline(
+        self,
+        ctx: EmitterContext,
+        n_blocks: int,
+        grid: Tuple[int, int, int],
+        block: Tuple[int, int, int],
+        stream=None,
+        trace_file: Optional[str] = None,
+    ):
+        """Compile and execute using inline code generation (new MacheteKernel interface)."""
+        from machete.megakernel.codegen import select_template
+        from machete.megakernel.codegen.templates import TemplateContext
+
+        sig_hash = self._compute_sig_hash(ctx)
+
+        # Store instructions in registry
+        MEGAKERNEL_REGISTRY[sig_hash] = self.instructions
+
+        # Collect all tensor specs and scalar names
+        all_tensor_specs = {}
+        all_scalar_names = []
+        kernel_instances = []
+
+        for inst in self.instructions:
+            kernel = inst["kernel"]
+            kernel_instances.append(kernel)
+
+            if inst.get("tensor_specs"):
+                all_tensor_specs.update(inst["tensor_specs"])
+            if inst.get("scalar_names"):
+                for name in inst["scalar_names"]:
+                    if name not in all_scalar_names:
+                        all_scalar_names.append(name)
+
+        # Build template context
+        template_ctx = TemplateContext(
+            kernel_instances=kernel_instances,
+            tensor_specs=all_tensor_specs,
+            scalar_names=all_scalar_names,
+            smem_size=ctx.total_smem_bytes,
+            grid=grid,
+            block=block,
+            num_stages=self.num_stages,
+            mode=self.mode,
+            sig_hash=sig_hash,
+        )
+
+        # Check compile cache
+        compile_key = (self.name, self.mode, sig_hash, grid, block, "inline")
+
+        if compile_key not in _GLOBAL_COMPILE_CACHE:
+            # Select and use appropriate template
+            template = select_template(ctx)
+            source = template.generate(template_ctx)
+
+            # Write module
+            gen_path = os.path.join(self.gen_dir, f"kernel_{sig_hash}_inline.py")
+            with open(gen_path, "w") as f:
+                f.write(source)
+
+            # Load module
+            spec = importlib.util.spec_from_file_location(f"gen_{sig_hash}_inline", gen_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            _GLOBAL_COMPILE_CACHE[compile_key] = module
+
+        # Get module
+        module = _GLOBAL_COMPILE_CACHE[compile_key]
+
+        # Flatten arguments and convert tensors to CuTe pointers
+        import torch
+        from cutlass.cute.runtime import make_ptr
+        from cutlass._mlir.dialects._cute_nvgpu_enum_gen import AddressSpace
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        flat_args = []
+        for inst in self.instructions:
+            for arg in inst["args"]:
+                if isinstance(arg, torch.Tensor):
+                    tensor = arg.detach() if arg.requires_grad else arg
+                    cute_dtype = torch2cute_dtype_map[tensor.dtype]
+                    ptr = make_ptr(cute_dtype, tensor.data_ptr(), AddressSpace.gmem, assumed_align=16)
+                    flat_args.append(ptr)
+                else:
+                    flat_args.append(arg)
+
+        # Get or compile the kernel, then execute
+        compiled = module.get_compiled_kernel(n_blocks, *flat_args)
+        compiled(n_blocks, *flat_args)
+
+        # Write trace file if requested
+        if trace_file:
+            self._write_trace(trace_file, ctx, n_blocks, grid, block)
+
+    def _compile_and_run_legacy(
+        self,
+        ctx: EmitterContext,
+        n_blocks: int,
+        grid: Tuple[int, int, int],
+        block: Tuple[int, int, int],
+        stream=None,
+        trace_file: Optional[str] = None,
+    ):
+        """Compile and execute using legacy function reference codegen."""
         sig_hash = self._compute_sig_hash(ctx)
 
         # Store instructions in registry

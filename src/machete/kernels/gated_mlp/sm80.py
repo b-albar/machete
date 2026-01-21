@@ -15,11 +15,11 @@ from cutlass import Float32, const_expr
 
 import quack.activation as qact
 from quack.cute_dsl_utils import torch2cute_dtype_map
-from machete.megakernel.interface import FusableKernel
+from machete.megakernel.interface import MacheteKernel
 from machete.megakernel.single import SingleKernel
 
 
-class GatedMLPSM80(SingleKernel, FusableKernel):
+class GatedMLPSM80(SingleKernel, MacheteKernel):
     """
     Gated MLP kernel with activation (SiLU/SwiGLU, GELU/GeGLU).
 

@@ -13,20 +13,27 @@ Key Features:
 - Mixed Kernel Types: Unified support for LCS and Producer/Consumer patterns
 
 Example:
-    from machete.megakernel import Megakernel, FusableKernel, reads, writes
+    from machete.megakernel import Megakernel, MacheteKernel, reads, writes
 
-    class MyKernel(FusableKernel):
+    class MyKernel(MacheteKernel):
         def get_logical_grid_size(self, *args):
             return batch * seq_len // tile_size
 
-        @reads("input")
-        @cute.jit
-        def load_forward(self, logical_idx, *args):
+        @property
+        def smem_size_fwd(self):
+            return 1024  # bytes
+
+        def declare_tensors(self):
+            return {...}
+
+        def setup_kernel(self, logical_idx, smem, *args):
+            # Allocate smem, setup per-block state
             ...
 
-        @writes("output")
-        @cute.jit
-        def store_forward(self, logical_idx, *args):
+        def load_forward(self, logical_idx, smem, *args):
+            ...
+
+        def compute_forward(self, logical_idx, smem, *args):
             ...
 
     mk = Megakernel()
@@ -37,19 +44,17 @@ Example:
 # Core classes
 from .core import Megakernel
 from .interface import (
-    # Operation base classes
-    MegakernelOp,
-    FusableOp,
-    FusableKernel,
-    WarpSpecializedKernel,
+    # Operation base class
+    MacheteKernel,
     machete_op,
+    # Tensor specification
+    TensorSpec,
+    KernelSignature,
+    MemorySpace,
+    tensor,
     # Dependency decorators
     reads,
     writes,
-    warp_role,
-    async_load,
-    prefetchable,
-    depends_on,
     # Warp configuration
     WarpRole,
     WarpConfig,
@@ -95,19 +100,17 @@ from .paged_buffer import (
 __all__ = [
     # Core
     "Megakernel",
-    # Operation base classes
-    "MegakernelOp",
-    "FusableOp",
-    "FusableKernel",
-    "WarpSpecializedKernel",
+    # Operation base class
+    "MacheteKernel",
     "machete_op",
+    # Tensor specification
+    "TensorSpec",
+    "KernelSignature",
+    "MemorySpace",
+    "tensor",
     # Dependency decorators
     "reads",
     "writes",
-    "warp_role",
-    "async_load",
-    "prefetchable",
-    "depends_on",
     # Warp configuration
     "WarpRole",
     "WarpConfig",

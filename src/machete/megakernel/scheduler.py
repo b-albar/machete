@@ -171,80 +171,6 @@ def writes(*tensors: str) -> Callable[[F], F]:
     return decorator
 
 
-def warp_role(role: WarpRole) -> Callable[[F], F]:
-    """Decorator to annotate which warp role should execute a method.
-
-    Usage:
-        @warp_role(WarpRole.LOADER)
-        @cute.jit
-        def load_forward(self, logical_idx, ...):
-            # Only loader warps execute this
-            ...
-    """
-
-    def decorator(func: F) -> F:
-        func._machete_warp_role = role
-        return func
-
-    return decorator
-
-
-def async_load() -> Callable[[F], F]:
-    """Decorator to mark a load as async (non-blocking).
-
-    Async loads can be issued early and overlapped with previous operations.
-    """
-
-    def decorator(func: F) -> F:
-        func._machete_async_load = True
-        return func
-
-    return decorator
-
-
-def prefetchable(*memory_regions: str) -> Callable[[F], F]:
-    """Decorator to mark which memory regions can be prefetched.
-
-    Prefetchable regions are loaded early (during previous op's compute)
-    to hide memory latency.
-    """
-
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_prefetchable", set())
-        func._machete_prefetchable = existing | set(memory_regions)
-        return func
-
-    return decorator
-
-
-def depends_on(
-    op_name: str,
-    granularity: str = "logical_block",
-    producer_dims: Optional[Tuple[int, ...]] = None,
-    consumer_dims: Optional[Tuple[int, ...]] = None,
-) -> Callable[[F], F]:
-    """Decorator to declare fine-grained dependency on another operation.
-
-    This enables logical block-level synchronization instead of waiting
-    for the entire previous operation to complete.
-
-    Args:
-        op_name: Name of the producer operation to depend on
-        granularity: "kernel", "logical_block", "reduction", or "broadcast"
-        producer_dims: Shape of producer's logical grid
-        consumer_dims: Shape of consumer's logical grid
-    """
-
-    def decorator(func: F) -> F:
-        existing = getattr(func, "_machete_depends_on", [])
-        func._machete_depends_on = existing + [
-            (op_name, granularity, producer_dims, consumer_dims)
-        ]
-        return func
-
-    return decorator
-
-
 # ============================================================================
 # Helper Functions for Extracting Decorator Info
 # ============================================================================
@@ -259,21 +185,6 @@ def get_method_dependencies(method: Callable) -> Tuple[Set[str], Set[str]]:
     reads_set = getattr(method, "_machete_reads", set())
     writes_set = getattr(method, "_machete_writes", set())
     return reads_set, writes_set
-
-
-def get_method_warp_role(method: Callable) -> Optional[WarpRole]:
-    """Extract warp role annotation from a method."""
-    return getattr(method, "_machete_warp_role", None)
-
-
-def is_async_load(method: Callable) -> bool:
-    """Check if a method is marked as async load."""
-    return getattr(method, "_machete_async_load", False)
-
-
-def get_prefetchable_regions(method: Callable) -> Set[str]:
-    """Get memory regions that can be prefetched."""
-    return getattr(method, "_machete_prefetchable", set())
 
 
 # ============================================================================
@@ -353,11 +264,6 @@ class OpNode:
     # Graph edges (indices of dependent operations)
     depends_on: Set[int] = field(default_factory=set)
     dependents: Set[int] = field(default_factory=set)
-
-    # Load optimization flags
-    can_early_load: bool = True
-    has_async_load: bool = False
-    prefetchable_regions: Set[str] = field(default_factory=set)
 
     # For warp specialization
     uses_warp_specialization: bool = False
@@ -462,17 +368,12 @@ class OperationGraph:
         # Extract reads/writes from decorators
         all_reads: Set[str] = set()
         all_writes: Set[str] = set()
-        has_async = False
-        prefetchable: Set[str] = set()
 
         for fn in [load_fn, compute_fn, store_fn]:
             if fn:
                 r, w = get_method_dependencies(fn)
                 all_reads |= r
                 all_writes |= w
-                if fn == load_fn:
-                    has_async = is_async_load(fn)
-                    prefetchable |= get_prefetchable_regions(fn)
 
         # Determine kernel type
         uses_warp_spec = getattr(kernel, "uses_warp_specialization", False)
@@ -518,8 +419,6 @@ class OperationGraph:
             logical_grid_size=logical_grid_size,
             reads=all_reads,
             writes=all_writes,
-            has_async_load=has_async,
-            prefetchable_regions=prefetchable,
             uses_warp_specialization=uses_warp_spec,
             warp_config=getattr(kernel, "warp_config", None) if uses_warp_spec else None,
         )
@@ -590,22 +489,12 @@ class OperationGraph:
     def can_move_load_early(self, op_idx: int) -> bool:
         """Check if op's load can be moved earlier (overlap with prev compute).
 
-        A load can be moved early if:
-        1. The op has no dependencies on previous ops (conservative check)
-        2. The op's can_early_load flag is True
-        3. There's enough smem to hold both ops' data
-
-        Note: We use a conservative check (no dependencies at all) because the
-        decorator-based dependency names may not match actual tensor flow.
-        Future improvement: track actual tensor identity instead of names.
+        A load can be moved early if it has no dependencies on previous ops.
+        Dependencies are inferred from reads/writes on TensorSpecs.
         """
         node = self.nodes[op_idx]
-        if not node.can_early_load:
-            return False
 
-        # Conservative: if this op depends on ANY previous op, don't move load early
-        # This is safe because we can't reliably detect if the load specifically
-        # depends on the previous op's output without actual tensor tracking
+        # If this op depends on ANY previous op, don't move load early
         if node.depends_on:
             return False
 
@@ -802,86 +691,3 @@ class SmemPlanner:
     def needs_separate_buffer(self, op_idx: int) -> bool:
         """Check if an op needs its own smem buffer (not shared)."""
         return op_idx in self._early_load_ops
-
-
-# ============================================================================
-# Schedule Representation
-# ============================================================================
-
-
-@dataclass
-class ScheduleEntry:
-    """A single entry in the execution schedule."""
-
-    op_idx: int
-    phase: str  # "load", "compute", "store", "wait", "signal"
-    warp_role: Optional[WarpRole] = None
-
-    # For load optimization
-    is_prefetch: bool = False
-    prefetch_for: Optional[int] = None
-
-    # For synchronization
-    sem_idx: Optional[int] = None
-
-
-class ScheduleOptimizer:
-    """Optimizes operation schedule for minimal latency.
-
-    Key optimizations:
-    1. Move loads earlier when safe (overlap with previous compute)
-    2. Ensure proper synchronization
-    3. Generate appropriate sync points
-    """
-
-    def __init__(self, graph: OperationGraph, smem_planner: SmemPlanner):
-        self.graph = graph
-        self.smem_planner = smem_planner
-        self.schedule: List[ScheduleEntry] = []
-
-    def optimize(self) -> List[ScheduleEntry]:
-        """Generate optimized unified schedule for all kernel types."""
-        self.schedule = []
-        order = self.graph.get_topological_order()
-
-        for op_idx in order:
-            node = self.graph.nodes[op_idx]
-
-            if node.kernel_type == KernelType.PRODUCER_CONSUMER:
-                # Warp-specialized kernel
-                self._add_producer_consumer_entries(op_idx, node)
-            else:
-                # Traditional L/C/S kernel
-                self._add_lcs_entries(op_idx, node)
-
-        return self.schedule
-
-    def _add_lcs_entries(self, op_idx: int, node: OpNode):
-        """Add schedule entries for LCS kernel."""
-        # Load phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="load"))
-        # Wait for load to complete
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="wait", sem_idx=0))
-        # Compute phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="compute"))
-        # Wait for compute to complete
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="wait", sem_idx=1))
-        # Store phase
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="store"))
-        # Signal completion
-        self.schedule.append(ScheduleEntry(op_idx=op_idx, phase="signal", sem_idx=2))
-
-    def _add_producer_consumer_entries(self, op_idx: int, node: OpNode):
-        """Add schedule entries for producer/consumer kernel."""
-        # Loader role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="load", warp_role=WarpRole.LOADER)
-        )
-        # Consumer role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="compute", warp_role=WarpRole.CONSUMER)
-        )
-        # Storer role
-        self.schedule.append(
-            ScheduleEntry(op_idx=op_idx, phase="store", warp_role=WarpRole.STORER)
-        )
