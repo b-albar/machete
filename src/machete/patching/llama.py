@@ -41,9 +41,11 @@ def make_attention_forward():
         value_states = self.v_proj(hidden_states)
 
         # Reshape to (batch, seq, heads, head_dim)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        num_heads = getattr(self, "num_heads", None) or self.config.num_attention_heads
+        num_kv_heads = getattr(self, "num_key_value_heads", None) or self.config.num_key_value_heads
+        query_states = query_states.view(bsz, q_len, num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, num_kv_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, num_kv_heads, self.head_dim)
 
         # Apply rotary embeddings if position_embeddings provided
         if position_embeddings is not None:

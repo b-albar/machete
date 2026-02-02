@@ -8,6 +8,7 @@ Supports both:
 """
 
 import math
+from dataclasses import dataclass
 from typing import Callable, Any, Optional
 
 import torch
@@ -25,6 +26,86 @@ except ImportError:
     cuda = None
     cute_testing = None
     JitArguments = None
+
+
+@dataclass
+class KernelBenchSpec:
+    """Wraps a compiled CuTe JIT kernel for benchmarking with CUDA graphs.
+
+    Used by Benchmark.run(mode="kernel") to distinguish CuTe JIT kernels
+    (which need cute.testing.benchmark) from regular callables (which use
+    torch.cuda.CUDAGraph).
+
+    Attributes:
+        compiled_kernel: A compiled @cute.jit annotated object.
+        workspace_generator: Function returning JitArguments for each iteration.
+        stream: A (torch.cuda.Stream, CUstream) pair. The CUstream must match
+            the stream passed inside JitArguments by workspace_generator.
+        workspace_count: Number of workspaces to rotate through.
+    """
+
+    compiled_kernel: Any
+    workspace_generator: Callable
+    stream: Any = None
+    workspace_count: int = 1
+
+
+# =============================================================================
+# CUDA graph benchmarking (for regular callables)
+# =============================================================================
+
+
+def benchmark_cuda_graph(
+    fn: Callable,
+    warmup: int = 25,
+    rep: int = 100,
+) -> float:
+    """Benchmark a callable using CUDA graph capture + CUDA event timing.
+
+    Captures the callable into a CUDA graph on a non-default stream, then
+    replays it with CUDA event timing. This removes CPU launch overhead and
+    provides measurements comparable to cute.testing.benchmark.
+
+    Args:
+        fn: Callable to benchmark (must be CUDA-only, no CPU side effects).
+        warmup: Number of warmup iterations (both pre-capture and post-capture).
+        rep: Number of timed iterations.
+
+    Returns:
+        Average execution time in milliseconds.
+    """
+    # Warmup on default stream
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    # Capture on non-default stream (required for CUDA graphs)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(graph, stream=stream):
+            fn()
+    torch.cuda.synchronize()
+
+    # Warmup graph replay
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            graph.replay()
+    torch.cuda.synchronize()
+
+    # Timed runs with CUDA events
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    times = []
+    with torch.cuda.stream(stream):
+        for _ in range(rep):
+            start.record(stream)
+            graph.replay()
+            end.record(stream)
+            stream.synchronize()
+            times.append(start.elapsed_time(end))
+
+    return sum(times) / len(times)
 
 
 # =============================================================================

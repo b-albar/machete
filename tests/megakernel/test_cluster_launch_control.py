@@ -11,7 +11,7 @@ import torch
 
 def test_imports():
     """Verify all CLC utilities can be imported."""
-    from machete.megakernel.utils import (
+    from machete.utils.cluster_launch_control import (
         # Data structures
         CLCResponse,
         WorkTileInfo,
@@ -71,7 +71,7 @@ def test_imports():
 
 def test_clc_response_dataclass():
     """Test CLCResponse dataclass creation."""
-    from machete.megakernel.utils import CLCResponse
+    from machete.utils.cluster_launch_control import CLCResponse
     from cutlass import Uint32
 
     # Test zero initialization
@@ -91,7 +91,7 @@ def test_clc_response_dataclass():
 
 def test_work_tile_info_dataclass():
     """Test WorkTileInfo dataclass creation."""
-    from machete.megakernel.utils import WorkTileInfo
+    from machete.utils.cluster_launch_control import WorkTileInfo
     from cutlass import Boolean, Int32
 
     tile_info = WorkTileInfo(
@@ -109,7 +109,7 @@ def test_work_tile_info_dataclass():
 
 def test_clc_pipeline_state():
     """Test CLCPipelineState initialization."""
-    from machete.megakernel.utils import CLCPipelineState
+    from machete.utils.cluster_launch_control import CLCPipelineState
     from cutlass import Int32
 
     state = CLCPipelineState(stages=3)
@@ -121,7 +121,7 @@ def test_clc_pipeline_state():
 
 def test_tile_scheduler_params():
     """Test TileSchedulerParams host-side configuration."""
-    from machete.megakernel.utils import TileSchedulerParams
+    from machete.utils.cluster_launch_control import TileSchedulerParams
 
     # Test basic initialization
     params = TileSchedulerParams(
@@ -155,7 +155,7 @@ def test_tile_scheduler_params():
 
 def test_tile_scheduler_params_n_major():
     """Test TileSchedulerParams with N-major rasterization."""
-    from machete.megakernel.utils import TileSchedulerParams
+    from machete.utils.cluster_launch_control import TileSchedulerParams
 
     params = TileSchedulerParams(
         problem_shape_m=512,
@@ -180,7 +180,7 @@ def test_tile_scheduler_params_n_major():
 
 def test_tile_scheduler_params_validation():
     """Test TileSchedulerParams validation."""
-    from machete.megakernel.utils import TileSchedulerParams
+    from machete.utils.cluster_launch_control import TileSchedulerParams
     import pytest
 
     # Non-power-of-2 swizzle should fail
@@ -194,7 +194,7 @@ def test_tile_scheduler_params_validation():
 
 def test_clc_fetch_pipeline():
     """Test CLCFetchPipeline configuration."""
-    from machete.megakernel.utils import CLCFetchPipeline, CLC_RESPONSE_BYTES
+    from machete.utils.cluster_launch_control import CLCFetchPipeline, CLC_RESPONSE_BYTES
 
     pipeline = CLCFetchPipeline(stages=3)
 
@@ -205,7 +205,7 @@ def test_clc_fetch_pipeline():
 
 def test_clc_pipeline_producer_consumer_state():
     """Test CLCPipelineProducerState and CLCPipelineConsumerState."""
-    from machete.megakernel.utils import CLCPipelineProducerState, CLCPipelineConsumerState
+    from machete.utils.cluster_launch_control import CLCPipelineProducerState, CLCPipelineConsumerState
     from cutlass import Int32
 
     # Test producer state
@@ -223,7 +223,7 @@ def test_clc_pipeline_producer_consumer_state():
 
 def test_persistent_tile_scheduler():
     """Test PersistentTileScheduler full configuration."""
-    from machete.megakernel.utils import PersistentTileScheduler, TileSchedulerParams
+    from machete.utils.cluster_launch_control import PersistentTileScheduler, TileSchedulerParams
 
     params = TileSchedulerParams(
         problem_shape_m=4096,
@@ -273,7 +273,7 @@ def test_clc_kernel_compilation():
     import cutlass
     import cutlass.cute as cute
     from cutlass import Int32, Int64
-    from machete.megakernel.utils import (
+    from machete.utils.cluster_launch_control import (
         CLCResponse,
         WorkTileInfo,
         CLC_RESPONSE_BYTES,
