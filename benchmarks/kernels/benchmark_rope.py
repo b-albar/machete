@@ -33,11 +33,11 @@ except ImportError:
     CUTLASS_AVAILABLE = False
 
 
-def is_blackwell_available():
+def is_hopper_or_newer():
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 def rope_bytes(batch, seq_len, n_heads, head_dim):
@@ -87,7 +87,7 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
         funcs["triton"] = triton_fn
 
     # Megakernel (in-place, via bench_spec for raw kernel timing)
-    if is_blackwell_available() and CUTLASS_AVAILABLE:
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         b, s, h, d = batch, seq_len, n_heads, head_dim
         q_mk = q.clone()
         q_flat = q_mk.view(b * s, h, d)
@@ -120,7 +120,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {props.name} ({props.multi_processor_count} SMs)")
-        print(f"Blackwell: {is_blackwell_available()}")
+        print(f"Hopper+: {is_hopper_or_newer()}")
     print(f"Triton: {HAS_TRITON}")
     print(f"CUTLASS: {CUTLASS_AVAILABLE}")
     print()

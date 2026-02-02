@@ -117,7 +117,12 @@ def _build_tile_fn(body_source, exec_globals, filename="<compile>"):
 
 
 def _merge_globals(*fns):
-    """Merge __globals__ from multiple functions."""
+    """Merge __globals__ from multiple functions.
+
+    Always includes init-required globals (interpreter primitives, _FLAT,
+    cutlass dtypes) so that generated init source strings work without
+    needing a function object to extract globals from.
+    """
     merged = {}
     for fn in fns:
         if hasattr(fn, "__globals__"):
@@ -125,6 +130,21 @@ def _merge_globals(*fns):
     merged["cute"] = cute
     merged["Int32"] = Int32
     merged["Int64"] = Int64
+
+    # Init-required globals (needed for generated init source strings)
+    from machete.megakernel.interpreter import ld_global_i64, ld_global_i32
+    merged["ld_global_i64"] = ld_global_i64
+    merged["ld_global_i32"] = ld_global_i32
+    merged["_FLAT"] = 1 << 24
+
+    # Cutlass dtype names used in tensor declarations
+    import cutlass
+    for name in dir(cutlass):
+        obj = getattr(cutlass, name)
+        if isinstance(obj, type) or (hasattr(obj, '__name__') and
+                                      name[0].isupper()):
+            merged[name] = obj
+
     return merged
 
 
@@ -142,20 +162,23 @@ def _is_pass_only(fn):
     return body == "pass"
 
 
-def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None):
+def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None,
+                       init_source=None):
     """Fuse init/load/compute/store into a sequential @cute.jit function.
 
     Extracts each op method's body via inspect and inlines them into a
     single function: [init →] load → sync → compute → sync → store.
 
-    When init_fn is provided, its body is inlined before the load phase.
-    Variables defined in init_forward are in scope for all subsequent phases.
+    Init can be provided as either a function (init_fn, extracted via inspect)
+    or a pre-generated source string (init_source, from Op.gen_init_source).
+    init_source takes precedence over init_fn when both are provided.
 
     Args:
         load_fn: Op.load_forward static method
         compute_fn: Op.compute_forward static method
         store_fn: Op.store_forward static method
-        init_fn: Op.init_forward static method (optional)
+        init_fn: Op.init_forward static method (optional, legacy)
+        init_source: Pre-generated init source string (optional, preferred)
 
     Returns:
         @cute.jit function with signature:
@@ -168,8 +191,11 @@ def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None):
     parts = []
     all_fns = [load_fn, compute_fn, store_fn]
 
-    # Inline init_forward body before everything else (if non-trivial)
-    if init_fn is not None and not _is_pass_only(init_fn):
+    # Inline init body before everything else
+    if init_source is not None:
+        # Generated init source with static dims baked in
+        parts.append(init_source)
+    elif init_fn is not None and not _is_pass_only(init_fn):
         parts.append(_extract_body(init_fn))
         all_fns.append(init_fn)
 
@@ -200,6 +226,7 @@ def compile_warp_specialized(
     compute_fn,
     store_fn,
     init_fn=None,
+    init_source=None,
     num_producer_warps=1,
     warps_per_block=8,
 ):
@@ -221,7 +248,7 @@ def compile_warp_specialized(
         store_forward()             ─ (idle) ─
         sync_threads()              sync_threads()
 
-    The init_forward body is inlined before the warp_id branch, so any
+    The init body is inlined before the warp_id branch, so any
     variables it defines (pipeline objects, TMA partitions, smem tensor
     views) are naturally in scope for both producer and consumer paths.
 
@@ -229,7 +256,8 @@ def compile_warp_specialized(
         load_fn: Op.load_forward static method
         compute_fn: Op.compute_forward static method
         store_fn: Op.store_forward static method
-        init_fn: Op.init_forward static method (optional)
+        init_fn: Op.init_forward static method (optional, legacy)
+        init_source: Pre-generated init source string (optional, preferred)
         num_producer_warps: Number of warps dedicated to load/store (default: 1)
         warps_per_block: Total warps per block (default: 8)
 
@@ -248,8 +276,10 @@ def compile_warp_specialized(
 
     parts = []
 
-    # Inline init_forward body before the warp split (if non-trivial)
-    if init_fn is not None and not _is_pass_only(init_fn):
+    # Inline init body before the warp split
+    if init_source is not None:
+        parts.append(init_source)
+    elif init_fn is not None and not _is_pass_only(init_fn):
         parts.append(_extract_body(init_fn))
         all_fns.append(init_fn)
 

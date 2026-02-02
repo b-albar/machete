@@ -74,6 +74,7 @@ class KernelCache:
                 op.tiles_m,
                 op.tiles_n,
                 op.tiles_l,
+                tuple(sorted(op.static_dims.items())) if op.static_dims else (),
             )
             for op in ops
         )

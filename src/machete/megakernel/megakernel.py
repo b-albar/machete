@@ -596,7 +596,7 @@ class Megakernel:
             post_handlers.append(
                 _make_post_handler(op_page_counts[i], signal_formulas))
 
-        # --- Deduplicate tile functions by (op_cls, exec_mode, producer_warps) ---
+        # --- Deduplicate tile functions by (op_cls, exec_mode, producer_warps, static_dims) ---
         # dedup_key → (class_idx, tile_caller)
         dedup_map = {}
         # class_idx → list of op indices that use this class
@@ -609,20 +609,33 @@ class Megakernel:
         init_attr = 'init_backward' if use_backward else 'init_forward'
 
         for i, op in enumerate(ops):
-            key = (op.op_cls, op.execution_mode, op.num_producer_warps, use_backward)
+            # Include static dims in key: different model constants → different compiled code
+            static_dims_key = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
+            key = (op.op_cls, op.execution_mode, op.num_producer_warps,
+                   use_backward, static_dims_key)
             if key not in dedup_map:
                 load_fn = getattr(op.op_cls, load_attr)
                 compute_fn = getattr(op.op_cls, compute_attr)
                 store_fn = getattr(op.op_cls, store_attr)
-                init_fn = getattr(op.op_cls, init_attr, None)
 
-                # Compile tile function once for this class
+                # Generate init source with static dims baked as compile-time constants.
+                # Falls back to init_fn for ops without gen_init_source (e.g., NOPOp).
+                init_source = None
+                init_fn = None
+                if hasattr(op.op_cls, 'gen_init_source') and op.static_dims:
+                    init_source = op.op_cls.gen_init_source(
+                        op.static_dims, backward=use_backward)
+                else:
+                    init_fn = getattr(op.op_cls, init_attr, None)
+
+                # Compile tile function once for this (class, static_dims) combo
                 if op.execution_mode == ExecutionMode.WARP_SPECIALIZED:
                     tile_fn = compile_warp_specialized(
                         load_fn,
                         compute_fn,
                         store_fn,
                         init_fn=init_fn,
+                        init_source=init_source,
                         num_producer_warps=op.num_producer_warps,
                         warps_per_block=self.config.warps_per_block,
                     )
@@ -632,6 +645,7 @@ class Megakernel:
                         compute_fn,
                         store_fn,
                         init_fn=init_fn,
+                        init_source=init_source,
                     )
 
                 class_idx = len(dedup_map)
@@ -879,8 +893,7 @@ class Megakernel:
                     # Trace: init lane
                     trace_buffer = cute.make_tensor(
                         cute.make_ptr(cute.Uint8, trace_buffer_ptr),
-                        cute.make_shape(Int32(1)),
-                        cute.make_stride(Int32(1)),
+                        cute.make_layout(1 << 24),
                     )
                     lane = begin_lane_dynamic_raw(
                         Int32(1), Int32(row_stride_bytes),

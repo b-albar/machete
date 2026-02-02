@@ -6,43 +6,30 @@ This module defines the operation protocol for GPU execution using CuTe DSL.
 Operations are templates that get inlined at compile time, enabling full
 compiler optimization with no runtime dispatch overhead.
 
-All operations must implement @cute.jit forward methods:
-- load_forward: Load data from global to shared memory
-- compute_forward: Perform the computation
-- store_forward: Store results to global memory
+Subclass ``Op`` and declare tensors, tiling, then implement compute_forward::
 
-Operations may optionally implement backward methods:
-- load_backward: Load data/gradients from global to shared memory
-- compute_backward: Compute gradients
-- store_backward: Store gradients to global memory
+    class MyOp(Op):
+        reads  = {"x": (Float32, "M, D")}
+        writes = {"x": (Float32, "M, D")}
+        tile   = ("M",)
 
-Usage:
-    from machete.megakernel import ScheduledOp, NOPOp, Megakernel
+        @staticmethod
+        def compute_forward(smem_base, config_ptr, page_ids,
+                            tile_m, tile_n, tile_l, op_config_ptr):
+            ...  # M is dynamic (tile dim), D is a static compile-time int
 
-    ops = [
-        ScheduledOp(NOPOp, tiles_m=32),
-    ]
-
+    ops = [MyOp.schedule(x=tensor)]
     kernel = Megakernel(ops)
     kernel.run()
 """
 
 import enum
-import linecache
 import struct
-import textwrap
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type
 
 import torch
 from cutlass import Int32, Int64
-
-
-# Counter for unique filenames in linecache for auto-generated init methods.
-_init_counter = 0
-# Track linecache entries for cleanup.
-_linecache_entries: List[str] = []
 
 
 def _parse_dims(dim_str: str) -> List[str]:
@@ -86,16 +73,41 @@ def _build_tensor_and_dim_lists(reads, writes):
     return unique_tensors, unique_dims
 
 
-def _gen_init_source(unique_tensors, unique_dims):
-    """Generate init_forward/init_backward method source code.
+def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
+                     tile_dim_names=None, dynamic_dim_overrides=None):
+    """Generate init source code with static dims as compile-time constants.
 
-    The generated function reads pointers and dims from the config tensor
-    in global memory, then creates CuTe flat tensor views. Variables are
-    visible to compute_forward/compute_backward after inlining by compile.py.
+    Static dims (non-tile dimensions) are emitted as Python int literals,
+    making them compile-time constants in CuTe DSL. This enables CuTe layout
+    algebra, TMA descriptors, and vectorized loads for those dimensions.
+
+    Dynamic dims (tile dimensions) are loaded from the config tensor at
+    runtime via ld_global_i32.
+
+    Args:
+        unique_tensors: List of (name, dtype, dims) tuples.
+        unique_dims: List of (dim_name, tensor_name, axis_idx) tuples.
+        static_dims: Dict mapping static dim names to their int values.
+            If None, all dims are treated as dynamic (legacy behavior).
+        tile_dim_names: Set of dim names that are tile (dynamic) dimensions.
+        dynamic_dim_overrides: Set of additional dim names to treat as dynamic.
     """
     lines = []
     lines.append("tidx = cute.arch.thread_idx()[0]")
     lines.append("num_threads = cute.arch.block_dim()[0]")
+
+    # Determine which dims are dynamic vs static
+    if static_dims is None:
+        # Legacy: all dims are dynamic
+        dynamic_names = {d for d, _, _ in unique_dims}
+    else:
+        dynamic_names = set(tile_dim_names or ())
+        if dynamic_dim_overrides:
+            dynamic_names |= set(dynamic_dim_overrides)
+
+    # Separate dims into dynamic (config-loaded) and static (literal)
+    dynamic_dims = [(d, t, a) for d, t, a in unique_dims if d in dynamic_names]
+    static_dim_list = [(d, t, a) for d, t, a in unique_dims if d not in dynamic_names]
 
     # Read pointers (int64, 2 int32 words each)
     for i, (name, dtype, dims) in enumerate(unique_tensors):
@@ -103,12 +115,17 @@ def _gen_init_source(unique_tensors, unique_dims):
             f"{name}_ptr_raw = ld_global_i64(op_config_ptr, Int32({i}))"
         )
 
-    # Read dims (int32, after pointers)
+    # Dynamic dims: load from config (after pointers)
     dim_offset = 2 * len(unique_tensors)
-    for j, (dim_name, _, _) in enumerate(unique_dims):
+    for j, (dim_name, _, _) in enumerate(dynamic_dims):
         lines.append(
             f"{dim_name} = ld_global_i32(op_config_ptr, Int32({dim_offset + j}))"
         )
+
+    # Static dims: Python int literals (compile-time constants in CuTe DSL)
+    if static_dims is not None:
+        for dim_name, _, _ in static_dim_list:
+            lines.append(f"{dim_name} = {static_dims[dim_name]}")
 
     # Create CuTe tensor views
     for name, dtype, dims in unique_tensors:
@@ -122,17 +139,21 @@ def _gen_init_source(unique_tensors, unique_dims):
     return "\n".join(lines)
 
 
-def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes):
-    """Generate and attach pack_config / pack_backward_config staticmethods."""
+def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
+                     dynamic_dim_names=None):
+    """Generate and attach pack_config / pack_backward_config staticmethods.
 
-    def _make_pack_fn(tensors_decl, dims_list):
+    Only packs pointers and dynamic dims into the config tensor. Static dims
+    are baked into the compiled kernel as compile-time constants.
+    """
+
+    def _make_pack_fn(tensors_decl, dims_list, dyn_names):
         """Create a pack_config function for a given tensor/dim specification."""
         num_unique = len(tensors_decl)
-        num_dims = len(dims_list)
-        config_size = 2 * num_unique + num_dims
-
-        # Pre-compute dim extraction info: (dim_name, tensor_name, axis_index)
-        dim_info = dims_list
+        # Only pack dynamic dims
+        dynamic_dims = [(d, t, a) for d, t, a in dims_list if d in dyn_names]
+        num_dynamic = len(dynamic_dims)
+        config_size = 2 * num_unique + num_dynamic
 
         def pack_config(**tensors):
             config = torch.zeros(config_size, dtype=torch.int32,
@@ -144,15 +165,19 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes):
                 lo, hi = struct.unpack('<2i', struct.pack('<Q', t.data_ptr()))
                 config[2 * i] = lo
                 config[2 * i + 1] = hi
-            # Pack dims
+            # Pack dynamic dims only
             offset = 2 * num_unique
-            for j, (dim_name, tensor_name, axis_idx) in enumerate(dim_info):
+            for j, (dim_name, tensor_name, axis_idx) in enumerate(dynamic_dims):
                 config[offset + j] = tensors[tensor_name].shape[axis_idx]
             return config
 
         return staticmethod(pack_config)
 
-    cls.pack_config = _make_pack_fn(unique_tensors, unique_dims)
+    # All dims are dynamic if no classification provided (legacy / NOPOp)
+    if dynamic_dim_names is None:
+        dynamic_dim_names = {d for d, _, _ in unique_dims}
+
+    cls.pack_config = _make_pack_fn(unique_tensors, unique_dims, dynamic_dim_names)
 
     # Backward config: use backward_reads/backward_writes if defined
     bwd_reads = getattr(cls, 'backward_reads', None) or reads
@@ -161,62 +186,9 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes):
         cls.pack_backward_config = cls.pack_config
     else:
         bwd_tensors, bwd_dims = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims)
+        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims,
+                                                  dynamic_dim_names)
 
-
-def _gen_init_method(cls, source, method_name):
-    """Generate an init method from source, register in linecache, attach to cls."""
-    global _init_counter
-    _init_counter += 1
-    unique_filename = f"<{cls.__name__}.{method_name}_{_init_counter}>"
-
-    fn_source = (
-        f"def {method_name}(smem_base, config_ptr, page_ids,"
-        " tile_m, tile_n, tile_l, op_config_ptr):\n"
-        + textwrap.indent(source, "    ")
-        + "\n"
-    )
-
-    # Register in linecache for inspect.getsource() (needed by CuTe DSL)
-    linecache.cache[unique_filename] = (
-        len(fn_source),
-        None,
-        fn_source.splitlines(True),
-        unique_filename,
-    )
-    _linecache_entries.append(unique_filename)
-
-    code = compile(fn_source, unique_filename, "exec")
-    exec_globals = {
-        "cute": __import__("cutlass").cute,
-        "Int32": Int32,
-        "Int64": Int64,
-    }
-    # Import dtype names used in tensor declarations
-    import cutlass
-    for name in dir(cutlass):
-        obj = getattr(cutlass, name)
-        if isinstance(obj, type) or (hasattr(obj, '__name__') and
-                                      name[0].isupper()):
-            exec_globals[name] = obj
-
-    # Import interpreter primitives
-    from machete.megakernel.interpreter import ld_global_i64, ld_global_i32
-    exec_globals["ld_global_i64"] = ld_global_i64
-    exec_globals["ld_global_i32"] = ld_global_i32
-    exec_globals["_FLAT"] = 1 << 24
-
-    exec(code, exec_globals)
-    setattr(cls, method_name, staticmethod(exec_globals[method_name]))
-
-
-def _noop_method():
-    """Return a no-op staticmethod for load/store stubs."""
-    @staticmethod
-    def noop(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l,
-             op_config_ptr):
-        pass
-    return noop
 
 
 def _process_op_declarations(cls):
@@ -224,8 +196,10 @@ def _process_op_declarations(cls):
 
     Auto-generates: INPUTS, OUTPUTS, NUM_INPUT_PAGES, NUM_OUTPUT_PAGES,
     DIM_NAMES, compute_tiles, tiles_n, tiles_l, pack_config,
-    pack_backward_config, init_forward, init_backward, load/store stubs,
-    and schedule() classmethod.
+    pack_backward_config, load/store stubs, and schedule() classmethod.
+
+    Stores tensor/dim metadata on the class for deferred init generation
+    at compile time (when static dim values are known).
     """
     reads = cls.reads
     writes = cls.writes
@@ -237,6 +211,32 @@ def _process_op_declarations(cls):
 
     # Build tensor and dim lists
     unique_tensors, unique_dims = _build_tensor_and_dim_lists(reads, writes)
+
+    # --- Classify dims as static or dynamic ---
+    # Tile dims are always dynamic (they determine grid size and change per input).
+    # All other dims are static by default (model constants baked into compiled kernel).
+    # Ops can override with dynamic_dims = ("S",) to keep specific dims dynamic.
+    tile_dim_names = set(tile)
+    dynamic_dim_overrides = set(getattr(cls, 'dynamic_dims', ()))
+    dynamic_dim_names = tile_dim_names | dynamic_dim_overrides
+    static_dim_names = [d for d, _, _ in unique_dims if d not in dynamic_dim_names]
+
+    # Store metadata for deferred init generation at compile time
+    cls._UNIQUE_TENSORS = unique_tensors
+    cls._UNIQUE_DIMS = unique_dims
+    cls._TILE_DIM_NAMES = tile_dim_names
+    cls._DYNAMIC_DIM_OVERRIDES = dynamic_dim_overrides
+    cls._STATIC_DIM_NAMES = static_dim_names
+
+    # Backward tensor/dim metadata (may differ from forward)
+    bwd_reads = getattr(cls, 'backward_reads', None) or reads
+    bwd_writes = getattr(cls, 'backward_writes', None) or writes
+    if bwd_reads is reads and bwd_writes is writes:
+        cls._BWD_UNIQUE_TENSORS = unique_tensors
+        cls._BWD_UNIQUE_DIMS = unique_dims
+    else:
+        cls._BWD_UNIQUE_TENSORS, cls._BWD_UNIQUE_DIMS = \
+            _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
 
     # Set INPUTS / OUTPUTS
     cls.INPUTS = list(reads.keys())
@@ -273,30 +273,9 @@ def _process_op_declarations(cls):
     if len(tile) > 2:
         cls.tiles_l = _make_tile_fn(*tile_dims[2])
 
-    # Generate pack_config / pack_backward_config
-    _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes)
-
-    # Generate init_forward
-    fwd_init_source = _gen_init_source(unique_tensors, unique_dims)
-    _gen_init_method(cls, fwd_init_source, "init_forward")
-
-    # Generate init_backward (same layout if backward_reads/writes not set)
-    bwd_reads = getattr(cls, 'backward_reads', None) or reads
-    bwd_writes = getattr(cls, 'backward_writes', None) or writes
-    if bwd_reads is reads and bwd_writes is writes:
-        bwd_init_source = fwd_init_source
-    else:
-        bwd_tensors, bwd_dims = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-        bwd_init_source = _gen_init_source(bwd_tensors, bwd_dims)
-    _gen_init_method(cls, bwd_init_source, "init_backward")
-
-    # Generate load/store stubs (pass) if not already user-defined
-    for method_name in ("load_forward", "store_forward",
-                        "load_backward", "store_backward"):
-        existing = getattr(cls, method_name, None)
-        # Check if it's the base Op's default or not overridden
-        if existing is None or existing is getattr(Op, method_name, None):
-            setattr(cls, method_name, _noop_method())
+    # Generate pack_config / pack_backward_config (only packs dynamic dims)
+    _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
+                     dynamic_dim_names=dynamic_dim_names)
 
     # Add schedule() classmethod
     @classmethod
@@ -305,6 +284,13 @@ def _process_op_declarations(cls):
         tiles_m = cls.compute_tiles(**tensors)
         tiles_n = cls.tiles_n(**tensors)
         tiles_l = cls.tiles_l(**tensors)
+
+        # Extract static dim values from actual tensor shapes
+        static_dims = {}
+        for dim_name, tensor_name, axis_idx in cls._UNIQUE_DIMS:
+            if dim_name not in (cls._TILE_DIM_NAMES | cls._DYNAMIC_DIM_OVERRIDES):
+                static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
+
         config_data = cls.pack_config(**tensors)
         return ScheduledOp(
             op_cls=cls,
@@ -312,10 +298,34 @@ def _process_op_declarations(cls):
             tiles_n=tiles_n,
             tiles_l=tiles_l,
             config_data=config_data,
+            static_dims=static_dims,
             dim_names=cls.DIM_NAMES,
         )
 
     cls.schedule = schedule
+
+    # Add gen_init_source classmethod for deferred init generation
+    @classmethod
+    def gen_init_source(cls, static_dims, backward=False):
+        """Generate init source with static dims baked as compile-time constants.
+
+        Called at kernel compile time when static dim values are known.
+        Returns a source string (not a function) to be inlined by compile.py.
+        """
+        if backward:
+            tensors = cls._BWD_UNIQUE_TENSORS
+            dims = cls._BWD_UNIQUE_DIMS
+        else:
+            tensors = cls._UNIQUE_TENSORS
+            dims = cls._UNIQUE_DIMS
+        return _gen_init_source(
+            tensors, dims,
+            static_dims=static_dims,
+            tile_dim_names=cls._TILE_DIM_NAMES,
+            dynamic_dim_overrides=cls._DYNAMIC_DIM_OVERRIDES,
+        )
+
+    cls.gen_init_source = gen_init_source
 
 
 # =============================================================================
@@ -340,44 +350,27 @@ class ExecutionMode(enum.Enum):
 # =============================================================================
 
 
-class Op(ABC):
-    """Abstract base for GPU-executable operations.
+class Op:
+    """Base class for GPU-executable operations.
 
     Each operation implements static methods that get inlined into the
     megakernel at compile time. The methods receive raw CuTe DSL types
     (Int32 pointers and indices) so they can execute on the GPU.
 
-    Operations must implement forward methods:
-    - load_forward: Load data from global to shared memory
-    - compute_forward: Perform the computation
-    - store_forward: Store results to global memory
+    Subclasses declare tensors and tiling via class attributes:
+        reads:  Dict of tensor name → (dtype, dim_string)
+        writes: Dict of tensor name → (dtype, dim_string)
+        tile:   Tuple of dim names that define the tile grid
 
-    Operations may optionally implement backward methods:
-    - load_backward: Load data/gradients from global to shared memory
-    - compute_backward: Compute gradients
-    - store_backward: Store gradients to global memory
+    Then implement at minimum ``compute_forward``. Load/store default
+    to no-ops (suitable for global-memory-only ops). Backward methods
+    are optional.
 
-    Operations may optionally implement init methods:
-    - init_forward: Shared setup that runs before warp split (e.g., pipeline
-      init, TMA partitions, smem tensor views). Its body is inlined into the
-      same function scope as load/compute/store, so local variables are visible
-      to all phases.
-    - init_backward: Same as init_forward but for the backward pass.
-
-    Method signature (same for forward and backward):
+    Method signature (same for all phases):
         def method(smem_base: Int32, config_ptr: Int32,
                    page_ids: tuple[Int32, ...],
                    tile_m: Int32, tile_n: Int32, tile_l: Int32,
                    op_config_ptr: Int64) -> None
-
-    Where:
-        smem_base: Base pointer to shared memory
-        config_ptr: Pointer to PageTableConfig in shared memory
-        page_ids: Tuple of physical page IDs (length = NUM_INPUT + NUM_OUTPUT)
-                  Use get_page_data_ptr(smem_base, config_ptr, pid) to get data pointer
-        tile_m/n/l: Tile indices for this work item
-        op_config_ptr: Pointer to per-op config struct in global memory (64-bit).
-                       Each op defines its own config layout (tensor pointers, shapes, etc.).
 
     Class attributes:
         NUM_INPUT_PAGES: Number of input shared memory pages needed
@@ -422,34 +415,31 @@ class Op(ABC):
         pass
 
     @staticmethod
-    @abstractmethod
     def load_forward(
         smem_base: Int32, config_ptr: Int32, page_ids: tuple,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Load data from global to shared memory."""
-        ...
+        pass
 
     @staticmethod
-    @abstractmethod
     def compute_forward(
         smem_base: Int32, config_ptr: Int32, page_ids: tuple,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Perform the forward computation."""
-        ...
+        pass
 
     @staticmethod
-    @abstractmethod
     def store_forward(
         smem_base: Int32, config_ptr: Int32, page_ids: tuple,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Store results to global memory."""
-        ...
+        pass
 
     # --- Backward pass (optional) ---
 
@@ -530,38 +520,6 @@ class NOPOp(Op):
     NUM_INPUT_PAGES: ClassVar[int] = 0
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
-    @staticmethod
-    def init_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        pass
-
-    @staticmethod
-    def load_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        pass
-
-    @staticmethod
-    def compute_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        pass
-
-    @staticmethod
-    def store_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        pass
-
 
 # =============================================================================
 # Scheduled Operation
@@ -598,6 +556,7 @@ class ScheduledOp:
     params: Dict[str, Any] = field(default_factory=dict)
     dim_names: Dict[str, str] = None
     config_data: Any = None  # Optional torch.Tensor with per-op config in global memory
+    static_dims: Dict[str, int] = field(default_factory=dict)  # Compile-time dim values
 
     def __post_init__(self):
         if self.dim_names is None:
