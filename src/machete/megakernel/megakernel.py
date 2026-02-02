@@ -451,6 +451,7 @@ class Megakernel:
         if self._instructions_tensor is None:
             self._instructions_tensor = self._builder.build_tensor(self.device)
             self._num_instructions = self._instructions_tensor.shape[0]
+            self._num_instructions_i32 = Int32(self._num_instructions)
 
         if self._barriers_tensor is None:
             self._barriers_tensor = torch.zeros(
@@ -992,23 +993,17 @@ class Megakernel:
 
         return PersistentKernel()
 
-    def run(self, stream=None) -> None:
-        """Run the persistent megakernel.
+    def compile(self) -> None:
+        """Compile the kernel without running it.
 
-        Args:
-            stream: CUDA stream (optional)
+        Triggers JIT compilation so that subsequent run() calls have no
+        compilation overhead. Safe to call multiple times (no-op after first).
         """
-        import cuda.bindings.driver as cuda
-
-        self._validate_requirements()
+        # _prepare_tensors is idempotent (checks for None internally)
         self._prepare_tensors()
 
-        if stream is None:
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
-
         if self._compiled_kernel is None:
-            # Set constexpr tracing flag before compilation
+            self._validate_requirements()
             from cutedsl_trace.config import set_tracing_enabled
             set_tracing_enabled(self.config.tracing)
 
@@ -1023,11 +1018,23 @@ class Megakernel:
             self._compiled_kernel = self._create_kernel()
             print("Compilation complete.")
 
-        # Get tensor addresses
-        instructions_ptr = Int64(self._instructions_tensor.data_ptr())
-        barriers_ptr = Int64(self._barriers_tensor.data_ptr())
-        op_configs_ptr = Int64(self._op_configs_tensor.data_ptr())
-        num_instructions = Int32(self._num_instructions)
+    def run(self, stream=None, sync: bool = True) -> None:
+        """Run the persistent megakernel.
+
+        Args:
+            stream: CUDA stream (optional). If None, uses current stream.
+            sync: If True (default), synchronize after launch. Set to False
+                for benchmarking or when managing synchronization externally.
+        """
+        # Compile on first call (no-op if already compiled).
+        # Always call compile() to ensure tensors are prepared, even when
+        # _compiled_kernel was injected externally (e.g., autograd cache).
+        self.compile()
+
+        if stream is None:
+            import cuda.bindings.driver as cuda
+            torch_stream = torch.cuda.current_stream()
+            stream = cuda.CUstream(torch_stream.cuda_stream)
 
         # Reset barriers for this run
         self._barriers_tensor.zero_()
@@ -1041,15 +1048,78 @@ class Megakernel:
             trace_buffer_ptr = Int64(0)
 
         self._compiled_kernel(
-            instructions_ptr,
-            barriers_ptr,
-            op_configs_ptr,
+            Int64(self._instructions_tensor.data_ptr()),
+            Int64(self._barriers_tensor.data_ptr()),
+            Int64(self._op_configs_tensor.data_ptr()),
             trace_buffer_ptr,
-            num_instructions,
+            self._num_instructions_i32,
             stream,
         )
 
-        torch.cuda.synchronize()
+        if sync:
+            torch.cuda.synchronize()
+
+    def bench_spec(self, setup_fn=None):
+        """Create a KernelBenchSpec for raw GPU kernel timing.
+
+        Returns a spec that can be passed to the benchmark framework for
+        precise kernel-only timing (excludes CPU overhead, tensor copies,
+        barrier resets, etc.).
+
+        Args:
+            setup_fn: Optional callable invoked before each timed iteration
+                to reset input tensors or other state. Runs outside the
+                timed region.
+
+        Returns:
+            KernelBenchSpec ready for use with Benchmark.run(mode="kernel").
+
+        Example:
+            kernel = Megakernel(ops, config=MegakernelConfig())
+            kernel.compile()
+
+            q_orig = q.clone()
+            def reset():
+                q.copy_(q_orig)
+
+            spec = kernel.bench_spec(setup_fn=reset)
+            # Pass spec as a benchmark function to the framework
+        """
+        import cuda.bindings.driver as cuda
+        from cutlass.cute.testing import JitArguments
+        from machete.utils.benchmark_utils import KernelBenchSpec
+
+        self.compile()
+
+        bench_stream = torch.cuda.Stream()
+        cu_stream = cuda.CUstream(bench_stream.cuda_stream)
+
+        # Capture references to internal state (stable after compile)
+        compiled_kernel = self._compiled_kernel
+        instructions_tensor = self._instructions_tensor
+        barriers_tensor = self._barriers_tensor
+        op_configs_tensor = self._op_configs_tensor
+        num_instructions_i32 = self._num_instructions_i32
+
+        def gen_workspace():
+            if setup_fn is not None:
+                setup_fn()
+            barriers_tensor.zero_()
+            return JitArguments(
+                Int64(instructions_tensor.data_ptr()),
+                Int64(barriers_tensor.data_ptr()),
+                Int64(op_configs_tensor.data_ptr()),
+                Int64(0),  # trace_buffer_ptr (tracing disabled for benchmarks)
+                num_instructions_i32,
+                cu_stream,
+            )
+
+        return KernelBenchSpec(
+            compiled_kernel=compiled_kernel,
+            workspace_generator=gen_workspace,
+            stream=(bench_stream, cu_stream),
+            workspace_count=1,
+        )
 
     def __repr__(self) -> str:
         op_names = ", ".join(

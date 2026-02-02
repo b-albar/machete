@@ -27,7 +27,7 @@ from .kernel_cache import KernelCache
 def _run_cached(scheduled_ops, mk_config, backward):
     """Run a megakernel with kernel caching. Executes exactly once.
 
-    On cache hit: injects the cached compiled kernel and launches directly.
+    On cache hit: injects the cached compiled kernel and launches via run().
     On cache miss: compiles + executes via mk.run(), then caches the result.
     """
     cache = KernelCache.get()
@@ -36,25 +36,9 @@ def _run_cached(scheduled_ops, mk_config, backward):
     mk = Megakernel(scheduled_ops, config=mk_config, backward=backward)
 
     if compiled_kernel is not None:
-        # Cache hit: inject and launch
+        # Cache hit: inject cached kernel, then use public run()
         mk._compiled_kernel = compiled_kernel
-        mk._prepare_tensors()
-        mk._barriers_tensor.zero_()
-
-        import cuda.bindings.driver as cuda_drv
-        torch_stream = torch.cuda.current_stream()
-        stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-
-        from cutlass import Int32, Int64
-        mk._compiled_kernel(
-            Int64(mk._instructions_tensor.data_ptr()),
-            Int64(mk._barriers_tensor.data_ptr()),
-            Int64(mk._op_configs_tensor.data_ptr()),
-            Int64(0),  # trace_buffer_ptr (unused, tracing disabled in autograd path)
-            Int32(mk._num_instructions),
-            stream,
-        )
-        torch.cuda.synchronize()
+        mk.run()
     else:
         # Cache miss: compile + execute once
         with contextlib.redirect_stdout(io.StringIO()):

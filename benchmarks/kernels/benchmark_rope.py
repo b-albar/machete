@@ -19,7 +19,6 @@ from machete.megakernel import Megakernel, MegakernelConfig
 from machete.kernels.rope import RopeOp
 from machete.kernels.rope.ref import rope_pytorch, HAS_TRITON
 from machete.utils.benchmark import Benchmark
-from machete.utils.benchmark_utils import KernelBenchSpec
 
 if HAS_TRITON:
     from machete.kernels.rope.ref import rope_triton
@@ -27,9 +26,7 @@ else:
     print("WARNING: Triton not available — Triton benchmark will be skipped.")
 
 try:
-    from cutlass import Int32, Int64
-    from cutlass.cute.testing import JitArguments
-    import cuda.bindings.driver as cuda
+    import cutlass  # noqa: F401
 
     CUTLASS_AVAILABLE = True
 except ImportError:
@@ -89,45 +86,22 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
 
         funcs["triton"] = triton_fn
 
-    # Megakernel (in-place, via KernelBenchSpec)
+    # Megakernel (in-place, via bench_spec for raw kernel timing)
     if is_blackwell_available() and CUTLASS_AVAILABLE:
         b, s, h, d = batch, seq_len, n_heads, head_dim
         q_mk = q.clone()
         q_flat = q_mk.view(b * s, h, d)
 
         ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin)]
-        mk_config = MegakernelConfig()
-        kernel = Megakernel(ops, config=mk_config)
+        kernel = Megakernel(ops, config=MegakernelConfig())
 
         # Trigger compilation + first run
         with contextlib.redirect_stdout(io.StringIO()):
             kernel.run()
         torch.cuda.synchronize()
 
-        compiled = kernel._compiled_kernel
-        barriers = kernel._barriers_tensor
-
-        # Create a dedicated stream for the workspace generator
-        bench_stream = torch.cuda.Stream()
-        cu_stream = cuda.CUstream(bench_stream.cuda_stream)
-
-        def gen_workspace():
-            q_mk.copy_(q)
-            barriers.zero_()
-            return JitArguments(
-                Int64(kernel._instructions_tensor.data_ptr()),
-                Int64(barriers.data_ptr()),
-                Int64(kernel._op_configs_tensor.data_ptr()),
-                Int64(0),  # trace_buffer_ptr (tracing disabled)
-                Int32(kernel._num_instructions),
-                cu_stream,
-            )
-
-        funcs["megakernel"] = KernelBenchSpec(
-            compiled_kernel=compiled,
-            workspace_generator=gen_workspace,
-            stream=(bench_stream, cu_stream),
-            workspace_count=1,
+        funcs["megakernel"] = kernel.bench_spec(
+            setup_fn=lambda: q_mk.copy_(q),
         )
 
     return funcs
