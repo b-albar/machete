@@ -15,6 +15,11 @@ from machete.megakernel.ops import (
     TileInstruction,
     InstructionStreamBuilder,
     INSTRUCTION_WORDS,
+    TileScheduler,
+    LevelBatchedScheduler,
+    BackwardScheduler,
+    get_default_scheduler,
+    set_default_scheduler,
 )
 from typing import ClassVar, List
 
@@ -576,15 +581,20 @@ class TestLinecacheCleanup:
 
 
 # =============================================================================
-# Interleaved Tile Scheduling Tests
+# Level-Batched Tile Scheduling Tests
 # =============================================================================
 
 
-class TestInterleavedScheduling:
-    """Test that build() interleaves tiles for pipeline overlap."""
+class TestLevelBatchedScheduling:
+    """Test that build() uses level-batched scheduling for load balancing.
 
-    def test_two_op_chain_interleaved(self):
-        """A 2-op 1:1 chain should interleave tiles, not emit sequentially."""
+    Level-batched scheduling emits all tiles from source ops (no dependencies)
+    first, then processes dependent ops. This spreads producer tiles across
+    SMs when using strided instruction fetch.
+    """
+
+    def test_two_op_chain_batched(self):
+        """A 2-op chain emits all source tiles before consumer tiles."""
         builder = InstructionStreamBuilder()
         builder.add_op(NOPOp, tiles_m=4)
         builder.add_op(NOPOp, tiles_m=4)
@@ -593,18 +603,12 @@ class TestInterleavedScheduling:
         assert len(instructions) == 8
         op_sequence = [i.op_idx for i in instructions]
 
-        # Op 1 tiles should NOT all come after op 0 tiles.
-        # With greedy scheduling, op 1's first tile should appear
-        # before all op 0 tiles are emitted.
-        first_op1 = op_sequence.index(1)
-        last_op0 = len(op_sequence) - 1 - op_sequence[::-1].index(0)
-        assert first_op1 < last_op0, (
-            f"Expected interleaving but got op1 first at {first_op1}, "
-            f"op0 last at {last_op0}. Sequence: {op_sequence}"
-        )
+        # With level-batched scheduling, all source tiles come first
+        # Expected: [0, 0, 0, 0, 1, 1, 1, 1]
+        assert op_sequence == [0, 0, 0, 0, 1, 1, 1, 1], f"Expected batched order but got: {op_sequence}"
 
-    def test_three_op_chain_interleaved(self):
-        """A 3-op chain should pipeline all three ops."""
+    def test_three_op_chain_batched(self):
+        """A 3-op chain emits source first, then wavefront for consumers."""
         builder = InstructionStreamBuilder()
         builder.add_op(NOPOp, tiles_m=4)
         builder.add_op(NOPOp, tiles_m=4)
@@ -614,10 +618,17 @@ class TestInterleavedScheduling:
         assert len(instructions) == 12
         op_sequence = [i.op_idx for i in instructions]
 
-        # Op 2 should start before op 0 finishes
-        first_op2 = op_sequence.index(2)
-        last_op0 = len(op_sequence) - 1 - op_sequence[::-1].index(0)
-        assert first_op2 < last_op0
+        # Source op 0 emits all tiles first (level-batched)
+        # Then ops 1 and 2 interleave via greedy wavefront
+        # Expected: [0,0,0,0, 1,2,1,2,1,2,1,2]
+        assert op_sequence[:4] == [0, 0, 0, 0], f"Source tiles not first: {op_sequence}"
+        # Remaining tiles should have both op 1 and op 2 interleaved
+        remaining = op_sequence[4:]
+        assert sorted(remaining) == [1, 1, 1, 1, 2, 2, 2, 2], f"Missing tiles: {remaining}"
+        # First op1 tile should appear before any op2 tiles complete
+        first_op2 = remaining.index(2)
+        assert remaining[0] == 1, f"Op 1 should start before op 2: {remaining}"
+        assert first_op2 > 0, f"Op 2 shouldn't start first: {remaining}"
 
     def test_all_tiles_present(self):
         """Interleaved build must emit all tiles from all ops."""
@@ -664,3 +675,83 @@ class TestInterleavedScheduling:
                 f"Consumer tile {k} at pos {positions[(1, k)]} "
                 f"before producer tile {k} at pos {positions[(0, k)]}"
             )
+
+
+# =============================================================================
+# Scheduler API Tests
+# =============================================================================
+
+
+class TestSchedulerAPI:
+    """Test the tile scheduler abstraction and different schedulers."""
+
+    def test_default_scheduler_is_level_batched(self):
+        """Default scheduler should be LevelBatchedScheduler."""
+        scheduler = get_default_scheduler()
+        assert isinstance(scheduler, LevelBatchedScheduler)
+
+    def test_set_default_scheduler(self):
+        """Can change the default scheduler globally."""
+        original = get_default_scheduler()
+        try:
+            backward = BackwardScheduler()
+            set_default_scheduler(backward)
+            assert get_default_scheduler() is backward
+        finally:
+            set_default_scheduler(original)
+
+    def test_explicit_scheduler_parameter(self):
+        """Can pass scheduler directly to build()."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(NOPOp, tiles_m=4)
+        builder.add_op(NOPOp, tiles_m=4)
+
+        # Using explicit scheduler should work
+        scheduler = LevelBatchedScheduler()
+        instructions = builder.build(scheduler=scheduler)
+        assert len(instructions) == 9  # 8 tiles + end marker
+
+    def test_backward_scheduler_respects_dependencies(self):
+        """BackwardScheduler must still respect dependencies."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(NOPOp, tiles_m=4)
+        builder.add_op(NOPOp, tiles_m=4)
+
+        scheduler = BackwardScheduler()
+        instructions = builder.build(scheduler=scheduler)[:-1]
+
+        # Track emission position of each (op_idx, tile_m)
+        positions = {}
+        for pos, instr in enumerate(instructions):
+            positions[(instr.op_idx, instr.tile_m)] = pos
+
+        # For 1:1 chain: consumer tile k must be after producer tile k
+        for k in range(4):
+            assert positions[(1, k)] > positions[(0, k)], (
+                f"BackwardScheduler violated deps: consumer tile {k} at pos {positions[(1, k)]} "
+                f"before producer tile {k} at pos {positions[(0, k)]}"
+            )
+
+    def test_backward_scheduler_all_tiles_present(self):
+        """BackwardScheduler must emit all tiles."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(NOPOp, tiles_m=3, tiles_n=2)
+        builder.add_op(NOPOp, tiles_m=3, tiles_n=2)
+
+        scheduler = BackwardScheduler()
+        instructions = builder.build(scheduler=scheduler)[:-1]
+
+        assert len(instructions) == 12
+
+        # Check op 0 has all 6 tiles
+        op0_tiles = {(i.tile_m, i.tile_n) for i in instructions if i.op_idx == 0}
+        assert op0_tiles == {(m, n) for m in range(3) for n in range(2)}
+
+        # Check op 1 has all 6 tiles
+        op1_tiles = {(i.tile_m, i.tile_n) for i in instructions if i.op_idx == 1}
+        assert op1_tiles == {(m, n) for m in range(3) for n in range(2)}
+
+    def test_scheduler_is_abstract(self):
+        """TileScheduler base class cannot be instantiated directly."""
+        with pytest.raises(TypeError):
+            TileScheduler()

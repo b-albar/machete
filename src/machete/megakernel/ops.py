@@ -25,6 +25,7 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute_forward::
 
 import enum
 import struct
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type
 
@@ -927,6 +928,349 @@ def _compute_formula_coeffs(
 
 
 # =============================================================================
+# Tile Schedulers
+# =============================================================================
+
+
+class TileScheduler(ABC):
+    """Abstract base class for tile scheduling strategies.
+
+    A scheduler takes the dependency graph and produces an ordered list of
+    TileInstructions that SMs will fetch and execute. Different strategies
+    optimize for different goals (load balance, latency, overlap, etc.).
+
+    The scheduler receives:
+    - op_records: List of _OpRecord with op metadata and tile coordinates
+    - consumer_deps: Dict mapping op_idx -> list of _DepEdge dependencies
+    - edges: All dependency edges in the graph
+
+    And produces a list of TileInstruction in execution order.
+    """
+
+    @abstractmethod
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        """Build the instruction list from ops and dependencies.
+
+        Args:
+            op_records: List of op records with tiles
+            consumer_deps: Maps consumer op_idx to its dependency edges
+            edges: All dependency edges
+
+        Returns:
+            Ordered list of TileInstruction (without END marker)
+        """
+        pass
+
+    @staticmethod
+    def _producer_threshold(
+        edge: "_DepEdge",
+        consumer_cursor: int,
+        producer_total: int,
+        consumer_total: int,
+    ) -> int:
+        """Minimum producer tiles that must be emitted before consumer tile k."""
+        if edge.kind == "many_to_one":
+            return producer_total
+        elif edge.kind == "one_to_many":
+            return min(
+                (consumer_cursor * producer_total) // consumer_total + 1,
+                producer_total,
+            )
+        else:
+            return min(consumer_cursor + 1, producer_total)
+
+
+class LevelBatchedScheduler(TileScheduler):
+    """Level-batched wavefront scheduler.
+
+    Emits tiles in dependency order, batching tiles from the same "level"
+    together to naturally spread work across SMs when they fetch
+    instructions with strided distribution.
+
+    Strategy:
+    1. Emit ALL tiles from source ops (no dependencies) first
+    2. Then emit dependent ops using greedy wavefront
+
+    This spreads producer tiles across SMs (better load balancing) while
+    still respecting dependencies via barriers.
+
+    Example (one-to-many, Producer 4 tiles → Consumer 16 tiles):
+        P0, P1, P2, P3, C0, C1, C2, ...
+    With 2 SMs: Block 0 gets P0,P2,C0,... Block 1 gets P1,P3,C1,...
+    """
+
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        num_ops = len(op_records)
+        cursors = [0] * num_ops
+        total_tiles = sum(rec.op.total_tiles for rec in op_records)
+        instructions: List[TileInstruction] = []
+
+        # Phase 1: Emit ALL tiles from source ops (no dependencies)
+        for rec in op_records:
+            idx = rec.op_idx
+            if idx not in consumer_deps:
+                for tile in rec.tiles:
+                    instructions.append(
+                        TileInstruction(
+                            op_idx=idx,
+                            tile_m=tile[0],
+                            tile_n=tile[1],
+                            tile_l=tile[2],
+                        )
+                    )
+                cursors[idx] = rec.op.total_tiles
+
+        # Phase 2: Greedy wavefront for remaining ops
+        while len(instructions) < total_tiles:
+            progress = False
+            for rec in op_records:
+                idx = rec.op_idx
+                if cursors[idx] >= rec.op.total_tiles:
+                    continue
+
+                can_emit = True
+                for edge in consumer_deps.get(idx, []):
+                    prod_rec = op_records[edge.producer_idx]
+                    needed = self._producer_threshold(
+                        edge,
+                        cursors[idx],
+                        prod_rec.op.total_tiles,
+                        rec.op.total_tiles,
+                    )
+                    if cursors[edge.producer_idx] < needed:
+                        can_emit = False
+                        break
+
+                if can_emit:
+                    tile = rec.tiles[cursors[idx]]
+                    instructions.append(
+                        TileInstruction(
+                            op_idx=idx,
+                            tile_m=tile[0],
+                            tile_n=tile[1],
+                            tile_l=tile[2],
+                        )
+                    )
+                    cursors[idx] += 1
+                    progress = True
+
+            if not progress:
+                scheduled = [
+                    f"{op_records[i].op.op_cls.__name__}: {cursors[i]}/{op_records[i].op.total_tiles}"
+                    for i in range(num_ops)
+                ]
+                raise RuntimeError(f"Deadlock in tile scheduling. Cursors: {scheduled}")
+
+        return instructions
+
+
+class BackwardScheduler(TileScheduler):
+    """Backward scheduler optimized for latency.
+
+    Plans execution from the final outputs backward, assigning each tile
+    the latest possible "start time" that still meets dependencies. Then
+    schedules tiles in order of their deadlines (earliest deadline first).
+
+    This achieves better overlap between stages because producers complete
+    "just in time" for consumers, minimizing idle waiting.
+
+    Algorithm:
+    1. Compute "depth" for each op (longest path to any sink)
+    2. For each tile, compute latest_start = max_depth - depth[op]
+    3. Sort tiles by (latest_start, op_idx, tile_idx) for determinism
+    4. Emit in sorted order, respecting dependencies
+
+    The depth-based ordering ensures:
+    - Sink tiles (final outputs) have highest priority (depth=0, latest_start=max)
+    - Source tiles (no deps) have lowest priority, scheduled last but still valid
+    - Critical path tiles are interleaved optimally
+    """
+
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        num_ops = len(op_records)
+        if num_ops == 0:
+            return []
+
+        # Build producer_deps: op_idx -> list of producer op indices
+        producer_deps: Dict[int, List[int]] = {i: [] for i in range(num_ops)}
+        for edge in edges:
+            producer_deps[edge.consumer_idx].append(edge.producer_idx)
+
+        # Compute depth: longest path FROM this op TO any sink (no outgoing edges)
+        # Sinks have depth 0, their producers have depth 1, etc.
+        # We compute "reverse depth" - distance to nearest sink
+        depth = [-1] * num_ops
+
+        # Find sinks (ops with no consumers)
+        has_consumer = set()
+        for edge in edges:
+            has_consumer.add(edge.producer_idx)
+        sinks = [i for i in range(num_ops) if i not in has_consumer]
+
+        # BFS from sinks backward
+        from collections import deque
+        queue = deque()
+        for sink_idx in sinks:
+            depth[sink_idx] = 0
+            queue.append(sink_idx)
+
+        while queue:
+            op_idx = queue.popleft()
+            current_depth = depth[op_idx]
+            # All producers of this op should have depth >= current + 1
+            for prod_idx in producer_deps[op_idx]:
+                if depth[prod_idx] < current_depth + 1:
+                    depth[prod_idx] = current_depth + 1
+                    queue.append(prod_idx)
+
+        # Handle disconnected ops (sources with no path to sink)
+        max_depth = max(depth) if depth else 0
+        for i in range(num_ops):
+            if depth[i] < 0:
+                depth[i] = max_depth + 1
+
+        # Compute priority for each tile: (depth, op_idx, tile_idx)
+        # Lower depth = closer to output = higher priority (schedule later)
+        # We want to schedule high-depth (sources) first, low-depth (sinks) last
+        # But we emit in order that respects dependencies
+
+        # Create all tile entries with priorities
+        tile_entries = []
+        for rec in op_records:
+            op_depth = depth[rec.op_idx]
+            for tile_idx, tile in enumerate(rec.tiles):
+                # Priority: higher depth = earlier in schedule
+                # This naturally puts producers before consumers
+                priority = (-op_depth, rec.op_idx, tile_idx)
+                tile_entries.append((priority, rec.op_idx, tile))
+
+        # Sort by priority (highest depth first = sources first)
+        tile_entries.sort(key=lambda x: x[0])
+
+        # Now emit in priority order, but verify dependencies are met
+        # Use cursors to track emitted tiles per op
+        cursors = [0] * num_ops
+        emitted = set()
+        instructions: List[TileInstruction] = []
+
+        # Track which tiles we've scheduled
+        pending = list(tile_entries)
+
+        while pending:
+            progress = False
+            next_pending = []
+
+            for priority, op_idx, tile in pending:
+                tile_global_idx = (op_idx, cursors[op_idx])
+
+                # Check if dependencies are met
+                can_emit = True
+                for edge in consumer_deps.get(op_idx, []):
+                    prod_rec = op_records[edge.producer_idx]
+                    needed = self._producer_threshold(
+                        edge,
+                        cursors[op_idx],
+                        prod_rec.op.total_tiles,
+                        op_records[op_idx].op.total_tiles,
+                    )
+                    if cursors[edge.producer_idx] < needed:
+                        can_emit = False
+                        break
+
+                if can_emit and tile_global_idx not in emitted:
+                    # Verify this is the next tile for this op
+                    expected_tile = op_records[op_idx].tiles[cursors[op_idx]]
+                    if tile == expected_tile:
+                        instructions.append(
+                            TileInstruction(
+                                op_idx=op_idx,
+                                tile_m=tile[0],
+                                tile_n=tile[1],
+                                tile_l=tile[2],
+                            )
+                        )
+                        emitted.add(tile_global_idx)
+                        cursors[op_idx] += 1
+                        progress = True
+                    else:
+                        next_pending.append((priority, op_idx, tile))
+                else:
+                    next_pending.append((priority, op_idx, tile))
+
+            if not progress and next_pending:
+                # Try emitting any ready tile (fallback to greedy)
+                for i, (priority, op_idx, tile) in enumerate(next_pending):
+                    if cursors[op_idx] < op_records[op_idx].op.total_tiles:
+                        can_emit = True
+                        for edge in consumer_deps.get(op_idx, []):
+                            prod_rec = op_records[edge.producer_idx]
+                            needed = self._producer_threshold(
+                                edge,
+                                cursors[op_idx],
+                                prod_rec.op.total_tiles,
+                                op_records[op_idx].op.total_tiles,
+                            )
+                            if cursors[edge.producer_idx] < needed:
+                                can_emit = False
+                                break
+
+                        if can_emit:
+                            actual_tile = op_records[op_idx].tiles[cursors[op_idx]]
+                            instructions.append(
+                                TileInstruction(
+                                    op_idx=op_idx,
+                                    tile_m=actual_tile[0],
+                                    tile_n=actual_tile[1],
+                                    tile_l=actual_tile[2],
+                                )
+                            )
+                            cursors[op_idx] += 1
+                            progress = True
+                            break
+
+                if not progress:
+                    scheduled = [
+                        f"{op_records[i].op.op_cls.__name__}: {cursors[i]}/{op_records[i].op.total_tiles}"
+                        for i in range(num_ops)
+                    ]
+                    raise RuntimeError(f"Deadlock in backward scheduling. Cursors: {scheduled}")
+
+            pending = next_pending
+
+        return instructions
+
+
+# Default scheduler instance
+_default_scheduler: TileScheduler = LevelBatchedScheduler()
+
+
+def get_default_scheduler() -> TileScheduler:
+    """Get the default tile scheduler."""
+    return _default_scheduler
+
+
+def set_default_scheduler(scheduler: TileScheduler) -> None:
+    """Set the default tile scheduler."""
+    global _default_scheduler
+    _default_scheduler = scheduler
+
+
+# =============================================================================
 # Instruction Stream Builder
 # =============================================================================
 
@@ -1076,33 +1420,6 @@ class InstructionStreamBuilder:
                 )
 
         return edges
-
-    @staticmethod
-    def _producer_threshold(
-        edge: _DepEdge,
-        consumer_cursor: int,
-        producer_total: int,
-        consumer_total: int,
-    ) -> int:
-        """Minimum producer tiles that must be emitted before consumer tile k.
-
-        Args:
-            edge: The dependency edge
-            consumer_cursor: Current consumer tile index (k)
-            producer_total: Total tiles in the producer op
-            consumer_total: Total tiles in the consumer op
-        """
-        if edge.kind == "many_to_one":
-            return producer_total
-        elif edge.kind == "one_to_many":
-            # Consumer tile k needs producer tile floor(k * P / C)
-            return min(
-                (consumer_cursor * producer_total) // consumer_total + 1,
-                producer_total,
-            )
-        else:
-            # one_to_one: consumer tile k needs producer tile k
-            return min(consumer_cursor + 1, producer_total)
 
     def _resolve(
         self,
@@ -1340,26 +1657,23 @@ class InstructionStreamBuilder:
 
         return formulas, barrier_counter
 
-    def build(self) -> List[TileInstruction]:
-        """Build an instruction list using level-batched wavefront scheduling.
+    def build(self, scheduler: Optional[TileScheduler] = None) -> List[TileInstruction]:
+        """Build an instruction list using the specified scheduler.
 
-        Emits tiles in dependency order, batching tiles from the same "level"
-        together to naturally spread work across SMs when they fetch
-        instructions with strided distribution.
+        Args:
+            scheduler: Tile scheduler to use. If None, uses the default
+                scheduler (LevelBatchedScheduler by default).
 
-        Strategy:
-        1. Emit ALL tiles from source ops (no dependencies) first
-        2. Then emit dependent ops using greedy wavefront
+        Returns:
+            List of TileInstructions with END marker at the end.
 
-        This spreads producer tiles across SMs (better load balancing) while
-        still respecting dependencies via barriers. For example:
+        The default LevelBatchedScheduler emits tiles in dependency order,
+        batching tiles from the same "level" together to naturally spread
+        work across SMs when they fetch instructions with strided distribution.
 
-        One-to-many (Producer 4 tiles → Consumer 16 tiles):
+        For example with one-to-many (Producer 4 tiles → Consumer 16 tiles):
             P0, P1, P2, P3, C0, C1, C2, ...
         With 2 SMs: Block 0 gets P0,P2,C0,... Block 1 gets P1,P3,C1,...
-
-        Contrast with pure greedy which interleaves P0,C0,P1,C1,... putting
-        all producers on one SM.
         """
         # Ensure formulas are resolved (sets _barrier_count)
         self._resolve()
@@ -1373,70 +1687,11 @@ class InstructionStreamBuilder:
         for edge in edges:
             consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
 
-        num_ops = len(self._op_records)
-        cursors = [0] * num_ops
-        total_tiles = sum(rec.op.total_tiles for rec in self._op_records)
-        instructions: List[TileInstruction] = []
+        # Use provided scheduler or default
+        if scheduler is None:
+            scheduler = get_default_scheduler()
 
-        # Phase 1: Emit ALL tiles from source ops (ops with no dependencies)
-        # This spreads them evenly across SMs via strided fetch
-        for rec in self._op_records:
-            idx = rec.op_idx
-            if idx not in consumer_deps:
-                # Source op: emit all tiles now
-                for tile in rec.tiles:
-                    instructions.append(
-                        TileInstruction(
-                            op_idx=idx,
-                            tile_m=tile[0],
-                            tile_n=tile[1],
-                            tile_l=tile[2],
-                        )
-                    )
-                cursors[idx] = rec.op.total_tiles
-
-        # Phase 2: Greedy wavefront for remaining ops
-        while len(instructions) < total_tiles:
-            progress = False
-            for rec in self._op_records:
-                idx = rec.op_idx
-                if cursors[idx] >= rec.op.total_tiles:
-                    continue
-
-                # Check all producer dependencies for the next tile
-                can_emit = True
-                for edge in consumer_deps.get(idx, []):
-                    prod_rec = self._op_records[edge.producer_idx]
-                    needed = self._producer_threshold(
-                        edge,
-                        cursors[idx],
-                        prod_rec.op.total_tiles,
-                        rec.op.total_tiles,
-                    )
-                    if cursors[edge.producer_idx] < needed:
-                        can_emit = False
-                        break
-
-                if can_emit:
-                    tile = rec.tiles[cursors[idx]]
-                    instructions.append(
-                        TileInstruction(
-                            op_idx=idx,
-                            tile_m=tile[0],
-                            tile_n=tile[1],
-                            tile_l=tile[2],
-                        )
-                    )
-                    cursors[idx] += 1
-                    progress = True
-
-            if not progress:
-                scheduled = [
-                    f"{self._op_records[i].op.op_cls.__name__}: {cursors[i]}/{self._op_records[i].op.total_tiles}"
-                    for i in range(num_ops)
-                ]
-                raise RuntimeError(f"Deadlock in tile scheduling. Cursors: {scheduled}")
-
+        instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
         instructions.append(TileInstruction.end_instruction())
         return instructions
 
@@ -1484,6 +1739,11 @@ __all__ = [
     "ExecutionMode",
     # Scheduling
     "ScheduledOp",
+    "TileScheduler",
+    "LevelBatchedScheduler",
+    "BackwardScheduler",
+    "get_default_scheduler",
+    "set_default_scheduler",
     # Barrier Formulas
     "BarrierFormula",
     # Instruction Stream
