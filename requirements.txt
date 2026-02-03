@@ -7,3 +7,4 @@ nvidia-cutlass-dsl>=4.3.4
 flash-attn-cute
 quack-kernels
 accelerate
+cutedsl-trace

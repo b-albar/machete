@@ -25,4 +25,9 @@ __version__ = "0.1.0"
 
 from machete.patch import patch, unpatch, is_patched
 
-__all__ = ["patch", "unpatch", "is_patched", "__version__"]
+__all__ = [
+    "patch",
+    "unpatch",
+    "is_patched",
+    "__version__",
+]
