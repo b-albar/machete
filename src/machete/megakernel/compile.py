@@ -276,17 +276,19 @@ def compile_warp_specialized(
 
     parts = []
 
-    # Inline init body before the warp split
+    # Inline init source (pointers, dims, tensors) before the warp split
     if init_source is not None:
         parts.append(init_source)
-    elif init_fn is not None and not _is_pass_only(init_fn):
+
+    # Also inline init_fn body if it has custom setup (e.g., smem allocations)
+    if init_fn is not None and not _is_pass_only(init_fn):
         parts.append(_extract_body(init_fn))
         all_fns.append(init_fn)
 
     parts.extend([
         "warp_id = cute.arch.warp_idx()",
         "",
-        "mbar_storage = cute.arch.alloc_smem(cute.uint64, 2, alignment=8)",
+        "mbar_storage = cute.arch.alloc_smem(cute.Uint64, 2, alignment=8)",
         "mbar_full = mbar_storage",
         "mbar_empty = mbar_storage + 1",
         "",
