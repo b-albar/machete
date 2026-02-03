@@ -37,6 +37,39 @@ def _parse_dims(dim_str: str) -> List[str]:
     return [d.strip() for d in dim_str.split(",")]
 
 
+def _parse_tile_spec(tile) -> Tuple[Tuple[str, ...], Dict[str, int]]:
+    """Parse tile specification into dimension names and tile sizes.
+
+    Supports two formats:
+    - Simple: tile = ("M", "N") - all tile sizes default to 1
+    - With sizes: tile = (("M", 2), ("N", 4)) - explicit tile sizes
+
+    Mixed format is also supported:
+    - tile = ("M", ("N", 4)) - M has size 1, N has size 4
+
+    Returns:
+        (dim_names, tile_sizes) where tile_sizes maps dim_name -> size
+    """
+    if isinstance(tile, str):
+        tile = (tile,)
+
+    dim_names = []
+    tile_sizes = {}
+
+    for item in tile:
+        if isinstance(item, str):
+            dim_names.append(item)
+            tile_sizes[item] = 1
+        elif isinstance(item, tuple) and len(item) == 2:
+            dim_name, size = item
+            dim_names.append(dim_name)
+            tile_sizes[dim_name] = size
+        else:
+            raise ValueError(f"Invalid tile spec item: {item}. Expected str or (str, int) tuple.")
+
+    return tuple(dim_names), tile_sizes
+
+
 def _build_tensor_and_dim_lists(reads, writes):
     """Build ordered unique tensor list and dim list from reads/writes.
 
@@ -73,8 +106,14 @@ def _build_tensor_and_dim_lists(reads, writes):
     return unique_tensors, unique_dims
 
 
-def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
-                     tile_dim_names=None, dynamic_dim_overrides=None):
+def _gen_init_source(
+    unique_tensors,
+    unique_dims,
+    static_dims=None,
+    tile_dim_names=None,
+    dynamic_dim_overrides=None,
+    kernel_config=None,
+):
     """Generate init source code with static dims as compile-time constants.
 
     Static dims (non-tile dimensions) are emitted as Python int literals,
@@ -91,10 +130,17 @@ def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
             If None, all dims are treated as dynamic (legacy behavior).
         tile_dim_names: Set of dim names that are tile (dynamic) dimensions.
         dynamic_dim_overrides: Set of additional dim names to treat as dynamic.
+        kernel_config: Dict of kernel configuration parameters to emit as
+            compile-time constants (e.g., threads_per_row, tile_size_M).
     """
     lines = []
     lines.append("tidx = cute.arch.thread_idx()[0]")
     lines.append("num_threads = cute.arch.block_dim()[0]")
+
+    # Emit kernel config parameters as compile-time constants
+    if kernel_config:
+        for name, value in kernel_config.items():
+            lines.append(f"{name} = {value}")
 
     # Determine which dims are dynamic vs static
     if static_dims is None:
@@ -111,16 +157,12 @@ def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
 
     # Read pointers (int64, 2 int32 words each)
     for i, (name, dtype, dims) in enumerate(unique_tensors):
-        lines.append(
-            f"{name}_ptr_raw = ld_global_i64(op_config_ptr, Int32({i}))"
-        )
+        lines.append(f"{name}_ptr_raw = ld_global_i64(op_config_ptr, Int32({i}))")
 
     # Dynamic dims: load from config (after pointers)
     dim_offset = 2 * len(unique_tensors)
     for j, (dim_name, _, _) in enumerate(dynamic_dims):
-        lines.append(
-            f"{dim_name} = ld_global_i32(op_config_ptr, Int32({dim_offset + j}))"
-        )
+        lines.append(f"{dim_name} = ld_global_i32(op_config_ptr, Int32({dim_offset + j}))")
 
     # Static dims: Python int literals (compile-time constants in CuTe DSL)
     if static_dims is not None:
@@ -129,7 +171,7 @@ def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
 
     # Create CuTe tensor views
     for name, dtype, dims in unique_tensors:
-        dtype_name = dtype.__name__ if hasattr(dtype, '__name__') else str(dtype)
+        dtype_name = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
         lines.append(
             f"{name} = cute.make_tensor("
             f"cute.make_ptr({dtype_name}, {name}_ptr_raw, cute.AddressSpace.gmem), "
@@ -139,8 +181,7 @@ def _gen_init_source(unique_tensors, unique_dims, static_dims=None,
     return "\n".join(lines)
 
 
-def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
-                     dynamic_dim_names=None):
+def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=None):
     """Generate and attach pack_config / pack_backward_config staticmethods.
 
     Only packs pointers and dynamic dims into the config tensor. Static dims
@@ -156,13 +197,12 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
         config_size = 2 * num_unique + num_dynamic
 
         def pack_config(**tensors):
-            config = torch.zeros(config_size, dtype=torch.int32,
-                                 device=next(iter(tensors.values())).device)
+            config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
             # Pack pointers
             for i, (name, dtype, dims) in enumerate(tensors_decl):
                 t = tensors[name]
                 assert t.is_contiguous(), f"{name} must be contiguous"
-                lo, hi = struct.unpack('<2i', struct.pack('<Q', t.data_ptr()))
+                lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
                 config[2 * i] = lo
                 config[2 * i + 1] = hi
             # Pack dynamic dims only
@@ -180,15 +220,13 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
     cls.pack_config = _make_pack_fn(unique_tensors, unique_dims, dynamic_dim_names)
 
     # Backward config: use backward_reads/backward_writes if defined
-    bwd_reads = getattr(cls, 'backward_reads', None) or reads
-    bwd_writes = getattr(cls, 'backward_writes', None) or writes
+    bwd_reads = getattr(cls, "backward_reads", None) or reads
+    bwd_writes = getattr(cls, "backward_writes", None) or writes
     if bwd_reads is reads and bwd_writes is writes:
         cls.pack_backward_config = cls.pack_config
     else:
         bwd_tensors, bwd_dims = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims,
-                                                  dynamic_dim_names)
-
+        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims, dynamic_dim_names)
 
 
 def _process_op_declarations(cls):
@@ -200,14 +238,18 @@ def _process_op_declarations(cls):
 
     Stores tensor/dim metadata on the class for deferred init generation
     at compile time (when static dim values are known).
+
+    Tile declaration format:
+        tile = ("M",)              # Simple: tile_size defaults to 1
+        tile = (("M", 2),)         # With size: M tiles process 2 items each
+        tile = ("M", ("N", 4))     # Mixed: M size 1, N size 4
     """
     reads = cls.reads
     writes = cls.writes
     tile = cls.tile
 
-    # Normalize tile to tuple
-    if isinstance(tile, str):
-        tile = (tile,)
+    # Parse tile spec into dim names and sizes
+    tile, tile_sizes = _parse_tile_spec(tile)
 
     # Build tensor and dim lists
     unique_tensors, unique_dims = _build_tensor_and_dim_lists(reads, writes)
@@ -217,7 +259,7 @@ def _process_op_declarations(cls):
     # All other dims are static by default (model constants baked into compiled kernel).
     # Ops can override with dynamic_dims = ("S",) to keep specific dims dynamic.
     tile_dim_names = set(tile)
-    dynamic_dim_overrides = set(getattr(cls, 'dynamic_dims', ()))
+    dynamic_dim_overrides = set(getattr(cls, "dynamic_dims", ()))
     dynamic_dim_names = tile_dim_names | dynamic_dim_overrides
     static_dim_names = [d for d, _, _ in unique_dims if d not in dynamic_dim_names]
 
@@ -227,16 +269,16 @@ def _process_op_declarations(cls):
     cls._TILE_DIM_NAMES = tile_dim_names
     cls._DYNAMIC_DIM_OVERRIDES = dynamic_dim_overrides
     cls._STATIC_DIM_NAMES = static_dim_names
+    cls._TILE_SIZES = tile_sizes  # {dim_name: tile_size}
 
     # Backward tensor/dim metadata (may differ from forward)
-    bwd_reads = getattr(cls, 'backward_reads', None) or reads
-    bwd_writes = getattr(cls, 'backward_writes', None) or writes
+    bwd_reads = getattr(cls, "backward_reads", None) or reads
+    bwd_writes = getattr(cls, "backward_writes", None) or writes
     if bwd_reads is reads and bwd_writes is writes:
         cls._BWD_UNIQUE_TENSORS = unique_tensors
         cls._BWD_UNIQUE_DIMS = unique_dims
     else:
-        cls._BWD_UNIQUE_TENSORS, cls._BWD_UNIQUE_DIMS = \
-            _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
+        cls._BWD_UNIQUE_TENSORS, cls._BWD_UNIQUE_DIMS = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
 
     # Set INPUTS / OUTPUTS
     cls.INPUTS = list(reads.keys())
@@ -257,25 +299,29 @@ def _process_op_declarations(cls):
     tile_dims = []
     for t in tile:
         if t not in dim_lookup:
-            raise ValueError(
-                f"Tile dim '{t}' not found in any tensor shape declaration"
-            )
+            raise ValueError(f"Tile dim '{t}' not found in any tensor shape declaration")
         tile_dims.append(dim_lookup[t])
 
-    def _make_tile_fn(tensor_name, axis_idx):
+    def _make_tile_fn(tensor_name, axis_idx, dim_name, tile_size):
         def tile_fn(**tensors):
-            return tensors[tensor_name].shape[axis_idx]
+            dim_size = tensors[tensor_name].shape[axis_idx]
+            # Ceiling division: (dim_size + tile_size - 1) // tile_size
+            return (dim_size + tile_size - 1) // tile_size
+
         return staticmethod(tile_fn)
 
-    cls.compute_tiles = _make_tile_fn(*tile_dims[0])
+    # Create tile functions with appropriate tile_size for each dimension
+    tile_dim_0 = tile[0]
+    cls.compute_tiles = _make_tile_fn(*tile_dims[0], tile_dim_0, tile_sizes[tile_dim_0])
     if len(tile) > 1:
-        cls.tiles_n = _make_tile_fn(*tile_dims[1])
+        tile_dim_1 = tile[1]
+        cls.tiles_n = _make_tile_fn(*tile_dims[1], tile_dim_1, tile_sizes[tile_dim_1])
     if len(tile) > 2:
-        cls.tiles_l = _make_tile_fn(*tile_dims[2])
+        tile_dim_2 = tile[2]
+        cls.tiles_l = _make_tile_fn(*tile_dims[2], tile_dim_2, tile_sizes[tile_dim_2])
 
     # Generate pack_config / pack_backward_config (only packs dynamic dims)
-    _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes,
-                     dynamic_dim_names=dynamic_dim_names)
+    _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
     # Add schedule() classmethod
     @classmethod
@@ -292,7 +338,7 @@ def _process_op_declarations(cls):
         tiles_l = cls.tiles_l(**tensors)
 
         # Select forward or backward dim/tensor declarations
-        if backward and hasattr(cls, '_BWD_UNIQUE_DIMS'):
+        if backward and hasattr(cls, "_BWD_UNIQUE_DIMS"):
             unique_dims = cls._BWD_UNIQUE_DIMS
             pack_fn = cls.pack_backward_config
         else:
@@ -320,11 +366,17 @@ def _process_op_declarations(cls):
 
     # Add gen_init_source classmethod for deferred init generation
     @classmethod
-    def gen_init_source(cls, static_dims, backward=False):
+    def gen_init_source(cls, static_dims, backward=False, kernel_config=None):
         """Generate init source with static dims baked as compile-time constants.
 
         Called at kernel compile time when static dim values are known.
         Returns a source string (not a function) to be inlined by compile.py.
+
+        Args:
+            static_dims: Dict mapping static dim names to their int values.
+            backward: If True, use backward tensor declarations.
+            kernel_config: Dict of kernel config parameters (e.g., threads_per_row).
+                Also includes tile_size_<DIM> for each tile dimension.
         """
         if backward:
             tensors = cls._BWD_UNIQUE_TENSORS
@@ -332,11 +384,23 @@ def _process_op_declarations(cls):
         else:
             tensors = cls._UNIQUE_TENSORS
             dims = cls._UNIQUE_DIMS
+
+        # Build kernel config with tile sizes
+        full_kernel_config = {}
+        if kernel_config:
+            full_kernel_config.update(kernel_config)
+
+        # Add tile sizes as tile_size_<DIM> (e.g., tile_size_M = 2)
+        for dim_name, size in cls._TILE_SIZES.items():
+            full_kernel_config[f"tile_size_{dim_name}"] = size
+
         return _gen_init_source(
-            tensors, dims,
+            tensors,
+            dims,
             static_dims=static_dims,
             tile_dim_names=cls._TILE_DIM_NAMES,
             dynamic_dim_overrides=cls._DYNAMIC_DIM_OVERRIDES,
+            kernel_config=full_kernel_config if full_kernel_config else None,
         )
 
     cls.gen_init_source = gen_init_source
@@ -404,15 +468,19 @@ class Op:
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if hasattr(cls, 'reads') and hasattr(cls, 'writes'):
+        if hasattr(cls, "reads") and hasattr(cls, "writes"):
             _process_op_declarations(cls)
 
     # --- Forward pass ---
 
     @staticmethod
     def init_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Shared setup before warp split (optional).
@@ -430,8 +498,12 @@ class Op:
 
     @staticmethod
     def load_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Load data from global to shared memory."""
@@ -439,8 +511,12 @@ class Op:
 
     @staticmethod
     def compute_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Perform the forward computation."""
@@ -448,8 +524,12 @@ class Op:
 
     @staticmethod
     def store_forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Store results to global memory."""
@@ -459,8 +539,12 @@ class Op:
 
     @staticmethod
     def init_backward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Shared setup before warp split for the backward pass (optional).
@@ -471,8 +555,12 @@ class Op:
 
     @staticmethod
     def load_backward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Load data/gradients from global to shared memory for backward pass."""
@@ -480,8 +568,12 @@ class Op:
 
     @staticmethod
     def compute_backward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Compute gradients."""
@@ -489,8 +581,12 @@ class Op:
 
     @staticmethod
     def store_backward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+        smem_base: Int32,
+        config_ptr: Int32,
+        page_ids: tuple,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Store gradients to global memory."""
@@ -508,9 +604,7 @@ class Op:
         Returns:
             tiles_m for the ScheduledOp.
         """
-        raise NotImplementedError(
-            "Op subclasses must implement compute_tiles()"
-        )
+        raise NotImplementedError("Op subclasses must implement compute_tiles()")
 
     @staticmethod
     def tiles_n(**tensors) -> int:
@@ -574,7 +668,7 @@ class ScheduledOp:
 
     def __post_init__(self):
         if self.dim_names is None:
-            self.dim_names = getattr(self.op_cls, 'DIM_NAMES', {})
+            self.dim_names = getattr(self.op_cls, "DIM_NAMES", {})
 
     @property
     def total_tiles(self) -> int:
@@ -617,6 +711,7 @@ class BarrierFormula:
             is less than this value. Defaults to NO_GUARD (always passes).
             Used for legacy mode with mismatched tile counts.
     """
+
     # Sentinel: guard_max value that always passes (larger than any tile count)
     NO_GUARD: ClassVar[int] = 2**30
 
@@ -629,10 +724,7 @@ class BarrierFormula:
 
     def compute_index(self, tile_m: int, tile_n: int, tile_l: int) -> int:
         """Compute barrier index for a given tile (host-side, for testing)."""
-        return (self.base
-                + self.coeff_m * tile_m
-                + self.coeff_n * tile_n
-                + self.coeff_l * tile_l)
+        return self.base + self.coeff_m * tile_m + self.coeff_n * tile_n + self.coeff_l * tile_l
 
     def is_guarded(self, tile_m: int, tile_n: int, tile_l: int) -> bool:
         """Check if the guard passes for a given tile (host-side, for testing)."""
@@ -692,6 +784,7 @@ class TileInstruction:
 @dataclass
 class _OpRecord:
     """Internal record for an op added to the builder."""
+
     op_idx: int
     op: ScheduledOp
     # Flat list of tile coordinate tuples: [(m, n, l), ...]
@@ -711,6 +804,7 @@ class _DepEdge:
               "many_to_one": each consumer tile needs ALL producer tiles
               "one_to_many": consumer tile k needs a proportional subset
     """
+
     producer_idx: int
     consumer_idx: int
     kind: str  # "one_to_one", "many_to_one", "one_to_many"
@@ -826,16 +920,10 @@ class InstructionStreamBuilder:
         if dim_names:
             for dim, axis in dim_names.items():
                 if axis not in _valid_axes:
-                    raise ValueError(
-                        f"Invalid axis '{axis}' for dim '{dim}'. "
-                        f"Must be one of {_valid_axes}"
-                    )
+                    raise ValueError(f"Invalid axis '{axis}' for dim '{dim}'. Must be one of {_valid_axes}")
             axes = list(dim_names.values())
             if len(axes) != len(set(axes)):
-                raise ValueError(
-                    f"dim_names maps multiple dims to the same axis: "
-                    f"{dim_names}"
-                )
+                raise ValueError(f"dim_names maps multiple dims to the same axis: {dim_names}")
 
         op = ScheduledOp(
             op_cls=op_cls,
@@ -867,10 +955,7 @@ class InstructionStreamBuilder:
 
     def _has_named_buffers(self) -> bool:
         """Check if any op declares INPUTS or OUTPUTS."""
-        return any(
-            r.op.op_cls.INPUTS or r.op.op_cls.OUTPUTS
-            for r in self._op_records
-        )
+        return any(r.op.op_cls.INPUTS or r.op.op_cls.OUTPUTS for r in self._op_records)
 
     def _resolve_dep_edges(self) -> List[_DepEdge]:
         """Resolve op-level dependency edges for tile scheduling.
@@ -881,8 +966,7 @@ class InstructionStreamBuilder:
         if not self._has_named_buffers():
             # Legacy linear chain: each op depends on previous, 1:1
             return [
-                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one")
-                for i in range(1, len(self._op_records))
+                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one") for i in range(1, len(self._op_records))
             ]
 
         # Named buffer dependencies
@@ -913,11 +997,13 @@ class InstructionStreamBuilder:
                 else:
                     kind = "one_to_one"
 
-                edges.append(_DepEdge(
-                    producer_idx=prod_idx,
-                    consumer_idx=rec.op_idx,
-                    kind=kind,
-                ))
+                edges.append(
+                    _DepEdge(
+                        producer_idx=prod_idx,
+                        consumer_idx=rec.op_idx,
+                        kind=kind,
+                    )
+                )
 
         return edges
 
@@ -948,7 +1034,9 @@ class InstructionStreamBuilder:
             # one_to_one: consumer tile k needs producer tile k
             return min(consumer_cursor + 1, producer_total)
 
-    def _resolve(self) -> Tuple[
+    def _resolve(
+        self,
+    ) -> Tuple[
         Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
         int,
     ]:
@@ -970,7 +1058,9 @@ class InstructionStreamBuilder:
         self._barrier_count = count
         return formulas, count
 
-    def _resolve_legacy_formulas(self) -> Tuple[
+    def _resolve_legacy_formulas(
+        self,
+    ) -> Tuple[
         Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
         int,
     ]:
@@ -992,9 +1082,14 @@ class InstructionStreamBuilder:
             cl = op.tiles_m * op.tiles_n
 
             # Signal: own barrier
-            signal_formulas = [BarrierFormula(
-                base=signal_base, coeff_m=cm, coeff_n=cn, coeff_l=cl,
-            )]
+            signal_formulas = [
+                BarrierFormula(
+                    base=signal_base,
+                    coeff_m=cm,
+                    coeff_n=cn,
+                    coeff_l=cl,
+                )
+            ]
 
             # Wait: previous op's barrier (if exists)
             wait_formulas: List[BarrierFormula] = []
@@ -1002,20 +1097,26 @@ class InstructionStreamBuilder:
                 prev_op = self._op_records[i - 1].op
                 prev_base = barrier_counter - prev_op.total_tiles
                 # Guard for mismatched tile counts
-                guard = (prev_op.total_tiles
-                         if prev_op.total_tiles != op.total_tiles
-                         else BarrierFormula.NO_GUARD)
-                wait_formulas.append(BarrierFormula(
-                    base=prev_base, coeff_m=cm, coeff_n=cn, coeff_l=cl,
-                    expected=1, guard_max=guard,
-                ))
+                guard = prev_op.total_tiles if prev_op.total_tiles != op.total_tiles else BarrierFormula.NO_GUARD
+                wait_formulas.append(
+                    BarrierFormula(
+                        base=prev_base,
+                        coeff_m=cm,
+                        coeff_n=cn,
+                        coeff_l=cl,
+                        expected=1,
+                        guard_max=guard,
+                    )
+                )
 
             formulas[i] = (wait_formulas, signal_formulas)
             barrier_counter += op.total_tiles
 
         return formulas, barrier_counter
 
-    def _resolve_named_formulas(self) -> Tuple[
+    def _resolve_named_formulas(
+        self,
+    ) -> Tuple[
         Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
         int,
     ]:
@@ -1034,10 +1135,7 @@ class InstructionStreamBuilder:
         for rec in self._op_records:
             for buf in rec.op.op_cls.OUTPUTS:
                 if buf in buffer_producers:
-                    raise ValueError(
-                        f"Buffer '{buf}' produced by both op {buffer_producers[buf]} "
-                        f"and op {rec.op_idx}"
-                    )
+                    raise ValueError(f"Buffer '{buf}' produced by both op {buffer_producers[buf]} and op {rec.op_idx}")
                 buffer_producers[buf] = rec.op_idx
 
         # Init per-op formula lists
@@ -1095,24 +1193,36 @@ class InstructionStreamBuilder:
 
                 # Compute formula coefficients
                 p_cm, p_cn, p_cl = _compute_formula_coeffs(
-                    p_op, target_op, shared_dims,
+                    p_op,
+                    target_op,
+                    shared_dims,
                 )
                 c_cm, c_cn, c_cl = _compute_formula_coeffs(
-                    c_op, target_op, shared_dims,
+                    c_op,
+                    target_op,
+                    shared_dims,
                 )
 
                 # Producer signal formula
-                formulas[prod_idx][1].append(BarrierFormula(
-                    base=barrier_counter,
-                    coeff_m=p_cm, coeff_n=p_cn, coeff_l=p_cl,
-                ))
+                formulas[prod_idx][1].append(
+                    BarrierFormula(
+                        base=barrier_counter,
+                        coeff_m=p_cm,
+                        coeff_n=p_cn,
+                        coeff_l=p_cl,
+                    )
+                )
 
                 # Consumer wait formula
-                formulas[rec.op_idx][0].append(BarrierFormula(
-                    base=barrier_counter,
-                    coeff_m=c_cm, coeff_n=c_cn, coeff_l=c_cl,
-                    expected=expected,
-                ))
+                formulas[rec.op_idx][0].append(
+                    BarrierFormula(
+                        base=barrier_counter,
+                        coeff_m=c_cm,
+                        coeff_n=c_cn,
+                        coeff_l=c_cl,
+                        expected=expected,
+                    )
+                )
 
                 barrier_counter += num_barriers
 
@@ -1172,24 +1282,23 @@ class InstructionStreamBuilder:
 
                 if can_emit:
                     tile = rec.tiles[cursors[idx]]
-                    instructions.append(TileInstruction(
-                        op_idx=idx,
-                        tile_m=tile[0],
-                        tile_n=tile[1],
-                        tile_l=tile[2],
-                    ))
+                    instructions.append(
+                        TileInstruction(
+                            op_idx=idx,
+                            tile_m=tile[0],
+                            tile_n=tile[1],
+                            tile_l=tile[2],
+                        )
+                    )
                     cursors[idx] += 1
                     progress = True
 
             if not progress:
                 scheduled = [
-                    f"{self._op_records[i].op.op_cls.__name__}: "
-                    f"{cursors[i]}/{self._op_records[i].op.total_tiles}"
+                    f"{self._op_records[i].op.op_cls.__name__}: {cursors[i]}/{self._op_records[i].op.total_tiles}"
                     for i in range(num_ops)
                 ]
-                raise RuntimeError(
-                    f"Deadlock in tile scheduling. Cursors: {scheduled}"
-                )
+                raise RuntimeError(f"Deadlock in tile scheduling. Cursors: {scheduled}")
 
         instructions.append(TileInstruction.end_instruction())
         return instructions

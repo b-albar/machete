@@ -196,11 +196,29 @@ if HAS_TRITON:
         return dx
 
 
+# =============================================================================
+# CUTLASS Reference (optional, requires SM90+)
+# =============================================================================
+
+# Import from the dedicated CUTLASS reference file
+try:
+    from machete.kernels.rms_norm.rmsnorm_ref_cutlass import (
+        rmsnorm_cutlass,
+        HAS_CUTLASS_RMSNORM,
+    )
+except ImportError:
+    HAS_CUTLASS_RMSNORM = False
+
+
 __all__ = [
     "rmsnorm_pytorch",
     "rmsnorm_backward_pytorch",
     "HAS_TRITON",
+    "HAS_CUTLASS_RMSNORM",
 ]
 
 if HAS_TRITON:
     __all__.extend(["rmsnorm_triton", "rmsnorm_backward_triton"])
+
+if HAS_CUTLASS_RMSNORM:
+    __all__.append("rmsnorm_cutlass")

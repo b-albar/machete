@@ -24,7 +24,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 import cutlass.cute as cute
@@ -105,6 +105,7 @@ def _make_pre_handler(n_pages, wait_formulas):
     """
 
     if n_pages == 0:
+
         @cute.jit
         def pre_handler(
             scratch_ptr: Int32,
@@ -121,14 +122,9 @@ def _make_pre_handler(n_pages, wait_formulas):
         ) -> None:
             if tidx == Int32(0):
                 for wf in wait_formulas:
-                    _linear = (Int32(wf.coeff_m) * tile_m
-                               + Int32(wf.coeff_n) * tile_n
-                               + Int32(wf.coeff_l) * tile_l)
+                    _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
                     if _linear < Int32(wf.guard_max):
-                        global_barrier_wait(
-                            barriers_ptr,
-                            Int32(wf.base) + _linear,
-                            Int32(wf.expected))
+                        global_barrier_wait(barriers_ptr, Int32(wf.base) + _linear, Int32(wf.expected))
 
         return pre_handler
 
@@ -148,14 +144,9 @@ def _make_pre_handler(n_pages, wait_formulas):
     ) -> None:
         if tidx == Int32(0):
             for wf in wait_formulas:
-                _linear = (Int32(wf.coeff_m) * tile_m
-                           + Int32(wf.coeff_n) * tile_n
-                           + Int32(wf.coeff_l) * tile_l)
+                _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
                 if _linear < Int32(wf.guard_max):
-                    global_barrier_wait(
-                        barriers_ptr,
-                        Int32(wf.base) + _linear,
-                        Int32(wf.expected))
+                    global_barrier_wait(barriers_ptr, Int32(wf.base) + _linear, Int32(wf.expected))
 
             # Batch acquire: read head once, acquire all pages, write head once
             _head = ld_shared_i32(free_list_head_ptr)
@@ -182,6 +173,7 @@ def _make_post_handler(n_pages, signal_formulas):
     """
 
     if n_pages == 0:
+
         @cute.jit
         def post_handler(
             scratch_ptr: Int32,
@@ -197,10 +189,12 @@ def _make_post_handler(n_pages, signal_formulas):
         ) -> None:
             if tidx == Int32(0):
                 for sf in signal_formulas:
-                    _sidx = (Int32(sf.base)
-                             + Int32(sf.coeff_m) * tile_m
-                             + Int32(sf.coeff_n) * tile_n
-                             + Int32(sf.coeff_l) * tile_l)
+                    _sidx = (
+                        Int32(sf.base)
+                        + Int32(sf.coeff_m) * tile_m
+                        + Int32(sf.coeff_n) * tile_n
+                        + Int32(sf.coeff_l) * tile_l
+                    )
                     global_barrier_signal(barriers_ptr, _sidx)
 
         return post_handler
@@ -230,10 +224,12 @@ def _make_post_handler(n_pages, signal_formulas):
             st_shared_i32(free_list_tail_ptr, _new_tail)
 
             for sf in signal_formulas:
-                _sidx = (Int32(sf.base)
-                         + Int32(sf.coeff_m) * tile_m
-                         + Int32(sf.coeff_n) * tile_n
-                         + Int32(sf.coeff_l) * tile_l)
+                _sidx = (
+                    Int32(sf.base)
+                    + Int32(sf.coeff_m) * tile_m
+                    + Int32(sf.coeff_n) * tile_n
+                    + Int32(sf.coeff_l) * tile_l
+                )
                 global_barrier_signal(barriers_ptr, _sidx)
 
     return post_handler
@@ -253,6 +249,7 @@ def _make_tile_caller(tile_fn, n_pages):
     """
 
     if n_pages == 0:
+
         @cute.jit
         def tile_caller(
             smem_base: Int32,
@@ -277,10 +274,7 @@ def _make_tile_caller(tile_fn, n_pages):
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        page_ids = tuple(
-            ld_shared_i32(scratch_ptr + Int32(k) * 4)
-            for k in range(n_pages)
-        )
+        page_ids = tuple(ld_shared_i32(scratch_ptr + Int32(k) * 4) for k in range(n_pages))
         tile_fn(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr)
 
     return tile_caller
@@ -325,6 +319,11 @@ class MegakernelConfig:
 class Megakernel:
     """Persistent megakernel with instruction stream, paged memory, and op dispatch.
 
+    Caching:
+        Compiled kernels are cached at the class level to avoid recompilation
+        when creating multiple Megakernel instances with the same configuration.
+        The cache key is based on: (op_classes, static_dims, config_params, backward).
+
     Architecture:
     - All SMs launched as persistent blocks
     - Each block fetches instructions from global memory in a strided pattern
@@ -355,6 +354,10 @@ class Megakernel:
         bwd_kernel.run()
     """
 
+    # Class-level cache for compiled kernels to avoid recompilation
+    # Key: (op_classes_tuple, static_dims_tuple, config_key, backward)
+    _compiled_kernel_cache: Dict[Tuple, Any] = {}
+
     def __init__(
         self,
         ops: List[ScheduledOp],
@@ -370,9 +373,7 @@ class Megakernel:
         # Detect SM count if not specified
         if self.config.num_sms is None:
             if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "CUDA is not available. Megakernel requires a CUDA GPU."
-                )
+                raise RuntimeError("CUDA is not available. Megakernel requires a CUDA GPU.")
             props = torch.cuda.get_device_properties(device)
             self.config.num_sms = props.multi_processor_count
 
@@ -454,9 +455,7 @@ class Megakernel:
             self._num_instructions_i32 = Int32(self._num_instructions)
 
         if self._barriers_tensor is None:
-            self._barriers_tensor = torch.zeros(
-                self.num_barriers, dtype=torch.int32, device=self.device
-            )
+            self._barriers_tensor = torch.zeros(self.num_barriers, dtype=torch.int32, device=self.device)
 
         if self._op_configs_tensor is None:
             # One Int64 pointer per op. Ops with no config get pointer 0.
@@ -466,9 +465,7 @@ class Megakernel:
                     config_ptrs.append(op.config_data.data_ptr())
                 else:
                     config_ptrs.append(0)
-            self._op_configs_tensor = torch.tensor(
-                config_ptrs, dtype=torch.int64, device=self.device
-            )
+            self._op_configs_tensor = torch.tensor(config_ptrs, dtype=torch.int64, device=self.device)
 
     def _validate_requirements(self) -> None:
         """Validate GPU requirements."""
@@ -481,8 +478,7 @@ class Megakernel:
 
         if major < 9:
             raise RuntimeError(
-                f"Megakernel requires Hopper (SM90+) GPU. "
-                f"Current GPU has compute capability sm_{major}x."
+                f"Megakernel requires Hopper (SM90+) GPU. Current GPU has compute capability sm_{major}x."
             )
 
         max_smem = props.shared_memory_per_block_optin
@@ -499,7 +495,10 @@ class Megakernel:
         """Set up cutedsl-trace builder and trace types."""
         import math
         from cutedsl_trace import (
-            TraceType, BlockType, TrackType, DynamicTraceBuilder,
+            TraceType,
+            BlockType,
+            TrackType,
+            DynamicTraceBuilder,
         )
         from cutedsl_trace.types import LaneType
 
@@ -581,20 +580,15 @@ class Megakernel:
         barrier_formulas = self._builder.get_op_barrier_formulas()
 
         # Pre-compute page counts per op (known at JIT time)
-        op_page_counts = [
-            op.op_cls.NUM_INPUT_PAGES + op.op_cls.NUM_OUTPUT_PAGES
-            for op in ops
-        ]
+        op_page_counts = [op.op_cls.NUM_INPUT_PAGES + op.op_cls.NUM_OUTPUT_PAGES for op in ops]
 
         # --- Build per-op pre/post handlers (N each) ---
         pre_handlers = []
         post_handlers = []
         for i, op in enumerate(ops):
             wait_formulas, signal_formulas = barrier_formulas.get(i, ([], []))
-            pre_handlers.append(
-                _make_pre_handler(op_page_counts[i], wait_formulas))
-            post_handlers.append(
-                _make_post_handler(op_page_counts[i], signal_formulas))
+            pre_handlers.append(_make_pre_handler(op_page_counts[i], wait_formulas))
+            post_handlers.append(_make_post_handler(op_page_counts[i], signal_formulas))
 
         # --- Deduplicate tile functions by (op_cls, exec_mode, producer_warps, static_dims) ---
         # dedup_key → (class_idx, tile_caller)
@@ -603,16 +597,15 @@ class Megakernel:
         class_to_ops = {}
 
         # Select forward or backward method names
-        load_attr = 'load_backward' if use_backward else 'load_forward'
-        compute_attr = 'compute_backward' if use_backward else 'compute_forward'
-        store_attr = 'store_backward' if use_backward else 'store_forward'
-        init_attr = 'init_backward' if use_backward else 'init_forward'
+        load_attr = "load_backward" if use_backward else "load_forward"
+        compute_attr = "compute_backward" if use_backward else "compute_forward"
+        store_attr = "store_backward" if use_backward else "store_forward"
+        init_attr = "init_backward" if use_backward else "init_forward"
 
         for i, op in enumerate(ops):
             # Include static dims in key: different model constants → different compiled code
             static_dims_key = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
-            key = (op.op_cls, op.execution_mode, op.num_producer_warps,
-                   use_backward, static_dims_key)
+            key = (op.op_cls, op.execution_mode, op.num_producer_warps, use_backward, static_dims_key)
             if key not in dedup_map:
                 load_fn = getattr(op.op_cls, load_attr)
                 compute_fn = getattr(op.op_cls, compute_attr)
@@ -622,9 +615,14 @@ class Megakernel:
                 # Falls back to init_fn for ops without gen_init_source (e.g., NOPOp).
                 init_source = None
                 init_fn = None
-                if hasattr(op.op_cls, 'gen_init_source') and op.static_dims:
+                if hasattr(op.op_cls, "gen_init_source") and op.static_dims:
+                    # Pass kernel config parameters (threads_per_row from threads_per_block)
+                    kernel_config = {
+                        "threads_per_row": self.config.threads_per_block,
+                    }
                     init_source = op.op_cls.gen_init_source(
-                        op.static_dims, backward=use_backward)
+                        op.static_dims, backward=use_backward, kernel_config=kernel_config
+                    )
                 else:
                     init_fn = getattr(op.op_cls, init_attr, None)
 
@@ -657,10 +655,7 @@ class Megakernel:
             class_to_ops[class_idx].append(i)
 
         # Build tile dispatch list: [(tile_caller, [op_indices]), ...]
-        tile_dispatch = [
-            (dedup_map[key][1], class_to_ops[dedup_map[key][0]])
-            for key in dedup_map
-        ]
+        tile_dispatch = [(dedup_map[key][1], class_to_ops[dedup_map[key][0]]) for key in dedup_map]
 
         @cute.jit
         def dispatch_op(
@@ -694,10 +689,16 @@ class Megakernel:
             for i, pre in enumerate(pre_handlers):
                 if op_idx == Int32(i):
                     pre(
-                        scratch_ptr, page_state_ptr, free_list_ptr,
+                        scratch_ptr,
+                        page_state_ptr,
+                        free_list_ptr,
                         free_list_head_ptr,
-                        tile_m, tile_n, tile_l,
-                        tidx, instr_idx, num_pages_val,
+                        tile_m,
+                        tile_n,
+                        tile_l,
+                        tidx,
+                        instr_idx,
+                        num_pages_val,
                         barriers_ptr,
                     )
 
@@ -711,8 +712,12 @@ class Megakernel:
                         _match = Boolean(True)
                 if _match:
                     tile_caller(
-                        smem_base, config_ptr, scratch_ptr,
-                        tile_m, tile_n, tile_l,
+                        smem_base,
+                        config_ptr,
+                        scratch_ptr,
+                        tile_m,
+                        tile_n,
+                        tile_l,
                         op_config_ptr,
                     )
 
@@ -722,10 +727,15 @@ class Megakernel:
             for i, post in enumerate(post_handlers):
                 if op_idx == Int32(i):
                     post(
-                        scratch_ptr, page_state_ptr, free_list_ptr,
+                        scratch_ptr,
+                        page_state_ptr,
+                        free_list_ptr,
                         free_list_tail_ptr,
-                        tile_m, tile_n, tile_l,
-                        tidx, num_pages_val,
+                        tile_m,
+                        tile_n,
+                        tile_l,
+                        tidx,
+                        num_pages_val,
                         barriers_ptr,
                     )
 
@@ -776,8 +786,7 @@ class Megakernel:
                     continue_processing = Boolean(False)
                 else:
                     if tidx == Int32(0):
-                        load_instruction_to_smem(
-                            instructions_ptr, instr_idx, scratch_ptr)
+                        load_instruction_to_smem(instructions_ptr, instr_idx, scratch_ptr)
 
                     cute.arch.barrier()
 
@@ -791,12 +800,19 @@ class Megakernel:
                         tile_l = ld_shared_i32(scratch_ptr + 12)
 
                         dispatch_op(
-                            op_idx, smem_base, config_ptr,
-                            scratch_ptr, page_state_ptr,
-                            free_list_ptr, free_list_head_ptr,
+                            op_idx,
+                            smem_base,
+                            config_ptr,
+                            scratch_ptr,
+                            page_state_ptr,
+                            free_list_ptr,
+                            free_list_head_ptr,
                             free_list_tail_ptr,
-                            tile_m, tile_n, tile_l,
-                            tidx, instr_idx,
+                            tile_m,
+                            tile_n,
+                            tile_l,
+                            tidx,
+                            instr_idx,
                             Int32(num_pages),
                             barriers_ptr,
                             op_configs_ptr,
@@ -830,8 +846,7 @@ class Megakernel:
             free_list_ptr = page_state_ptr + Int32(num_pages) * 16
             free_list_head_ptr = free_list_ptr + Int32(num_pages) * 4
             free_list_tail_ptr = free_list_head_ptr + 4
-            return (config_ptr, scratch_ptr, page_state_ptr,
-                    free_list_ptr, free_list_head_ptr, free_list_tail_ptr)
+            return (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr)
 
         if tracing:
             from cutedsl_trace.device import (
@@ -840,6 +855,7 @@ class Megakernel:
                 end_event_dynamic_raw_1,
                 finish_lane_dynamic_raw,
             )
+
             row_stride_bytes = self._trace_builder.row_stride_bytes
             op_format_ids = self._trace_format_ids
 
@@ -860,8 +876,11 @@ class Megakernel:
                     stream,
                 ):
                     self.kernel(
-                        instructions_ptr, barriers_ptr, op_configs_ptr,
-                        trace_buffer_ptr, num_instructions,
+                        instructions_ptr,
+                        barriers_ptr,
+                        op_configs_ptr,
+                        trace_buffer_ptr,
+                        num_instructions,
                     ).launch(
                         grid=[self.num_sms, 1, 1],
                         block=[self.threads_per_block, 1, 1],
@@ -886,9 +905,9 @@ class Megakernel:
                     _init_smem(smem_base, tidx)
                     cute.arch.barrier()
 
-                    (config_ptr, scratch_ptr, page_state_ptr,
-                     free_list_ptr, free_list_head_ptr,
-                     free_list_tail_ptr) = _smem_pointers(smem_base)
+                    (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr) = (
+                        _smem_pointers(smem_base)
+                    )
 
                     # Trace: init lane
                     trace_buffer = cute.make_tensor(
@@ -896,8 +915,11 @@ class Megakernel:
                         cute.make_layout(1 << 24),
                     )
                     lane = begin_lane_dynamic_raw(
-                        Int32(1), Int32(row_stride_bytes),
-                        block_id, Int32(0), tidx == Int32(0),
+                        Int32(1),
+                        Int32(row_stride_bytes),
+                        block_id,
+                        Int32(0),
+                        tidx == Int32(0),
                     )
 
                     # Persistent loop with tracing
@@ -909,8 +931,7 @@ class Megakernel:
                             continue_processing = Boolean(False)
                         else:
                             if tidx == Int32(0):
-                                load_instruction_to_smem(
-                                    instructions_ptr, instr_idx, scratch_ptr)
+                                load_instruction_to_smem(instructions_ptr, instr_idx, scratch_ptr)
 
                             cute.arch.barrier()
                             op_idx = ld_shared_i32(scratch_ptr)
@@ -925,12 +946,19 @@ class Megakernel:
                                 _ts = trace_start()
 
                                 dispatch_op(
-                                    op_idx, smem_base, config_ptr,
-                                    scratch_ptr, page_state_ptr,
-                                    free_list_ptr, free_list_head_ptr,
+                                    op_idx,
+                                    smem_base,
+                                    config_ptr,
+                                    scratch_ptr,
+                                    page_state_ptr,
+                                    free_list_ptr,
+                                    free_list_head_ptr,
                                     free_list_tail_ptr,
-                                    tile_m, tile_n, tile_l,
-                                    tidx, instr_idx,
+                                    tile_m,
+                                    tile_n,
+                                    tile_l,
+                                    tidx,
+                                    instr_idx,
                                     Int32(num_pages),
                                     barriers_ptr,
                                     op_configs_ptr,
@@ -939,9 +967,12 @@ class Megakernel:
                                 for _i, _fmt_id in enumerate(op_format_ids):
                                     if op_idx == Int32(_i):
                                         lane = end_event_dynamic_raw_1(
-                                            _ts, trace_buffer,
+                                            _ts,
+                                            trace_buffer,
                                             Int32(row_stride_bytes),
-                                            lane, Int32(_fmt_id), op_idx,
+                                            lane,
+                                            Int32(_fmt_id),
+                                            op_idx,
                                         )
 
                                 instr_idx = instr_idx + num_blocks
@@ -949,6 +980,7 @@ class Megakernel:
                     finish_lane_dynamic_raw(trace_buffer, lane)
 
         else:
+
             class PersistentKernel:
                 def __init__(self):
                     self.num_sms = num_sms
@@ -966,7 +998,9 @@ class Megakernel:
                     stream,
                 ):
                     self.kernel(
-                        instructions_ptr, barriers_ptr, op_configs_ptr,
+                        instructions_ptr,
+                        barriers_ptr,
+                        op_configs_ptr,
                         num_instructions,
                     ).launch(
                         grid=[self.num_sms, 1, 1],
@@ -991,33 +1025,73 @@ class Megakernel:
                     _init_smem(smem_base, tidx)
                     cute.arch.barrier()
 
-                    (config_ptr, scratch_ptr, page_state_ptr,
-                     free_list_ptr, free_list_head_ptr,
-                     free_list_tail_ptr) = _smem_pointers(smem_base)
+                    (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr) = (
+                        _smem_pointers(smem_base)
+                    )
 
                     _kernel_loop(
-                        instructions_ptr, barriers_ptr, op_configs_ptr,
+                        instructions_ptr,
+                        barriers_ptr,
+                        op_configs_ptr,
                         num_instructions,
-                        tidx, block_id, num_blocks, smem_base,
-                        config_ptr, scratch_ptr, page_state_ptr,
-                        free_list_ptr, free_list_head_ptr,
+                        tidx,
+                        block_id,
+                        num_blocks,
+                        smem_base,
+                        config_ptr,
+                        scratch_ptr,
+                        page_state_ptr,
+                        free_list_ptr,
+                        free_list_head_ptr,
                         free_list_tail_ptr,
                     )
 
         return PersistentKernel()
+
+    def _make_cache_key(self) -> Tuple:
+        """Create a cache key for the compiled kernel.
+
+        The key includes all parameters that affect kernel compilation:
+        - Op classes and their static dimensions
+        - Config parameters (threads, pages, etc.)
+        - Backward flag
+        """
+        op_keys = []
+        for op in self.ops:
+            static_dims_tuple = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
+            op_keys.append((op.op_cls, static_dims_tuple))
+
+        config_key = (
+            self.config.threads_per_block,
+            self.config.num_pages,
+            self.config.page_size,
+            self.config.tracing,
+        )
+
+        return (tuple(op_keys), config_key, self.backward)
 
     def compile(self) -> None:
         """Compile the kernel without running it.
 
         Triggers JIT compilation so that subsequent run() calls have no
         compilation overhead. Safe to call multiple times (no-op after first).
+
+        Uses a class-level cache to avoid recompilation when multiple Megakernel
+        instances have the same configuration (same ops, static_dims, config).
         """
         # _prepare_tensors is idempotent (checks for None internally)
         self._prepare_tensors()
 
         if self._compiled_kernel is None:
+            # Check class-level cache first
+            cache_key = self._make_cache_key()
+            if cache_key in Megakernel._compiled_kernel_cache:
+                self._compiled_kernel = Megakernel._compiled_kernel_cache[cache_key]
+                return
+
             self._validate_requirements()
             from cutedsl_trace.config import set_tracing_enabled
+
             set_tracing_enabled(self.config.tracing)
 
             mode = "backward" if self.backward else "forward"
@@ -1029,6 +1103,24 @@ class Megakernel:
                 f"{self.smem_size // 1024}KB smem..."
             )
             self._compiled_kernel = self._create_kernel()
+
+            # Force upfront JIT compilation with cute.compile()
+            # This avoids lazy compilation on first run()
+            import cuda.bindings.driver as cuda
+            torch_stream = torch.cuda.current_stream()
+            cu_stream = cuda.CUstream(torch_stream.cuda_stream)
+            self._compiled_kernel = cute.compile(
+                self._compiled_kernel,
+                Int64(self._instructions_tensor.data_ptr()),
+                Int64(self._barriers_tensor.data_ptr()),
+                Int64(self._op_configs_tensor.data_ptr()),
+                Int64(0),  # trace_buffer_ptr
+                self._num_instructions_i32,
+                cu_stream,
+            )
+
+            # Store in class-level cache
+            Megakernel._compiled_kernel_cache[cache_key] = self._compiled_kernel
             print("Compilation complete.")
 
     def run(self, stream=None, sync: bool = True) -> None:
@@ -1046,6 +1138,7 @@ class Megakernel:
 
         if stream is None:
             import cuda.bindings.driver as cuda
+
             torch_stream = torch.cuda.current_stream()
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
@@ -1139,9 +1232,7 @@ class Megakernel:
         )
 
     def __repr__(self) -> str:
-        op_names = ", ".join(
-            f"{op.op_cls.__name__}({op.total_tiles})" for op in self.ops
-        )
+        op_names = ", ".join(f"{op.op_cls.__name__}({op.total_tiles})" for op in self.ops)
         mode = "backward" if self.backward else "forward"
         return (
             f"Megakernel(\n"
