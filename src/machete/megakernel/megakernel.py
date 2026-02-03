@@ -603,9 +603,18 @@ class Megakernel:
         init_attr = "init_backward" if use_backward else "init_forward"
 
         for i, op in enumerate(ops):
-            # Include static dims in key: different model constants → different compiled code
+            # Include static dims and tensor dtypes in key: different values → different compiled code
             static_dims_key = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
-            key = (op.op_cls, op.execution_mode, op.num_producer_warps, use_backward, static_dims_key)
+            # Convert dtypes to their names for hashing (CUTLASS dtype objects aren't hashable directly)
+            tensor_dtypes_key = (
+                tuple(sorted((k, v.__name__) for k, v in op.tensor_dtypes.items()))
+                if op.tensor_dtypes
+                else ()
+            )
+            key = (
+                op.op_cls, op.execution_mode, op.num_producer_warps,
+                use_backward, static_dims_key, tensor_dtypes_key,
+            )
             if key not in dedup_map:
                 load_fn = getattr(op.op_cls, load_attr)
                 compute_fn = getattr(op.op_cls, compute_attr)
@@ -615,13 +624,16 @@ class Megakernel:
                 # Falls back to init_fn for ops without gen_init_source (e.g., NOPOp).
                 init_source = None
                 init_fn = None
-                if hasattr(op.op_cls, "gen_init_source") and op.static_dims:
+                if hasattr(op.op_cls, "gen_init_source") and (op.static_dims or op.tensor_dtypes):
                     # Pass kernel config parameters (threads_per_row from threads_per_block)
                     kernel_config = {
                         "threads_per_row": self.config.threads_per_block,
                     }
                     init_source = op.op_cls.gen_init_source(
-                        op.static_dims, backward=use_backward, kernel_config=kernel_config
+                        op.static_dims,
+                        backward=use_backward,
+                        kernel_config=kernel_config,
+                        tensor_dtypes=op.tensor_dtypes,
                     )
                 else:
                     init_fn = getattr(op.op_cls, init_attr, None)

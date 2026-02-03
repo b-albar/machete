@@ -28,8 +28,39 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type
 
+import cutlass
 import torch
 from cutlass import Int32, Int64
+
+
+# =============================================================================
+# Dtype Mapping
+# =============================================================================
+
+TORCH_TO_CUTLASS_DTYPE = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
+
+def _resolve_dtype(declared_dtype, tensor_dtype):
+    """Resolve a dtype declaration, allowing inference from tensor.
+
+    Args:
+        declared_dtype: The dtype declared in reads/writes. Can be:
+            - A CUTLASS dtype (Float32, Float16, etc.) - used as-is
+            - None - infer from tensor_dtype
+        tensor_dtype: The actual PyTorch tensor dtype (e.g., torch.float16)
+
+    Returns:
+        The resolved CUTLASS dtype.
+    """
+    if declared_dtype is None:
+        if tensor_dtype not in TORCH_TO_CUTLASS_DTYPE:
+            raise ValueError(f"Unsupported tensor dtype: {tensor_dtype}")
+        return TORCH_TO_CUTLASS_DTYPE[tensor_dtype]
+    return declared_dtype
 
 
 def _parse_dims(dim_str: str) -> List[str]:
@@ -113,6 +144,7 @@ def _gen_init_source(
     tile_dim_names=None,
     dynamic_dim_overrides=None,
     kernel_config=None,
+    tensor_dtypes=None,
 ):
     """Generate init source code with static dims as compile-time constants.
 
@@ -169,14 +201,19 @@ def _gen_init_source(
         for dim_name, _, _ in static_dim_list:
             lines.append(f"{dim_name} = {static_dims[dim_name]}")
 
-    # Create CuTe tensor views
+    # Create CuTe tensor views and emit dtype constants
     for name, dtype, dims in unique_tensors:
+        # Use overridden dtype if provided, otherwise use declared dtype
+        if tensor_dtypes and name in tensor_dtypes:
+            dtype = tensor_dtypes[name]
         dtype_name = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
         lines.append(
             f"{name} = cute.make_tensor("
             f"cute.make_ptr({dtype_name}, {name}_ptr_raw, cute.AddressSpace.gmem), "
             f"cute.make_layout(_FLAT))"
         )
+        # Emit dtype constant for use in compute methods (e.g., x_dtype = Float16)
+        lines.append(f"{name}_dtype = {dtype_name}")
 
     return "\n".join(lines)
 
@@ -340,9 +377,11 @@ def _process_op_declarations(cls):
         # Select forward or backward dim/tensor declarations
         if backward and hasattr(cls, "_BWD_UNIQUE_DIMS"):
             unique_dims = cls._BWD_UNIQUE_DIMS
+            unique_tensors = cls._BWD_UNIQUE_TENSORS
             pack_fn = cls.pack_backward_config
         else:
             unique_dims = cls._UNIQUE_DIMS
+            unique_tensors = cls._UNIQUE_TENSORS
             pack_fn = cls.pack_config
 
         # Extract static dim values from actual tensor shapes
@@ -350,6 +389,14 @@ def _process_op_declarations(cls):
         for dim_name, tensor_name, axis_idx in unique_dims:
             if dim_name not in (cls._TILE_DIM_NAMES | cls._DYNAMIC_DIM_OVERRIDES):
                 static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
+
+        # Extract tensor dtypes when declared dtype is None (infer from tensor)
+        tensor_dtypes = {}
+        for name, dtype, dims in unique_tensors:
+            if dtype is None:
+                # Infer dtype from the actual tensor
+                tensor_dtypes[name] = _resolve_dtype(None, tensors[name].dtype)
+            # Note: if dtype is specified, we don't store it (use the declared one)
 
         config_data = pack_fn(**tensors)
         return ScheduledOp(
@@ -359,6 +406,7 @@ def _process_op_declarations(cls):
             tiles_l=tiles_l,
             config_data=config_data,
             static_dims=static_dims,
+            tensor_dtypes=tensor_dtypes,
             dim_names=cls.DIM_NAMES,
         )
 
@@ -366,7 +414,7 @@ def _process_op_declarations(cls):
 
     # Add gen_init_source classmethod for deferred init generation
     @classmethod
-    def gen_init_source(cls, static_dims, backward=False, kernel_config=None):
+    def gen_init_source(cls, static_dims, backward=False, kernel_config=None, tensor_dtypes=None):
         """Generate init source with static dims baked as compile-time constants.
 
         Called at kernel compile time when static dim values are known.
@@ -377,6 +425,8 @@ def _process_op_declarations(cls):
             backward: If True, use backward tensor declarations.
             kernel_config: Dict of kernel config parameters (e.g., threads_per_row).
                 Also includes tile_size_<DIM> for each tile dimension.
+            tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes. Used to
+                override declared dtypes (for dtype inference from actual tensors).
         """
         if backward:
             tensors = cls._BWD_UNIQUE_TENSORS
@@ -401,6 +451,7 @@ def _process_op_declarations(cls):
             tile_dim_names=cls._TILE_DIM_NAMES,
             dynamic_dim_overrides=cls._DYNAMIC_DIM_OVERRIDES,
             kernel_config=full_kernel_config if full_kernel_config else None,
+            tensor_dtypes=tensor_dtypes,
         )
 
     cls.gen_init_source = gen_init_source
@@ -665,6 +716,7 @@ class ScheduledOp:
     dim_names: Dict[str, str] = None
     config_data: Any = None  # Optional torch.Tensor with per-op config in global memory
     static_dims: Dict[str, int] = field(default_factory=dict)  # Compile-time dim values
+    tensor_dtypes: Dict[str, Any] = field(default_factory=dict)  # Compile-time tensor dtypes
 
     def __post_init__(self):
         if self.dim_names is None:

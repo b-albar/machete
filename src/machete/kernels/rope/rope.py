@@ -37,20 +37,21 @@ class RopeOp(Op):
     typed CuTe tensor views constructed from op_config_ptr.
 
     Tensor declarations:
-        q:   (M, H, D)   — query tensor, float32, modified in-place
-        cos: (S, D2)     — cosine table, float32
-        sin: (S, D2)     — sine table, float32
+        q:   (M, H, D)   — query tensor, bf16/fp16/fp32, modified in-place
+        cos: (S, D2)     — cosine table, same dtype as q
+        sin: (S, D2)     — sine table, same dtype as q
 
     Tiling:
         tile_m indexes M (one tile per position, M = batch * seqlen).
     """
 
+    # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
     reads = {
-        "q": (Float32, "M, H, D"),
-        "cos": (Float32, "S, D2"),
-        "sin": (Float32, "S, D2"),
+        "q": (None, "M, H, D"),
+        "cos": (None, "S, D2"),
+        "sin": (None, "S, D2"),
     }
-    writes = {"q": (Float32, "M, H, D")}
+    writes = {"q": (None, "M, H, D")}
     tile = ("M",)
 
     # --- Forward ---
@@ -72,14 +73,16 @@ class RopeOp(Op):
             q0_idx = tile_m * H * D + h * D + i
             q1_idx = q0_idx + D2
 
-            c = cos[cs_idx]
-            sn = sin[cs_idx]
-            q0 = q[q0_idx]
-            q1 = q[q1_idx]
+            # Load and convert to fp32 for computation
+            c = cos[cs_idx].to(Float32)
+            sn = sin[cs_idx].to(Float32)
+            q0 = q[q0_idx].to(Float32)
+            q1 = q[q1_idx].to(Float32)
 
             # Forward rotation: [[cos, -sin], [sin, cos]]
-            q[q0_idx] = q0 * c - q1 * sn
-            q[q1_idx] = q1 * c + q0 * sn
+            # Store back in input dtype
+            q[q0_idx] = (q0 * c - q1 * sn).to(q_dtype)
+            q[q1_idx] = (q1 * c + q0 * sn).to(q_dtype)
 
     # --- Backward ---
 
@@ -100,14 +103,16 @@ class RopeOp(Op):
             q0_idx = tile_m * H * D + h * D + i
             q1_idx = q0_idx + D2
 
-            c = cos[cs_idx]
-            sn = sin[cs_idx]
-            q0 = q[q0_idx]
-            q1 = q[q1_idx]
+            # Load and convert to fp32 for computation
+            c = cos[cs_idx].to(Float32)
+            sn = sin[cs_idx].to(Float32)
+            q0 = q[q0_idx].to(Float32)
+            q1 = q[q1_idx].to(Float32)
 
             # Inverse rotation: [[cos, sin], [-sin, cos]]
-            q[q0_idx] = q0 * c + q1 * sn
-            q[q1_idx] = q1 * c - q0 * sn
+            # Store back in input dtype
+            q[q0_idx] = (q0 * c + q1 * sn).to(q_dtype)
+            q[q1_idx] = (q1 * c - q0 * sn).to(q_dtype)
 
 
 __all__ = ["RopeOp"]
