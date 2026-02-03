@@ -102,6 +102,7 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
 
         funcs["megakernel"] = kernel.bench_spec(
             setup_fn=lambda: q_mk.copy_(q),
+            keep_alive=[q_flat, cos, sin],
         )
 
     return funcs

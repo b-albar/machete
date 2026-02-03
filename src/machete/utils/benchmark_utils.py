@@ -48,6 +48,7 @@ class KernelBenchSpec:
     workspace_generator: Callable
     stream: Any = None
     workspace_count: int = 1
+    _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
 
 
 # =============================================================================

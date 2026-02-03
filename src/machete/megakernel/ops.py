@@ -279,19 +279,33 @@ def _process_op_declarations(cls):
 
     # Add schedule() classmethod
     @classmethod
-    def schedule(cls, **tensors):
-        """Create a ScheduledOp from tensor kwargs."""
+    def schedule(cls, backward=False, **tensors):
+        """Create a ScheduledOp from tensor kwargs.
+
+        Args:
+            backward: If True, use backward_reads/backward_writes tensor
+                      declarations for packing and dim extraction.
+            **tensors: Tensor keyword arguments matching the declared reads/writes.
+        """
         tiles_m = cls.compute_tiles(**tensors)
         tiles_n = cls.tiles_n(**tensors)
         tiles_l = cls.tiles_l(**tensors)
 
+        # Select forward or backward dim/tensor declarations
+        if backward and hasattr(cls, '_BWD_UNIQUE_DIMS'):
+            unique_dims = cls._BWD_UNIQUE_DIMS
+            pack_fn = cls.pack_backward_config
+        else:
+            unique_dims = cls._UNIQUE_DIMS
+            pack_fn = cls.pack_config
+
         # Extract static dim values from actual tensor shapes
         static_dims = {}
-        for dim_name, tensor_name, axis_idx in cls._UNIQUE_DIMS:
+        for dim_name, tensor_name, axis_idx in unique_dims:
             if dim_name not in (cls._TILE_DIM_NAMES | cls._DYNAMIC_DIM_OVERRIDES):
                 static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
 
-        config_data = cls.pack_config(**tensors)
+        config_data = pack_fn(**tensors)
         return ScheduledOp(
             op_cls=cls,
             tiles_m=tiles_m,

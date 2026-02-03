@@ -1072,7 +1072,7 @@ class Megakernel:
         if sync:
             torch.cuda.synchronize()
 
-    def bench_spec(self, setup_fn=None):
+    def bench_spec(self, setup_fn=None, keep_alive=None):
         """Create a KernelBenchSpec for raw GPU kernel timing.
 
         Returns a spec that can be passed to the benchmark framework for
@@ -1083,6 +1083,10 @@ class Megakernel:
             setup_fn: Optional callable invoked before each timed iteration
                 to reset input tensors or other state. Runs outside the
                 timed region.
+            keep_alive: Optional list of tensors/objects to prevent from being
+                garbage collected. The kernel references GPU memory via raw
+                pointers in op_configs_tensor — if the original tensors are
+                freed, those pointers become dangling.
 
         Returns:
             KernelBenchSpec ready for use with Benchmark.run(mode="kernel").
@@ -1095,8 +1099,7 @@ class Megakernel:
             def reset():
                 q.copy_(q_orig)
 
-            spec = kernel.bench_spec(setup_fn=reset)
-            # Pass spec as a benchmark function to the framework
+            spec = kernel.bench_spec(setup_fn=reset, keep_alive=[q, cos, sin])
         """
         import cuda.bindings.driver as cuda
         from cutlass.cute.testing import JitArguments
@@ -1132,6 +1135,7 @@ class Megakernel:
             workspace_generator=gen_workspace,
             stream=(bench_stream, cu_stream),
             workspace_count=1,
+            _keep_alive=(self, keep_alive),  # prevent GC from freeing GPU memory
         )
 
     def __repr__(self) -> str:
