@@ -169,6 +169,12 @@ def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None,
     Extracts each op method's body via inspect and inlines them into a
     single function: [init →] load → sync → compute → sync → store.
 
+    Sync barriers are only emitted when needed:
+    - If load_fn is just 'pass', no sync after load
+    - If store_fn is just 'pass', no sync before store
+
+    This avoids unnecessary sync_threads() calls for compute-only ops.
+
     Init can be provided as either a function (init_fn, extracted via inspect)
     or a pre-generated source string (init_source, from Op.gen_init_source).
     init_source takes precedence over init_fn when both are provided.
@@ -184,9 +190,8 @@ def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None,
         @cute.jit function with signature:
             (smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr) -> None
     """
-    load_body = _extract_body(load_fn)
-    compute_body = _extract_body(compute_fn)
-    store_body = _extract_body(store_fn)
+    load_is_noop = _is_pass_only(load_fn)
+    store_is_noop = _is_pass_only(store_fn)
 
     parts = []
     all_fns = [load_fn, compute_fn, store_fn]
@@ -199,13 +204,18 @@ def compile_sequential(load_fn, compute_fn, store_fn, init_fn=None,
         parts.append(_extract_body(init_fn))
         all_fns.append(init_fn)
 
-    parts.extend([
-        load_body,
-        "cute.arch.sync_threads()",
-        compute_body,
-        "cute.arch.sync_threads()",
-        store_body,
-    ])
+    # Load phase (skip if just 'pass')
+    if not load_is_noop:
+        parts.append(_extract_body(load_fn))
+        parts.append("cute.arch.sync_threads()")
+
+    # Compute phase (always included)
+    parts.append(_extract_body(compute_fn))
+
+    # Store phase (skip if just 'pass')
+    if not store_is_noop:
+        parts.append("cute.arch.sync_threads()")
+        parts.append(_extract_body(store_fn))
 
     combined = "\n".join(parts)
 
