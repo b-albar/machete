@@ -235,16 +235,6 @@ def ld_global_i64(
     return Int64(result)
 
 
-__all__ = [
-    "global_barrier_wait",
-    "global_barrier_signal",
-    "load_instruction_to_smem",
-    "ld_global_i32",
-    "ld_global_i64",
-    "st_global_i32",
-]
-
-
 @dsl_user_op
 def st_global_i32(
     base_ptr: Int64,
@@ -282,3 +272,13 @@ def st_global_i32(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+__all__ = [
+    "global_barrier_wait",
+    "global_barrier_signal",
+    "load_instruction_to_smem",
+    "ld_global_i32",
+    "ld_global_i64",
+    "st_global_i32",
+]

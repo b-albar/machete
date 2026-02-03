@@ -122,9 +122,17 @@ def _make_pre_handler(n_pages, wait_formulas):
         ) -> None:
             if tidx == Int32(0):
                 for wf in wait_formulas:
+                    # Compute linear index (without divisors) for guard check
                     _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
                     if _linear < Int32(wf.guard_max):
-                        global_barrier_wait(barriers_ptr, Int32(wf.base) + _linear, Int32(wf.expected))
+                        # Compute barrier index (with divisors for tile size ratios)
+                        _idx = (
+                            Int32(wf.base)
+                            + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
+                            + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
+                            + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
+                        )
+                        global_barrier_wait(barriers_ptr, _idx, Int32(wf.expected))
 
         return pre_handler
 
@@ -144,9 +152,17 @@ def _make_pre_handler(n_pages, wait_formulas):
     ) -> None:
         if tidx == Int32(0):
             for wf in wait_formulas:
+                # Compute linear index (without divisors) for guard check
                 _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
                 if _linear < Int32(wf.guard_max):
-                    global_barrier_wait(barriers_ptr, Int32(wf.base) + _linear, Int32(wf.expected))
+                    # Compute barrier index (with divisors for tile size ratios)
+                    _idx = (
+                        Int32(wf.base)
+                        + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
+                        + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
+                        + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
+                    )
+                    global_barrier_wait(barriers_ptr, _idx, Int32(wf.expected))
 
             # Batch acquire: read head once, acquire all pages, write head once
             _head = ld_shared_i32(free_list_head_ptr)
@@ -189,11 +205,12 @@ def _make_post_handler(n_pages, signal_formulas):
         ) -> None:
             if tidx == Int32(0):
                 for sf in signal_formulas:
+                    # Compute barrier index (with divisors for tile size ratios)
                     _sidx = (
                         Int32(sf.base)
-                        + Int32(sf.coeff_m) * tile_m
-                        + Int32(sf.coeff_n) * tile_n
-                        + Int32(sf.coeff_l) * tile_l
+                        + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
+                        + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
+                        + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
                     )
                     global_barrier_signal(barriers_ptr, _sidx)
 
@@ -224,11 +241,12 @@ def _make_post_handler(n_pages, signal_formulas):
             st_shared_i32(free_list_tail_ptr, _new_tail)
 
             for sf in signal_formulas:
+                # Compute barrier index (with divisors for tile size ratios)
                 _sidx = (
                     Int32(sf.base)
-                    + Int32(sf.coeff_m) * tile_m
-                    + Int32(sf.coeff_n) * tile_n
-                    + Int32(sf.coeff_l) * tile_l
+                    + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
+                    + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
+                    + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
                 )
                 global_barrier_signal(barriers_ptr, _sidx)
 

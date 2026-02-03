@@ -114,25 +114,16 @@ def _build_tensor_and_dim_lists(reads, writes):
     seen_dims = set()
     unique_dims = []
 
-    for name, (dtype, dim_str) in reads.items():
-        if name not in seen_tensors:
-            seen_tensors.add(name)
-            dims = _parse_dims(dim_str)
-            unique_tensors.append((name, dtype, dims))
-            for i, d in enumerate(dims):
-                if d not in seen_dims:
-                    seen_dims.add(d)
-                    unique_dims.append((d, name, i))
-
-    for name, (dtype, dim_str) in writes.items():
-        if name not in seen_tensors:
-            seen_tensors.add(name)
-            dims = _parse_dims(dim_str)
-            unique_tensors.append((name, dtype, dims))
-            for i, d in enumerate(dims):
-                if d not in seen_dims:
-                    seen_dims.add(d)
-                    unique_dims.append((d, name, i))
+    for decls in (reads, writes):
+        for name, (dtype, dim_str) in decls.items():
+            if name not in seen_tensors:
+                seen_tensors.add(name)
+                dims = _parse_dims(dim_str)
+                unique_tensors.append((name, dtype, dims))
+                for i, d in enumerate(dims):
+                    if d not in seen_dims:
+                        seen_dims.add(d)
+                        unique_dims.append((d, name, i))
 
     return unique_tensors, unique_dims
 
@@ -408,6 +399,7 @@ def _process_op_declarations(cls):
             static_dims=static_dims,
             tensor_dtypes=tensor_dtypes,
             dim_names=cls.DIM_NAMES,
+            tile_sizes=cls._TILE_SIZES.copy(),  # Include tile sizes for barrier computation
         )
 
     cls.schedule = schedule
@@ -717,6 +709,7 @@ class ScheduledOp:
     config_data: Any = None  # Optional torch.Tensor with per-op config in global memory
     static_dims: Dict[str, int] = field(default_factory=dict)  # Compile-time dim values
     tensor_dtypes: Dict[str, Any] = field(default_factory=dict)  # Compile-time tensor dtypes
+    tile_sizes: Dict[str, int] = field(default_factory=dict)  # Tile sizes per dim (e.g., {"M": 4})
 
     def __post_init__(self):
         if self.dim_names is None:
@@ -730,6 +723,14 @@ class ScheduledOp:
     def tiles_for_axis(self, axis: str) -> int:
         """Get tile count for a given axis ("m", "n", or "l")."""
         return {"m": self.tiles_m, "n": self.tiles_n, "l": self.tiles_l}[axis]
+
+    def tile_size_for_axis(self, axis: str) -> int:
+        """Get tile size for a given axis ("m", "n", or "l"). Default is 1."""
+        # Find the dim name that maps to this axis, then look up its tile size
+        for dim_name, ax in self.dim_names.items():
+            if ax == axis and dim_name in self.tile_sizes:
+                return self.tile_sizes[dim_name]
+        return 1  # Default tile size
 
     def axis_for_dim(self, dim_name: str) -> Optional[str]:
         """Get the tile axis for a semantic dimension name, or None."""
@@ -745,7 +746,8 @@ class ScheduledOp:
 class BarrierFormula:
     """Compile-time formula for computing a barrier index from tile coordinates.
 
-    barrier_idx = base + coeff_m * tile_m + coeff_n * tile_n + coeff_l * tile_l
+    barrier_idx = base + (coeff_m * tile_m) // div_m + (coeff_n * tile_n) // div_n
+                       + (coeff_l * tile_l) // div_l
 
     Used by the megakernel handler to bake barrier wait/signal calls directly
     into each op's handler at JIT compile time. No per-instruction encoding
@@ -757,6 +759,9 @@ class BarrierFormula:
         coeff_m: Multiplier for tile_m
         coeff_n: Multiplier for tile_n
         coeff_l: Multiplier for tile_l
+        div_m: Divisor for tile_m (for tile size ratio handling, default 1)
+        div_n: Divisor for tile_n (for tile size ratio handling, default 1)
+        div_l: Divisor for tile_l (for tile size ratio handling, default 1)
         expected: For wait deps: how many signals to wait for (default 1)
         guard_max: Only execute when the computed linear index
             (coeff_m * tile_m + coeff_n * tile_n + coeff_l * tile_l)
@@ -771,12 +776,20 @@ class BarrierFormula:
     coeff_m: int = 0
     coeff_n: int = 0
     coeff_l: int = 0
+    div_m: int = 1  # Divisor for tile_m (for tile size ratios)
+    div_n: int = 1  # Divisor for tile_n (for tile size ratios)
+    div_l: int = 1  # Divisor for tile_l (for tile size ratios)
     expected: int = 1
     guard_max: int = NO_GUARD
 
     def compute_index(self, tile_m: int, tile_n: int, tile_l: int) -> int:
         """Compute barrier index for a given tile (host-side, for testing)."""
-        return self.base + self.coeff_m * tile_m + self.coeff_n * tile_n + self.coeff_l * tile_l
+        return (
+            self.base
+            + (self.coeff_m * tile_m) // self.div_m
+            + (self.coeff_n * tile_n) // self.div_n
+            + (self.coeff_l * tile_l) // self.div_l
+        )
 
     def is_guarded(self, tile_m: int, tile_n: int, tile_l: int) -> bool:
         """Check if the guard passes for a given tile (host-side, for testing)."""
@@ -787,6 +800,11 @@ class BarrierFormula:
     def has_guard(self) -> bool:
         """Whether this formula has an active guard (not NO_GUARD)."""
         return self.guard_max != self.NO_GUARD
+
+    @property
+    def has_divisors(self) -> bool:
+        """Whether this formula uses divisors (any div > 1)."""
+        return self.div_m > 1 or self.div_n > 1 or self.div_l > 1
 
 
 # =============================================================================
@@ -1223,6 +1241,11 @@ class InstructionStreamBuilder:
                     )
 
                 # Determine target side and compute barrier count / expected
+                # Also compute divisors for tile size ratio handling
+                p_div_m, p_div_n, p_div_l = 1, 1, 1  # Producer divisors
+                c_div_m, c_div_n, c_div_l = 1, 1, 1  # Consumer divisors
+                expected = 1
+
                 if producer_only and not consumer_only:
                     # Many-to-one: barriers indexed by consumer tiles
                     target_op = c_op
@@ -1238,10 +1261,41 @@ class InstructionStreamBuilder:
                     num_barriers = p_op.total_tiles
                     expected = 1
                 else:
-                    # 1:1: same dims (or no dims)
+                    # Same dims (or no dims) - check for tile size differences
+                    # Compute per-axis tile size ratios for shared dimensions
+                    for dim in shared_dims:
+                        p_axis = p_op.dim_names[dim]
+                        c_axis = c_op.dim_names[dim]
+                        p_ts = p_op.tile_sizes.get(dim, 1)
+                        c_ts = c_op.tile_sizes.get(dim, 1)
+
+                        if p_ts > c_ts:
+                            # Producer has coarser granularity (larger tile size)
+                            # One producer tile → many consumer tiles
+                            # Consumer needs divisor to map to producer's barrier
+                            ratio = p_ts // c_ts
+                            if c_axis == "m":
+                                c_div_m = ratio
+                            elif c_axis == "n":
+                                c_div_n = ratio
+                            elif c_axis == "l":
+                                c_div_l = ratio
+                        elif c_ts > p_ts:
+                            # Consumer has coarser granularity (larger tile size)
+                            # Many producer tiles → one consumer tile
+                            # Producer needs divisor, expected increases
+                            ratio = c_ts // p_ts
+                            if p_axis == "m":
+                                p_div_m = ratio
+                            elif p_axis == "n":
+                                p_div_n = ratio
+                            elif p_axis == "l":
+                                p_div_l = ratio
+                            expected *= ratio
+
+                    # Use min total tiles for barrier count (the coarser granularity)
                     target_op = c_op
-                    num_barriers = max(p_op.total_tiles, c_op.total_tiles)
-                    expected = 1
+                    num_barriers = min(p_op.total_tiles, c_op.total_tiles)
 
                 # Compute formula coefficients
                 p_cm, p_cn, p_cl = _compute_formula_coeffs(
@@ -1255,23 +1309,29 @@ class InstructionStreamBuilder:
                     shared_dims,
                 )
 
-                # Producer signal formula
+                # Producer signal formula (with divisors for fine-grained producer)
                 formulas[prod_idx][1].append(
                     BarrierFormula(
                         base=barrier_counter,
                         coeff_m=p_cm,
                         coeff_n=p_cn,
                         coeff_l=p_cl,
+                        div_m=p_div_m,
+                        div_n=p_div_n,
+                        div_l=p_div_l,
                     )
                 )
 
-                # Consumer wait formula
+                # Consumer wait formula (with divisors for fine-grained consumer)
                 formulas[rec.op_idx][0].append(
                     BarrierFormula(
                         base=barrier_counter,
                         coeff_m=c_cm,
                         coeff_n=c_cn,
                         coeff_l=c_cl,
+                        div_m=c_div_m,
+                        div_n=c_div_n,
+                        div_l=c_div_l,
                         expected=expected,
                     )
                 )
@@ -1281,17 +1341,25 @@ class InstructionStreamBuilder:
         return formulas, barrier_counter
 
     def build(self) -> List[TileInstruction]:
-        """Build an interleaved instruction list using greedy wavefront scheduling.
+        """Build an instruction list using level-batched wavefront scheduling.
 
-        Emits tiles from multiple ops in an order that maximizes pipeline
-        overlap: a consumer tile is emitted as soon as its producer
-        dependencies have been emitted, rather than waiting for the entire
-        producer op to finish.
+        Emits tiles in dependency order, batching tiles from the same "level"
+        together to naturally spread work across SMs when they fetch
+        instructions with strided distribution.
 
-        For a 2-op 1:1 chain (A→B) with 4 tiles each, the output is:
-            A[0], A[1], B[0], A[2], B[1], A[3], B[2], B[3]
-        instead of the flat sequential:
-            A[0], A[1], A[2], A[3], B[0], B[1], B[2], B[3]
+        Strategy:
+        1. Emit ALL tiles from source ops (no dependencies) first
+        2. Then emit dependent ops using greedy wavefront
+
+        This spreads producer tiles across SMs (better load balancing) while
+        still respecting dependencies via barriers. For example:
+
+        One-to-many (Producer 4 tiles → Consumer 16 tiles):
+            P0, P1, P2, P3, C0, C1, C2, ...
+        With 2 SMs: Block 0 gets P0,P2,C0,... Block 1 gets P1,P3,C1,...
+
+        Contrast with pure greedy which interleaves P0,C0,P1,C1,... putting
+        all producers on one SM.
         """
         # Ensure formulas are resolved (sets _barrier_count)
         self._resolve()
@@ -1305,12 +1373,29 @@ class InstructionStreamBuilder:
         for edge in edges:
             consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
 
-        # Greedy wavefront: emit tiles as soon as dependencies are met
         num_ops = len(self._op_records)
         cursors = [0] * num_ops
         total_tiles = sum(rec.op.total_tiles for rec in self._op_records)
         instructions: List[TileInstruction] = []
 
+        # Phase 1: Emit ALL tiles from source ops (ops with no dependencies)
+        # This spreads them evenly across SMs via strided fetch
+        for rec in self._op_records:
+            idx = rec.op_idx
+            if idx not in consumer_deps:
+                # Source op: emit all tiles now
+                for tile in rec.tiles:
+                    instructions.append(
+                        TileInstruction(
+                            op_idx=idx,
+                            tile_m=tile[0],
+                            tile_n=tile[1],
+                            tile_l=tile[2],
+                        )
+                    )
+                cursors[idx] = rec.op.total_tiles
+
+        # Phase 2: Greedy wavefront for remaining ops
         while len(instructions) < total_tiles:
             progress = False
             for rec in self._op_records:
