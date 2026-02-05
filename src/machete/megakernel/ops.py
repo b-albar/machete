@@ -27,7 +27,7 @@ import enum
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
 import cutlass
 import torch
@@ -390,6 +390,14 @@ def _process_op_declarations(cls):
                 tensor_dtypes[name] = _resolve_dtype(None, tensors[name].dtype)
             # Note: if dtype is specified, we don't store it (use the declared one)
 
+        # Capture tensor data pointers for automatic dependency detection
+        # This allows the framework to detect when the same tensor is used
+        # as output of one op and input of another, regardless of buffer names
+        tensor_ptrs = {}
+        for name in tensors:
+            if hasattr(tensors[name], 'data_ptr'):
+                tensor_ptrs[name] = tensors[name].data_ptr()
+
         config_data = pack_fn(**tensors)
         return ScheduledOp(
             op_cls=cls,
@@ -399,6 +407,7 @@ def _process_op_declarations(cls):
             config_data=config_data,
             static_dims=static_dims,
             tensor_dtypes=tensor_dtypes,
+            tensor_ptrs=tensor_ptrs,
             dim_names=cls.DIM_NAMES,
             tile_sizes=cls._TILE_SIZES.copy(),  # Include tile sizes for barrier computation
         )
@@ -711,6 +720,7 @@ class ScheduledOp:
     static_dims: Dict[str, int] = field(default_factory=dict)  # Compile-time dim values
     tensor_dtypes: Dict[str, Any] = field(default_factory=dict)  # Compile-time tensor dtypes
     tile_sizes: Dict[str, int] = field(default_factory=dict)  # Tile sizes per dim (e.g., {"M": 4})
+    tensor_ptrs: Dict[str, int] = field(default_factory=dict)  # Tensor data pointers for dependency matching
 
     def __post_init__(self):
         if self.dim_names is None:
@@ -1311,8 +1321,8 @@ class InstructionStreamBuilder:
 
     def add_op(
         self,
-        op_cls: Type[Op],
-        tiles_m: int,
+        op_or_cls: Union[ScheduledOp, Type[Op]],
+        tiles_m: Optional[int] = None,
         tiles_n: int = 1,
         tiles_l: int = 1,
         dim_names: Optional[Dict[str, str]] = None,
@@ -1320,40 +1330,53 @@ class InstructionStreamBuilder:
     ) -> "InstructionStreamBuilder":
         """Add an operation to the stream.
 
+        Can be called in two ways:
+        1. With a ScheduledOp: add_op(scheduled_op)
+           Preserves all fields including tensor_ptrs for dependency detection.
+        2. With an Op class: add_op(OpClass, tiles_m=4, tiles_n=1, ...)
+           Creates a new ScheduledOp from the parameters.
+
         Args:
-            op_cls: Operation class
-            tiles_m: Number of M tiles
-            tiles_n: Number of N tiles
-            tiles_l: Number of L tiles
+            op_or_cls: Either a ScheduledOp instance or an Op class
+            tiles_m: Number of M tiles (required when passing Op class)
+            tiles_n: Number of N tiles (default: 1)
+            tiles_l: Number of L tiles (default: 1)
             dim_names: Maps semantic dimension names to tile axes.
                 Example: {"batch": "m", "seqlen": "n"}
-            **params: Operation-specific parameters
+            **params: Operation-specific parameters (only used with Op class)
         """
+        # Handle ScheduledOp instance
+        if isinstance(op_or_cls, ScheduledOp):
+            op = op_or_cls
+        else:
+            # Handle Op class with parameters
+            if tiles_m is None:
+                raise ValueError("tiles_m is required when passing an Op class")
+            op = ScheduledOp(
+                op_cls=op_or_cls,
+                tiles_m=tiles_m,
+                tiles_n=tiles_n,
+                tiles_l=tiles_l,
+                params=params,
+                dim_names=dim_names or {},
+            )
+
         # Validate dim_names
         _valid_axes = {"m", "n", "l"}
-        if dim_names:
-            for dim, axis in dim_names.items():
+        if op.dim_names:
+            for dim, axis in op.dim_names.items():
                 if axis not in _valid_axes:
                     raise ValueError(f"Invalid axis '{axis}' for dim '{dim}'. Must be one of {_valid_axes}")
-            axes = list(dim_names.values())
+            axes = list(op.dim_names.values())
             if len(axes) != len(set(axes)):
-                raise ValueError(f"dim_names maps multiple dims to the same axis: {dim_names}")
-
-        op = ScheduledOp(
-            op_cls=op_cls,
-            tiles_m=tiles_m,
-            tiles_n=tiles_n,
-            tiles_l=tiles_l,
-            params=params,
-            dim_names=dim_names or {},
-        )
+                raise ValueError(f"dim_names maps multiple dims to the same axis: {op.dim_names}")
 
         # Pre-compute flat tile list
         tiles = []
         for tile_idx in range(op.total_tiles):
-            tile_l_idx = tile_idx // (tiles_m * tiles_n)
-            tile_n_idx = (tile_idx // tiles_m) % tiles_n
-            tile_m_idx = tile_idx % tiles_m
+            tile_l_idx = tile_idx // (op.tiles_m * op.tiles_n)
+            tile_n_idx = (tile_idx // op.tiles_m) % op.tiles_n
+            tile_m_idx = tile_idx % op.tiles_m
             tiles.append((tile_m_idx, tile_n_idx, tile_l_idx))
 
         record = _OpRecord(
@@ -1517,13 +1540,32 @@ class InstructionStreamBuilder:
         2. Compute formula coefficients for both sides
         3. Allocate barriers
         """
-        # Track buffer producers
+        # Track buffer producers by name
         buffer_producers: Dict[str, int] = {}
         for rec in self._op_records:
             for buf in rec.op.op_cls.OUTPUTS:
                 if buf in buffer_producers:
                     raise ValueError(f"Buffer '{buf}' produced by both op {buffer_producers[buf]} and op {rec.op_idx}")
                 buffer_producers[buf] = rec.op_idx
+
+        # Also track buffer producers by tensor data pointer for automatic dependency detection
+        # This maps (consumer_op_idx, consumer_input_buf) -> producer_op_idx
+        # when tensors share the same data pointer but have different buffer names
+        tensor_ptr_deps: Dict[Tuple[int, str], int] = {}
+        for cons_rec in self._op_records:
+            for cons_buf in cons_rec.op.op_cls.INPUTS:
+                cons_ptr = cons_rec.op.tensor_ptrs.get(cons_buf)
+                if cons_ptr is None:
+                    continue
+                # Look for a producer with matching tensor pointer
+                for prod_rec in self._op_records:
+                    if prod_rec.op_idx >= cons_rec.op_idx:
+                        continue  # Only look at earlier ops
+                    for prod_buf in prod_rec.op.op_cls.OUTPUTS:
+                        prod_ptr = prod_rec.op.tensor_ptrs.get(prod_buf)
+                        if prod_ptr is not None and prod_ptr == cons_ptr:
+                            # Found a match by tensor identity
+                            tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
 
         # Init per-op formula lists
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {
@@ -1534,11 +1576,21 @@ class InstructionStreamBuilder:
         # Process each dependency edge
         for rec in self._op_records:
             for buf in rec.op.op_cls.INPUTS:
-                if buf not in buffer_producers:
+                # First try matching by buffer name
+                prod_idx = buffer_producers.get(buf)
+
+                # If no name match, or name matches self (in-place op), try tensor identity
+                # This handles cases like RopeOp (q->q in-place) depending on RMSNormOp (->y)
+                # where the tensor pointers match but buffer names differ
+                if prod_idx is None or prod_idx == rec.op_idx:
+                    ptr_prod_idx = tensor_ptr_deps.get((rec.op_idx, buf))
+                    if ptr_prod_idx is not None:
+                        prod_idx = ptr_prod_idx
+
+                if prod_idx is None:
                     continue  # External input (provided by host, not by another op)
-                prod_idx = buffer_producers[buf]
                 if prod_idx == rec.op_idx:
-                    continue  # Self-dependency (in-place op reads/writes same buffer)
+                    continue  # True self-dependency (same op produces and consumes)
                 producer = self._op_records[prod_idx]
                 consumer = rec
 

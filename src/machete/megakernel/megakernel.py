@@ -410,16 +410,10 @@ class Megakernel:
         )
 
         # Build instruction stream
+        # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
         self._builder = InstructionStreamBuilder()
         for op in ops:
-            self._builder.add_op(
-                op.op_cls,
-                tiles_m=op.tiles_m,
-                tiles_n=op.tiles_n,
-                tiles_l=op.tiles_l,
-                dim_names=op.dim_names if op.dim_names else None,
-                **op.params,
-            )
+            self._builder.add_op(op)
 
         self._instructions_tensor: Optional[torch.Tensor] = None
         self._barriers_tensor: Optional[torch.Tensor] = None
@@ -1082,14 +1076,27 @@ class Megakernel:
         """Create a cache key for the compiled kernel.
 
         The key includes all parameters that affect kernel compilation:
-        - Op classes and their static dimensions
+        - Op classes, their static dimensions, tensor dtypes, and tile counts
         - Config parameters (threads, pages, etc.)
         - Backward flag
+
+        Tile counts (tiles_m, tiles_n, tiles_l) are included because barrier
+        formulas are baked into the kernel at compile time. Different tile
+        counts produce different barrier formulas and instruction streams.
         """
         op_keys = []
         for op in self.ops:
             static_dims_tuple = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
-            op_keys.append((op.op_cls, static_dims_tuple))
+            # Include tensor dtypes - different dtypes require different compiled code
+            # Convert dtypes to their names for hashing (CUTLASS dtype objects aren't hashable directly)
+            tensor_dtypes_tuple = (
+                tuple(sorted((k, v.__name__) for k, v in op.tensor_dtypes.items()))
+                if op.tensor_dtypes
+                else ()
+            )
+            # Include tile counts - barrier formulas are baked into the kernel
+            tile_counts = (op.tiles_m, op.tiles_n, op.tiles_l)
+            op_keys.append((op.op_cls, static_dims_tuple, tensor_dtypes_tuple, tile_counts))
 
         config_key = (
             self.config.threads_per_block,

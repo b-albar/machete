@@ -205,41 +205,17 @@ class TestMegakernelGPU:
         if major < 10:
             pytest.skip("Requires Blackwell (SM100+) GPU")
 
-    def test_single_op_run(self):
-        """Test running a single operation."""
+    @pytest.mark.parametrize("num_ops", [1, 2])
+    def test_nop_kernel_run(self, num_ops):
+        """Test running NOPOp kernels with barrier reset across multiple runs."""
         from machete.megakernel import Megakernel, ScheduledOp, NOPOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=8)]
+        ops = [ScheduledOp(NOPOp, tiles_m=8) for _ in range(num_ops)]
         kernel = Megakernel(ops)
 
-        # Should not raise
-        kernel.run()
-
-    def test_two_ops_run(self):
-        """Test running two operations with dependencies."""
-        from machete.megakernel import Megakernel, ScheduledOp, NOPOp
-
-        ops = [
-            ScheduledOp(NOPOp, tiles_m=16),
-            ScheduledOp(NOPOp, tiles_m=16),
-        ]
-        kernel = Megakernel(ops)
-
-        # Should not raise - second op waits for first
-        kernel.run()
-
-    def test_barrier_reset_between_runs(self):
-        """Test that barriers are reset between runs."""
-        from machete.megakernel import Megakernel, ScheduledOp, NOPOp
-
-        ops = [ScheduledOp(NOPOp, tiles_m=4)]
-        kernel = Megakernel(ops)
-
-        # First run
-        kernel.run()
-
-        # Second run should also work (barriers reset)
-        kernel.run()
+        # Run multiple times to verify barrier reset
+        for _ in range(2):
+            kernel.run()
 
 
 

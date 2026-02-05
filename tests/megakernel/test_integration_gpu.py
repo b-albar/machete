@@ -615,83 +615,40 @@ class TestComprehensiveGPU:
             f"OpC mismatch: {c_results.tolist()} != {expected_c.tolist()}"
         )
 
-    def test_mismatched_tiles_more_producer(self):
-        """Producer has 8 tiles, consumer has 4. Guard prevents deadlock.
+    @pytest.mark.parametrize("tiles_a,tiles_b", [(8, 4), (4, 8)])
+    def test_mismatched_tile_counts(self, tiles_a, tiles_b):
+        """Test mismatched tile counts between producer and consumer.
 
-        Verifies:
-        - All 8 producer tiles complete
-        - All 4 consumer tiles complete (guard skips non-existent barriers)
-        - No deadlock despite tile count mismatch
+        Guard logic prevents deadlock when ops have different tile counts:
+        - More producer tiles: consumer skips non-existent barriers
+        - More consumer tiles: extra consumer tiles skip wait via guard
         """
         global _opa_result_ptr, _opb_result_ptr
 
-        a_results = torch.zeros(8, dtype=torch.int32, device="cuda")
-        b_results = torch.zeros(4, dtype=torch.int32, device="cuda")
+        a_results = torch.zeros(tiles_a, dtype=torch.int32, device="cuda")
+        b_results = torch.zeros(tiles_b, dtype=torch.int32, device="cuda")
 
         _opa_result_ptr = a_results.data_ptr()
         _opb_result_ptr = b_results.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=8),
-            ScheduledOp(OpB, tiles_m=4),
+            ScheduledOp(OpA, tiles_m=tiles_a),
+            ScheduledOp(OpB, tiles_m=tiles_b),
         ]
         config = MegakernelConfig(num_sms=2, num_pages=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
         expected_a = torch.tensor(
-            [i * 100 + 1 for i in range(8)],
+            [i * 100 + 1 for i in range(tiles_a)],
             dtype=torch.int32, device="cuda",
         )
         expected_b = torch.tensor(
-            [i * 200 + 2 for i in range(4)],
+            [i * 200 + 2 for i in range(tiles_b)],
             dtype=torch.int32, device="cuda",
         )
-        assert torch.equal(a_results, expected_a), (
-            f"OpA mismatch: {a_results.tolist()}"
-        )
-        assert torch.equal(b_results, expected_b), (
-            f"OpB mismatch: {b_results.tolist()}"
-        )
-
-    def test_mismatched_tiles_more_consumer(self):
-        """Producer has 4 tiles, consumer has 8. Guard skips extra tiles.
-
-        Verifies:
-        - All 4 producer tiles complete
-        - All 8 consumer tiles complete (tiles 4-7 skip wait via guard)
-        - No deadlock
-        """
-        global _opa_result_ptr, _opb_result_ptr
-
-        a_results = torch.zeros(4, dtype=torch.int32, device="cuda")
-        b_results = torch.zeros(8, dtype=torch.int32, device="cuda")
-
-        _opa_result_ptr = a_results.data_ptr()
-        _opb_result_ptr = b_results.data_ptr()
-
-        ops = [
-            ScheduledOp(OpA, tiles_m=4),
-            ScheduledOp(OpB, tiles_m=8),
-        ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
-        kernel = Megakernel(ops, config=config)
-        kernel.run()
-
-        expected_a = torch.tensor(
-            [i * 100 + 1 for i in range(4)],
-            dtype=torch.int32, device="cuda",
-        )
-        expected_b = torch.tensor(
-            [i * 200 + 2 for i in range(8)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(a_results, expected_a), (
-            f"OpA mismatch: {a_results.tolist()}"
-        )
-        assert torch.equal(b_results, expected_b), (
-            f"OpB mismatch: {b_results.tolist()}"
-        )
+        assert torch.equal(a_results, expected_a), f"OpA mismatch: {a_results.tolist()}"
+        assert torch.equal(b_results, expected_b), f"OpB mismatch: {b_results.tolist()}"
 
     def test_2d_tile_grid(self):
         """Single 2D op: tiles_m=4, tiles_n=3 (12 tiles).
