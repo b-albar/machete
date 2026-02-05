@@ -40,11 +40,11 @@ from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import st_global_i32, ld_global_i32
 
 
-def is_blackwell_available():
+def is_hopper_available():
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 # =============================================================================
@@ -120,7 +120,7 @@ class Consumer1DOp(Op):
 # =============================================================================
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestManyToOnePatternGPU:
     """
     GPU test for many:1 dependency: 2D producer -> 1D consumer.

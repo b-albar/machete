@@ -9,12 +9,12 @@ import pytest
 import torch
 
 
-def is_blackwell_available():
-    """Check if Blackwell (SM100+) GPU is available."""
+def is_hopper_available():
+    """Check if Hopper (SM90+) GPU is available."""
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 class TestMegakernel:
@@ -38,9 +38,9 @@ class TestMegakernel:
         assert kernel.grid == (8, 1, 1)  # Now based on num_sms (persistent blocks)
         assert kernel.block == (256, 1, 1)
 
-    @pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell required")
+    @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) required")
     def test_megakernel_execution(self):
-        """Test running the megakernel on Blackwell hardware."""
+        """Test running the megakernel on Hopper+ hardware."""
         from machete.megakernel import Megakernel, ScheduledOp, NOPOp
 
         # Use NOPs to test the runtime loop without complex math
@@ -58,14 +58,14 @@ class TestMegakernel:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):
-        """Test that validation checks for Blackwell Architecture."""
+        """Test that validation checks for Hopper+ Architecture."""
         from machete.megakernel import Megakernel, ScheduledOp, NOPOp
 
         ops = [ScheduledOp(NOPOp, tiles_m=1)]
         kernel = Megakernel(ops)
 
         major, _ = torch.cuda.get_device_capability()
-        if major < 10:
+        if major < 9:
             with pytest.raises(RuntimeError, match="requires Hopper"):
                 kernel.run()
         else:

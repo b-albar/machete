@@ -19,11 +19,11 @@ from machete.kernels.rope import RopeOp
 from machete.kernels.rope.ref import rope_pytorch
 
 
-def is_blackwell_available():
+def is_hopper_available():
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 def get_tolerances(dtype):
@@ -36,7 +36,7 @@ def get_tolerances(dtype):
     return {"rtol": 1e-2, "atol": 1e-2}
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestFusedRMSNormRoPE:
     """Tests for fused RMSNorm + RoPE in a single megakernel."""
 

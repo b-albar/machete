@@ -4,7 +4,7 @@ Dependency pattern tests for megakernel barrier synchronization.
 
 Each test file covers a specific dependency pattern with ASCII diagrams
 explaining the tile mapping and barrier synchronization. All tests execute
-on GPU with real kernels (requires Blackwell GPU).
+on GPU with real kernels (requires Hopper+ GPU).
 
 Test Files:
 -----------

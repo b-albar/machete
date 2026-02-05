@@ -190,7 +190,7 @@ class TestMegakernelHost:
 
 
 # =============================================================================
-# GPU Tests (Require Blackwell)
+# GPU Tests (Require Hopper)
 # =============================================================================
 
 
@@ -200,10 +200,10 @@ class TestMegakernelGPU:
 
     @pytest.fixture(autouse=True)
     def check_gpu(self):
-        """Skip if not Blackwell (SM100+)."""
+        """Skip if not Hopper (SM90+)."""
         major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            pytest.skip("Requires Blackwell (SM100+) GPU")
+        if major < 9:
+            pytest.skip("Requires Hopper (SM90+) GPU")
 
     @pytest.mark.parametrize("num_ops", [1, 2])
     def test_nop_kernel_run(self, num_ops):
@@ -231,7 +231,7 @@ class TestSharedMemoryLayout:
         # 4 pages * 16KB = 64KB for page data alone
         assert layout.page_data_offset > 0
         assert layout.total_size >= 4 * 16 * 1024
-        # Must fit in Blackwell's 228KB shared memory
+        # Must fit in Hopper.s 228KB shared memory
         assert layout.total_size <= 228 * 1024
 
     def test_layout_offsets_are_aligned(self):

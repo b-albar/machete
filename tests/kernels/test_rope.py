@@ -32,11 +32,11 @@ if HAS_TRITON:
     from machete.kernels.rope.ref import rope_triton
 
 
-def is_blackwell_available():
+def is_hopper_available():
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 # =============================================================================
@@ -94,7 +94,7 @@ def mk_rope_backward(q, cos, sin):
 # =============================================================================
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestRopeForwardGPU:
     """Test RopeOp forward pass correctness."""
 
@@ -170,7 +170,7 @@ class TestRopeForwardGPU:
 # =============================================================================
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestRopeBackwardGPU:
     """Test RopeOp backward pass correctness."""
 
@@ -259,7 +259,7 @@ SHAPE_IDS = [
 ]
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestRopeAutogradGPU:
     """Test RoPE autograd bridge: forward output + backward gradients."""
 

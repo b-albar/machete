@@ -11,12 +11,12 @@ from machete.patching.ops.rope import (
 )
 
 
-def is_blackwell_available():
-    """Check if Blackwell GPU is available."""
+def is_hopper_available():
+    """Check if Hopper (SM90+) GPU is available."""
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major >= 9
 
 
 def rope_pytorch_ref(q, cos, sin):
@@ -101,7 +101,7 @@ class TestMacheteRoPECPU:
         assert not torch.allclose(rope_10k.inv_freq, rope_50k.inv_freq)
 
 
-@pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+@pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 @pytest.mark.skipif(not HAS_MEGAKERNEL_ROPE, reason="megakernel RoPE not available")
 class TestMacheteRoPEGPU:
     """Test MacheteRoPE on GPU with megakernel backend."""
@@ -183,7 +183,7 @@ class TestApplyRopeFunctional:
         assert q_rotated.shape == q.shape
         assert k_rotated.shape == k.shape
 
-    @pytest.mark.skipif(not is_blackwell_available(), reason="Blackwell GPU required")
+    @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
     @pytest.mark.skipif(not HAS_MEGAKERNEL_ROPE, reason="megakernel RoPE not available")
     def test_apply_rope_gpu(self):
         """apply_rope uses megakernel on GPU."""
