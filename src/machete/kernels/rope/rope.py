@@ -57,7 +57,7 @@ class RopeOp(Op):
     # --- Forward ---
 
     @staticmethod
-    def compute_forward(
+    def forward(
         smem_base: Int32, config_ptr: Int32, page_ids: tuple,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
@@ -87,7 +87,7 @@ class RopeOp(Op):
     # --- Backward ---
 
     @staticmethod
-    def compute_backward(
+    def backward(
         smem_base: Int32, config_ptr: Int32, page_ids: tuple,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,

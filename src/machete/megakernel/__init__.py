@@ -21,7 +21,6 @@ Usage:
 from .ops import (
     Op,
     NOPOp,
-    ExecutionMode,
     ScheduledOp,
     BarrierFormula,
     INSTRUCTION_WORDS,
@@ -30,8 +29,7 @@ from .ops import (
 )
 
 from .compile import (
-    compile_sequential,
-    compile_warp_specialized,
+    compile_op,
     cleanup_linecache,
 )
 
@@ -58,13 +56,11 @@ __all__ = [
     # Operation Protocol
     "Op",
     "NOPOp",
-    "ExecutionMode",
     "ScheduledOp",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
-    "compile_sequential",
-    "compile_warp_specialized",
+    "compile_op",
     "cleanup_linecache",
     # Instruction Stream
     "INSTRUCTION_WORDS",

@@ -34,11 +34,10 @@ from cutlass._mlir.dialects import llvm
 
 from .ops import (
     ScheduledOp,
-    ExecutionMode,
     InstructionStreamBuilder,
     TileInstruction,
 )
-from .compile import compile_sequential, compile_warp_specialized
+from .compile import compile_op
 from .interpreter import (
     global_barrier_wait,
     global_barrier_signal,
@@ -354,9 +353,8 @@ class Megakernel:
         Block 0: instr 0 -> instr num_sms -> instr 2*num_sms -> ...
         Block 1: instr 1 -> instr num_sms+1 -> instr 2*num_sms+1 -> ...
 
-    When backward=True, the kernel dispatches to each op's backward methods
-    (load_backward, compute_backward, store_backward, init_backward) instead
-    of the forward methods. This enables using the same op definitions and
+    When backward=True, the kernel dispatches to each op's backward() method
+    instead of forward(). This enables using the same op definitions and
     scheduling infrastructure for gradient computation.
 
     Example:
@@ -576,14 +574,12 @@ class Megakernel:
         Phase 2 (K branches): Tile execution — deduplicated by op class
         Phase 3 (N branches): Post-execution — page release + barrier signal
 
-        Tile functions are compiled once per unique (op_cls, execution_mode,
-        num_producer_warps) key. Pre/post handlers are lightweight (barrier
+        Tile functions are compiled once per unique (op_cls, static_dims,
+        tensor_dtypes) key. Pre/post handlers are lightweight (barrier
         atomics + shared memory loads/stores) so N branches have minimal
         code bloat.
 
-        When self.backward is True, the backward methods (load_backward,
-        compute_backward, store_backward, init_backward) are used instead
-        of the forward methods.
+        When self.backward is True, Op.backward is used instead of Op.forward.
         """
         ops = self.ops
         use_backward = self.backward
@@ -602,17 +598,14 @@ class Megakernel:
             pre_handlers.append(_make_pre_handler(op_page_counts[i], wait_formulas))
             post_handlers.append(_make_post_handler(op_page_counts[i], signal_formulas))
 
-        # --- Deduplicate tile functions by (op_cls, exec_mode, producer_warps, static_dims) ---
+        # --- Deduplicate tile functions by (op_cls, static_dims, tensor_dtypes) ---
         # dedup_key → (class_idx, tile_caller)
         dedup_map = {}
         # class_idx → list of op indices that use this class
         class_to_ops = {}
 
-        # Select forward or backward method names
-        load_attr = "load_backward" if use_backward else "load_forward"
-        compute_attr = "compute_backward" if use_backward else "compute_forward"
-        store_attr = "store_backward" if use_backward else "store_forward"
-        init_attr = "init_backward" if use_backward else "init_forward"
+        # Select forward or backward method
+        op_method_attr = "backward" if use_backward else "forward"
 
         for i, op in enumerate(ops):
             # Include static dims and tensor dtypes in key: different values → different compiled code
@@ -624,18 +617,14 @@ class Megakernel:
                 else ()
             )
             key = (
-                op.op_cls, op.execution_mode, op.num_producer_warps,
+                op.op_cls,
                 use_backward, static_dims_key, tensor_dtypes_key,
             )
             if key not in dedup_map:
-                load_fn = getattr(op.op_cls, load_attr)
-                compute_fn = getattr(op.op_cls, compute_attr)
-                store_fn = getattr(op.op_cls, store_attr)
+                op_fn = getattr(op.op_cls, op_method_attr)
 
                 # Generate init source with static dims baked as compile-time constants.
-                # Falls back to init_fn for ops without gen_init_source (e.g., NOPOp).
                 init_source = None
-                init_fn = None
                 if hasattr(op.op_cls, "gen_init_source") and (op.static_dims or op.tensor_dtypes):
                     # Pass kernel config parameters (threads_per_row from threads_per_block)
                     kernel_config = {
@@ -647,28 +636,9 @@ class Megakernel:
                         kernel_config=kernel_config,
                         tensor_dtypes=op.tensor_dtypes,
                     )
-                else:
-                    init_fn = getattr(op.op_cls, init_attr, None)
 
                 # Compile tile function once for this (class, static_dims) combo
-                if op.execution_mode == ExecutionMode.WARP_SPECIALIZED:
-                    tile_fn = compile_warp_specialized(
-                        load_fn,
-                        compute_fn,
-                        store_fn,
-                        init_fn=init_fn,
-                        init_source=init_source,
-                        num_producer_warps=op.num_producer_warps,
-                        warps_per_block=self.config.warps_per_block,
-                    )
-                else:
-                    tile_fn = compile_sequential(
-                        load_fn,
-                        compute_fn,
-                        store_fn,
-                        init_fn=init_fn,
-                        init_source=init_source,
-                    )
+                tile_fn = compile_op(op_fn, init_source=init_source)
 
                 class_idx = len(dedup_map)
                 tile_caller = _make_tile_caller(tile_fn, op_page_counts[i])

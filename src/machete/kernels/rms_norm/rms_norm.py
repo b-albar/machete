@@ -97,7 +97,7 @@ class RMSNormOp(Op):
     # --- Forward ---
 
     @staticmethod
-    def compute_forward(
+    def forward(
         smem_base: Int32,
         config_ptr: Int32,
         page_ids: tuple,
@@ -281,7 +281,7 @@ class RMSNormOp(Op):
     # --- Backward ---
 
     @staticmethod
-    def compute_backward(
+    def backward(
         smem_base: Int32,
         config_ptr: Int32,
         page_ids: tuple,

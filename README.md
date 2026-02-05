@@ -117,8 +117,8 @@ class MyOp(Op):
     OUTPUTS = ["y"]
 
     @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids,
-                        tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids,
+                tile_m, tile_n, tile_l, op_config_ptr):
         # M is dynamic (tile dim), D is static (compile-time constant)
         ...
 

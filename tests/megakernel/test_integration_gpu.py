@@ -74,11 +74,7 @@ class StampOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 1
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         data_ptr = get_page_data_ptr(smem_base, config_ptr, page_ids[0])
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
@@ -92,12 +88,6 @@ class StampOp(Op):
             cute.printf("[StampOp] tile_m=%d wrote=%d readback=%d",
                         tile_m, tile_m * Int32(100) + Int32(42), readback)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        tidx = cute.arch.thread_idx()[0]
-        if tidx == Int32(0):
-            cute.printf("[StampOp] tile_m=%d DONE", tile_m)
-
 
 class CheckOp(Op):
     """Reads stale page data, writes tile_m * 200 + 7, stores results to global tensors."""
@@ -106,37 +96,25 @@ class CheckOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        tidx = cute.arch.thread_idx()[0]
-        if tidx == Int32(0):
-            stale = ld_shared_i32(
-                get_page_data_ptr(smem_base, config_ptr, page_ids[0])
-            )
-            # Write stale value to global tensor for verification
-            st_global_i32(Int64(_check_stale_ptr), tile_m, stale)
-            cute.printf("[CheckOp] tile_m=%d START stale_page_value=%d",
-                        tile_m, stale)
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         data_ptr = get_page_data_ptr(smem_base, config_ptr, page_ids[0])
         tidx = cute.arch.thread_idx()[0]
+        # Read stale value for verification
+        if tidx == Int32(0):
+            stale = ld_shared_i32(data_ptr)
+            st_global_i32(Int64(_check_stale_ptr), tile_m, stale)
+            cute.printf("[CheckOp] tile_m=%d START stale_page_value=%d", tile_m, stale)
+        cute.arch.sync_threads()
+        # Write and verify
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(7)
             st_shared_i32(data_ptr, value)
         cute.arch.sync_threads()
         if tidx == Int32(0):
             readback = ld_shared_i32(data_ptr)
-            # Write readback to global results tensor
             st_global_i32(Int64(_check_result_ptr), tile_m, readback)
             cute.printf("[CheckOp] tile_m=%d wrote=%d readback=%d",
                         tile_m, tile_m * Int32(200) + Int32(7), readback)
-
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        tidx = cute.arch.thread_idx()[0]
-        if tidx == Int32(0):
-            cute.printf("[CheckOp] tile_m=%d DONE", tile_m)
 
 
 # =============================================================================
@@ -275,19 +253,12 @@ class OpA(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(100) + Int32(1)
             st_global_i32(Int64(_opa_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class OpB(Op):
@@ -297,19 +268,12 @@ class OpB(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(2)
             st_global_i32(Int64(_opb_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class OpC(Op):
@@ -319,19 +283,12 @@ class OpC(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(300) + Int32(3)
             st_global_i32(Int64(_opc_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 # --- Tag2DOp globals (for 2D tile grid tests) ---
@@ -350,20 +307,13 @@ class Tag2DOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(1000) + tile_n
             idx = tile_n * Int32(_tag2d_cols) + tile_m
             st_global_i32(Int64(_tag2d_result_ptr), idx, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class Tag2DOpB(Op):
@@ -373,20 +323,13 @@ class Tag2DOpB(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(2000) + tile_n
             idx = tile_n * Int32(_tag2d_cols) + tile_m
             st_global_i32(Int64(_opb_result_ptr), idx, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 # =============================================================================
@@ -408,19 +351,12 @@ class NamedProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(100) + Int32(42)
             st_global_i32(Int64(_nprod_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class NamedConsumerOp(Op):
@@ -432,19 +368,12 @@ class NamedConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(7)
             st_global_i32(Int64(_ncons_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class NamedProducerY(Op):
@@ -456,19 +385,12 @@ class NamedProducerY(Op):
     OUTPUTS: ClassVar[List[str]] = ["y"]
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(300) + Int32(11)
             st_global_i32(Int64(_nprody_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class NamedFanInOp(Op):
@@ -480,19 +402,12 @@ class NamedFanInOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(400) + Int32(13)
             st_global_i32(Int64(_nfanin_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 # =============================================================================
@@ -513,19 +428,12 @@ class ManyToOneProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             idx = tile_m * Int32(_mto_cols) + tile_n
             st_global_i32(Int64(_mto_matrix_ptr), idx, Int32(1))
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class ManyToOneConsumerOp(Op):
@@ -537,19 +445,12 @@ class ManyToOneConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(500) + Int32(17)
             st_global_i32(Int64(_mto_result_ptr), tile_m, value)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 # =============================================================================
@@ -1038,11 +939,7 @@ class ScaleOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -1051,9 +948,6 @@ class ScaleOp(Op):
             val = ld_global_i32(input_ptr, tile_m)
             st_global_i32(output_ptr, tile_m, val * scale)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class AddOp(Op):
@@ -1071,11 +965,7 @@ class AddOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_a_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -1085,9 +975,6 @@ class AddOp(Op):
             b = ld_global_i32(input_b_ptr, tile_m)
             st_global_i32(output_ptr, tile_m, a + b)
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 class TensorScaleOp(Op):
@@ -1106,11 +993,7 @@ class TensorScaleOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
-
-    @staticmethod
-    def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read pointers and scale from config
@@ -1131,9 +1014,6 @@ class TensorScaleOp(Op):
             # Access via tensor indexing
             out_tensor[tile_m] = in_tensor[tile_m] * scale
 
-    @staticmethod
-    def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        pass
 
 
 @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")

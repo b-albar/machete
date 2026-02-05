@@ -292,15 +292,7 @@ class TestMegakernelPagedMemory:
             NUM_OUTPUT_PAGES: ClassVar[int] = 1
 
             @staticmethod
-            def load_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-                pass
-
-            @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-                pass
-
-            @staticmethod
-            def store_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 pass
 
         ops = [ScheduledOp(TwoPageOp, tiles_m=4)]

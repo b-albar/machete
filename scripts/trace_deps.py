@@ -75,7 +75,7 @@ def trace_one_to_one(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["data"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 st_global_i32(Int64(_ptr_a), tile_m, tile_m + Int32(1))
@@ -87,7 +87,7 @@ def trace_one_to_one(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = []
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 val = ld_global_i32(Int64(_ptr_a), tile_m)
@@ -137,7 +137,7 @@ def trace_one_to_many(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["data"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 st_global_i32(Int64(_ptr_a), tile_m, tile_m + Int32(1))
@@ -149,7 +149,7 @@ def trace_one_to_many(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = []
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 val = ld_global_i32(Int64(_ptr_a), tile_m)
@@ -199,7 +199,7 @@ def trace_many_to_one(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["data"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 idx = tile_m * Int32(_num_cols) + tile_n
@@ -212,7 +212,7 @@ def trace_many_to_one(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = []
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 last_idx = tile_m * Int32(_num_cols) + Int32(_num_cols - 1)
@@ -261,7 +261,7 @@ def trace_chain_mixed(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 idx = tile_m * Int32(_num_cols) + tile_n
@@ -274,7 +274,7 @@ def trace_chain_mixed(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["buf"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 _ = ld_global_i32(Int64(_ptr_a), tile_m * Int32(_num_cols) + Int32(_num_cols - 1))
@@ -287,7 +287,7 @@ def trace_chain_mixed(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = []
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 val = ld_global_i32(Int64(_ptr_b), tile_m)
@@ -340,7 +340,7 @@ def trace_diamond(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["data"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 st_global_i32(Int64(_ptr_a), tile_m, tile_m + Int32(1))
@@ -352,7 +352,7 @@ def trace_diamond(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["buf_b"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 val = ld_global_i32(Int64(_ptr_a), tile_m)
@@ -365,7 +365,7 @@ def trace_diamond(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = ["buf_c"]
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 val = ld_global_i32(Int64(_ptr_a), tile_m)
@@ -378,7 +378,7 @@ def trace_diamond(output_dir: str):
         OUTPUTS: ClassVar[List[str]] = []
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
             tidx = cute.arch.thread_idx()[0]
             if tidx == Int32(0):
                 b_val = ld_global_i32(Int64(_ptr_b), tile_m)

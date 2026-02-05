@@ -22,7 +22,7 @@ Usage:
 import threading
 from typing import Dict, List, Optional, Tuple, Type
 
-from .ops import ScheduledOp, ExecutionMode, Op
+from .ops import ScheduledOp, Op
 from .megakernel import MegakernelConfig
 
 
@@ -69,8 +69,6 @@ class KernelCache:
         op_structure = tuple(
             (
                 op.op_cls,
-                op.execution_mode.value if isinstance(op.execution_mode, ExecutionMode) else op.execution_mode,
-                op.num_producer_warps,
                 op.tiles_m,
                 op.tiles_n,
                 op.tiles_l,

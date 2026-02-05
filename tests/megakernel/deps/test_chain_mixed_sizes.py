@@ -80,7 +80,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     idx = tile_m * Int32(_num_cols) + tile_n
@@ -93,7 +93,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this M to verify all producers completed
@@ -107,7 +107,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf_ptr), tile_m)
@@ -163,7 +163,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_buf1_ptr), tile_m, tile_m * Int32(10) + Int32(1))
@@ -175,7 +175,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf1_ptr), tile_m)
@@ -189,7 +189,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this M
@@ -247,7 +247,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_a_ptr), tile_m, tile_m + Int32(1))
@@ -259,7 +259,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_m)
@@ -273,7 +273,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     in_idx = tile_m * Int32(_num_cols) + tile_n
@@ -287,7 +287,7 @@ class TestChainMixedDimsGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute_forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this M

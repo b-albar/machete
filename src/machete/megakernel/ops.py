@@ -6,7 +6,7 @@ This module defines the operation protocol for GPU execution using CuTe DSL.
 Operations are templates that get inlined at compile time, enabling full
 compiler optimization with no runtime dispatch overhead.
 
-Subclass ``Op`` and declare tensors, tiling, then implement compute_forward::
+Subclass ``Op`` and declare tensors, tiling, then implement forward::
 
     class MyOp(Op):
         reads  = {"x": (Float32, "M, D")}
@@ -14,8 +14,8 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute_forward::
         tile   = ("M",)
 
         @staticmethod
-        def compute_forward(smem_base, config_ptr, page_ids,
-                            tile_m, tile_n, tile_l, op_config_ptr):
+        def forward(smem_base, config_ptr, page_ids,
+                    tile_m, tile_n, tile_l, op_config_ptr):
             ...  # M is dynamic (tile dim), D is a static compile-time int
 
     ops = [MyOp.schedule(x=tensor)]
@@ -23,7 +23,6 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute_forward::
     kernel.run()
 """
 
-import enum
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -460,23 +459,6 @@ def _process_op_declarations(cls):
 
 
 # =============================================================================
-# Execution Mode
-# =============================================================================
-
-
-class ExecutionMode(enum.Enum):
-    """Execution strategy for an op's load/compute/store phases.
-
-    SEQUENTIAL: All threads execute load → sync → compute → sync → store.
-    WARP_SPECIALIZED: Producer warps do load/store, consumer warps do compute,
-                      synchronized via hardware mbarrier.
-    """
-
-    SEQUENTIAL = "sequential"
-    WARP_SPECIALIZED = "warp_specialized"
-
-
-# =============================================================================
 # Operation Protocol
 # =============================================================================
 
@@ -493,15 +475,13 @@ class Op:
         writes: Dict of tensor name → (dtype, dim_string)
         tile:   Tuple of dim names that define the tile grid
 
-    Then implement at minimum ``compute_forward``. Load/store default
-    to no-ops (suitable for global-memory-only ops). Backward methods
-    are optional.
+    Then implement ``forward`` (required) and optionally ``backward``.
 
-    Method signature (same for all phases):
-        def method(smem_base: Int32, config_ptr: Int32,
-                   page_ids: tuple[Int32, ...],
-                   tile_m: Int32, tile_n: Int32, tile_l: Int32,
-                   op_config_ptr: Int64) -> None
+    Method signature:
+        def forward(smem_base: Int32, config_ptr: Int32,
+                    page_ids: tuple[Int32, ...],
+                    tile_m: Int32, tile_n: Int32, tile_l: Int32,
+                    op_config_ptr: Int64) -> None
 
     Class attributes:
         NUM_INPUT_PAGES: Number of input shared memory pages needed
@@ -510,8 +490,8 @@ class Op:
         OUTPUTS: Named global memory buffers this op produces
     """
 
-    NUM_INPUT_PAGES: ClassVar[int] = 1
-    NUM_OUTPUT_PAGES: ClassVar[int] = 1
+    NUM_INPUT_PAGES: ClassVar[int] = 0
+    NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     # Named buffer declarations for automatic dependency inference.
     # Each string names a global memory buffer. The builder matches
@@ -524,10 +504,8 @@ class Op:
         if hasattr(cls, "reads") and hasattr(cls, "writes"):
             _process_op_declarations(cls)
 
-    # --- Forward pass ---
-
     @staticmethod
-    def init_forward(
+    def forward(
         smem_base: Int32,
         config_ptr: Int32,
         page_ids: tuple,
@@ -536,21 +514,25 @@ class Op:
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Shared setup before warp split (optional).
+        """Perform the forward computation for one tile.
 
-        Runs before load/compute/store in both sequential and warp-specialized
-        modes. In warp-specialized mode, its body is inlined before the warp_id
-        branch, so any variables defined here are visible to both producer and
-        consumer warps.
+        This is the main entry point for the op. Implement all logic here:
+        loading data, computing, and storing results.
 
-        Use this for pipeline initialization, TMA descriptor partitioning,
-        shared memory tensor views, or any setup that must be shared across
-        warp roles.
+        Args:
+            smem_base: Base pointer to shared memory
+            config_ptr: Pointer to page table config in shared memory
+            page_ids: Tuple of allocated page IDs (empty for zero-page ops)
+            tile_m: M tile index
+            tile_n: N tile index
+            tile_l: L tile index
+            op_config_ptr: Pointer to op-specific config in global memory
+                          (tensor pointers, dimensions, etc.)
         """
         pass
 
     @staticmethod
-    def load_forward(
+    def backward(
         smem_base: Int32,
         config_ptr: Int32,
         page_ids: tuple,
@@ -559,90 +541,10 @@ class Op:
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Load data from global to shared memory."""
-        pass
+        """Compute gradients for one tile (optional).
 
-    @staticmethod
-    def compute_forward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Perform the forward computation."""
-        pass
-
-    @staticmethod
-    def store_forward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Store results to global memory."""
-        pass
-
-    # --- Backward pass (optional) ---
-
-    @staticmethod
-    def init_backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Shared setup before warp split for the backward pass (optional).
-
-        Same role as init_forward but for gradient computation.
+        Same signature as forward. Implement gradient computation here.
         """
-        pass
-
-    @staticmethod
-    def load_backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Load data/gradients from global to shared memory for backward pass."""
-        pass
-
-    @staticmethod
-    def compute_backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Compute gradients."""
-        pass
-
-    @staticmethod
-    def store_backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Store gradients to global memory."""
         pass
 
     # --- Host-side tiling (used by autograd and scheduling) ---
@@ -691,16 +593,13 @@ class NOPOp(Op):
 class ScheduledOp:
     """An operation scheduled for execution with tile requirements.
 
-    Pairs an operation class with the number of tiles to process and
-    an execution strategy.
+    Pairs an operation class with the number of tiles to process.
 
     Attributes:
         op_cls: Operation class (must be Op subclass)
         tiles_m: Number of tiles in M dimension
         tiles_n: Number of tiles in N dimension
         tiles_l: Number of tiles in L dimension
-        execution_mode: How to execute load/compute/store phases
-        num_producer_warps: Producer warps for WARP_SPECIALIZED mode
         params: Operation-specific parameters
         dim_names: Maps semantic dimension names to tile axes ("m", "n", "l").
             Example: {"batch": "m", "seqlen": "n"} means tile_m indexes batch
@@ -712,8 +611,6 @@ class ScheduledOp:
     tiles_m: int
     tiles_n: int = 1
     tiles_l: int = 1
-    execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL
-    num_producer_warps: int = 1
     params: Dict[str, Any] = field(default_factory=dict)
     dim_names: Dict[str, str] = None
     config_data: Any = None  # Optional torch.Tensor with per-op config in global memory
@@ -1787,8 +1684,6 @@ __all__ = [
     "Op",
     # Built-in Operations
     "NOPOp",
-    # Execution Mode
-    "ExecutionMode",
     # Scheduling
     "ScheduledOp",
     "TileScheduler",
