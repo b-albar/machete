@@ -386,6 +386,242 @@ def cp_async_wait_group(
     )
 
 
+# =============================================================================
+# mbarrier Primitives (SM90+ Hardware Barriers)
+# =============================================================================
+
+
+@dsl_user_op
+def mbarrier_init(
+    smem_addr: Int32,
+    expected_count: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Initialize an mbarrier object in shared memory.
+
+    Sets the expected arrival count for the barrier. Must be called by
+    exactly one thread before any arrive/wait operations.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier (8-byte aligned, 8 bytes)
+        expected_count: Number of arrivals expected before the barrier triggers
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), expected_count.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            mbarrier.init.shared.b64 [$0], $1;
+        }
+        """,
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def mbarrier_init_fence(
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Fence after mbarrier initialization.
+
+    Issues a fence.proxy.async to ensure mbarrier initialization is visible
+    to all threads before any arrive/wait operations. Must be called after
+    all mbarrier_init calls and before any mbarrier_arrive/mbarrier_wait.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.shared::cta;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def mbarrier_arrive(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Signal arrival at an mbarrier.
+
+    Decrements the expected arrival count by 1. When all expected arrivals
+    have occurred, the barrier phase flips and waiters are released.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b64 %state;
+            mbarrier.arrive.shared.b64 %state, [$0];
+        }
+        """,
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def mbarrier_wait(
+    smem_addr: Int32,
+    phase: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Wait for an mbarrier to complete the given phase.
+
+    Spins using mbarrier.try_wait.parity until the barrier's phase matches
+    the expected phase. The phase alternates (0/1) each time the barrier
+    completes a full cycle of arrivals.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier
+        phase: Expected phase (0 or 1). Flips each time the barrier completes.
+    """
+    global _ptx_label_counter
+    _ptx_label_counter += 1
+    _loop = "LBB_mbar_wait_loop_{}".format(_ptx_label_counter)
+    _done = "LBB_mbar_wait_done_{}".format(_ptx_label_counter)
+
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), phase.ir_value(loc=loc, ip=ip)],
+        "{{ "
+        ".reg .pred %p; "
+        "{loop}: "
+        "mbarrier.try_wait.parity.shared.b64 %p, [$0], $1; "
+        "@%p bra {done}; "
+        "nanosleep.u32 8; "
+        "bra {loop}; "
+        "{done}: "
+        "}}".format(loop=_loop, done=_done),
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def mbarrier_try_wait(
+    smem_addr: Int32,
+    phase: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Non-blocking test if an mbarrier has completed the given phase.
+
+    Returns 1 if the barrier's phase has advanced past the expected phase,
+    0 otherwise. Does NOT spin — returns immediately.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier
+        phase: Expected phase (0 or 1)
+
+    Returns:
+        Int32: 1 if phase completed (ready), 0 if still pending
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [smem_addr.ir_value(loc=loc, ip=ip), phase.ir_value(loc=loc, ip=ip)],
+        "{ "
+        ".reg .pred %p; "
+        "mbarrier.try_wait.parity.shared.b64 %p, [$1], $2; "
+        "selp.u32 $0, 1, 0, %p; "
+        "}",
+        "=r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def nanosleep(
+    duration: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Sleep for approximately the given number of nanoseconds.
+
+    Used to reduce power consumption when the DMA warp has no work to do.
+
+    Args:
+        duration: Sleep duration in nanoseconds (approximate)
+    """
+    llvm.inline_asm(
+        None,
+        [duration.ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# =============================================================================
+# Named Barrier (Thread Subset Synchronization)
+# =============================================================================
+
+
+@dsl_user_op
+def named_barrier_sync(
+    barrier_id: Int32,
+    thread_count: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Synchronize a subset of threads using a named barrier.
+
+    Uses PTX bar.sync to synchronize exactly thread_count threads on the
+    given barrier ID. Unlike __syncthreads() which syncs ALL threads in a
+    block, this only waits for the specified number of threads to arrive.
+
+    Used to replace __syncthreads() in warp-specialized kernels where the
+    DMA warp doesn't participate in compute synchronization.
+
+    Args:
+        barrier_id: Barrier ID (0-15). 0 is equivalent to __syncthreads when
+            thread_count equals block size. Use 1+ for compute-only barriers.
+        thread_count: Number of threads that must arrive before any can proceed.
+    """
+    llvm.inline_asm(
+        None,
+        [barrier_id.ir_value(loc=loc, ip=ip), thread_count.ir_value(loc=loc, ip=ip)],
+        "bar.sync $0, $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
@@ -395,4 +631,14 @@ __all__ = [
     "ld_global_i64",
     "st_global_i32",
     "cp_async_wait_group",
+    # mbarrier primitives
+    "mbarrier_init",
+    "mbarrier_init_fence",
+    "mbarrier_arrive",
+    "mbarrier_wait",
+    "mbarrier_try_wait",
+    # Named barrier
+    "named_barrier_sync",
+    # Misc
+    "nanosleep",
 ]

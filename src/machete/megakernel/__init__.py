@@ -29,7 +29,6 @@ from .ops import (
 )
 
 from .compile import (
-    compile_op,
     cleanup_linecache,
 )
 
@@ -60,7 +59,6 @@ __all__ = [
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
-    "compile_op",
     "cleanup_linecache",
     # Instruction Stream
     "INSTRUCTION_WORDS",

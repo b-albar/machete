@@ -130,79 +130,69 @@ def _build_tensor_and_dim_lists(reads, writes):
 def _gen_init_source(
     unique_tensors,
     unique_dims,
+    tensor_param_map=None,
     static_dims=None,
-    tile_dim_names=None,
-    dynamic_dim_overrides=None,
     kernel_config=None,
     tensor_dtypes=None,
+    warp_specialized=False,
+    dma_warp_mode=False,
 ):
-    """Generate init source code with static dims as compile-time constants.
+    """Generate init source for tensor parameter mode (runtime cute.Tensor params).
 
-    Static dims (non-tile dimensions) are emitted as Python int literals,
-    making them compile-time constants in CuTe DSL. This enables CuTe layout
-    algebra, TMA descriptors, and vectorized loads for those dimensions.
-
-    Dynamic dims (tile dimensions) are loaded from the config tensor at
-    runtime via ld_global_i32.
+    Tensors are passed as function parameters (e.g., t0, t1, t2) and aliased
+    to the op's local names (e.g., x, weight, y). ALL dimensions are emitted
+    as compile-time Python int literals. No config tensor loading needed.
 
     Args:
         unique_tensors: List of (name, dtype, dims) tuples.
         unique_dims: List of (dim_name, tensor_name, axis_idx) tuples.
-        static_dims: Dict mapping static dim names to their int values.
-            If None, all dims are treated as dynamic (legacy behavior).
-        tile_dim_names: Set of dim names that are tile (dynamic) dimensions.
-        dynamic_dim_overrides: Set of additional dim names to treat as dynamic.
-        kernel_config: Dict of kernel configuration parameters to emit as
-            compile-time constants (e.g., threads_per_row, tile_size_M).
+        tensor_param_map: Dict mapping local tensor name to canonical parameter
+            name. E.g., ``{'x': 't0', 'weight': 't1', 'y': 't2'}``.
+        static_dims: Dict mapping ALL dim names to their int values.
+        kernel_config: Dict of kernel configuration parameters.
+        tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
+        warp_specialized: If True, set num_threads to threads_per_row (compute
+            threads only, excluding the DMA warp) instead of block_dim.
+        dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
+            tidx is offset so DMA warp threads become 0-31, num_threads=32.
     """
     lines = []
-    lines.append("tidx = cute.arch.thread_idx()[0]")
-    lines.append("num_threads = cute.arch.block_dim()[0]")
 
-    # Emit kernel config parameters as compile-time constants
+    # Kernel config params first (threads_per_row, tile_size_M, etc.)
+    # Must come before tidx/num_threads since warp_specialized mode references threads_per_row
     if kernel_config:
         for name, value in kernel_config.items():
             lines.append(f"{name} = {value}")
 
-    # Determine which dims are dynamic vs static
-    if static_dims is None:
-        # Legacy: all dims are dynamic
-        dynamic_names = {d for d, _, _ in unique_dims}
+    if dma_warp_mode:
+        # DMA warp: remap tidx to 0-31 (subtract compute thread count)
+        compute_threads = kernel_config.get("threads_per_row", 0) if kernel_config else 0
+        lines.append(f"tidx = cute.arch.thread_idx()[0] - Int32({compute_threads})")
+        lines.append("num_threads = 32")
+    elif warp_specialized:
+        lines.append("tidx = cute.arch.thread_idx()[0]")
+        # In warp-specialized mode, num_threads = compute threads only
+        lines.append("num_threads = threads_per_row")
     else:
-        dynamic_names = set(tile_dim_names or ())
-        if dynamic_dim_overrides:
-            dynamic_names |= set(dynamic_dim_overrides)
+        lines.append("tidx = cute.arch.thread_idx()[0]")
+        lines.append("num_threads = cute.arch.block_dim()[0]")
 
-    # Separate dims into dynamic (config-loaded) and static (literal)
-    dynamic_dims = [(d, t, a) for d, t, a in unique_dims if d in dynamic_names]
-    static_dim_list = [(d, t, a) for d, t, a in unique_dims if d not in dynamic_names]
+    # Alias tensor params to local names: x = t0, weight = t1, etc.
+    if tensor_param_map:
+        for local_name, canonical_name in tensor_param_map.items():
+            lines.append(f"{local_name} = {canonical_name}")
 
-    # Read pointers (int64, 2 int32 words each)
-    for i, (name, dtype, dims) in enumerate(unique_tensors):
-        lines.append(f"{name}_ptr_raw = ld_global_i64(op_config_ptr, Int32({i}))")
+    # ALL dims as compile-time Python int literals
+    if static_dims:
+        for dim_name, _, _ in unique_dims:
+            if dim_name in static_dims:
+                lines.append(f"{dim_name} = {static_dims[dim_name]}")
 
-    # Dynamic dims: load from config (after pointers)
-    dim_offset = 2 * len(unique_tensors)
-    for j, (dim_name, _, _) in enumerate(dynamic_dims):
-        lines.append(f"{dim_name} = ld_global_i32(op_config_ptr, Int32({dim_offset + j}))")
-
-    # Static dims: Python int literals (compile-time constants in CuTe DSL)
-    if static_dims is not None:
-        for dim_name, _, _ in static_dim_list:
-            lines.append(f"{dim_name} = {static_dims[dim_name]}")
-
-    # Create CuTe tensor views and emit dtype constants
+    # Dtype constants for each tensor
     for name, dtype, dims in unique_tensors:
-        # Use overridden dtype if provided, otherwise use declared dtype
         if tensor_dtypes and name in tensor_dtypes:
             dtype = tensor_dtypes[name]
         dtype_name = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
-        lines.append(
-            f"{name} = cute.make_tensor("
-            f"cute.make_ptr({dtype_name}, {name}_ptr_raw, cute.AddressSpace.gmem), "
-            f"cute.make_layout(_FLAT))"
-        )
-        # Emit dtype constant for use in compute methods (e.g., x_dtype = Float16)
         lines.append(f"{name}_dtype = {dtype_name}")
 
     return "\n".join(lines)
@@ -240,7 +230,7 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
 
         return staticmethod(pack_config)
 
-    # All dims are dynamic if no classification provided (legacy / NOPOp)
+    # All dims are dynamic if no classification provided (e.g. NOPOp)
     if dynamic_dim_names is None:
         dynamic_dim_names = {d for d, _, _ in unique_dims}
 
@@ -374,11 +364,11 @@ def _process_op_declarations(cls):
             unique_tensors = cls._UNIQUE_TENSORS
             pack_fn = cls.pack_config
 
-        # Extract static dim values from actual tensor shapes
+        # Extract ALL dim values from actual tensor shapes (compile-time constants).
+        # The cache key includes static_dims, so different values trigger recompilation.
         static_dims = {}
         for dim_name, tensor_name, axis_idx in unique_dims:
-            if dim_name not in (cls._TILE_DIM_NAMES | cls._DYNAMIC_DIM_OVERRIDES):
-                static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
+            static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
         tensor_dtypes = {}
@@ -392,9 +382,11 @@ def _process_op_declarations(cls):
         # This allows the framework to detect when the same tensor is used
         # as output of one op and input of another, regardless of buffer names
         tensor_ptrs = {}
+        tensor_refs = {}
         for name in tensors:
             if hasattr(tensors[name], 'data_ptr'):
                 tensor_ptrs[name] = tensors[name].data_ptr()
+                tensor_refs[name] = tensors[name]
 
         config_data = pack_fn(**tensors)
         return ScheduledOp(
@@ -406,6 +398,7 @@ def _process_op_declarations(cls):
             static_dims=static_dims,
             tensor_dtypes=tensor_dtypes,
             tensor_ptrs=tensor_ptrs,
+            tensor_refs=tensor_refs,
             dim_names=cls.DIM_NAMES,
             tile_sizes=cls._TILE_SIZES.copy(),  # Include tile sizes for barrier computation
         )
@@ -414,19 +407,23 @@ def _process_op_declarations(cls):
 
     # Add gen_init_source classmethod for deferred init generation
     @classmethod
-    def gen_init_source(cls, static_dims, backward=False, kernel_config=None, tensor_dtypes=None):
-        """Generate init source with static dims baked as compile-time constants.
+    def gen_init_source(cls, static_dims, tensor_param_map=None,
+                                    backward=False, kernel_config=None, tensor_dtypes=None,
+                                    warp_specialized=False, dma_warp_mode=False):
+        """Generate init source for tensor parameter mode.
 
-        Called at kernel compile time when static dim values are known.
-        Returns a source string (not a function) to be inlined by compile.py.
+        Tensors are passed as function parameters and aliased to local names.
+        ALL dimensions are emitted as compile-time constants.
 
         Args:
-            static_dims: Dict mapping static dim names to their int values.
+            static_dims: Dict mapping ALL dim names to their int values.
+            tensor_param_map: Dict mapping local tensor name to canonical
+                param name. E.g., ``{'x': 't0', 'weight': 't1', 'y': 't2'}``.
             backward: If True, use backward tensor declarations.
-            kernel_config: Dict of kernel config parameters (e.g., threads_per_row).
-                Also includes tile_size_<DIM> for each tile dimension.
-            tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes. Used to
-                override declared dtypes (for dtype inference from actual tensors).
+            kernel_config: Dict of kernel config parameters.
+            tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
+            warp_specialized: If True, set num_threads to compute threads only.
+            dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
         """
         if backward:
             tensors = cls._BWD_UNIQUE_TENSORS
@@ -435,26 +432,40 @@ def _process_op_declarations(cls):
             tensors = cls._UNIQUE_TENSORS
             dims = cls._UNIQUE_DIMS
 
-        # Build kernel config with tile sizes
         full_kernel_config = {}
         if kernel_config:
             full_kernel_config.update(kernel_config)
-
-        # Add tile sizes as tile_size_<DIM> (e.g., tile_size_M = 2)
         for dim_name, size in cls._TILE_SIZES.items():
             full_kernel_config[f"tile_size_{dim_name}"] = size
 
         return _gen_init_source(
             tensors,
             dims,
+            tensor_param_map=tensor_param_map,
             static_dims=static_dims,
-            tile_dim_names=cls._TILE_DIM_NAMES,
-            dynamic_dim_overrides=cls._DYNAMIC_DIM_OVERRIDES,
             kernel_config=full_kernel_config if full_kernel_config else None,
             tensor_dtypes=tensor_dtypes,
+            warp_specialized=warp_specialized,
+            dma_warp_mode=dma_warp_mode,
         )
 
     cls.gen_init_source = gen_init_source
+
+    # Add gen_tensor_param_names classmethod
+    @classmethod
+    def gen_tensor_param_names(cls, backward=False):
+        """Get the tensor parameter names for function signature in tensor mode.
+
+        Returns the list of tensor names declared in reads/writes (deduplicated,
+        in declaration order). Used to build the phase function signature.
+
+        Args:
+            backward: If True, use backward tensor declarations.
+        """
+        tensors = cls._BWD_UNIQUE_TENSORS if backward else cls._UNIQUE_TENSORS
+        return [name for name, _, _ in tensors]
+
+    cls.gen_tensor_param_names = gen_tensor_param_names
 
 
 # =============================================================================
@@ -486,42 +497,16 @@ class Op:
         For ops that don't use shared memory staging, put all logic in compute()
         and leave load_async()/store() as pass.
 
-    Example (with shared memory staging):
+    Example (direct global memory, typical pattern):
         class MyOp(Op):
             reads = {"x": (Float32, "M, D")}
             writes = {"y": (Float32, "M, D")}
             tile = ("M",)
 
             @staticmethod
-            def load_async(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                # Issue cp.async to load tile data to shared memory
-                for i in range(tidx, D, num_threads):
-                    cp_async_f32(page_ptr, Int32(i * 4), x_ptr + tile_m * D + i)
-                cp_async_commit()  # REQUIRED at end
-
-            @staticmethod
             def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                # Process data from shared memory
-                for i in range(tidx, D, num_threads):
-                    val = ld_shared_f32(page_ptr + i * 4)
-                    st_shared_f32(page_ptr + i * 4, val * 2.0)
-
-            @staticmethod
-            def store(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                # Write results to global memory
-                for i in range(tidx, D, num_threads):
-                    val = ld_shared_f32(page_ptr + i * 4)
-                    st_global_f32(y_ptr, tile_m * D + i, val)
-
-    Example (direct global memory access, no staging):
-        class MyDirectOp(Op):
-            reads = {"x": (Float32, "M, D")}
-            writes = {"y": (Float32, "M, D")}
-            tile = ("M",)
-
-            @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                # Direct global memory access in compute phase
+                # x, y are cute.Tensor params aliased via init_source
+                # M, D are compile-time constants from init_source
                 for i in range(tidx, D, num_threads):
                     y[tile_m * D + i] = x[tile_m * D + i] * 2.0
 
@@ -697,9 +682,6 @@ class Op:
         return 1
 
 
-# Keep PipelinedOp as an alias for backward compatibility
-PipelinedOp = Op
-
 
 # =============================================================================
 # NOP Operation
@@ -747,6 +729,7 @@ class ScheduledOp:
     tensor_dtypes: Dict[str, Any] = field(default_factory=dict)  # Compile-time tensor dtypes
     tile_sizes: Dict[str, int] = field(default_factory=dict)  # Tile sizes per dim (e.g., {"M": 4})
     tensor_ptrs: Dict[str, int] = field(default_factory=dict)  # Tensor data pointers for dependency matching
+    tensor_refs: Dict[str, Any] = field(default_factory=dict)  # {name: torch.Tensor} for tensor param mode
 
     def __post_init__(self):
         if self.dim_names is None:
@@ -772,6 +755,133 @@ class ScheduledOp:
     def axis_for_dim(self, dim_name: str) -> Optional[str]:
         """Get the tile axis for a semantic dimension name, or None."""
         return self.dim_names.get(dim_name)
+
+
+# =============================================================================
+# Tensor Registry (Deduplication for Tensor Parameter Mode)
+# =============================================================================
+
+
+@dataclass
+class TensorRegistry:
+    """Deduplicates tensors across ops by data_ptr() for tensor parameter mode.
+
+    When multiple ops share the same underlying tensor (e.g., RMSNorm.y and
+    Rope.q point to the same GPU buffer), this registry assigns a single
+    canonical parameter name (t0, t1, ...) to avoid passing duplicate tensors.
+
+    Usage:
+        registry = TensorRegistry.from_ops(ops)
+        # registry.canonical_names → ['t0', 't1', 't2', 't3', 't4']
+        # registry.get_op_tensor_args(0, RMSNormOp) → ['t0', 't1', 't2']
+        # registry.get_op_tensor_args(1, RopeOp) → ['t2', 't3', 't4']
+    """
+
+    # List of (canonical_name, torch.Tensor, cutlass_dtype)
+    tensors: List[Tuple[str, Any, Any]]
+    # Per-op mappings: {op_idx: {local_name: canonical_name}}
+    op_mappings: Dict[int, Dict[str, str]]
+    # Reverse mapping: canonical_name -> index in tensors list
+    name_to_idx: Dict[str, int]
+
+    @classmethod
+    def from_ops(cls, ops: List[ScheduledOp], backward: bool = False) -> "TensorRegistry":
+        """Build a TensorRegistry from a list of ScheduledOps.
+
+        Iterates through each op's tensor_refs in declaration order,
+        deduplicating by data_ptr(). Tensors with the same GPU address
+        get the same canonical name.
+
+        Args:
+            ops: List of scheduled operations with tensor_refs populated.
+            backward: If True, use backward tensor declarations for ordering.
+        """
+        ptr_to_canonical: Dict[int, str] = {}
+        tensors: List[Tuple[str, Any, Any]] = []
+        op_mappings: Dict[int, Dict[str, str]] = {}
+        name_to_idx: Dict[str, int] = {}
+
+        for i, op in enumerate(ops):
+            mapping: Dict[str, str] = {}
+            # Skip ops that don't have tensor declarations (e.g., simple test ops
+            # like StampOp/TensorScaleOp that don't use the @op decorator)
+            if not hasattr(op.op_cls, '_UNIQUE_TENSORS'):
+                op_mappings[i] = mapping
+                continue
+
+            # Use the op's unique_tensors for consistent ordering
+            unique_tensors = (
+                op.op_cls._BWD_UNIQUE_TENSORS if backward else op.op_cls._UNIQUE_TENSORS
+            )
+
+            for name, dtype, dims in unique_tensors:
+                if name not in op.tensor_refs:
+                    continue
+                tensor = op.tensor_refs[name]
+                ptr = tensor.data_ptr()
+
+                if ptr not in ptr_to_canonical:
+                    canonical = f"t{len(tensors)}"
+                    ptr_to_canonical[ptr] = canonical
+
+                    # Resolve dtype (None means infer from tensor)
+                    resolved_dtype = dtype
+                    if resolved_dtype is None:
+                        resolved_dtype = TORCH_TO_CUTLASS_DTYPE.get(tensor.dtype)
+
+                    name_to_idx[canonical] = len(tensors)
+                    tensors.append((canonical, tensor, resolved_dtype))
+
+                mapping[name] = ptr_to_canonical[ptr]
+            op_mappings[i] = mapping
+
+        return cls(tensors=tensors, op_mappings=op_mappings, name_to_idx=name_to_idx)
+
+    @property
+    def canonical_names(self) -> List[str]:
+        """List of canonical tensor parameter names in order."""
+        return [name for name, _, _ in self.tensors]
+
+    @property
+    def num_tensors(self) -> int:
+        """Number of unique tensors."""
+        return len(self.tensors)
+
+    def get_op_tensor_args(self, op_idx: int, op_cls, backward: bool = False) -> List[str]:
+        """Get ordered canonical tensor names for an op's function call.
+
+        Returns canonical names in the same order as the op's tensor
+        declarations (reads then writes, deduplicated). This order matches
+        the tensor parameter positions in the compiled phase function.
+
+        Args:
+            op_idx: Index of the op in the ops list.
+            op_cls: The op class (for accessing _UNIQUE_TENSORS).
+            backward: If True, use backward tensor declarations.
+        """
+        if not hasattr(op_cls, '_UNIQUE_TENSORS'):
+            return []
+        unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
+        mapping = self.op_mappings[op_idx]
+        return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
+
+    def get_op_local_names(self, op_idx: int, op_cls, backward: bool = False) -> List[str]:
+        """Get ordered local tensor names for an op's function signature.
+
+        Returns the op's own tensor names (x, weight, y, etc.) in declaration
+        order. Used to build the phase function signature where tensor params
+        use the op's local names.
+
+        Args:
+            op_idx: Index of the op in the ops list.
+            op_cls: The op class (for accessing _UNIQUE_TENSORS).
+            backward: If True, use backward tensor declarations.
+        """
+        if not hasattr(op_cls, '_UNIQUE_TENSORS'):
+            return []
+        unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
+        mapping = self.op_mappings[op_idx]
+        return [name for name, _, _ in unique_tensors if name in mapping]
 
 
 # =============================================================================
@@ -803,7 +913,7 @@ class BarrierFormula:
         guard_max: Only execute when the computed linear index
             (coeff_m * tile_m + coeff_n * tile_n + coeff_l * tile_l)
             is less than this value. Defaults to NO_GUARD (always passes).
-            Used for legacy mode with mismatched tile counts.
+            Used for linear chain mode with mismatched tile counts.
     """
 
     # Sentinel: guard_max value that always passes (larger than any tile count)
@@ -1332,7 +1442,7 @@ class InstructionStreamBuilder:
                        dim_names={"batch": "m"})
         # OpB reads OpA's output → OpB batch=0 waits for all 32 seqlen tiles
 
-    Legacy mode (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
+    Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
     """
 
     def __init__(self):
@@ -1427,7 +1537,7 @@ class InstructionStreamBuilder:
         dependency kind. Used by build() to determine tile emission order.
         """
         if not self._has_named_buffers():
-            # Legacy linear chain: each op depends on previous, 1:1
+            # Linear chain fallback: each op depends on previous, 1:1
             return [
                 _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one") for i in range(1, len(self._op_records))
             ]
@@ -1488,19 +1598,19 @@ class InstructionStreamBuilder:
         if self._has_named_buffers():
             formulas, count = self._resolve_named_formulas()
         else:
-            formulas, count = self._resolve_legacy_formulas()
+            formulas, count = self._resolve_linear_chain_formulas()
 
         self._cached_formulas = formulas
         self._barrier_count = count
         return formulas, count
 
-    def _resolve_legacy_formulas(
+    def _resolve_linear_chain_formulas(
         self,
     ) -> Tuple[
         Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
         int,
     ]:
-        """Compute barrier formulas for legacy linear chain.
+        """Compute barrier formulas for linear chain (no named buffers).
 
         Each op signals its own barrier set. The next op waits on the
         previous op's barriers with 1:1 tile index mapping.
@@ -1811,11 +1921,11 @@ class InstructionStreamBuilder:
 __all__ = [
     # Protocol
     "Op",
-    "PipelinedOp",
     # Built-in Operations
     "NOPOp",
     # Scheduling
     "ScheduledOp",
+    "TensorRegistry",
     "TileScheduler",
     "LevelBatchedScheduler",
     "BackwardScheduler",

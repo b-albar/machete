@@ -33,7 +33,6 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Int64, Float32
 
 from machete.megakernel.ops import Op
-from machete.utils.testing import is_blackwell_available, is_hopper_available
 
 
 # =============================================================================
@@ -214,15 +213,15 @@ class GemmOp(Op):
         # Create Global Memory Tensors
         # =====================================================================
         mA = cute.make_tensor(
-            cute.make_ptr(a_dtype, a_ptr_raw, cute.AddressSpace.gmem, assumed_align=16),
+            a.iterator,
             cute.make_layout((M, K), stride=(K, 1)),
         )
         mB = cute.make_tensor(
-            cute.make_ptr(a_dtype, b_ptr_raw, cute.AddressSpace.gmem, assumed_align=16),
+            b.iterator,
             cute.make_layout((N, K), stride=(K, 1)),
         )
         mC = cute.make_tensor(
-            cute.make_ptr(a_dtype, c_ptr_raw, cute.AddressSpace.gmem, assumed_align=16),
+            c.iterator,
             cute.make_layout((M, N), stride=(N, 1)),
         )
 
@@ -610,6 +609,4 @@ def gemm_megakernel(
 __all__ = [
     "GemmOp",
     "gemm_megakernel",
-    "is_blackwell_available",
-    "is_hopper_available",
 ]

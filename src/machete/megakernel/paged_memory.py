@@ -231,6 +231,7 @@ class NPageLayout:
     _TILE_INFO_SIZE: int = 16  # Per-page: op_idx, tile_m, tile_n, tile_l
     _INSTR_SIZE: int = 16
     _FLAGS_SIZE: int = 16
+    _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
         """Calculate layout offsets after initialization."""
@@ -240,11 +241,12 @@ class NPageLayout:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
 
         # Scratch region layout:
-        # [tile_info_0][tile_info_1]...[tile_info_N-1][instr][flags]
+        # [tile_info_0..N-1][instr][flags][mbarriers: load_done[0..N-1], compute_done[0..N-1]]
         raw_scratch_size = (
             self.num_pages * self._TILE_INFO_SIZE  # Tile info per page
             + self._INSTR_SIZE
             + self._FLAGS_SIZE
+            + 2 * self.num_pages * self._MBARRIER_SIZE  # load_done + compute_done
         )
         self.scratch_size = _align_up(raw_scratch_size, 128)
 
@@ -253,6 +255,9 @@ class NPageLayout:
         self.ring_state_offset = 0
         self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
         self.flags_offset = self.instr_offset + self._INSTR_SIZE
+        # mbarrier array: 2 * num_pages mbarriers (load_done[0..N-1], compute_done[0..N-1])
+        # Each mbarrier is 8 bytes, 8-byte aligned. flags_offset + _FLAGS_SIZE is 16-byte aligned.
+        self.mbarrier_offset = self.flags_offset + self._FLAGS_SIZE
 
         # Page layout - pages start right after scratch
         # Page pointer computed as: smem_base + pages_start + page_idx * aligned_page_size
@@ -269,6 +274,14 @@ class NPageLayout:
                 f"Invalid page_idx {page_idx}, must be 0 to {self.num_pages - 1}"
             )
         return self.pages_start + page_idx * self.aligned_page_size
+
+    def load_done_mbar_offset(self, page_idx: int) -> int:
+        """Get offset to the load_done mbarrier for a given page."""
+        return self.mbarrier_offset + page_idx * self._MBARRIER_SIZE
+
+    def compute_done_mbar_offset(self, page_idx: int) -> int:
+        """Get offset to the compute_done mbarrier for a given page."""
+        return self.mbarrier_offset + self.num_pages * self._MBARRIER_SIZE + page_idx * self._MBARRIER_SIZE
 
     @classmethod
     def for_device(
