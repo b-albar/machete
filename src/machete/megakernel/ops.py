@@ -6,7 +6,7 @@ This module defines the operation protocol for GPU execution using CuTe DSL.
 Operations are templates that get inlined at compile time, enabling full
 compiler optimization with no runtime dispatch overhead.
 
-Subclass ``Op`` and declare tensors, tiling, then implement forward::
+Subclass ``Op`` and declare tensors, tiling, then implement compute::
 
     class MyOp(Op):
         reads  = {"x": (Float32, "M, D")}
@@ -14,8 +14,7 @@ Subclass ``Op`` and declare tensors, tiling, then implement forward::
         tile   = ("M",)
 
         @staticmethod
-        def forward(smem_base, config_ptr, page_ids,
-                    tile_m, tile_n, tile_l, op_config_ptr):
+        def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
             ...  # M is dynamic (tile dim), D is a static compile-time int
 
     ops = [MyOp.schedule(x=tensor)]
@@ -464,7 +463,7 @@ def _process_op_declarations(cls):
 
 
 class Op:
-    """Base class for GPU-executable operations.
+    """Base class for GPU-executable operations with pipelined execution.
 
     Each operation implements static methods that get inlined into the
     megakernel at compile time. The methods receive raw CuTe DSL types
@@ -475,13 +474,56 @@ class Op:
         writes: Dict of tensor name → (dtype, dim_string)
         tile:   Tuple of dim names that define the tile grid
 
-    Then implement ``forward`` (required) and optionally ``backward``.
+    Execution Model:
+        The megakernel uses double-buffered pipelining. Ops implement three phases:
+        - load_async(): Issue cp.async copies from global to shared memory
+        - compute(): Process data (main computation logic)
+        - store(): Write results to global memory
 
-    Method signature:
-        def forward(smem_base: Int32, config_ptr: Int32,
-                    page_ids: tuple[Int32, ...],
-                    tile_m: Int32, tile_n: Int32, tile_l: Int32,
-                    op_config_ptr: Int64) -> None
+        When dependencies allow, load[N+1] overlaps with compute[N].
+        When dependencies block, execution gracefully degrades to sequential.
+
+        For ops that don't use shared memory staging, put all logic in compute()
+        and leave load_async()/store() as pass.
+
+    Example (with shared memory staging):
+        class MyOp(Op):
+            reads = {"x": (Float32, "M, D")}
+            writes = {"y": (Float32, "M, D")}
+            tile = ("M",)
+
+            @staticmethod
+            def load_async(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+                # Issue cp.async to load tile data to shared memory
+                for i in range(tidx, D, num_threads):
+                    cp_async_f32(page_ptr, Int32(i * 4), x_ptr + tile_m * D + i)
+                cp_async_commit()  # REQUIRED at end
+
+            @staticmethod
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+                # Process data from shared memory
+                for i in range(tidx, D, num_threads):
+                    val = ld_shared_f32(page_ptr + i * 4)
+                    st_shared_f32(page_ptr + i * 4, val * 2.0)
+
+            @staticmethod
+            def store(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+                # Write results to global memory
+                for i in range(tidx, D, num_threads):
+                    val = ld_shared_f32(page_ptr + i * 4)
+                    st_global_f32(y_ptr, tile_m * D + i, val)
+
+    Example (direct global memory access, no staging):
+        class MyDirectOp(Op):
+            reads = {"x": (Float32, "M, D")}
+            writes = {"y": (Float32, "M, D")}
+            tile = ("M",)
+
+            @staticmethod
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+                # Direct global memory access in compute phase
+                for i in range(tidx, D, num_threads):
+                    y[tile_m * D + i] = x[tile_m * D + i] * 2.0
 
     Class attributes:
         NUM_INPUT_PAGES: Number of input shared memory pages needed
@@ -504,50 +546,133 @@ class Op:
         if hasattr(cls, "reads") and hasattr(cls, "writes"):
             _process_op_declarations(cls)
 
+    # =========================================================================
+    # Pipelined Execution Interface
+    # =========================================================================
+
     @staticmethod
-    def forward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
+    def load_async(
+        page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Perform the forward computation for one tile.
+        """Issue async copies from global memory to shared memory page.
 
-        This is the main entry point for the op. Implement all logic here:
-        loading data, computing, and storing results.
+        Override this to prefetch data into shared memory for compute overlap.
+        MUST call cp_async_commit() at the end to mark the copy group.
+        MUST NOT call cp_async_wait_*() - the dispatcher handles synchronization.
+
+        Default: no-op (for ops that don't use shared memory staging).
 
         Args:
-            smem_base: Base pointer to shared memory
-            config_ptr: Pointer to page table config in shared memory
-            page_ids: Tuple of allocated page IDs (empty for zero-page ops)
+            page_ptr: Shared memory page base address (32-bit)
             tile_m: M tile index
             tile_n: N tile index
             tile_l: L tile index
             op_config_ptr: Pointer to op-specific config in global memory
-                          (tensor pointers, dimensions, etc.)
         """
         pass
 
     @staticmethod
-    def backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Compute gradients for one tile (optional).
+        """Main computation for one tile.
 
-        Same signature as forward. Implement gradient computation here.
+        This is where the op's core logic goes. Can access:
+        - Shared memory via page_ptr (if load_async staged data there)
+        - Global memory directly via tensor pointers from init_source
+
+        Called after cp_async_wait_all() ensures any async loads are complete.
+
+        Args:
+            page_ptr: Shared memory page base address (32-bit)
+            tile_m: M tile index
+            tile_n: N tile index
+            tile_l: L tile index
+            op_config_ptr: Pointer to op-specific config in global memory
         """
         pass
 
-    # --- Host-side tiling (used by autograd and scheduling) ---
+    @staticmethod
+    def store(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
+        op_config_ptr: Int64,
+    ) -> None:
+        """Store results from shared memory page to global memory.
+
+        Override this if compute() writes results to shared memory that
+        need to be copied back to global memory.
+
+        Default: no-op (for ops that write directly to global memory in compute()).
+
+        Args:
+            page_ptr: Shared memory page with computed results (32-bit)
+            tile_m: M tile index
+            tile_n: N tile index
+            tile_l: L tile index
+            op_config_ptr: Pointer to op-specific config in global memory
+        """
+        pass
+
+    # =========================================================================
+    # Backward Pass Interface
+    # =========================================================================
+
+    @staticmethod
+    def backward_load_async(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
+        op_config_ptr: Int64,
+    ) -> None:
+        """Issue async copies for backward pass.
+
+        Default: no-op (for ops that don't use shared memory staging).
+        """
+        pass
+
+    @staticmethod
+    def backward_compute(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
+        op_config_ptr: Int64,
+    ) -> None:
+        """Backward computation for one tile.
+
+        Default: no-op.
+        """
+        pass
+
+    @staticmethod
+    def backward_store(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
+        op_config_ptr: Int64,
+    ) -> None:
+        """Store backward results from shared memory to global memory.
+
+        Default: no-op.
+        """
+        pass
+
+    # =========================================================================
+    # Host-side tiling (used by autograd and scheduling)
+    # =========================================================================
 
     @staticmethod
     def compute_tiles(**tensors) -> int:
@@ -570,6 +695,10 @@ class Op:
     def tiles_l(**tensors) -> int:
         """Compute tiles_l from input tensor shapes. Default: 1."""
         return 1
+
+
+# Keep PipelinedOp as an alias for backward compatibility
+PipelinedOp = Op
 
 
 # =============================================================================
@@ -1682,6 +1811,7 @@ class InstructionStreamBuilder:
 __all__ = [
     # Protocol
     "Op",
+    "PipelinedOp",
     # Built-in Operations
     "NOPOp",
     # Scheduling

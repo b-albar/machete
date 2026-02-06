@@ -2,22 +2,19 @@
 """
 Paged Shared Memory Manager for Megakernel.
 
-This module implements a circular buffer paging system for shared memory
-management within the megakernel. Key features:
+This module provides shared memory layout calculation for pipelined execution:
 
-1. Physical Pages: Divide shared memory into fixed-size pages (16KB each)
-2. Logical-to-Physical Mapping: Instructions reference logical page IDs (LID)
-   which are dynamically mapped to physical page IDs (PID)
-3. Page Release/Acquire: Automatic rotation as instructions complete
+1. NPageLayout: N-page ring buffer for overlapping loads with compute
+2. Shared memory primitives: st_shared_i32, ld_shared_i32
 
-Shared Memory Layout:
-    [Control/Scratch] -> [Page Table Config + States + Free List]
-    -> [Page Data]
+Layout:
+    [Scratch] -> [Page 0..N-1]
+
+With N pages, up to N-1 loads can overlap with compute.
 """
 
 from dataclasses import dataclass
 
-import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -107,102 +104,7 @@ class PageTableConfig:
 
 
 # =============================================================================
-# Page Table Initialization (Device Side)
-# =============================================================================
-
-
-@cute.jit
-def init_page_table(
-    smem_base: Int32,
-    page_table_offset: Int32,
-    num_pages: Int32,
-    page_size: Int32,
-    page_data_offset: Int32,
-) -> None:
-    """Write PageTableConfig into shared memory. Called by thread 0.
-
-    Args:
-        smem_base: Base address of shared memory
-        page_table_offset: Offset to page table region
-        num_pages: Number of physical pages
-        page_size: Size of each page in bytes
-        page_data_offset: Offset from smem_base to page data region
-    """
-    config_ptr = smem_base + page_table_offset
-    st_shared_i32(config_ptr, num_pages)
-    st_shared_i32(config_ptr + 4, page_size)
-    st_shared_i32(config_ptr + 8, page_data_offset)
-
-
-@cute.jit
-def init_page_states(
-    smem_base: Int32,
-    page_table_offset: Int32,
-    num_pages: Int32,
-) -> None:
-    """Initialize page states and free list. Called by thread 0.
-
-    Page states are stored after PageTableConfig (12 bytes).
-    Each PageState is 16 bytes: [owner(4), reserved(12)].
-    Free list follows: num_pages * 4 bytes + head(4) + tail(4).
-
-    All pages start as free (owner = -1), free list = [0, 1, ..., N-1].
-
-    Args:
-        smem_base: Base address of shared memory
-        page_table_offset: Offset to page table region
-        num_pages: Number of physical pages
-    """
-    # PageState array starts after config (12 bytes)
-    page_state_ptr = smem_base + page_table_offset + 12
-
-    # Free list starts after page states
-    free_list_ptr = page_state_ptr + num_pages * 16
-
-    # Head and tail pointers after free list
-    free_list_head_ptr = free_list_ptr + num_pages * 4
-    free_list_tail_ptr = free_list_head_ptr + 4
-
-    i = Int32(0)
-    while i < num_pages:
-        # Mark page as free (owner = -1)
-        st_shared_i32(page_state_ptr + i * 16, Int32(-1))
-        # Initialize free list entry
-        st_shared_i32(free_list_ptr + i * 4, i)
-        i = i + Int32(1)
-
-    # Head = 0 (next page to acquire), tail = 0 (next slot to release into)
-    # With all N pages in the list, head==tail means full (we track count implicitly
-    # by only acquiring what we release)
-    st_shared_i32(free_list_head_ptr, Int32(0))
-    st_shared_i32(free_list_tail_ptr, Int32(0))
-
-
-# =============================================================================
-# Page Pointer Access (Device Side)
-# =============================================================================
-
-
-@cute.jit
-def get_page_data_ptr(smem_base: Int32, page_table_config_ptr: Int32, page_id: Int32) -> Int32:
-    """Get pointer to data region of a physical page.
-
-    Args:
-        smem_base: Base address of shared memory
-        page_table_config_ptr: Pointer to PageTableConfig in shared memory
-        page_id: Physical page ID
-
-    Returns:
-        Shared memory pointer to page data
-    """
-    # Config layout: [num_pages, page_size, base_offset]
-    page_size = ld_shared_i32(page_table_config_ptr + 4)
-    base_offset = ld_shared_i32(page_table_config_ptr + 8)
-    return smem_base + base_offset + page_id * page_size
-
-
-# =============================================================================
-# Shared Memory Layout Calculator
+# Legacy Shared Memory Layout (for backward compatibility with tests)
 # =============================================================================
 
 
@@ -277,14 +179,173 @@ class SharedMemoryLayout:
         )
 
 
+# =============================================================================
+# N-Page Buffer Layout (Generalized Pipelined Execution)
+# =============================================================================
+
+
+def _align_up(value: int, alignment: int) -> int:
+    """Round up value to next multiple of alignment."""
+    return (value + alignment - 1) // alignment * alignment
+
+
+@dataclass
+class NPageLayout:
+    """N-page shared memory layout for pipelined execution.
+
+    Provides a flexible memory layout where N pages are allocated based on
+    available shared memory. With N pages, up to N-1 loads can overlap with
+    compute, improving performance for memory-bound operations.
+
+    Layout (all regions 128-byte aligned):
+        [Scratch]       — Instruction decode area + ring buffer metadata
+        [Page 0..N-1]   — N data pages (computed via pages_start + idx * aligned_page_size)
+
+    The number of pages is determined by:
+    1. User-specified num_pages (if provided)
+    2. Otherwise, maximum that fits in max_smem
+
+    Usage:
+        # Auto-detect max pages for GPU
+        layout = NPageLayout.for_device(page_size=16384)
+
+        # Force specific number of pages
+        layout = NPageLayout(num_pages=4, page_size=16384)
+
+    Attributes:
+        num_pages: Number of pages (2 to MAX_PAGES)
+        page_size: Size of each page in bytes
+        scratch_size: Size of scratch area (128-byte aligned)
+        pages_start: Offset to first page (for arithmetic computation)
+        aligned_page_size: Page size aligned to 128 bytes
+        total_size: Total shared memory required
+    """
+
+    num_pages: int = 2
+    page_size: int = PAGE_SIZE
+
+    # Scratch area layout:
+    # - Per-page tile info: num_pages * 16 bytes [op_idx, tile_m, tile_n, tile_l] per page
+    # - Current instruction: 16 bytes [op_idx, tile_m, tile_n, tile_l]
+    # - Flags: 16 bytes [ready flag, padding]
+    _TILE_INFO_SIZE: int = 16  # Per-page: op_idx, tile_m, tile_n, tile_l
+    _INSTR_SIZE: int = 16
+    _FLAGS_SIZE: int = 16
+
+    def __post_init__(self):
+        """Calculate layout offsets after initialization."""
+        if self.num_pages < 2:
+            raise ValueError(f"num_pages must be >= 2, got {self.num_pages}")
+        if self.num_pages > MAX_PAGES:
+            raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
+
+        # Scratch region layout:
+        # [tile_info_0][tile_info_1]...[tile_info_N-1][instr][flags]
+        raw_scratch_size = (
+            self.num_pages * self._TILE_INFO_SIZE  # Tile info per page
+            + self._INSTR_SIZE
+            + self._FLAGS_SIZE
+        )
+        self.scratch_size = _align_up(raw_scratch_size, 128)
+
+        # Offsets within scratch
+        # ring_state_offset points to tile info array (used by kernel for per-page tile data)
+        self.ring_state_offset = 0
+        self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
+        self.flags_offset = self.instr_offset + self._INSTR_SIZE
+
+        # Page layout - pages start right after scratch
+        # Page pointer computed as: smem_base + pages_start + page_idx * aligned_page_size
+        self.aligned_page_size = _align_up(self.page_size, 128)
+        self.pages_start = self.scratch_size
+
+        # Total size
+        self.total_size = self.pages_start + self.num_pages * self.aligned_page_size
+
+    def get_page_offset(self, page_idx: int) -> int:
+        """Get offset for a specific page."""
+        if page_idx < 0 or page_idx >= self.num_pages:
+            raise ValueError(
+                f"Invalid page_idx {page_idx}, must be 0 to {self.num_pages - 1}"
+            )
+        return self.pages_start + page_idx * self.aligned_page_size
+
+    @classmethod
+    def for_device(
+        cls,
+        page_size: int = PAGE_SIZE,
+        max_smem: int | None = None,
+        min_pages: int = 2,
+    ) -> "NPageLayout":
+        """Create layout with maximum pages that fit in device shared memory.
+
+        Args:
+            page_size: Size of each page in bytes
+            max_smem: Maximum shared memory (None = auto-detect from GPU)
+            min_pages: Minimum number of pages required
+
+        Returns:
+            NPageLayout configured for maximum pages
+        """
+        import torch
+
+        if max_smem is None:
+            if not torch.cuda.is_available():
+                # Default for CPU testing
+                max_smem = 228 * 1024  # 228KB (Hopper default)
+            else:
+                props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                max_smem = props.shared_memory_per_block_optin
+
+        # Find max pages that fit (search from max down)
+        aligned_page_size = _align_up(page_size, 128)
+
+        # Estimate scratch overhead (conservative)
+        scratch_overhead = 256 + MAX_PAGES * 4  # Ring state + page offsets
+
+        available = max_smem - scratch_overhead
+        max_possible = min(available // aligned_page_size, MAX_PAGES)
+
+        if max_possible < min_pages:
+            raise ValueError(
+                f"Cannot fit {min_pages} pages of {page_size // 1024}KB in "
+                f"{max_smem // 1024}KB shared memory"
+            )
+
+        # Try from max down to find largest that actually fits
+        for n in range(max_possible, min_pages - 1, -1):
+            layout = cls(num_pages=n, page_size=page_size)
+            if layout.total_size <= max_smem:
+                return layout
+
+        # Fallback to minimum
+        return cls(num_pages=min_pages, page_size=page_size)
+
+    def __repr__(self) -> str:
+        return (
+            f"NPageLayout(\n"
+            f"  num_pages={self.num_pages},\n"
+            f"  page_size={self.page_size // 1024}KB,\n"
+            f"  total_size={self.total_size // 1024}KB,\n"
+            f"  scratch_size={self.scratch_size}B,\n"
+            f"  pages_start={self.pages_start},\n"
+            f"  aligned_page_size={self.aligned_page_size}\n"
+            f")"
+        )
+
+
+# Backward compatibility alias
+DoubleBufferLayout = NPageLayout
+
+
 __all__ = [
     "PAGE_SIZE",
     "MAX_PAGES",
     "st_shared_i32",
     "ld_shared_i32",
+    "NPageLayout",
+    "DoubleBufferLayout",  # Alias for NPageLayout (backward compatibility)
+    # Legacy (for test compatibility)
     "PageTableConfig",
-    "init_page_table",
-    "init_page_states",
-    "get_page_data_ptr",
     "SharedMemoryLayout",
 ]

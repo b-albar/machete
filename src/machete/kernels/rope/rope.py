@@ -54,15 +54,21 @@ class RopeOp(Op):
     writes = {"q": (None, "M, H, D")}
     tile = ("M",)
 
-    # --- Forward ---
+    # --- Forward (Compute Phase) ---
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+    def compute(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Apply RoPE rotation for one position (tile_m) across all heads."""
+        """Apply RoPE rotation for one position (tile_m) across all heads.
+
+        Zero-page op: all data accessed directly from global memory.
+        page_ptr is unused.
+        """
         s = tile_m % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):
@@ -84,15 +90,21 @@ class RopeOp(Op):
             q[q0_idx] = (q0 * c - q1 * sn).to(q_dtype)
             q[q1_idx] = (q1 * c + q0 * sn).to(q_dtype)
 
-    # --- Backward ---
+    # --- Backward (Compute Phase) ---
 
     @staticmethod
-    def backward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
+    def backward_compute(
+        page_ptr: Int32,
+        tile_m: Int32,
+        tile_n: Int32,
+        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Inverse RoPE rotation (transpose of forward rotation matrix)."""
+        """Inverse RoPE rotation (transpose of forward rotation matrix).
+
+        Zero-page op: all data accessed directly from global memory.
+        page_ptr is unused.
+        """
         s = tile_m % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):

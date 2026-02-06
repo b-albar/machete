@@ -73,6 +73,59 @@ def global_barrier_wait(
 
 
 @dsl_user_op
+def check_barrier_ready(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    expected: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Non-blocking check if a global memory barrier is ready.
+
+    Returns 1 if barrier[barrier_idx] >= expected, 0 otherwise.
+    Does NOT spin - returns immediately. Used for speculative pipelining
+    to check if dependencies are satisfied without blocking.
+
+    Args:
+        barrier_ptr: Pointer to barrier array in global memory (64-bit)
+        barrier_idx: Index of barrier to check
+        expected: Expected count threshold
+
+    Returns:
+        Int32: 1 if barrier >= expected (ready), 0 otherwise (not ready)
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [
+            barrier_ptr.ir_value(loc=loc, ip=ip),
+            barrier_idx.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred %p;
+            .reg .u32 %val;
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $2, 4, $1;
+            ld.acquire.sys.global.b32 %val, [%addr];
+            setp.ge.u32 %p, %val, $3;
+            selp.u32 $0, 1, 0, %p;
+        }
+        """,
+        "=r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
 def global_barrier_signal(
     barrier_ptr: Int64,
     barrier_idx: Int32,
@@ -274,11 +327,72 @@ def st_global_i32(
     )
 
 
+# =============================================================================
+# Async Copy Synchronization
+# =============================================================================
+
+
+@dsl_user_op
+def cp_async_wait_group(
+    n: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Wait until at most N async copy groups remain in flight.
+
+    This is used for N-page pipelining where we want to wait for the oldest
+    async copy to complete while keeping newer ones in flight.
+
+    cp.async.wait_group N waits until at most N commit groups are pending.
+    - wait_group 0: wait for all (same as cp.async.wait_all)
+    - wait_group 1: wait until at most 1 group pending
+    - wait_group N: wait until at most N groups pending
+
+    Args:
+        n: Maximum number of groups to leave in flight (0 = wait for all)
+    """
+    # Note: PTX cp.async.wait_group requires an immediate constant.
+    # We generate a switch on common values. For very deep pipelines,
+    # the kernel loop caps tiles_in_flight anyway.
+    llvm.inline_asm(
+        None,
+        [n.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .pred %p0, %p1, %p2, %p3, %p4, %p5, %p6, %p7;
+            setp.eq.u32 %p0, $0, 0;
+            setp.eq.u32 %p1, $0, 1;
+            setp.eq.u32 %p2, $0, 2;
+            setp.eq.u32 %p3, $0, 3;
+            setp.eq.u32 %p4, $0, 4;
+            setp.eq.u32 %p5, $0, 5;
+            setp.eq.u32 %p6, $0, 6;
+            setp.ge.u32 %p7, $0, 7;
+            @%p0 cp.async.wait_group 0;
+            @%p1 cp.async.wait_group 1;
+            @%p2 cp.async.wait_group 2;
+            @%p3 cp.async.wait_group 3;
+            @%p4 cp.async.wait_group 4;
+            @%p5 cp.async.wait_group 5;
+            @%p6 cp.async.wait_group 6;
+            @%p7 cp.async.wait_group 7;
+        }
+        """,
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
+    "check_barrier_ready",
     "load_instruction_to_smem",
     "ld_global_i32",
     "ld_global_i64",
     "st_global_i32",
+    "cp_async_wait_group",
 ]

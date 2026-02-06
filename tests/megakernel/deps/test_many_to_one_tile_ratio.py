@@ -74,8 +74,8 @@ class Producer2DOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -100,8 +100,8 @@ class Consumer1DOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -257,7 +257,7 @@ class TestManyToOnePatternGPU:
             OUTPUTS: ClassVar[List[str]] = ["data"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     idx = tile_m * Int32(_num_cols) + tile_n
@@ -270,7 +270,7 @@ class TestManyToOnePatternGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this M to verify producers completed
@@ -284,7 +284,7 @@ class TestManyToOnePatternGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf_ptr), tile_m)

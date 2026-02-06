@@ -67,8 +67,8 @@ class ProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -92,8 +92,8 @@ class ConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -231,7 +231,7 @@ class TestOneToOneSameSizeGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_opa_result_ptr), tile_m, tile_m + Int32(1))
@@ -243,7 +243,7 @@ class TestOneToOneSameSizeGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_opa_result_ptr), tile_m)
@@ -256,7 +256,7 @@ class TestOneToOneSameSizeGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_opb_result_ptr), tile_m)

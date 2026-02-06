@@ -274,7 +274,7 @@ class _ProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         pass
 
 
@@ -286,7 +286,7 @@ class _ConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         pass
 
 
@@ -298,7 +298,7 @@ class _ProducerY(Op):
     OUTPUTS: ClassVar[List[str]] = ["y"]
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         pass
 
 
@@ -310,7 +310,7 @@ class _FanInOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         pass
 
 
@@ -525,14 +525,14 @@ class TestLinecacheCleanup:
 
     def test_cleanup_removes_entries(self):
         from machete.megakernel.compile import (
-            compile_op,
+            compile_compute,
             cleanup_linecache,
             _linecache_entries,
         )
         import linecache
 
         before = len(_linecache_entries)
-        compile_op(NOPOp.forward)
+        compile_compute(NOPOp)
         assert len(_linecache_entries) > before
 
         # Verify entries exist in linecache

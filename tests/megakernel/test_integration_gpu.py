@@ -3,7 +3,7 @@
 
 Tests cover:
 1. Dependency ordering — StampOp tile i completes before CheckOp tile i starts
-2. Shared memory paging — page data write/readback via get_page_data_ptr
+2. Shared memory paging — page data write/readback via page_ptr
 3. Page recycling — circular buffer with more tiles than pages
 4. Multi-op chains (3+ ops)
 5. Mismatched tile counts with guard logic
@@ -38,7 +38,6 @@ def _pack_ptr(config, offset, ptr):
     config[offset] = lo
     config[offset + 1] = hi
 from machete.megakernel.paged_memory import (
-    get_page_data_ptr,
     st_shared_i32,
     ld_shared_i32,
 )
@@ -74,15 +73,14 @@ class StampOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 1
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        data_ptr = get_page_data_ptr(smem_base, config_ptr, page_ids[0])
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(100) + Int32(42)
-            st_shared_i32(data_ptr, value)
+            st_shared_i32(page_ptr, value)
         cute.arch.sync_threads()
         if tidx == Int32(0):
-            readback = ld_shared_i32(data_ptr)
+            readback = ld_shared_i32(page_ptr)
             # Write readback to global results tensor
             st_global_i32(Int64(_stamp_result_ptr), tile_m, readback)
             cute.printf("[StampOp] tile_m=%d wrote=%d readback=%d",
@@ -96,22 +94,21 @@ class CheckOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
-        data_ptr = get_page_data_ptr(smem_base, config_ptr, page_ids[0])
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         # Read stale value for verification
         if tidx == Int32(0):
-            stale = ld_shared_i32(data_ptr)
+            stale = ld_shared_i32(page_ptr)
             st_global_i32(Int64(_check_stale_ptr), tile_m, stale)
             cute.printf("[CheckOp] tile_m=%d START stale_page_value=%d", tile_m, stale)
         cute.arch.sync_threads()
         # Write and verify
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(7)
-            st_shared_i32(data_ptr, value)
+            st_shared_i32(page_ptr, value)
         cute.arch.sync_threads()
         if tidx == Int32(0):
-            readback = ld_shared_i32(data_ptr)
+            readback = ld_shared_i32(page_ptr)
             st_global_i32(Int64(_check_result_ptr), tile_m, readback)
             cute.printf("[CheckOp] tile_m=%d wrote=%d readback=%d",
                         tile_m, tile_m * Int32(200) + Int32(7), readback)
@@ -149,7 +146,7 @@ class TestSequentialOpsGPU:
             ScheduledOp(StampOp, tiles_m=num_tiles),
             ScheduledOp(CheckOp, tiles_m=num_tiles),
         ]
-        config = MegakernelConfig(num_pages=2)
+        config = MegakernelConfig()
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -211,7 +208,7 @@ class TestSequentialOpsGPU:
             ScheduledOp(StampOp, tiles_m=num_tiles),
             ScheduledOp(CheckOp, tiles_m=num_tiles),
         ]
-        config = MegakernelConfig(num_pages=2)
+        config = MegakernelConfig()
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -253,7 +250,7 @@ class OpA(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(100) + Int32(1)
@@ -268,7 +265,7 @@ class OpB(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(2)
@@ -283,7 +280,7 @@ class OpC(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(300) + Int32(3)
@@ -307,7 +304,7 @@ class Tag2DOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(1000) + tile_n
@@ -323,7 +320,7 @@ class Tag2DOpB(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(2000) + tile_n
@@ -351,7 +348,7 @@ class NamedProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(100) + Int32(42)
@@ -368,7 +365,7 @@ class NamedConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(200) + Int32(7)
@@ -385,7 +382,7 @@ class NamedProducerY(Op):
     OUTPUTS: ClassVar[List[str]] = ["y"]
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(300) + Int32(11)
@@ -402,7 +399,7 @@ class NamedFanInOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(400) + Int32(13)
@@ -428,7 +425,7 @@ class ManyToOneProducerOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             idx = tile_m * Int32(_mto_cols) + tile_n
@@ -445,7 +442,7 @@ class ManyToOneConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_m * Int32(500) + Int32(17)
@@ -490,7 +487,7 @@ class TestComprehensiveGPU:
             ScheduledOp(OpB, tiles_m=num_tiles),
             ScheduledOp(OpC, tiles_m=num_tiles),
         ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
+        config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -536,7 +533,7 @@ class TestComprehensiveGPU:
             ScheduledOp(OpA, tiles_m=tiles_a),
             ScheduledOp(OpB, tiles_m=tiles_b),
         ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
+        config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -602,7 +599,7 @@ class TestComprehensiveGPU:
             ScheduledOp(Tag2DOp, tiles_m=tiles_m, tiles_n=tiles_n),
             ScheduledOp(Tag2DOpB, tiles_m=tiles_m, tiles_n=tiles_n),
         ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
+        config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -792,7 +789,7 @@ class TestComprehensiveGPU:
             ScheduledOp(StampOp, tiles_m=num_tiles),
             ScheduledOp(CheckOp, tiles_m=num_tiles),
         ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
+        config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
 
         expected_stamp = torch.tensor(
@@ -852,7 +849,7 @@ class TestComprehensiveGPU:
             ScheduledOp(StampOp, tiles_m=num_tiles),
             ScheduledOp(CheckOp, tiles_m=num_tiles),
         ]
-        config = MegakernelConfig(num_sms=2, num_pages=2)
+        config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
@@ -939,7 +936,7 @@ class ScaleOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -965,7 +962,7 @@ class AddOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_a_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -993,7 +990,7 @@ class TensorScaleOp(Op):
     NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     @staticmethod
-    def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read pointers and scale from config

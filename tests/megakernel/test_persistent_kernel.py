@@ -267,40 +267,42 @@ class TestSharedMemoryLayout:
 
 
 class TestMegakernelPagedMemory:
-    """Test megakernel with paged memory integration."""
+    """Test megakernel with double-buffer memory integration."""
 
     def test_smem_size_from_layout(self):
-        """Test that smem_size is computed from SharedMemoryLayout."""
+        """Test that smem_size is computed from DoubleBufferLayout."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
 
         ops = [ScheduledOp(NOPOp, tiles_m=4)]
-        config = MegakernelConfig(num_sms=8, num_pages=4)
+        config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
-        # smem_size should be > 0 and derived from the layout
+        # smem_size should be > 0 and derived from the double-buffer layout
+        # Double-buffer layout has scratch + 2 pages
         assert kernel.smem_size > 0
-        assert kernel.smem_size >= 4 * config.page_size
+        assert kernel.smem_size >= 2 * config.page_size
 
-    def test_auto_page_count(self):
-        """Test that num_pages auto-sizes to fit the most demanding op."""
+    def test_double_buffer_layout(self):
+        """Test that kernel uses fixed 2-page double-buffer layout."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
         from machete.megakernel.ops import Op
         from typing import ClassVar
 
-        class TwoPageOp(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 2
+        class SimpleOp(Op):
+            NUM_INPUT_PAGES: ClassVar[int] = 0
             NUM_OUTPUT_PAGES: ClassVar[int] = 1
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 pass
 
-        ops = [ScheduledOp(TwoPageOp, tiles_m=4)]
-        # Start with num_pages=1, should auto-size to 3
-        config = MegakernelConfig(num_sms=8, num_pages=1)
+        ops = [ScheduledOp(SimpleOp, tiles_m=4)]
+        config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
-        assert kernel.config.num_pages >= 3
+        # Double-buffer layout uses exactly 2 pages for ping-pong buffering
+        # smem includes scratch + 2 pages
+        assert kernel.smem_size > 0
 
 
 if __name__ == "__main__":

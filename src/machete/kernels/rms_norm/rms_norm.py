@@ -94,13 +94,11 @@ class RMSNormOp(Op):
     }
     backward_writes = {"dx": (None, "M, D")}
 
-    # --- Forward ---
+    # --- Forward (compute phase) ---
 
     @staticmethod
-    def forward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
@@ -140,7 +138,7 @@ class RMSNormOp(Op):
 
             # Allocate reduction buffer in shared memory: (1, num_warps)
             reduction_buffer = cute.make_tensor(
-                cute.make_ptr(Float32, smem_base, cute.AddressSpace.smem),
+                cute.make_ptr(Float32, page_ptr, cute.AddressSpace.smem),
                 cute.make_layout((1, num_warps)),
             )
 
@@ -278,13 +276,11 @@ class RMSNormOp(Op):
                     w = weight[i].to(Float32)
                     y[row_offset + i] = (val * rstd * w).to(x_dtype)
 
-    # --- Backward ---
+    # --- Backward (compute phase) ---
 
     @staticmethod
-    def backward(
-        smem_base: Int32,
-        config_ptr: Int32,
-        page_ids: tuple,
+    def backward_compute(
+        page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
@@ -303,7 +299,7 @@ class RMSNormOp(Op):
         row_idx = row_start + warp_idx
 
         if warp_idx < tile_size_M and row_idx < M:
-            if D >= 32:
+            if cutlass.const_expr(D >= 32):
                 # === Vectorized path ===
                 thr_layout = cute.make_layout(32)
 
@@ -388,7 +384,7 @@ class RMSNormOp(Op):
                 sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
                 rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
 
-                # Pass 2: Compute sum(dout * weight * x) (accumulate in fp32)
+                # Pass 2: Compute sum(dout * weight * x)
                 partial_grad = Float32(0.0)
                 for i in range(lane_idx, D, 32):
                     d = dout[row_offset + i].to(Float32)
@@ -399,7 +395,7 @@ class RMSNormOp(Op):
                 sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
                 mean_grad = sum_grad / D
 
-                # Pass 3: Compute dx (compute in fp32, store in input dtype)
+                # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd
                 for i in range(lane_idx, D, 32):
                     d = dout[row_offset + i].to(Float32)
                     w = weight[i].to(Float32)

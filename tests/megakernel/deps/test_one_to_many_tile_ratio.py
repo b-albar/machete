@@ -74,8 +74,8 @@ class Producer1DOp(Op):
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -98,8 +98,8 @@ class Consumer2DOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -257,7 +257,7 @@ class TestOneToManyPatternGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_buf1_ptr), tile_m, tile_m + Int32(1))
@@ -269,7 +269,7 @@ class TestOneToManyPatternGPU:
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf1_ptr), tile_m)
@@ -282,7 +282,7 @@ class TestOneToManyPatternGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf2_ptr), tile_m)

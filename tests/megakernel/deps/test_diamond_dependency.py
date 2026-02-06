@@ -78,8 +78,8 @@ class OpA(Op):
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -96,8 +96,8 @@ class OpB(Op):
     OUTPUTS: ClassVar[List[str]] = ["buf_b"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -115,8 +115,8 @@ class OpC(Op):
     OUTPUTS: ClassVar[List[str]] = ["buf_c"]
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -134,8 +134,8 @@ class OpD(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
+    def compute(
+        page_ptr: Int32,
         tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
@@ -280,7 +280,7 @@ class TestDiamondDependencyGPU:
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_a_ptr), tile_m, tile_m + Int32(1))
@@ -292,7 +292,7 @@ class TestDiamondDependencyGPU:
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_m)
@@ -305,7 +305,7 @@ class TestDiamondDependencyGPU:
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_m)
@@ -318,7 +318,7 @@ class TestDiamondDependencyGPU:
             OUTPUTS: ClassVar[List[str]] = ["d"]
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_m)
@@ -331,7 +331,7 @@ class TestDiamondDependencyGPU:
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     b_val = ld_global_i32(Int64(_b_ptr), tile_m)

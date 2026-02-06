@@ -9,7 +9,7 @@ tensors are rebuilt per call (cheap CPU work).
 The cache key captures everything that affects the compiled MLIR/PTX:
 - Op class types and their execution modes
 - Tile dimensions (barrier formulas bake tiles_m/n into coefficients)
-- num_sms, threads_per_block, num_pages, backward flag
+- num_sms, threads_per_block, page_size, num_pages, backward flag
 
 Usage:
     cache = KernelCache.get()
@@ -81,6 +81,7 @@ class KernelCache:
             config.num_sms,
             backward,
             config.threads_per_block,
+            config.page_size,
             config.num_pages,
         )
 

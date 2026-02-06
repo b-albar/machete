@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Boolean
+from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -37,20 +37,31 @@ from .ops import (
     InstructionStreamBuilder,
     TileInstruction,
 )
-from .compile import compile_op
+from .compile import (
+    compile_load_async,
+    compile_compute,
+    compile_store,
+    compile_backward_load_async,
+    compile_backward_compute,
+    compile_backward_store,
+)
 from .interpreter import (
     global_barrier_wait,
     global_barrier_signal,
+    check_barrier_ready,
     load_instruction_to_smem,
     ld_global_i64,
+    cp_async_wait_group,
 )
 from .paged_memory import (
     PAGE_SIZE,
-    SharedMemoryLayout,
-    init_page_table,
-    init_page_states,
+    NPageLayout,
     st_shared_i32,
     ld_shared_i32,
+)
+from machete.kernels.utils.async_copy import (
+    cp_async_commit,
+    cp_async_wait_all,
 )
 
 
@@ -87,217 +98,6 @@ def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
 
 
 # =============================================================================
-# Per-Phase Handler Factories (Pre / Tile / Post)
-# =============================================================================
-
-
-def _make_pre_handler(n_pages, wait_formulas):
-    """Create a @cute.jit pre-execution handler for a single op.
-
-    Handles barrier wait and page acquire (thread 0 only).
-    Does NOT include a trailing cute.arch.barrier() — the dispatch
-    function handles synchronization between phases.
-
-    Args:
-        n_pages: Number of pages this op needs (0 for NOPOp)
-        wait_formulas: List of BarrierFormula for dependencies to wait on
-    """
-
-    if n_pages == 0:
-
-        @cute.jit
-        def pre_handler(
-            scratch_ptr: Int32,
-            page_state_ptr: Int32,
-            free_list_ptr: Int32,
-            free_list_head_ptr: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            tidx: Int32,
-            instr_idx: Int32,
-            num_pages_val: Int32,
-            barriers_ptr: Int64,
-        ) -> None:
-            if tidx == Int32(0):
-                for wf in wait_formulas:
-                    # Compute linear index (without divisors) for guard check
-                    _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
-                    if _linear < Int32(wf.guard_max):
-                        # Compute barrier index (with divisors for tile size ratios)
-                        _idx = (
-                            Int32(wf.base)
-                            + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
-                            + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
-                            + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
-                        )
-                        global_barrier_wait(barriers_ptr, _idx, Int32(wf.expected))
-
-        return pre_handler
-
-    @cute.jit
-    def pre_handler(
-        scratch_ptr: Int32,
-        page_state_ptr: Int32,
-        free_list_ptr: Int32,
-        free_list_head_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        tidx: Int32,
-        instr_idx: Int32,
-        num_pages_val: Int32,
-        barriers_ptr: Int64,
-    ) -> None:
-        if tidx == Int32(0):
-            for wf in wait_formulas:
-                # Compute linear index (without divisors) for guard check
-                _linear = Int32(wf.coeff_m) * tile_m + Int32(wf.coeff_n) * tile_n + Int32(wf.coeff_l) * tile_l
-                if _linear < Int32(wf.guard_max):
-                    # Compute barrier index (with divisors for tile size ratios)
-                    _idx = (
-                        Int32(wf.base)
-                        + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
-                        + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
-                        + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
-                    )
-                    global_barrier_wait(barriers_ptr, _idx, Int32(wf.expected))
-
-            # Batch acquire: read head once, acquire all pages, write head once
-            _head = ld_shared_i32(free_list_head_ptr)
-            for _j in range(n_pages):
-                _idx = (_head + Int32(_j)) % num_pages_val
-                _pid = ld_shared_i32(free_list_ptr + _idx * 4)
-                st_shared_i32(page_state_ptr + _pid * 16, instr_idx)
-                st_shared_i32(scratch_ptr + Int32(_j) * 4, _pid)
-            _new_head = (_head + Int32(n_pages)) % num_pages_val
-            st_shared_i32(free_list_head_ptr, _new_head)
-
-    return pre_handler
-
-
-def _make_post_handler(n_pages, signal_formulas):
-    """Create a @cute.jit post-execution handler for a single op.
-
-    Handles page release and barrier signal (thread 0 only).
-    Called after a cute.arch.barrier() in the dispatch function.
-
-    Args:
-        n_pages: Number of pages this op needs (0 for NOPOp)
-        signal_formulas: List of BarrierFormula for barriers to signal
-    """
-
-    if n_pages == 0:
-
-        @cute.jit
-        def post_handler(
-            scratch_ptr: Int32,
-            page_state_ptr: Int32,
-            free_list_ptr: Int32,
-            free_list_tail_ptr: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            tidx: Int32,
-            num_pages_val: Int32,
-            barriers_ptr: Int64,
-        ) -> None:
-            if tidx == Int32(0):
-                for sf in signal_formulas:
-                    # Compute barrier index (with divisors for tile size ratios)
-                    _sidx = (
-                        Int32(sf.base)
-                        + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
-                        + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
-                        + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
-                    )
-                    global_barrier_signal(barriers_ptr, _sidx)
-
-        return post_handler
-
-    @cute.jit
-    def post_handler(
-        scratch_ptr: Int32,
-        page_state_ptr: Int32,
-        free_list_ptr: Int32,
-        free_list_tail_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        tidx: Int32,
-        num_pages_val: Int32,
-        barriers_ptr: Int64,
-    ) -> None:
-        if tidx == Int32(0):
-            # Batch release: read tail once, release all pages, write tail once
-            _tail = ld_shared_i32(free_list_tail_ptr)
-            for _j in range(n_pages):
-                _pid = ld_shared_i32(scratch_ptr + Int32(_j) * 4)
-                st_shared_i32(page_state_ptr + _pid * 16, Int32(-1))
-                _slot = (_tail + Int32(_j)) % num_pages_val
-                st_shared_i32(free_list_ptr + _slot * 4, _pid)
-            _new_tail = (_tail + Int32(n_pages)) % num_pages_val
-            st_shared_i32(free_list_tail_ptr, _new_tail)
-
-            for sf in signal_formulas:
-                # Compute barrier index (with divisors for tile size ratios)
-                _sidx = (
-                    Int32(sf.base)
-                    + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
-                    + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
-                    + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
-                )
-                global_barrier_signal(barriers_ptr, _sidx)
-
-    return post_handler
-
-
-def _make_tile_caller(tile_fn, n_pages):
-    """Create a @cute.jit function that reads page IDs and calls a tile function.
-
-    The n_pages branch is resolved at Python level (not inside @cute.jit)
-    because CuTe DSL's AST transformer traces both branches of dynamic if
-    statements, and ops that access page_ids would fail if traced with an
-    empty tuple.
-
-    Args:
-        tile_fn: Compiled @cute.jit function from compile.py
-        n_pages: Number of pages this op needs (0 for NOPOp)
-    """
-
-    if n_pages == 0:
-
-        @cute.jit
-        def tile_caller(
-            smem_base: Int32,
-            config_ptr: Int32,
-            scratch_ptr: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            op_config_ptr: Int64,
-        ) -> None:
-            tile_fn(smem_base, config_ptr, (), tile_m, tile_n, tile_l, op_config_ptr)
-
-        return tile_caller
-
-    @cute.jit
-    def tile_caller(
-        smem_base: Int32,
-        config_ptr: Int32,
-        scratch_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        page_ids = tuple(ld_shared_i32(scratch_ptr + Int32(k) * 4) for k in range(n_pages))
-        tile_fn(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr)
-
-    return tile_caller
-
-
-# =============================================================================
 # Megakernel Configuration
 # =============================================================================
 
@@ -309,8 +109,10 @@ class MegakernelConfig:
     Attributes:
         threads_per_block: Threads per block (default: 256)
         num_sms: Number of SMs to use (None = auto-detect)
-        num_pages: Number of shared memory pages (default: 4)
         page_size: Size of each page in bytes (default: 16KB)
+        num_pages: Number of pages for pipelining (None = auto-detect max).
+            With N pages, up to N-1 loads can overlap with compute.
+            Minimum is 2 (double-buffering).
         tracing: Enable cutedsl-trace instrumentation (default: False).
             When False, all trace calls are eliminated at compile time
             via constexpr (zero overhead).
@@ -318,8 +120,8 @@ class MegakernelConfig:
 
     threads_per_block: int = 256
     num_sms: Optional[int] = None
-    num_pages: int = 4
     page_size: int = PAGE_SIZE
+    num_pages: Optional[int] = None  # None = auto-detect max for GPU
     tracing: bool = False
 
     @property
@@ -393,19 +195,21 @@ class Megakernel:
             props = torch.cuda.get_device_properties(device)
             self.config.num_sms = props.multi_processor_count
 
-        # Ensure enough pages for the most demanding op
-        max_pages_needed = max(
-            (op.op_cls.NUM_INPUT_PAGES + op.op_cls.NUM_OUTPUT_PAGES for op in ops),
-            default=0,
-        )
-        if self.config.num_pages < max_pages_needed:
-            self.config.num_pages = max_pages_needed
-
-        # Compute shared memory layout
-        self._layout = SharedMemoryLayout(
-            num_pages=self.config.num_pages,
-            page_size=self.config.page_size,
-        )
+        # Create N-page layout (auto-detect max pages or use user-specified)
+        if self.config.num_pages is not None:
+            # User specified number of pages
+            self._layout = NPageLayout(
+                num_pages=self.config.num_pages,
+                page_size=self.config.page_size,
+            )
+        else:
+            # Auto-detect maximum pages that fit in shared memory
+            self._layout = NPageLayout.for_device(
+                page_size=self.config.page_size,
+                min_pages=2,
+            )
+            # Store computed num_pages back to config for cache key
+            self.config.num_pages = self._layout.num_pages
 
         # Build instruction stream
         # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
@@ -496,7 +300,7 @@ class Megakernel:
         if required_smem > max_smem:
             raise RuntimeError(
                 f"Megakernel requires {required_smem // 1024}KB shared memory "
-                f"({self.config.num_pages} pages × {self.config.page_size // 1024}KB + metadata), "
+                f"({self._layout.num_pages} pages × {self.config.page_size // 1024}KB + scratch), "
                 f"but the GPU only supports {max_smem // 1024}KB per block. "
                 f"Reduce num_pages or page_size in MegakernelConfig."
             )
@@ -563,199 +367,243 @@ class Megakernel:
             writer.register_trace_type(tt)
         writer.write(filename)
 
-    def _build_dispatch_fn(self):
-        """Build a compile-time 3-phase op dispatch function.
+    def _build_pipelined_dispatch_fns(self):
+        """Build dispatch functions for pipelined execution phases.
 
-        Separates barrier/page management (per op index) from tile execution
-        (per unique op class) to avoid duplicating heavy tile code when the
-        same op class appears multiple times with different barrier formulas.
+        All ops use the pipelined interface (load_async/compute/store).
+        Phases that are just `pass` compile to no-ops automatically.
 
-        Phase 1 (N branches): Pre-execution — barrier wait + page acquire
-        Phase 2 (K branches): Tile execution — deduplicated by op class
-        Phase 3 (N branches): Post-execution — page release + barrier signal
-
-        Tile functions are compiled once per unique (op_cls, static_dims,
-        tensor_dtypes) key. Pre/post handlers are lightweight (barrier
-        atomics + shared memory loads/stores) so N branches have minimal
-        code bloat.
-
-        When self.backward is True, Op.backward is used instead of Op.forward.
+        Returns:
+            (dispatch_load_async, dispatch_compute, dispatch_store)
         """
         ops = self.ops
         use_backward = self.backward
 
-        # Get per-op barrier formulas
-        barrier_formulas = self._builder.get_op_barrier_formulas()
-
-        # Pre-compute page counts per op (known at JIT time)
-        op_page_counts = [op.op_cls.NUM_INPUT_PAGES + op.op_cls.NUM_OUTPUT_PAGES for op in ops]
-
-        # --- Build per-op pre/post handlers (N each) ---
-        pre_handlers = []
-        post_handlers = []
-        for i, op in enumerate(ops):
-            wait_formulas, signal_formulas = barrier_formulas.get(i, ([], []))
-            pre_handlers.append(_make_pre_handler(op_page_counts[i], wait_formulas))
-            post_handlers.append(_make_post_handler(op_page_counts[i], signal_formulas))
-
-        # --- Deduplicate tile functions by (op_cls, static_dims, tensor_dtypes) ---
-        # dedup_key → (class_idx, tile_caller)
-        dedup_map = {}
-        # class_idx → list of op indices that use this class
-        class_to_ops = {}
-
-        # Select forward or backward method
-        op_method_attr = "backward" if use_backward else "forward"
+        # Compile each phase for each op
+        load_fns = []
+        compute_fns = []
+        store_fns = []
 
         for i, op in enumerate(ops):
-            # Include static dims and tensor dtypes in key: different values → different compiled code
-            static_dims_key = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
-            # Convert dtypes to their names for hashing (CUTLASS dtype objects aren't hashable directly)
-            tensor_dtypes_key = (
-                tuple(sorted((k, v.__name__) for k, v in op.tensor_dtypes.items()))
-                if op.tensor_dtypes
-                else ()
-            )
-            key = (
-                op.op_cls,
-                use_backward, static_dims_key, tensor_dtypes_key,
-            )
-            if key not in dedup_map:
-                op_fn = getattr(op.op_cls, op_method_attr)
+            # Generate init source for this op
+            init_source = None
+            if hasattr(op.op_cls, "gen_init_source") and (op.static_dims or op.tensor_dtypes):
+                kernel_config = {"threads_per_row": self.config.threads_per_block}
+                init_source = op.op_cls.gen_init_source(
+                    op.static_dims,
+                    backward=use_backward,
+                    kernel_config=kernel_config,
+                    tensor_dtypes=op.tensor_dtypes,
+                )
 
-                # Generate init source with static dims baked as compile-time constants.
-                init_source = None
-                if hasattr(op.op_cls, "gen_init_source") and (op.static_dims or op.tensor_dtypes):
-                    # Pass kernel config parameters (threads_per_row from threads_per_block)
-                    kernel_config = {
-                        "threads_per_row": self.config.threads_per_block,
-                    }
-                    init_source = op.op_cls.gen_init_source(
-                        op.static_dims,
-                        backward=use_backward,
-                        kernel_config=kernel_config,
-                        tensor_dtypes=op.tensor_dtypes,
-                    )
+            # Compile all three phases - pass-only methods become no-ops
+            # Use backward phase methods when in backward mode
+            if use_backward:
+                load_fns.append(compile_backward_load_async(op.op_cls, init_source))
+                compute_fns.append(compile_backward_compute(op.op_cls, init_source))
+                store_fns.append(compile_backward_store(op.op_cls, init_source))
+            else:
+                load_fns.append(compile_load_async(op.op_cls, init_source))
+                compute_fns.append(compile_compute(op.op_cls, init_source))
+                store_fns.append(compile_store(op.op_cls, init_source))
 
-                # Compile tile function once for this (class, static_dims) combo
-                tile_fn = compile_op(op_fn, init_source=init_source)
-
-                class_idx = len(dedup_map)
-                tile_caller = _make_tile_caller(tile_fn, op_page_counts[i])
-                dedup_map[key] = (class_idx, tile_caller)
-                class_to_ops[class_idx] = []
-
-            class_idx, _ = dedup_map[key]
-            class_to_ops[class_idx].append(i)
-
-        # Build tile dispatch list: [(tile_caller, [op_indices]), ...]
-        tile_dispatch = [(dedup_map[key][1], class_to_ops[dedup_map[key][0]]) for key in dedup_map]
-
+        # Build dispatch_load_async
         @cute.jit
-        def dispatch_op(
+        def dispatch_load_async(
             op_idx: Int32,
-            smem_base: Int32,
-            config_ptr: Int32,
-            scratch_ptr: Int32,
-            page_state_ptr: Int32,
-            free_list_ptr: Int32,
-            free_list_head_ptr: Int32,
-            free_list_tail_ptr: Int32,
+            page_ptr: Int32,
             tile_m: Int32,
             tile_n: Int32,
             tile_l: Int32,
-            tidx: Int32,
-            instr_idx: Int32,
-            num_pages_val: Int32,
-            barriers_ptr: Int64,
-            op_configs_ptr: Int64,
+            op_config_ptr: Int64,
         ) -> None:
-            """3-phase dispatch: pre (N) → tile (K) → post (N).
-
-            Phase 1 and 3 are keyed by op_idx (barrier formulas differ per
-            op instance). Phase 2 is keyed by unique op class (tile code
-            is shared across instances of the same class).
-            """
-            # Read per-op config pointer from global memory
-            op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
-
-            # Phase 1: Pre-execution (barrier wait + page acquire)
-            for i, pre in enumerate(pre_handlers):
+            for i, fn in enumerate(load_fns):
                 if op_idx == Int32(i):
-                    pre(
-                        scratch_ptr,
-                        page_state_ptr,
-                        free_list_ptr,
-                        free_list_head_ptr,
-                        tile_m,
-                        tile_n,
-                        tile_l,
-                        tidx,
-                        instr_idx,
-                        num_pages_val,
-                        barriers_ptr,
-                    )
+                    fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
 
-            cute.arch.barrier()
-
-            # Phase 2: Tile execution (deduplicated by op class)
-            for tile_caller, op_indices in tile_dispatch:
-                _match = Boolean(False)
-                for i in op_indices:
-                    if op_idx == Int32(i):
-                        _match = Boolean(True)
-                if _match:
-                    tile_caller(
-                        smem_base,
-                        config_ptr,
-                        scratch_ptr,
-                        tile_m,
-                        tile_n,
-                        tile_l,
-                        op_config_ptr,
-                    )
-
-            cute.arch.barrier()
-
-            # Phase 3: Post-execution (page release + barrier signal)
-            for i, post in enumerate(post_handlers):
+        # Build dispatch_compute
+        @cute.jit
+        def dispatch_compute(
+            op_idx: Int32,
+            page_ptr: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            op_config_ptr: Int64,
+        ) -> None:
+            for i, fn in enumerate(compute_fns):
                 if op_idx == Int32(i):
-                    post(
-                        scratch_ptr,
-                        page_state_ptr,
-                        free_list_ptr,
-                        free_list_tail_ptr,
-                        tile_m,
-                        tile_n,
-                        tile_l,
-                        tidx,
-                        num_pages_val,
-                        barriers_ptr,
-                    )
+                    fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
 
-        return dispatch_op
+        # Build dispatch_store
+        @cute.jit
+        def dispatch_store(
+            op_idx: Int32,
+            page_ptr: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            op_config_ptr: Int64,
+        ) -> None:
+            for i, fn in enumerate(store_fns):
+                if op_idx == Int32(i):
+                    fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+
+        return dispatch_load_async, dispatch_compute, dispatch_store
+
+    def _build_dependency_checker(self):
+        """Build function to check if tile's dependencies are satisfied (non-blocking).
+
+        Returns a @cute.jit function that returns 1 if all wait barriers for
+        the given tile are satisfied, 0 otherwise. Uses relaxed memory ordering
+        for reads (no blocking).
+        """
+        barrier_formulas = self._builder.get_op_barrier_formulas()
+
+        @cute.jit
+        def check_dependencies_ready(
+            op_idx: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            barriers_ptr: Int64,
+        ) -> Int32:
+            """Returns 1 if all wait barriers are satisfied, 0 otherwise."""
+            result = Int32(1)
+
+            for i, (wait_formulas, _) in barrier_formulas.items():
+                if op_idx == Int32(i):
+                    for wf in wait_formulas:
+                        # Compute barrier index (with divisors for tile size ratios)
+                        barrier_idx = (
+                            Int32(wf.base)
+                            + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
+                            + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
+                            + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
+                        )
+
+                        # Compute linear index for guard check
+                        _linear = (
+                            Int32(wf.coeff_m) * tile_m
+                            + Int32(wf.coeff_n) * tile_n
+                            + Int32(wf.coeff_l) * tile_l
+                        )
+
+                        if _linear < Int32(wf.guard_max):
+                            # Non-blocking check
+                            ready = check_barrier_ready(
+                                barriers_ptr, barrier_idx, Int32(wf.expected)
+                            )
+                            if ready == Int32(0):
+                                result = Int32(0)
+
+            return result
+
+        return check_dependencies_ready
+
+    def _build_wait_barriers(self):
+        """Build function to wait on barriers (blocking).
+
+        Returns a @cute.jit function that blocks until all wait barriers
+        for the given tile are satisfied.
+        """
+        barrier_formulas = self._builder.get_op_barrier_formulas()
+
+        @cute.jit
+        def wait_barriers(
+            op_idx: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            barriers_ptr: Int64,
+        ) -> None:
+            """Block until all wait barriers are satisfied."""
+            for i, (wait_formulas, _) in barrier_formulas.items():
+                if op_idx == Int32(i):
+                    for wf in wait_formulas:
+                        # Compute linear index for guard check
+                        _linear = (
+                            Int32(wf.coeff_m) * tile_m
+                            + Int32(wf.coeff_n) * tile_n
+                            + Int32(wf.coeff_l) * tile_l
+                        )
+                        if _linear < Int32(wf.guard_max):
+                            # Compute barrier index
+                            barrier_idx = (
+                                Int32(wf.base)
+                                + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
+                                + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
+                                + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
+                            )
+                            global_barrier_wait(barriers_ptr, barrier_idx, Int32(wf.expected))
+
+        return wait_barriers
+
+    def _build_signal_barriers(self):
+        """Build function to signal barriers after tile completion.
+
+        Returns a @cute.jit function that signals all barriers for the
+        given tile after it completes.
+        """
+        barrier_formulas = self._builder.get_op_barrier_formulas()
+
+        @cute.jit
+        def signal_barriers(
+            op_idx: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            barriers_ptr: Int64,
+        ) -> None:
+            """Signal all barriers for the completed tile."""
+            for i, (_, signal_formulas) in barrier_formulas.items():
+                if op_idx == Int32(i):
+                    for sf in signal_formulas:
+                        # Compute barrier index
+                        barrier_idx = (
+                            Int32(sf.base)
+                            + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
+                            + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
+                            + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
+                        )
+                        global_barrier_signal(barriers_ptr, barrier_idx)
+
+        return signal_barriers
 
     def _create_kernel(self):
-        """Create the persistent kernel with paged memory and op dispatch."""
+        """Create the persistent pipelined kernel with N-page buffered execution."""
         num_sms = self.config.num_sms
         threads_per_block = self.config.threads_per_block
-        smem_size = self._layout.total_size
         layout = self._layout
+        smem_size = layout.total_size
         tracing = self.config.tracing
+        num_pages = layout.num_pages
 
         # Capture layout offsets as compile-time constants
-        control_offset = layout.control_offset
-        page_table_offset = layout.page_table_offset
-        page_data_offset = layout.page_data_offset
-        num_pages = layout.num_pages
-        page_size = layout.page_size
+        scratch_offset = layout.instr_offset
+        flags_offset = layout.flags_offset
+        ring_state_offset = layout.ring_state_offset
+        pages_start = layout.pages_start
+        aligned_page_size = layout.aligned_page_size
 
-        # Build the dispatch function (captures ops + barrier formulas at JIT time)
-        dispatch_op = self._build_dispatch_fn()
+        # Build pipelined dispatch functions
+        dispatch_load_async, dispatch_compute, dispatch_store = self._build_pipelined_dispatch_fns()
 
-        # Common kernel body as a @cute.jit function (shared between traced/non-traced)
+        # Build barrier functions
+        check_deps = self._build_dependency_checker()
+        wait_barriers = self._build_wait_barriers()
+        signal_barriers = self._build_signal_barriers()
+
+        # Helper to get page pointer by index - uses arithmetic (no branching needed)
+        # page_ptr = smem_base + pages_start + page_idx * aligned_page_size
         @cute.jit
-        def _kernel_loop(
+        def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
+            """Get page pointer for given index using direct arithmetic."""
+            return smem_base + Int32(pages_start) + page_idx * Int32(aligned_page_size)
+
+        # N-page pipelined kernel loop
+        @cute.jit
+        def _kernel_loop_n_pipelined(
             instructions_ptr: Int64,
             barriers_ptr: Int64,
             op_configs_ptr: Int64,
@@ -764,281 +612,278 @@ class Megakernel:
             block_id: Int32,
             num_blocks: Int32,
             smem_base: Int32,
-            config_ptr: Int32,
-            scratch_ptr: Int32,
-            page_state_ptr: Int32,
-            free_list_ptr: Int32,
-            free_list_head_ptr: Int32,
-            free_list_tail_ptr: Int32,
         ) -> None:
-            """Persistent loop: fetch instructions, dispatch ops."""
-            instr_idx = block_id
-            continue_processing = Boolean(True)
+            """N-page pipelined persistent loop with ring buffer of pages.
 
-            while continue_processing:
-                if instr_idx >= num_instructions:
-                    continue_processing = Boolean(False)
-                else:
+            With N pages, we can have up to N-1 loads in flight overlapping
+            with compute. Uses a ring buffer: compute_ptr points to the oldest
+            loaded page, acquire_ptr points to the next page to load into.
+            """
+            # Ring buffer state
+            acquire_ptr = Int32(0)   # Next page index to acquire for loading
+            compute_ptr = Int32(0)   # Next page index to compute (oldest ready)
+            tiles_in_flight = Int32(0)  # Number of tiles loaded but not yet computed
+
+            # Current instruction index for this block
+            next_instr_idx = block_id
+
+            # Scratch pointer for instruction decode
+            scratch_ptr = smem_base + Int32(scratch_offset)
+            flags_ptr = smem_base + Int32(flags_offset)
+
+            # ========== PROLOGUE: Fill pipeline with up to N-1 tiles ==========
+            max_in_flight = Int32(num_pages - 1)
+            done_filling = Int32(0)  # Flag to track if we should stop filling
+
+            # Use simple counter loop - check conditions inside with nested ifs
+            for _fill_iter in range(num_pages - 1):
+                # Check all conditions using nested ifs (avoid & operator on Booleans)
+                if tiles_in_flight < max_in_flight:
+                    if next_instr_idx < num_instructions:
+                        if done_filling == Int32(0):
+                            # Fetch instruction
+                            if tidx == Int32(0):
+                                load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
+                            cute.arch.barrier()
+
+                            op_idx = ld_shared_i32(scratch_ptr)
+                            tile_m = ld_shared_i32(scratch_ptr + 4)
+                            tile_n = ld_shared_i32(scratch_ptr + 8)
+                            tile_l = ld_shared_i32(scratch_ptr + 12)
+
+                            # Check for end marker - if found, stop filling
+                            if op_idx == Int32(TileInstruction.END_MARKER):
+                                done_filling = Int32(1)
+
+                            if op_idx != Int32(TileInstruction.END_MARKER):
+                                # Check if dependencies are ready (non-blocking)
+                                if tidx == Int32(0):
+                                    ready = check_deps(op_idx, tile_m, tile_n, tile_l, barriers_ptr)
+                                    st_shared_i32(flags_ptr, ready)
+                                cute.arch.barrier()
+                                deps_ready = ld_shared_i32(flags_ptr)
+
+                                # If deps not ready and nothing in flight, wait blocking
+                                if deps_ready == Int32(0):
+                                    if tiles_in_flight == Int32(0):
+                                        if tidx == Int32(0):
+                                            wait_barriers(op_idx, tile_m, tile_n, tile_l, barriers_ptr)
+                                        cute.arch.barrier()
+                                    else:
+                                        # Can't speculate further - stop filling
+                                        done_filling = Int32(1)
+
+                                # Only load if we haven't decided to stop
+                                if done_filling == Int32(0):
+                                    # Get page pointer and issue load
+                                    page_ptr = _get_page_ptr(smem_base, acquire_ptr)
+                                    op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
+                                    dispatch_load_async(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+                                    cp_async_commit()
+
+                                    # Store tile info
+                                    tile_info_ptr = smem_base + Int32(ring_state_offset) + acquire_ptr * Int32(16)
+                                    if tidx == Int32(0):
+                                        st_shared_i32(tile_info_ptr, op_idx)
+                                        st_shared_i32(tile_info_ptr + 4, tile_m)
+                                        st_shared_i32(tile_info_ptr + 8, tile_n)
+                                        st_shared_i32(tile_info_ptr + 12, tile_l)
+
+                                    # Advance ring buffer
+                                    acquire_ptr = (acquire_ptr + Int32(1)) % Int32(num_pages)
+                                    tiles_in_flight = tiles_in_flight + Int32(1)
+                                    next_instr_idx = next_instr_idx + num_blocks
+
+            # ========== MAIN LOOP: Process tiles and try to load more ==========
+            while tiles_in_flight > Int32(0):
+                # Wait for the oldest load to complete (keep others in flight)
+                cp_async_wait_group(tiles_in_flight - Int32(1))
+                cute.arch.barrier()
+
+                # Get compute page pointer and tile info
+                compute_page_ptr = _get_page_ptr(smem_base, compute_ptr)
+                tile_info_ptr = smem_base + Int32(ring_state_offset) + compute_ptr * Int32(16)
+                curr_op_idx = ld_shared_i32(tile_info_ptr)
+                curr_tile_m = ld_shared_i32(tile_info_ptr + 4)
+                curr_tile_n = ld_shared_i32(tile_info_ptr + 8)
+                curr_tile_l = ld_shared_i32(tile_info_ptr + 12)
+                curr_op_config_ptr = ld_global_i64(op_configs_ptr, curr_op_idx)
+
+                # ===== TRY TO LOAD MORE TILES (speculative) =====
+                can_try_load = tiles_in_flight < max_in_flight
+                can_try_load = can_try_load & (next_instr_idx < num_instructions)
+
+                if can_try_load:
+                    # Fetch next instruction
                     if tidx == Int32(0):
-                        load_instruction_to_smem(instructions_ptr, instr_idx, scratch_ptr)
-
+                        load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
                     cute.arch.barrier()
 
-                    op_idx = ld_shared_i32(scratch_ptr)
+                    next_op_idx = ld_shared_i32(scratch_ptr)
+                    if next_op_idx != Int32(TileInstruction.END_MARKER):
+                        next_tile_m = ld_shared_i32(scratch_ptr + 4)
+                        next_tile_n = ld_shared_i32(scratch_ptr + 8)
+                        next_tile_l = ld_shared_i32(scratch_ptr + 12)
 
-                    if op_idx == Int32(TileInstruction.END_MARKER):
-                        continue_processing = Boolean(False)
+                        # Check dependencies (non-blocking)
+                        if tidx == Int32(0):
+                            ready = check_deps(next_op_idx, next_tile_m, next_tile_n, next_tile_l, barriers_ptr)
+                            st_shared_i32(flags_ptr, ready)
+                        cute.arch.barrier()
+
+                        if ld_shared_i32(flags_ptr) == Int32(1):
+                            # Dependencies ready - issue load
+                            next_page_ptr = _get_page_ptr(smem_base, acquire_ptr)
+                            next_op_config_ptr = ld_global_i64(op_configs_ptr, next_op_idx)
+                            dispatch_load_async(
+                                next_op_idx, next_page_ptr, next_tile_m, next_tile_n, next_tile_l, next_op_config_ptr
+                            )
+                            cp_async_commit()
+
+                            # Store tile info
+                            next_tile_info_ptr = smem_base + Int32(ring_state_offset) + acquire_ptr * Int32(16)
+                            if tidx == Int32(0):
+                                st_shared_i32(next_tile_info_ptr, next_op_idx)
+                                st_shared_i32(next_tile_info_ptr + 4, next_tile_m)
+                                st_shared_i32(next_tile_info_ptr + 8, next_tile_n)
+                                st_shared_i32(next_tile_info_ptr + 12, next_tile_l)
+
+                            acquire_ptr = (acquire_ptr + Int32(1)) % Int32(num_pages)
+                            tiles_in_flight = tiles_in_flight + Int32(1)
+                            next_instr_idx = next_instr_idx + num_blocks
+
+                # ===== COMPUTE CURRENT TILE =====
+                dispatch_compute(curr_op_idx, compute_page_ptr, curr_tile_m, curr_tile_n, curr_tile_l, curr_op_config_ptr)
+                cute.arch.barrier()
+
+                # ===== STORE CURRENT TILE =====
+                dispatch_store(curr_op_idx, compute_page_ptr, curr_tile_m, curr_tile_n, curr_tile_l, curr_op_config_ptr)
+                cute.arch.barrier()
+
+                # ===== SIGNAL COMPLETION =====
+                if tidx == Int32(0):
+                    signal_barriers(curr_op_idx, curr_tile_m, curr_tile_n, curr_tile_l, barriers_ptr)
+
+                # Release page and advance compute pointer
+                compute_ptr = (compute_ptr + Int32(1)) % Int32(num_pages)
+                tiles_in_flight = tiles_in_flight - Int32(1)
+
+            # ========== EPILOGUE: Handle remaining tiles sequentially ==========
+            # The epilogue only runs if the main loop couldn't fill enough tiles.
+            # This happens when dependencies blocked speculation. Process remaining
+            # tiles one at a time with blocking waits.
+            done_epilogue = Int32(0)
+
+            # Use the main loop pattern - simple condition that CuTe DSL can handle
+            while tiles_in_flight >= Int32(0):  # Always true, exit via done_epilogue
+                # Check if we should continue - use nested ifs to avoid & operator
+                if next_instr_idx < num_instructions:
+                    if done_epilogue == Int32(0):
+                        # Fetch instruction
+                        if tidx == Int32(0):
+                            load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
+                        cute.arch.barrier()
+
+                        op_idx = ld_shared_i32(scratch_ptr)
+
+                        # Check for end marker
+                        if op_idx == Int32(TileInstruction.END_MARKER):
+                            done_epilogue = Int32(1)
+
+                        if op_idx != Int32(TileInstruction.END_MARKER):
+                            tile_m = ld_shared_i32(scratch_ptr + 4)
+                            tile_n = ld_shared_i32(scratch_ptr + 8)
+                            tile_l = ld_shared_i32(scratch_ptr + 12)
+
+                            # Wait for dependencies (blocking)
+                            if tidx == Int32(0):
+                                wait_barriers(op_idx, tile_m, tile_n, tile_l, barriers_ptr)
+                            cute.arch.barrier()
+
+                            # Use page 0 for sequential fallback
+                            page_ptr = _get_page_ptr(smem_base, Int32(0))
+                            op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
+
+                            # Load synchronously
+                            dispatch_load_async(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+                            cp_async_commit()
+                            cp_async_wait_all()
+                            cute.arch.barrier()
+
+                            # Compute
+                            dispatch_compute(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+                            cute.arch.barrier()
+
+                            # Store
+                            dispatch_store(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+                            cute.arch.barrier()
+
+                            # Signal
+                            if tidx == Int32(0):
+                                signal_barriers(op_idx, tile_m, tile_n, tile_l, barriers_ptr)
+
+                            next_instr_idx = next_instr_idx + num_blocks
                     else:
-                        tile_m = ld_shared_i32(scratch_ptr + 4)
-                        tile_n = ld_shared_i32(scratch_ptr + 8)
-                        tile_l = ld_shared_i32(scratch_ptr + 12)
-
-                        dispatch_op(
-                            op_idx,
-                            smem_base,
-                            config_ptr,
-                            scratch_ptr,
-                            page_state_ptr,
-                            free_list_ptr,
-                            free_list_head_ptr,
-                            free_list_tail_ptr,
-                            tile_m,
-                            tile_n,
-                            tile_l,
-                            tidx,
-                            instr_idx,
-                            Int32(num_pages),
-                            barriers_ptr,
-                            op_configs_ptr,
-                        )
-
-                        instr_idx = instr_idx + num_blocks
-
-        @cute.jit
-        def _init_smem(smem_base: Int32, tidx: Int32) -> None:
-            """Initialize page table and page states (thread 0 only)."""
-            if tidx == 0:
-                init_page_table(
-                    smem_base,
-                    Int32(page_table_offset),
-                    Int32(num_pages),
-                    Int32(page_size),
-                    Int32(page_data_offset),
-                )
-                init_page_states(
-                    smem_base,
-                    Int32(page_table_offset),
-                    Int32(num_pages),
-                )
-
-        @cute.jit
-        def _smem_pointers(smem_base: Int32):
-            """Compute shared memory region pointers."""
-            config_ptr = smem_base + Int32(page_table_offset)
-            scratch_ptr = smem_base + Int32(control_offset)
-            page_state_ptr = config_ptr + 12
-            free_list_ptr = page_state_ptr + Int32(num_pages) * 16
-            free_list_head_ptr = free_list_ptr + Int32(num_pages) * 4
-            free_list_tail_ptr = free_list_head_ptr + 4
-            return (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr)
+                        # done_epilogue is set, exit
+                        tiles_in_flight = Int32(-1)
+                else:
+                    # No more instructions, exit the loop
+                    tiles_in_flight = Int32(-1)
 
         if tracing:
-            from cutedsl_trace.device import (
-                start as trace_start,
-                begin_lane_dynamic_raw,
-                end_event_dynamic_raw_1,
-                finish_lane_dynamic_raw,
-            )
+            raise NotImplementedError("Tracing not yet supported with pipelined kernel")
 
-            row_stride_bytes = self._trace_builder.row_stride_bytes
-            op_format_ids = self._trace_format_ids
+        class PersistentKernel:
+            def __init__(self):
+                self.num_sms = num_sms
+                self.threads_per_block = threads_per_block
+                self.smem_size = smem_size
 
-            class PersistentKernel:
-                def __init__(self):
-                    self.num_sms = num_sms
-                    self.threads_per_block = threads_per_block
-                    self.smem_size = smem_size
+            @cute.jit
+            def __call__(
+                self,
+                instructions_ptr: Int64,
+                barriers_ptr: Int64,
+                op_configs_ptr: Int64,
+                trace_buffer_ptr: Int64,
+                num_instructions: Int32,
+                stream,
+            ):
+                self.kernel(
+                    instructions_ptr,
+                    barriers_ptr,
+                    op_configs_ptr,
+                    num_instructions,
+                ).launch(
+                    grid=[self.num_sms, 1, 1],
+                    block=[self.threads_per_block, 1, 1],
+                    smem=self.smem_size,
+                    stream=stream,
+                )
 
-                @cute.jit
-                def __call__(
-                    self,
-                    instructions_ptr: Int64,
-                    barriers_ptr: Int64,
-                    op_configs_ptr: Int64,
-                    trace_buffer_ptr: Int64,
-                    num_instructions: Int32,
-                    stream,
-                ):
-                    self.kernel(
-                        instructions_ptr,
-                        barriers_ptr,
-                        op_configs_ptr,
-                        trace_buffer_ptr,
-                        num_instructions,
-                    ).launch(
-                        grid=[self.num_sms, 1, 1],
-                        block=[self.threads_per_block, 1, 1],
-                        smem=self.smem_size,
-                        stream=stream,
-                    )
+            @cute.kernel
+            def kernel(
+                self,
+                instructions_ptr: Int64,
+                barriers_ptr: Int64,
+                op_configs_ptr: Int64,
+                num_instructions: Int32,
+            ):
+                tidx = cute.arch.thread_idx()[0]
+                block_id = cute.arch.block_idx()[0]
+                num_blocks = cute.arch.grid_dim()[0]
+                smem_base = get_smem_base_ptr()
 
-                @cute.kernel
-                def kernel(
-                    self,
-                    instructions_ptr: Int64,
-                    barriers_ptr: Int64,
-                    op_configs_ptr: Int64,
-                    trace_buffer_ptr: Int64,
-                    num_instructions: Int32,
-                ):
-                    tidx = cute.arch.thread_idx()[0]
-                    block_id = cute.arch.block_idx()[0]
-                    num_blocks = cute.arch.grid_dim()[0]
-                    smem_base = get_smem_base_ptr()
-
-                    _init_smem(smem_base, tidx)
-                    cute.arch.barrier()
-
-                    (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr) = (
-                        _smem_pointers(smem_base)
-                    )
-
-                    # Trace: init lane
-                    trace_buffer = cute.make_tensor(
-                        cute.make_ptr(cute.Uint8, trace_buffer_ptr),
-                        cute.make_layout(1 << 24),
-                    )
-                    lane = begin_lane_dynamic_raw(
-                        Int32(1),
-                        Int32(row_stride_bytes),
-                        block_id,
-                        Int32(0),
-                        tidx == Int32(0),
-                    )
-
-                    # Persistent loop with tracing
-                    instr_idx = block_id
-                    continue_processing = Boolean(True)
-
-                    while continue_processing:
-                        if instr_idx >= num_instructions:
-                            continue_processing = Boolean(False)
-                        else:
-                            if tidx == Int32(0):
-                                load_instruction_to_smem(instructions_ptr, instr_idx, scratch_ptr)
-
-                            cute.arch.barrier()
-                            op_idx = ld_shared_i32(scratch_ptr)
-
-                            if op_idx == Int32(TileInstruction.END_MARKER):
-                                continue_processing = Boolean(False)
-                            else:
-                                tile_m = ld_shared_i32(scratch_ptr + 4)
-                                tile_n = ld_shared_i32(scratch_ptr + 8)
-                                tile_l = ld_shared_i32(scratch_ptr + 12)
-
-                                _ts = trace_start()
-
-                                dispatch_op(
-                                    op_idx,
-                                    smem_base,
-                                    config_ptr,
-                                    scratch_ptr,
-                                    page_state_ptr,
-                                    free_list_ptr,
-                                    free_list_head_ptr,
-                                    free_list_tail_ptr,
-                                    tile_m,
-                                    tile_n,
-                                    tile_l,
-                                    tidx,
-                                    instr_idx,
-                                    Int32(num_pages),
-                                    barriers_ptr,
-                                    op_configs_ptr,
-                                )
-
-                                for _i, _fmt_id in enumerate(op_format_ids):
-                                    if op_idx == Int32(_i):
-                                        lane = end_event_dynamic_raw_1(
-                                            _ts,
-                                            trace_buffer,
-                                            Int32(row_stride_bytes),
-                                            lane,
-                                            Int32(_fmt_id),
-                                            op_idx,
-                                        )
-
-                                instr_idx = instr_idx + num_blocks
-
-                    finish_lane_dynamic_raw(trace_buffer, lane)
-
-        else:
-
-            class PersistentKernel:
-                def __init__(self):
-                    self.num_sms = num_sms
-                    self.threads_per_block = threads_per_block
-                    self.smem_size = smem_size
-
-                @cute.jit
-                def __call__(
-                    self,
-                    instructions_ptr: Int64,
-                    barriers_ptr: Int64,
-                    op_configs_ptr: Int64,
-                    trace_buffer_ptr: Int64,
-                    num_instructions: Int32,
-                    stream,
-                ):
-                    self.kernel(
-                        instructions_ptr,
-                        barriers_ptr,
-                        op_configs_ptr,
-                        num_instructions,
-                    ).launch(
-                        grid=[self.num_sms, 1, 1],
-                        block=[self.threads_per_block, 1, 1],
-                        smem=self.smem_size,
-                        stream=stream,
-                    )
-
-                @cute.kernel
-                def kernel(
-                    self,
-                    instructions_ptr: Int64,
-                    barriers_ptr: Int64,
-                    op_configs_ptr: Int64,
-                    num_instructions: Int32,
-                ):
-                    tidx = cute.arch.thread_idx()[0]
-                    block_id = cute.arch.block_idx()[0]
-                    num_blocks = cute.arch.grid_dim()[0]
-                    smem_base = get_smem_base_ptr()
-
-                    _init_smem(smem_base, tidx)
-                    cute.arch.barrier()
-
-                    (config_ptr, scratch_ptr, page_state_ptr, free_list_ptr, free_list_head_ptr, free_list_tail_ptr) = (
-                        _smem_pointers(smem_base)
-                    )
-
-                    _kernel_loop(
-                        instructions_ptr,
-                        barriers_ptr,
-                        op_configs_ptr,
-                        num_instructions,
-                        tidx,
-                        block_id,
-                        num_blocks,
-                        smem_base,
-                        config_ptr,
-                        scratch_ptr,
-                        page_state_ptr,
-                        free_list_ptr,
-                        free_list_head_ptr,
-                        free_list_tail_ptr,
-                    )
+                _kernel_loop_n_pipelined(
+                    instructions_ptr,
+                    barriers_ptr,
+                    op_configs_ptr,
+                    num_instructions,
+                    tidx,
+                    block_id,
+                    num_blocks,
+                    smem_base,
+                )
 
         return PersistentKernel()
 
@@ -1070,8 +915,8 @@ class Megakernel:
 
         config_key = (
             self.config.threads_per_block,
-            self.config.num_pages,
             self.config.page_size,
+            self.config.num_pages,
             self.config.tracing,
         )
 
