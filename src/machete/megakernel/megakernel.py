@@ -39,10 +39,10 @@ from .ops import (
     TileInstruction,
 )
 from .compile import (
-    compile_load_async,
+    compile_load,
     compile_compute,
     compile_store,
-    compile_backward_load_async,
+    compile_backward_load,
     compile_backward_compute,
     compile_backward_store,
 )
@@ -52,24 +52,18 @@ from .interpreter import (
     check_barrier_ready,
     load_instruction_to_smem,
     ld_global_i64,
-    cp_async_wait_group,
     mbarrier_init,
     mbarrier_init_fence,
     mbarrier_arrive,
     mbarrier_wait,
     mbarrier_try_wait,
     named_barrier_sync,
-    nanosleep,
 )
 from .paged_memory import (
     PAGE_SIZE,
     NPageLayout,
     st_shared_i32,
     ld_shared_i32,
-)
-from machete.kernels.utils.async_copy import (
-    cp_async_commit,
-    cp_async_wait_all,
 )
 
 
@@ -407,7 +401,7 @@ class Megakernel:
         canonical tensor names and route the correct subset to each phase fn.
 
         Returns:
-            (dispatch_load_async, dispatch_compute, dispatch_store)
+            (dispatch_load, dispatch_compute, dispatch_store)
         """
         ops = self.ops
         use_backward = self.backward
@@ -458,7 +452,7 @@ class Megakernel:
             # Compute phases get barrier replacement (named barrier instead of __syncthreads)
             # Load/store phases get DMA warp init (tidx remapped to 0-31, num_threads=32)
             if use_backward:
-                load_fns.append(compile_backward_load_async(
+                load_fns.append(compile_backward_load(
                     op.op_cls, dma_init, tensor_param_names=tensor_args))
                 compute_fns.append(compile_backward_compute(
                     op.op_cls, compute_init, tensor_param_names=tensor_args,
@@ -466,7 +460,7 @@ class Megakernel:
                 store_fns.append(compile_backward_store(
                     op.op_cls, dma_init, tensor_param_names=tensor_args))
             else:
-                load_fns.append(compile_load_async(
+                load_fns.append(compile_load(
                     op.op_cls, dma_init, tensor_param_names=tensor_args))
                 compute_fns.append(compile_compute(
                     op.op_cls, compute_init, tensor_param_names=tensor_args,
@@ -480,11 +474,11 @@ class Megakernel:
             return self._build_exec_dispatch_fn(
                 phase_fns, phase_name, op_tensor_args, all_canonical)
 
-        dispatch_load_async = _build_dispatch(load_fns, "load_async")
+        dispatch_load = _build_dispatch(load_fns, "load")
         dispatch_compute = _build_dispatch(compute_fns, "compute")
         dispatch_store = _build_dispatch(store_fns, "store")
 
-        return dispatch_load_async, dispatch_compute, dispatch_store
+        return dispatch_load, dispatch_compute, dispatch_store
 
     def _build_exec_dispatch_fn(self, phase_fns, phase_name, op_tensor_args, all_canonical):
         """Build a dispatch function via exec() with tensor parameters.
@@ -543,8 +537,8 @@ class Megakernel:
 
     def _build_kernel(
         self, kernel_loop_fn,
-        dispatch_load_async, dispatch_compute, dispatch_store,
-        check_deps, wait_barriers, signal_barriers, get_page_ptr_fn,
+        dispatch_load, dispatch_compute, dispatch_store,
+        wait_barriers, signal_barriers, get_page_ptr_fn,
         num_sms, threads_per_block, smem_size,
         num_pages, scratch_offset, flags_offset, ring_state_offset,
         extra_exec_globals=None,
@@ -570,7 +564,7 @@ class Megakernel:
         body = _extract_body(kernel_loop_fn)
         if tensor_params:
             body = re.sub(
-                r'(dispatch_(?:load_async|compute|store)\([^)]*?config_ptr)\s*\)',
+                r'(dispatch_(?:load|compute|store)\([^)]*?config_ptr)\s*\)',
                 lambda m: m.group(1) + ', ' + tensor_params + ')',
                 body,
             )
@@ -589,10 +583,9 @@ class Megakernel:
         exec_globals = {
             "cute": cute, "Int32": Int32, "Int64": Int64,
             "TileInstruction": TileInstruction,
-            "dispatch_load_async": dispatch_load_async,
+            "dispatch_load": dispatch_load,
             "dispatch_compute": dispatch_compute,
             "dispatch_store": dispatch_store,
-            "check_deps": check_deps,
             "wait_barriers": wait_barriers,
             "signal_barriers": signal_barriers,
             "_get_page_ptr": get_page_ptr_fn,
@@ -600,16 +593,11 @@ class Megakernel:
             "st_shared_i32": st_shared_i32,
             "load_instruction_to_smem": load_instruction_to_smem,
             "ld_global_i64": ld_global_i64,
-            "cp_async_commit": cp_async_commit,
-            "cp_async_wait_all": cp_async_wait_all,
-            "cp_async_wait_group": cp_async_wait_group,
             "mbarrier_init": mbarrier_init,
             "mbarrier_init_fence": mbarrier_init_fence,
             "mbarrier_arrive": mbarrier_arrive,
             "mbarrier_wait": mbarrier_wait,
-            "mbarrier_try_wait": mbarrier_try_wait,
             "named_barrier_sync": named_barrier_sync,
-            "nanosleep": nanosleep,
             "num_pages": num_pages,
             "scratch_offset": scratch_offset,
             "flags_offset": flags_offset,
@@ -677,56 +665,6 @@ class Megakernel:
         exec(code, pk_globals)
         return pk_globals["PersistentKernel"]()
 
-    def _build_dependency_checker(self):
-        """Build function to check if tile's dependencies are satisfied (non-blocking).
-
-        Returns a @cute.jit function that returns 1 if all wait barriers for
-        the given tile are satisfied, 0 otherwise. Uses relaxed memory ordering
-        for reads (no blocking).
-        """
-        barrier_formulas = self._builder.get_op_barrier_formulas()
-
-        @cute.jit
-        def check_dependencies_ready(
-            op_idx: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            barriers_ptr: Int64,
-        ) -> Int32:
-            """Returns 1 if all wait barriers are satisfied, 0 otherwise."""
-            result = Int32(1)
-
-            for i, (wait_formulas, _) in barrier_formulas.items():
-                if op_idx == Int32(i):
-                    for wf in wait_formulas:
-                        # Compute barrier index (with divisors for tile size ratios)
-                        barrier_idx = (
-                            Int32(wf.base)
-                            + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
-                            + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
-                            + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
-                        )
-
-                        # Compute linear index for guard check
-                        _linear = (
-                            Int32(wf.coeff_m) * tile_m
-                            + Int32(wf.coeff_n) * tile_n
-                            + Int32(wf.coeff_l) * tile_l
-                        )
-
-                        if _linear < Int32(wf.guard_max):
-                            # Non-blocking check
-                            ready = check_barrier_ready(
-                                barriers_ptr, barrier_idx, Int32(wf.expected)
-                            )
-                            if ready == Int32(0):
-                                result = Int32(0)
-
-            return result
-
-        return check_dependencies_ready
-
     def _build_wait_barriers(self):
         """Build function to wait on barriers (blocking).
 
@@ -765,6 +703,48 @@ class Megakernel:
 
         return wait_barriers
 
+    def _build_check_barriers(self):
+        """Build non-blocking function to check if all barriers are ready.
+
+        Returns a @cute.jit function that checks (without blocking) whether
+        all wait barriers for the given tile are satisfied.
+
+        Returns Int32(1) if all deps ready, Int32(0) otherwise.
+        """
+        barrier_formulas = self._builder.get_op_barrier_formulas()
+
+        @cute.jit
+        def check_barriers(
+            op_idx: Int32,
+            tile_m: Int32,
+            tile_n: Int32,
+            tile_l: Int32,
+            barriers_ptr: Int64,
+        ) -> Int32:
+            """Non-blocking check: are all wait barriers satisfied?"""
+            all_ready = Int32(1)
+            for i, (wait_formulas, _) in barrier_formulas.items():
+                if op_idx == Int32(i):
+                    for wf in wait_formulas:
+                        _linear = (
+                            Int32(wf.coeff_m) * tile_m
+                            + Int32(wf.coeff_n) * tile_n
+                            + Int32(wf.coeff_l) * tile_l
+                        )
+                        if _linear < Int32(wf.guard_max):
+                            barrier_idx = (
+                                Int32(wf.base)
+                                + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
+                                + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
+                                + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
+                            )
+                            r = check_barrier_ready(barriers_ptr, barrier_idx, Int32(wf.expected))
+                            if r == Int32(0):
+                                all_ready = Int32(0)
+            return all_ready
+
+        return check_barriers
+
     def _build_signal_barriers(self):
         """Build function to signal barriers after tile completion.
 
@@ -797,16 +777,20 @@ class Megakernel:
         return signal_barriers
 
     def _create_kernel(self):
-        """Create the persistent warp-specialized kernel with mbarrier sync.
+        """Create the persistent warp-specialized kernel with ring buffer pages.
 
         Architecture:
-        - DMA warp (last warp): instruction fetch, dependency checks, load_async,
-          store, global barrier signaling, mbarrier management
+        - DMA warp (last warp): non-blocking polling loop for fetch/load/store
         - MMA warps (all other warps): compute only, synced via mbarrier
 
-        Two mbarriers per page:
-        - load_done[p]: DMA arrives (1) -> MMA warps wait
-        - compute_done[p]: MMA warps arrive (num_mma_warps) -> DMA waits
+        Ring buffer page management:
+        - DMA polls in a three-phase loop: try-store, try-produce, check-done
+        - All DMA barrier checks are non-blocking (no spin loops in inline asm)
+        - Phase alternates 0/1 with each use; tracked via produce/consume counters
+
+        Two mbarrier arrays:
+        - work_notify[slot]: DMA arrives (1) -> MMA warps wait
+        - compute_done[slot]: MMA warps arrive (num_mma_warps) -> DMA polls
         """
         num_sms = self.config.num_sms
         threads_per_block = self.config.threads_per_block
@@ -821,18 +805,21 @@ class Megakernel:
         ring_state_offset = layout.ring_state_offset
         pages_start = layout.pages_start
         aligned_page_size = layout.aligned_page_size
-        mbarrier_offset = layout.mbarrier_offset
+
+        # Mbarrier sub-offsets (work_notify at position 0, compute_done at position N)
+        work_notify_mbar_offset_0 = layout.work_notify_mbar_offset(0)
+        compute_done_mbar_offset_0 = layout.compute_done_mbar_offset(0)
 
         # Warp specialization constants
         num_mma_warps = (threads_per_block // 32) - 1
         num_compute_threads = num_mma_warps * 32
 
         # Build pipelined dispatch functions (with barrier replacement for compute)
-        dispatch_load_async, dispatch_compute, dispatch_store = self._build_pipelined_dispatch_fns()
+        dispatch_load, dispatch_compute, dispatch_store = self._build_pipelined_dispatch_fns()
 
         # Build barrier functions
-        check_deps = self._build_dependency_checker()
         wait_barriers = self._build_wait_barriers()
+        check_barriers = self._build_check_barriers()
         signal_barriers = self._build_signal_barriers()
 
         # Helper to get page pointer by index
@@ -840,18 +827,18 @@ class Megakernel:
         def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
             return smem_base + Int32(pages_start) + page_idx * Int32(aligned_page_size)
 
-        # Helper to get load_done mbarrier smem address
+        # Helper to get work_notify mbarrier smem address (per slot)
         @cute.jit
-        def _load_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
-            return smem_base + Int32(mbarrier_offset) + page_idx * Int32(8)
+        def _work_notify_mbar(smem_base: Int32, slot: Int32) -> Int32:
+            return smem_base + Int32(work_notify_mbar_offset_0) + slot * Int32(8)
 
-        # Helper to get compute_done mbarrier smem address
+        # Helper to get compute_done mbarrier smem address (per slot)
         @cute.jit
         def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
-            return smem_base + Int32(mbarrier_offset) + Int32(num_pages * 8) + page_idx * Int32(8)
+            return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(8)
 
-        # Warp-specialized kernel loop
-        def _kernel_loop_warp_specialized(
+        # Ring buffer kernel loop
+        def _kernel_loop_ring(
             instructions_ptr: Int64,
             barriers_ptr: Int64,
             op_configs_ptr: Int64,
@@ -861,11 +848,11 @@ class Megakernel:
             num_blocks: Int32,
             smem_base: Int32,
         ) -> None:
-            """Warp-specialized persistent loop with mbarrier synchronization.
+            """Warp-specialized ring buffer loop.
 
-            DMA warp (last warp): fetches instructions, loads data, stores results.
-            MMA warps (all others): compute only.
-            Synchronization via mbarrier (load_done, compute_done per page).
+            DMA warp (last warp): in-order fetch, blocking dep wait, load/store.
+            MMA warps: compute from ring buffer slots (page == slot).
+            Mbarrier phases alternate 0/1 with each use (hardware auto-reset).
             """
             warp_id = tidx // Int32(32)
             lane_id = tidx % Int32(32)
@@ -873,142 +860,98 @@ class Megakernel:
 
             # Scratch pointer for instruction decode
             scratch_ptr = smem_base + Int32(scratch_offset)
+            flags_ptr = smem_base + Int32(flags_offset)
 
-            # ========== INIT: Initialize mbarriers (DMA warp thread 0) ==========
+            # ========== INIT (DMA warp thread 0) ==========
             if is_dma_warp:
                 if lane_id == Int32(0):
-                    for _init_page in range(num_pages):
-                        # load_done: 1 arrival (DMA warp signals after load)
+                    # Clear done flag
+                    st_shared_i32(flags_ptr, Int32(0))
+                    for _ip in range(num_pages):
                         mbarrier_init(
-                            _load_done_mbar(smem_base, Int32(_init_page)),
+                            _work_notify_mbar(smem_base, Int32(_ip)),
                             Int32(1),
                         )
-                        # compute_done: num_mma_warps arrivals (one per MMA warp)
                         mbarrier_init(
-                            _compute_done_mbar(smem_base, Int32(_init_page)),
+                            _compute_done_mbar(smem_base, Int32(_ip)),
                             Int32(num_mma_warps),
                         )
                     mbarrier_init_fence()
 
-            # Sync all threads after mbarrier init (use named barrier 0 = full block)
+            # Sync all threads after init (named barrier 0 = full block)
             named_barrier_sync(Int32(0), Int32(threads_per_block))
 
-            # ========== DMA WARP LOOP (fully non-blocking) ==========
+            # ========== DMA WARP LOOP (non-blocking polling) ==========
             if is_dma_warp:
-                acquire_ptr = Int32(0)   # Next ring slot to load into
-                store_ptr = Int32(0)     # Next ring slot to store from
+                produce_idx = Int32(0)
+                store_idx = Int32(0)
                 next_instr_idx = block_id
-                done_loading = Int32(0)  # All instructions consumed
-                done_all = Int32(0)      # All work complete
+                done = Int32(0)
 
-                # Pending instruction state (fetched but deps not ready)
-                pending = Int32(0)
-                pending_op_idx = Int32(0)
-                pending_tile_m = Int32(0)
-                pending_tile_n = Int32(0)
-                pending_tile_l = Int32(0)
+                while done == Int32(0):
+                    if lane_id == Int32(0):
+                        iter_done = Int32(0)
 
-                flags_ptr = smem_base + Int32(flags_offset)
+                        # TRY STORE: non-blocking check if oldest slot is done
+                        if store_idx < produce_idx:
+                            _s_slot = store_idx % Int32(num_pages)
+                            _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
+                            if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
+                                _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(16)
+                                _s_op = ld_shared_i32(_s_ti)
+                                _s_m = ld_shared_i32(_s_ti + 4)
+                                _s_n = ld_shared_i32(_s_ti + 8)
+                                _s_l = ld_shared_i32(_s_ti + 12)
+                                _s_config_ptr = ld_global_i64(op_configs_ptr, _s_op)
+                                _s_pp = _get_page_ptr(smem_base, _s_slot)
+                                dispatch_store(_s_op, _s_pp, _s_m, _s_n, _s_l, _s_config_ptr)
+                                signal_barriers(_s_op, _s_m, _s_n, _s_l, barriers_ptr)
+                                store_idx = store_idx + Int32(1)
 
-                while done_all == Int32(0):
-                    did_work = Int32(0)
-
-                    # === PRIORITY 1: Try to store completed tiles (non-blocking) ===
-                    if store_ptr < acquire_ptr:
-                        s_page = store_ptr % Int32(num_pages)
-                        s_phase = (store_ptr // Int32(num_pages)) % Int32(2)
-                        s_ready = mbarrier_try_wait(_compute_done_mbar(smem_base, s_page), s_phase)
-                        if s_ready == Int32(1):
-                            s_page_ptr = _get_page_ptr(smem_base, s_page)
-                            s_info_ptr = smem_base + Int32(ring_state_offset) + s_page * Int32(16)
-                            s_op = ld_shared_i32(s_info_ptr)
-                            s_tm = ld_shared_i32(s_info_ptr + 4)
-                            s_tn = ld_shared_i32(s_info_ptr + 8)
-                            s_tl = ld_shared_i32(s_info_ptr + 12)
-                            s_config_ptr = ld_global_i64(op_configs_ptr, s_op)
-
-                            dispatch_store(s_op, s_page_ptr, s_tm, s_tn, s_tl, s_config_ptr)
-                            if lane_id == Int32(0):
-                                signal_barriers(s_op, s_tm, s_tn, s_tl, barriers_ptr)
-                            store_ptr = store_ptr + Int32(1)
-                            did_work = Int32(1)
-
-                    # === PRIORITY 2: Try to fetch + load (non-blocking) ===
-                    if done_loading == Int32(0):
-                        # Only proceed if we have a free page
-                        if acquire_ptr - store_ptr < Int32(num_pages):
-                            # Fetch next instruction if nothing pending
-                            if pending == Int32(0):
-                                if next_instr_idx < num_instructions:
-                                    if lane_id == Int32(0):
-                                        load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
-                                    named_barrier_sync(Int32(2), Int32(32))
-
-                                    pending_op_idx = ld_shared_i32(scratch_ptr)
-                                    if pending_op_idx == Int32(TileInstruction.END_MARKER):
-                                        done_loading = Int32(1)
-                                    if pending_op_idx != Int32(TileInstruction.END_MARKER):
-                                        pending_tile_m = ld_shared_i32(scratch_ptr + 4)
-                                        pending_tile_n = ld_shared_i32(scratch_ptr + 8)
-                                        pending_tile_l = ld_shared_i32(scratch_ptr + 12)
-                                        pending = Int32(1)
-                                        did_work = Int32(1)
-                                else:
-                                    done_loading = Int32(1)
-
-                            # Try to issue load for pending instruction (non-blocking dep check)
-                            if pending == Int32(1):
-                                if lane_id == Int32(0):
-                                    dep_ok = check_deps(pending_op_idx, pending_tile_m, pending_tile_n, pending_tile_l, barriers_ptr)
-                                    st_shared_i32(flags_ptr, dep_ok)
-                                named_barrier_sync(Int32(2), Int32(32))
-                                deps_ready = ld_shared_i32(flags_ptr)
-
-                                if deps_ready == Int32(1):
-                                    l_page = acquire_ptr % Int32(num_pages)
-                                    l_page_ptr = _get_page_ptr(smem_base, l_page)
-
-                                    # Write tile info for MMA warps
-                                    l_info_ptr = smem_base + Int32(ring_state_offset) + l_page * Int32(16)
-                                    if lane_id == Int32(0):
-                                        st_shared_i32(l_info_ptr, pending_op_idx)
-                                        st_shared_i32(l_info_ptr + 4, pending_tile_m)
-                                        st_shared_i32(l_info_ptr + 8, pending_tile_n)
-                                        st_shared_i32(l_info_ptr + 12, pending_tile_l)
-
-                                    l_config_ptr = ld_global_i64(op_configs_ptr, pending_op_idx)
-                                    dispatch_load_async(
-                                        pending_op_idx, l_page_ptr,
-                                        pending_tile_m, pending_tile_n,
-                                        pending_tile_l, l_config_ptr)
-                                    cp_async_commit()
-                                    cp_async_wait_all()
-
-                                    if lane_id == Int32(0):
-                                        mbarrier_arrive(_load_done_mbar(smem_base, l_page))
-
-                                    acquire_ptr = acquire_ptr + Int32(1)
+                        # TRY PRODUCE: fetch instruction, check deps, load
+                        _can_produce = Int32(0)
+                        if (produce_idx - store_idx) < Int32(num_pages):
+                            if next_instr_idx < num_instructions:
+                                _can_produce = Int32(1)
+                        if _can_produce == Int32(1):
+                            load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
+                            _f_op = ld_shared_i32(scratch_ptr)
+                            if _f_op == Int32(TileInstruction.END_MARKER):
+                                next_instr_idx = num_instructions
+                            if _f_op != Int32(TileInstruction.END_MARKER):
+                                _f_m = ld_shared_i32(scratch_ptr + 4)
+                                _f_n = ld_shared_i32(scratch_ptr + 8)
+                                _f_l = ld_shared_i32(scratch_ptr + 12)
+                                if check_barriers(_f_op, _f_m, _f_n, _f_l, barriers_ptr) == Int32(1):
+                                    _p_slot = produce_idx % Int32(num_pages)
+                                    _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(16)
+                                    st_shared_i32(_p_ti, _f_op)
+                                    st_shared_i32(_p_ti + 4, _f_m)
+                                    st_shared_i32(_p_ti + 8, _f_n)
+                                    st_shared_i32(_p_ti + 12, _f_l)
+                                    _p_config_ptr = ld_global_i64(op_configs_ptr, _f_op)
+                                    _p_pp = _get_page_ptr(smem_base, _p_slot)
+                                    dispatch_load(_f_op, _p_pp, _f_m, _f_n, _f_l, _p_config_ptr)
+                                    mbarrier_arrive(_work_notify_mbar(smem_base, _p_slot))
+                                    produce_idx = produce_idx + Int32(1)
                                     next_instr_idx = next_instr_idx + num_blocks
-                                    pending = Int32(0)
-                                    did_work = Int32(1)
 
-                    # === CHECK DONE ===
-                    if done_loading == Int32(1):
-                        if pending == Int32(0):
-                            if store_ptr >= acquire_ptr:
-                                done_all = Int32(1)
+                        # DONE: all fetched and all stored
+                        if next_instr_idx >= num_instructions:
+                            if store_idx >= produce_idx:
+                                iter_done = Int32(1)
+                        st_shared_i32(flags_ptr, iter_done)
 
-                    # === NANOSLEEP when idle to save energy ===
-                    if did_work == Int32(0):
-                        if done_all == Int32(0):
-                            nanosleep(Int32(8))
+                    done = ld_shared_i32(flags_ptr)
 
-                # ===== SENTINEL: Wake MMA warps to exit =====
-                sentinel_page = acquire_ptr % Int32(num_pages)
-                sentinel_tile_info = smem_base + Int32(ring_state_offset) + sentinel_page * Int32(16)
+                # SENTINEL: wake MMA warps to exit
                 if lane_id == Int32(0):
-                    st_shared_i32(sentinel_tile_info, Int32(TileInstruction.END_MARKER))
-                    mbarrier_arrive(_load_done_mbar(smem_base, sentinel_page))
+                    _sent = produce_idx % Int32(num_pages)
+                    st_shared_i32(
+                        smem_base + Int32(ring_state_offset) + _sent * Int32(16),
+                        Int32(TileInstruction.END_MARKER),
+                    )
+                    mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
 
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
@@ -1016,14 +959,16 @@ class Megakernel:
                 mma_running = Int32(1)
 
                 while mma_running == Int32(1):
-                    page = consume_ptr % Int32(num_pages)
-                    phase = (consume_ptr // Int32(num_pages)) % Int32(2)
+                    slot = consume_ptr % Int32(num_pages)
 
-                    # Wait for load to complete on this page
-                    mbarrier_wait(_load_done_mbar(smem_base, page), phase)
+                    # Wait for work (phase alternates with each ring buffer pass)
+                    _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
+                    mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
 
-                    # Read tile info
-                    tile_info_ptr = smem_base + Int32(ring_state_offset) + page * Int32(16)
+                    # Read tile info (page == slot, no work queue indirection)
+                    tile_info_ptr = (
+                        smem_base + Int32(ring_state_offset) + slot * Int32(16)
+                    )
                     op_idx = ld_shared_i32(tile_info_ptr)
 
                     # Check for sentinel (END_MARKER = exit)
@@ -1035,18 +980,18 @@ class Megakernel:
                         tile_n = ld_shared_i32(tile_info_ptr + 8)
                         tile_l = ld_shared_i32(tile_info_ptr + 12)
 
-                        page_ptr = _get_page_ptr(smem_base, page)
+                        page_ptr = _get_page_ptr(smem_base, slot)
                         op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
 
                         # Compute
                         dispatch_compute(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
 
-                        # Sync MMA warps post-compute (named barrier 1, compute threads only)
+                        # Sync MMA warps post-compute
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
-                        # Signal compute_done for this page (one arrive per MMA warp)
+                        # Signal compute_done for this slot
                         if lane_id == Int32(0):
-                            mbarrier_arrive(_compute_done_mbar(smem_base, page))
+                            mbarrier_arrive(_compute_done_mbar(smem_base, slot))
 
                         consume_ptr = consume_ptr + Int32(1)
 
@@ -1054,14 +999,16 @@ class Megakernel:
             raise NotImplementedError("Tracing not yet supported with warp-specialized kernel")
 
         return self._build_kernel(
-            _kernel_loop_warp_specialized,
-            dispatch_load_async, dispatch_compute, dispatch_store,
-            check_deps, wait_barriers, signal_barriers, _get_page_ptr,
+            _kernel_loop_ring,
+            dispatch_load, dispatch_compute, dispatch_store,
+            wait_barriers, signal_barriers, _get_page_ptr,
             num_sms, threads_per_block, smem_size,
             num_pages, scratch_offset, flags_offset, ring_state_offset,
             extra_exec_globals={
-                "_load_done_mbar": _load_done_mbar,
+                "_work_notify_mbar": _work_notify_mbar,
                 "_compute_done_mbar": _compute_done_mbar,
+                "check_barriers": check_barriers,
+                "mbarrier_try_wait": mbarrier_try_wait,
                 "num_mma_warps": num_mma_warps,
                 "num_compute_threads": num_compute_threads,
                 "threads_per_block": threads_per_block,
@@ -1095,6 +1042,7 @@ class Megakernel:
             op_keys.append((op.op_cls, static_dims_tuple, tensor_dtypes_tuple, tile_counts))
 
         config_key = (
+            self.config.num_sms,
             self.config.threads_per_block,
             self.config.page_size,
             self.config.num_pages,

@@ -2,7 +2,7 @@
 """
 Phase Function Compilation for Megakernel.
 
-Compiles an Op's pipelined phase methods (load_async, compute, store) into
+Compiles an Op's pipelined phase methods (load, compute, store) into
 @cute.jit functions. The op method body is extracted via inspect and inlined
 with init_source prepended. This allows CuTe DSL's AST preprocessor to
 transform all control flow (if/while over dynamic values) in a single pass.
@@ -154,7 +154,7 @@ def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
     parameters (passed through the dispatch chain from the kernel).
 
     Args:
-        phase_fn: PipelinedOp.load_async, .compute, or .store static method.
+        phase_fn: PipelinedOp.load, .compute, or .store static method.
         init_source: Pre-generated init source string (tensor aliases, dims, dtypes).
         tensor_param_names: List of tensor parameter names for the signature.
         replace_barrier: If True, replace cute.arch.barrier() and
@@ -205,9 +205,9 @@ def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
     )
 
 
-def compile_load_async(op_cls, init_source=None, tensor_param_names=None):
-    """Compile load_async phase."""
-    return compile_phase(op_cls.load_async, init_source, tensor_param_names)
+def compile_load(op_cls, init_source=None, tensor_param_names=None):
+    """Compile load phase."""
+    return compile_phase(op_cls.load, init_source, tensor_param_names)
 
 
 def compile_compute(op_cls, init_source=None, tensor_param_names=None,
@@ -223,9 +223,9 @@ def compile_store(op_cls, init_source=None, tensor_param_names=None):
     return compile_phase(op_cls.store, init_source, tensor_param_names)
 
 
-def compile_backward_load_async(op_cls, init_source=None, tensor_param_names=None):
-    """Compile backward_load_async phase."""
-    return compile_phase(op_cls.backward_load_async, init_source, tensor_param_names)
+def compile_backward_load(op_cls, init_source=None, tensor_param_names=None):
+    """Compile backward_load phase."""
+    return compile_phase(op_cls.backward_load, init_source, tensor_param_names)
 
 
 def compile_backward_compute(op_cls, init_source=None, tensor_param_names=None,
@@ -257,10 +257,10 @@ def cleanup_linecache() -> int:
 
 __all__ = [
     "compile_phase",
-    "compile_load_async",
+    "compile_load",
     "compile_compute",
     "compile_store",
-    "compile_backward_load_async",
+    "compile_backward_load",
     "compile_backward_compute",
     "compile_backward_store",
     "cleanup_linecache",

@@ -219,58 +219,11 @@ class TestMegakernelGPU:
 
 
 
-class TestSharedMemoryLayout:
-    """Host-side tests for SharedMemoryLayout."""
-
-    def test_layout_sizes(self):
-        """Test that layout computes reasonable sizes."""
-        from machete.megakernel.paged_memory import SharedMemoryLayout
-
-        layout = SharedMemoryLayout(num_pages=4, page_size=16 * 1024)
-
-        # 4 pages * 16KB = 64KB for page data alone
-        assert layout.page_data_offset > 0
-        assert layout.total_size >= 4 * 16 * 1024
-        # Must fit in Hopper.s 228KB shared memory
-        assert layout.total_size <= 228 * 1024
-
-    def test_layout_offsets_are_aligned(self):
-        """Test that all region offsets are 128-byte aligned."""
-        from machete.megakernel.paged_memory import SharedMemoryLayout
-
-        layout = SharedMemoryLayout(num_pages=4)
-
-        assert layout.control_offset % 128 == 0
-        assert layout.page_table_offset % 128 == 0
-        # page_data_offset alignment depends on previous regions
-
-    def test_layout_regions_dont_overlap(self):
-        """Test that memory regions don't overlap."""
-        from machete.megakernel.paged_memory import SharedMemoryLayout
-
-        layout = SharedMemoryLayout(num_pages=4)
-
-        assert layout.control_offset < layout.page_table_offset
-        assert layout.page_table_offset < layout.page_data_offset
-        assert layout.page_data_offset < layout.total_size
-
-    def test_to_config(self):
-        """Test PageTableConfig generation from layout."""
-        from machete.megakernel.paged_memory import SharedMemoryLayout
-
-        layout = SharedMemoryLayout(num_pages=4, page_size=16 * 1024)
-        config = layout.to_config()
-
-        assert config.num_pages == 4
-        assert config.page_size == 16 * 1024
-        assert config.base_offset == layout.page_data_offset
-
-
 class TestMegakernelPagedMemory:
     """Test megakernel with double-buffer memory integration."""
 
     def test_smem_size_from_layout(self):
-        """Test that smem_size is computed from DoubleBufferLayout."""
+        """Test that smem_size is computed from NPageLayout."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
 
         ops = [ScheduledOp(NOPOp, tiles_m=4)]

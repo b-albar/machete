@@ -78,108 +78,6 @@ def ld_shared_i32(
 
 
 # =============================================================================
-# Page Table Configuration (Host Side)
-# =============================================================================
-
-
-@dataclass
-class PageTableConfig:
-    """Configuration for the page table.
-
-    This is the host-side mirror of what gets written into shared memory
-    at page_table_offset. Layout in smem (12 bytes):
-        [0]  num_pages     (int32)
-        [4]  page_size     (int32)
-        [8]  base_offset   (int32) — offset from smem_base to page data
-
-    Attributes:
-        num_pages: Total number of pages
-        page_size: Size of each page in bytes
-        base_offset: Offset from start of shared memory to page data
-    """
-
-    num_pages: int = 4
-    page_size: int = PAGE_SIZE
-    base_offset: int = 0
-
-
-# =============================================================================
-# Legacy Shared Memory Layout (for backward compatibility with tests)
-# =============================================================================
-
-
-@dataclass
-class SharedMemoryLayout:
-    """Calculates and stores the shared memory layout for megakernel.
-
-    Layout (all regions 128-byte aligned):
-        [Control/Scratch]  — scratch area for broadcasting page IDs
-        [Page Table]       — PageTableConfig (12B) + PageState[] + free list
-        [Page Data]        — num_pages * page_size
-
-    Note: Global barriers live in global memory (_barriers_tensor),
-    not in shared memory.
-    """
-
-    def __init__(
-        self,
-        num_pages: int = 4,
-        page_size: int = PAGE_SIZE,
-    ):
-        self.num_pages = num_pages
-        self.page_size = page_size
-        self._calculate_layout()
-
-    def _calculate_layout(self):
-        """Calculate memory layout offsets."""
-        offset = 0
-
-        # Control/scratch region: used to broadcast page IDs from thread 0
-        # Size: MAX_PAGES * 4 bytes (one int32 per page ID slot)
-        self.control_offset = offset
-        control_size = MAX_PAGES * 4
-        control_size = (control_size + 127) // 128 * 128
-        offset += control_size
-
-        # Page table: config + page states + free list
-        self.page_table_offset = offset
-        # PageTableConfig: 12 bytes
-        # PageState array: num_pages * 16 bytes (owner + 12 reserved)
-        # Free list: num_pages * 4 bytes
-        # Free list head + tail: 8 bytes
-        page_table_size = 12 + self.num_pages * 16 + self.num_pages * 4 + 8
-        page_table_size = (page_table_size + 127) // 128 * 128
-        offset += page_table_size
-
-        # Page data
-        self.page_data_offset = offset
-        page_data_size = self.num_pages * self.page_size
-        offset += page_data_size
-
-        self.total_size = offset
-
-    def to_config(self) -> PageTableConfig:
-        """Create PageTableConfig from layout."""
-        return PageTableConfig(
-            num_pages=self.num_pages,
-            page_size=self.page_size,
-            base_offset=self.page_data_offset,
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"SharedMemoryLayout(\n"
-            f"  total_size={self.total_size / 1024:.1f}KB,\n"
-            f"  control_offset={self.control_offset},\n"
-            f"  page_table_offset={self.page_table_offset},\n"
-            f"  page_data_offset={self.page_data_offset},\n"
-            f"  num_pages={self.num_pages},\n"
-            f"  page_size={self.page_size / 1024:.1f}KB\n"
-            f")"
-        )
-
-
-# =============================================================================
 # N-Page Buffer Layout (Generalized Pipelined Execution)
 # =============================================================================
 
@@ -224,13 +122,14 @@ class NPageLayout:
     num_pages: int = 2
     page_size: int = PAGE_SIZE
 
-    # Scratch area layout:
+    # Scratch area layout (ring buffer):
     # - Per-page tile info: num_pages * 16 bytes [op_idx, tile_m, tile_n, tile_l] per page
     # - Current instruction: 16 bytes [op_idx, tile_m, tile_n, tile_l]
-    # - Flags: 16 bytes [ready flag, padding]
+    # - Flags: 4 bytes [done flag for warp-uniform loop exit]
+    # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
     _TILE_INFO_SIZE: int = 16  # Per-page: op_idx, tile_m, tile_n, tile_l
     _INSTR_SIZE: int = 16
-    _FLAGS_SIZE: int = 16
+    _FLAGS_SIZE: int = 4  # Single int32 done flag
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
@@ -240,24 +139,22 @@ class NPageLayout:
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
 
-        # Scratch region layout:
-        # [tile_info_0..N-1][instr][flags][mbarriers: load_done[0..N-1], compute_done[0..N-1]]
-        raw_scratch_size = (
-            self.num_pages * self._TILE_INFO_SIZE  # Tile info per page
-            + self._INSTR_SIZE
-            + self._FLAGS_SIZE
-            + 2 * self.num_pages * self._MBARRIER_SIZE  # load_done + compute_done
-        )
-        self.scratch_size = _align_up(raw_scratch_size, 128)
-
-        # Offsets within scratch
-        # ring_state_offset points to tile info array (used by kernel for per-page tile data)
+        # Scratch region layout: [tile_info][instr][flags][mbarriers]
         self.ring_state_offset = 0
         self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
         self.flags_offset = self.instr_offset + self._INSTR_SIZE
-        # mbarrier array: 2 * num_pages mbarriers (load_done[0..N-1], compute_done[0..N-1])
-        # Each mbarrier is 8 bytes, 8-byte aligned. flags_offset + _FLAGS_SIZE is 16-byte aligned.
-        self.mbarrier_offset = self.flags_offset + self._FLAGS_SIZE
+
+        # mbarrier array: 2 * num_pages mbarriers (work_notify[0..N-1], compute_done[0..N-1])
+        # Each mbarrier is 8 bytes and MUST be 8-byte aligned (PTX requirement).
+        self.mbarrier_offset = _align_up(
+            self.flags_offset + self._FLAGS_SIZE, 8
+        )
+
+        raw_scratch_size = (
+            self.mbarrier_offset
+            + 2 * self.num_pages * self._MBARRIER_SIZE
+        )
+        self.scratch_size = _align_up(raw_scratch_size, 128)
 
         # Page layout - pages start right after scratch
         # Page pointer computed as: smem_base + pages_start + page_idx * aligned_page_size
@@ -275,9 +172,9 @@ class NPageLayout:
             )
         return self.pages_start + page_idx * self.aligned_page_size
 
-    def load_done_mbar_offset(self, page_idx: int) -> int:
-        """Get offset to the load_done mbarrier for a given page."""
-        return self.mbarrier_offset + page_idx * self._MBARRIER_SIZE
+    def work_notify_mbar_offset(self, slot_idx: int) -> int:
+        """Get offset to the work_notify mbarrier for a given work slot."""
+        return self.mbarrier_offset + slot_idx * self._MBARRIER_SIZE
 
     def compute_done_mbar_offset(self, page_idx: int) -> int:
         """Get offset to the compute_done mbarrier for a given page."""
@@ -347,9 +244,6 @@ class NPageLayout:
         )
 
 
-# Backward compatibility alias
-DoubleBufferLayout = NPageLayout
-
 
 __all__ = [
     "PAGE_SIZE",
@@ -357,8 +251,4 @@ __all__ = [
     "st_shared_i32",
     "ld_shared_i32",
     "NPageLayout",
-    "DoubleBufferLayout",  # Alias for NPageLayout (backward compatibility)
-    # Legacy (for test compatibility)
-    "PageTableConfig",
-    "SharedMemoryLayout",
 ]

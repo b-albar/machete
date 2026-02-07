@@ -487,7 +487,7 @@ class Op:
 
     Execution Model:
         The megakernel uses double-buffered pipelining. Ops implement three phases:
-        - load_async(): Issue cp.async copies from global to shared memory
+        - load(): Load data from global to shared memory
         - compute(): Process data (main computation logic)
         - store(): Write results to global memory
 
@@ -495,7 +495,7 @@ class Op:
         When dependencies block, execution gracefully degrades to sequential.
 
         For ops that don't use shared memory staging, put all logic in compute()
-        and leave load_async()/store() as pass.
+        and leave load()/store() as pass.
 
     Example (direct global memory, typical pattern):
         class MyOp(Op):
@@ -536,20 +536,19 @@ class Op:
     # =========================================================================
 
     @staticmethod
-    def load_async(
+    def load(
         page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Issue async copies from global memory to shared memory page.
+        """Load data from global memory to shared memory page.
 
-        Override this to prefetch data into shared memory for compute overlap.
-        MUST call cp_async_commit() at the end to mark the copy group.
-        MUST NOT call cp_async_wait_*() - the dispatcher handles synchronization.
+        Called by DMA warp thread 0. For TMA-based ops, issue
+        cute.copy(tma_atom, ..., tma_bar_ptr=...) here.
 
-        Default: no-op (for ops that don't use shared memory staging).
+        Default: no-op (for ops that access global memory directly in compute).
 
         Args:
             page_ptr: Shared memory page base address (32-bit)
@@ -571,10 +570,10 @@ class Op:
         """Main computation for one tile.
 
         This is where the op's core logic goes. Can access:
-        - Shared memory via page_ptr (if load_async staged data there)
+        - Shared memory via page_ptr (if load staged data there)
         - Global memory directly via tensor pointers from init_source
 
-        Called after cp_async_wait_all() ensures any async loads are complete.
+        Called by MMA warps after DMA warp completes the load phase.
 
         Args:
             page_ptr: Shared memory page base address (32-bit)
@@ -595,10 +594,10 @@ class Op:
     ) -> None:
         """Store results from shared memory page to global memory.
 
-        Override this if compute() writes results to shared memory that
-        need to be copied back to global memory.
+        Called by DMA warp thread 0. For TMA-based ops, issue
+        cute.copy(tma_store_atom, ...) here (S2G does not need mbarrier).
 
-        Default: no-op (for ops that write directly to global memory in compute()).
+        Default: no-op (for ops that write directly to global memory in compute).
 
         Args:
             page_ptr: Shared memory page with computed results (32-bit)
@@ -614,14 +613,14 @@ class Op:
     # =========================================================================
 
     @staticmethod
-    def backward_load_async(
+    def backward_load(
         page_ptr: Int32,
         tile_m: Int32,
         tile_n: Int32,
         tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Issue async copies for backward pass.
+        """Load data for backward pass.
 
         Default: no-op (for ops that don't use shared memory staging).
         """

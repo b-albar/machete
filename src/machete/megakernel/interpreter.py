@@ -328,65 +328,6 @@ def st_global_i32(
 
 
 # =============================================================================
-# Async Copy Synchronization
-# =============================================================================
-
-
-@dsl_user_op
-def cp_async_wait_group(
-    n: Int32,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """Wait until at most N async copy groups remain in flight.
-
-    This is used for N-page pipelining where we want to wait for the oldest
-    async copy to complete while keeping newer ones in flight.
-
-    cp.async.wait_group N waits until at most N commit groups are pending.
-    - wait_group 0: wait for all (same as cp.async.wait_all)
-    - wait_group 1: wait until at most 1 group pending
-    - wait_group N: wait until at most N groups pending
-
-    Args:
-        n: Maximum number of groups to leave in flight (0 = wait for all)
-    """
-    # Note: PTX cp.async.wait_group requires an immediate constant.
-    # We generate a switch on common values. For very deep pipelines,
-    # the kernel loop caps tiles_in_flight anyway.
-    llvm.inline_asm(
-        None,
-        [n.ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .pred %p0, %p1, %p2, %p3, %p4, %p5, %p6, %p7;
-            setp.eq.u32 %p0, $0, 0;
-            setp.eq.u32 %p1, $0, 1;
-            setp.eq.u32 %p2, $0, 2;
-            setp.eq.u32 %p3, $0, 3;
-            setp.eq.u32 %p4, $0, 4;
-            setp.eq.u32 %p5, $0, 5;
-            setp.eq.u32 %p6, $0, 6;
-            setp.ge.u32 %p7, $0, 7;
-            @%p0 cp.async.wait_group 0;
-            @%p1 cp.async.wait_group 1;
-            @%p2 cp.async.wait_group 2;
-            @%p3 cp.async.wait_group 3;
-            @%p4 cp.async.wait_group 4;
-            @%p5 cp.async.wait_group 5;
-            @%p6 cp.async.wait_group 6;
-            @%p7 cp.async.wait_group 7;
-        }
-        """,
-        "r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-# =============================================================================
 # mbarrier Primitives (SM90+ Hardware Barriers)
 # =============================================================================
 
@@ -439,6 +380,28 @@ def mbarrier_init_fence(
         None,
         [],
         "fence.proxy.async.shared::cta;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def fence_acq_rel_cta(
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """CTA-scope acquire-release fence for shared memory ordering.
+
+    Ensures all prior shared memory writes are visible to all threads
+    in the CTA before any subsequent shared memory reads.
+    """
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.acq_rel.cta;",
         "",
         has_side_effects=True,
         is_align_stack=False,
@@ -630,7 +593,6 @@ __all__ = [
     "ld_global_i32",
     "ld_global_i64",
     "st_global_i32",
-    "cp_async_wait_group",
     # mbarrier primitives
     "mbarrier_init",
     "mbarrier_init_fence",
