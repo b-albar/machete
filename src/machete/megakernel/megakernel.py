@@ -45,7 +45,6 @@ from .compile import (
     compile_backward_store,
 )
 from .interpreter import (
-    global_barrier_wait,
     global_barrier_signal,
     check_barrier_ready,
     load_instruction_to_smem,
@@ -473,21 +472,22 @@ class Megakernel:
         is_load = phase_name == "load"
         tensor_params = ", ".join(all_canonical)
 
-        # Build dispatch branches
+        # Build dispatch branches (if/elif chain so only the matching op executes)
         lines = []
         for i, args in enumerate(op_tensor_args):
             args_str = ", ".join(args)
             if args_str:
                 args_str = ", " + args_str
 
+            keyword = "if" if i == 0 else "elif"
             if is_load:
                 lines.append(
-                    f"    if op_idx == Int32({i}):\n"
+                    f"    {keyword} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar{args_str})"
                 )
             else:
                 lines.append(
-                    f"    if op_idx == Int32({i}):\n"
+                    f"    {keyword} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{args_str})"
                 )
 
@@ -522,7 +522,7 @@ class Megakernel:
     def _build_kernel(
         self, kernel_loop_fn,
         dispatch_load, dispatch_compute, dispatch_store,
-        wait_barriers, signal_barriers, get_page_ptr_fn,
+        signal_barriers, get_page_ptr_fn,
         num_sms, threads_per_block, smem_size,
         num_pages, scratch_offset, flags_offset, ring_state_offset,
         extra_exec_globals=None,
@@ -570,7 +570,6 @@ class Megakernel:
             "dispatch_load": dispatch_load,
             "dispatch_compute": dispatch_compute,
             "dispatch_store": dispatch_store,
-            "wait_barriers": wait_barriers,
             "signal_barriers": signal_barriers,
             "_get_page_ptr": get_page_ptr_fn,
             "ld_shared_i32": ld_shared_i32,
@@ -649,116 +648,124 @@ class Megakernel:
         exec(code, pk_globals)
         return pk_globals["PersistentKernel"]()
 
-    def _build_wait_barriers(self):
-        """Build function to wait on barriers (blocking).
-
-        Returns a @cute.jit function that blocks until all wait barriers
-        for the given tile are satisfied.
-        """
-        barrier_formulas = self._builder.get_op_barrier_formulas()
-
-        @cute.jit
-        def wait_barriers(
-            op_idx: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            barriers_ptr: Int64,
-        ) -> None:
-            """Block until all wait barriers are satisfied."""
-            for i, (wait_formulas, _) in barrier_formulas.items():
-                if op_idx == Int32(i):
-                    for wf in wait_formulas:
-                        # Compute linear index for guard check
-                        _linear = (
-                            Int32(wf.coeff_m) * tile_m
-                            + Int32(wf.coeff_n) * tile_n
-                            + Int32(wf.coeff_l) * tile_l
-                        )
-                        if _linear < Int32(wf.guard_max):
-                            # Compute barrier index
-                            barrier_idx = (
-                                Int32(wf.base)
-                                + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
-                                + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
-                                + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
-                            )
-                            global_barrier_wait(barriers_ptr, barrier_idx, Int32(wf.expected))
-
-        return wait_barriers
-
     def _build_check_barriers(self):
         """Build non-blocking function to check if all barriers are ready.
 
         Returns a @cute.jit function that checks (without blocking) whether
         all wait barriers for the given tile are satisfied.
+        Uses if/elif chain so only the matching op's barriers are evaluated.
 
         Returns Int32(1) if all deps ready, Int32(0) otherwise.
         """
-        barrier_formulas = self._builder.get_op_barrier_formulas()
-
-        @cute.jit
-        def check_barriers(
-            op_idx: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            barriers_ptr: Int64,
-        ) -> Int32:
-            """Non-blocking check: are all wait barriers satisfied?"""
-            all_ready = Int32(1)
-            for i, (wait_formulas, _) in barrier_formulas.items():
-                if op_idx == Int32(i):
-                    for wf in wait_formulas:
-                        _linear = (
-                            Int32(wf.coeff_m) * tile_m
-                            + Int32(wf.coeff_n) * tile_n
-                            + Int32(wf.coeff_l) * tile_l
-                        )
-                        if _linear < Int32(wf.guard_max):
-                            barrier_idx = (
-                                Int32(wf.base)
-                                + (Int32(wf.coeff_m) * tile_m) // Int32(wf.div_m)
-                                + (Int32(wf.coeff_n) * tile_n) // Int32(wf.div_n)
-                                + (Int32(wf.coeff_l) * tile_l) // Int32(wf.div_l)
-                            )
-                            r = check_barrier_ready(barriers_ptr, barrier_idx, Int32(wf.expected))
-                            if r == Int32(0):
-                                all_ready = Int32(0)
-            return all_ready
-
-        return check_barriers
+        return self._build_barrier_fn("check")
 
     def _build_signal_barriers(self):
         """Build function to signal barriers after tile completion.
 
         Returns a @cute.jit function that signals all barriers for the
-        given tile after it completes.
+        given tile after it completes. Uses if/elif chain so only the
+        matching op's barriers are evaluated.
         """
+        return self._build_barrier_fn("signal")
+
+    def _build_barrier_fn(self, mode: str):
+        """Generate a barrier function via exec() with if/elif dispatch.
+
+        Args:
+            mode: "check" (non-blocking) or "signal"
+        """
+        import linecache
+        import machete.megakernel.compile as compile_mod
+
         barrier_formulas = self._builder.get_op_barrier_formulas()
 
-        @cute.jit
-        def signal_barriers(
-            op_idx: Int32,
-            tile_m: Int32,
-            tile_n: Int32,
-            tile_l: Int32,
-            barriers_ptr: Int64,
-        ) -> None:
-            """Signal all barriers for the completed tile."""
-            for i, (_, signal_formulas) in barrier_formulas.items():
-                if op_idx == Int32(i):
-                    for sf in signal_formulas:
-                        # Compute barrier index
-                        barrier_idx = (
-                            Int32(sf.base)
-                            + (Int32(sf.coeff_m) * tile_m) // Int32(sf.div_m)
-                            + (Int32(sf.coeff_n) * tile_n) // Int32(sf.div_n)
-                            + (Int32(sf.coeff_l) * tile_l) // Int32(sf.div_l)
-                        )
-                        global_barrier_signal(barriers_ptr, barrier_idx)
+        if mode == "check":
+            fn_name = "check_barriers"
+            ret_type = " -> Int32"
+            preamble = "    all_ready = Int32(1)\n"
+            epilogue = "    return all_ready\n"
+        else:
+            fn_name = "signal_barriers"
+            ret_type = ""
+            preamble = ""
+            epilogue = ""
 
-        return signal_barriers
+        # Build if/elif branches for each op
+        branches = []
+        first = True
+        for i, (wait_formulas, signal_formulas) in barrier_formulas.items():
+            keyword = "if" if first else "elif"
+            first = False
+
+            formulas = wait_formulas if mode == "check" else signal_formulas
+            if not formulas:
+                branches.append(f"    {keyword} op_idx == Int32({i}):\n        pass")
+                continue
+
+            lines = [f"    {keyword} op_idx == Int32({i}):"]
+            for wf in formulas:
+                if mode == "signal":
+                    lines.append(
+                        f"        barrier_idx = ("
+                        f"Int32({wf.base})"
+                        f" + (Int32({wf.coeff_m}) * tile_m) // Int32({wf.div_m})"
+                        f" + (Int32({wf.coeff_n}) * tile_n) // Int32({wf.div_n})"
+                        f" + (Int32({wf.coeff_l}) * tile_l) // Int32({wf.div_l})"
+                        f")"
+                    )
+                    lines.append("        global_barrier_signal(barriers_ptr, barrier_idx)")
+                else:  # check
+                    lines.append(
+                        f"        _linear = ("
+                        f"Int32({wf.coeff_m}) * tile_m"
+                        f" + Int32({wf.coeff_n}) * tile_n"
+                        f" + Int32({wf.coeff_l}) * tile_l"
+                        f")"
+                    )
+                    lines.append(f"        if _linear < Int32({wf.guard_max}):")
+                    lines.append(
+                        f"            barrier_idx = ("
+                        f"Int32({wf.base})"
+                        f" + (Int32({wf.coeff_m}) * tile_m) // Int32({wf.div_m})"
+                        f" + (Int32({wf.coeff_n}) * tile_n) // Int32({wf.div_n})"
+                        f" + (Int32({wf.coeff_l}) * tile_l) // Int32({wf.div_l})"
+                        f")"
+                    )
+                    lines.append(
+                        f"            r = check_barrier_ready("
+                        f"barriers_ptr, barrier_idx, Int32({wf.expected}))"
+                    )
+                    lines.append("            if r == Int32(0):")
+                    lines.append("                all_ready = Int32(0)")
+
+            branches.append("\n".join(lines))
+
+        body = "\n".join(branches) if branches else "    pass"
+
+        fn_source = (
+            "@cute.jit\n"
+            f"def {fn_name}(op_idx, tile_m, tile_n, tile_l, barriers_ptr){ret_type}:\n"
+            f"{preamble}"
+            f"{body}\n"
+            f"{epilogue}"
+        )
+
+        exec_globals = {
+            "cute": cute, "Int32": Int32, "Int64": Int64,
+            "global_barrier_signal": global_barrier_signal,
+            "check_barrier_ready": check_barrier_ready,
+        }
+
+        compile_mod._compile_counter += 1
+        unique_filename = f"<{fn_name}>_{compile_mod._compile_counter}"
+        linecache.cache[unique_filename] = (
+            len(fn_source), None, fn_source.splitlines(True), unique_filename,
+        )
+        compile_mod._linecache_entries.append(unique_filename)
+
+        code = compile(fn_source, unique_filename, "exec")
+        exec(code, exec_globals)
+        return exec_globals[fn_name]
 
     def _create_kernel(self):
         """Create the persistent warp-specialized kernel with ring buffer pages.
@@ -806,7 +813,6 @@ class Megakernel:
         dispatch_load, dispatch_compute, dispatch_store = self._build_pipelined_dispatch_fns()
 
         # Build barrier functions
-        wait_barriers = self._build_wait_barriers()
         check_barriers = self._build_check_barriers()
         signal_barriers = self._build_signal_barriers()
 
@@ -942,7 +948,22 @@ class Megakernel:
                                     dispatch_load(_ic_op, _p_pp, _ic_m, _ic_n, _ic_l, _p_config_ptr, _p_wn)
                                     produce_idx = produce_idx + Int32(1)
                                     next_instr_idx = next_instr_idx + num_blocks
+
+                                    # Prefetch next instruction while G2S copy
+                                    # is in flight — hides gmem fetch latency.
                                     _instr_cached = Int32(0)
+                                    if next_instr_idx < num_instructions:
+                                        load_instruction_to_smem(
+                                            instructions_ptr, next_instr_idx, scratch_ptr,
+                                        )
+                                        _ic_op = ld_shared_i32(scratch_ptr)
+                                        if _ic_op == Int32(TileInstruction.END_MARKER):
+                                            next_instr_idx = num_instructions
+                                        if _ic_op != Int32(TileInstruction.END_MARKER):
+                                            _ic_m = ld_shared_i32(scratch_ptr + 4)
+                                            _ic_n = ld_shared_i32(scratch_ptr + 8)
+                                            _ic_l = ld_shared_i32(scratch_ptr + 12)
+                                            _instr_cached = Int32(1)
 
                         # STEP 3: TRY ISSUE STORE (S2G copy) — after produce
                         # so the G2S from step 2 starts before the S2G here.
@@ -1032,7 +1053,7 @@ class Megakernel:
         return self._build_kernel(
             _kernel_loop_ring,
             dispatch_load, dispatch_compute, dispatch_store,
-            wait_barriers, signal_barriers, _get_page_ptr,
+            signal_barriers, _get_page_ptr,
             num_sms, threads_per_block, smem_size,
             num_pages, scratch_offset, flags_offset, ring_state_offset,
             extra_exec_globals={

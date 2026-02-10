@@ -865,24 +865,6 @@ class TensorRegistry:
         mapping = self.op_mappings[op_idx]
         return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
 
-    def get_op_local_names(self, op_idx: int, op_cls, backward: bool = False) -> List[str]:
-        """Get ordered local tensor names for an op's function signature.
-
-        Returns the op's own tensor names (x, weight, y, etc.) in declaration
-        order. Used to build the phase function signature where tensor params
-        use the op's local names.
-
-        Args:
-            op_idx: Index of the op in the ops list.
-            op_cls: The op class (for accessing _UNIQUE_TENSORS).
-            backward: If True, use backward tensor declarations.
-        """
-        if not hasattr(op_cls, '_UNIQUE_TENSORS'):
-            return []
-        unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
-        mapping = self.op_mappings[op_idx]
-        return [name for name, _, _ in unique_tensors if name in mapping]
-
 
 # =============================================================================
 # Compile-Time Barrier Formulas
@@ -948,10 +930,6 @@ class BarrierFormula:
         """Whether this formula has an active guard (not NO_GUARD)."""
         return self.guard_max != self.NO_GUARD
 
-    @property
-    def has_divisors(self) -> bool:
-        """Whether this formula uses divisors (any div > 1)."""
-        return self.div_m > 1 or self.div_n > 1 or self.div_l > 1
 
 
 # =============================================================================
