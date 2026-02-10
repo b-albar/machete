@@ -244,7 +244,6 @@ class NPageLayout:
         )
 
 
-
 __all__ = [
     "PAGE_SIZE",
     "MAX_PAGES",

@@ -17,13 +17,7 @@ from machete.kernels.rms_norm import RMSNormOp
 from machete.kernels.rms_norm.ref import rmsnorm_pytorch
 from machete.kernels.rope import RopeOp
 from machete.kernels.rope.ref import rope_pytorch
-
-
-def is_hopper_available():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+from machete.utils.testing import is_hopper_available
 
 
 def get_tolerances(dtype):

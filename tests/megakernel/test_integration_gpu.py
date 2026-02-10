@@ -42,13 +42,7 @@ from machete.megakernel.paged_memory import (
     ld_shared_i32,
 )
 from machete.megakernel.interpreter import st_global_i32, ld_global_i32, ld_global_i64
-
-
-def is_hopper_available():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+from machete.utils.testing import is_hopper_available
 
 
 # =============================================================================

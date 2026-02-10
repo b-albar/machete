@@ -8,13 +8,7 @@ Tests the megakernel that uses instruction stream and fine-grained barriers.
 import pytest
 import torch
 
-
-def is_hopper_available():
-    """Check if Hopper (SM90+) GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major >= 9
+from machete.utils.testing import is_hopper_available
 
 
 class TestMegakernel:

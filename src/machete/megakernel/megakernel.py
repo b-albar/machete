@@ -29,8 +29,6 @@ import torch
 
 import cutlass.cute as cute
 from cutlass import Int32, Int64
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
 
 from .ops import (
     ScheduledOp,
@@ -58,6 +56,7 @@ from .interpreter import (
     mbarrier_wait,
     mbarrier_try_wait,
     named_barrier_sync,
+    get_smem_base_ptr,
 )
 from .paged_memory import (
     PAGE_SIZE,
@@ -65,38 +64,6 @@ from .paged_memory import (
     st_shared_i32,
     ld_shared_i32,
 )
-
-
-# =============================================================================
-# Shared Memory Pointer Access
-# =============================================================================
-
-
-@dsl_user_op
-def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
-    """Get the base pointer to shared memory using PTX.
-
-    Returns:
-        32-bit unsigned integer address of shared memory base.
-    """
-    result = llvm.inline_asm(
-        T.i32(),
-        [],
-        """
-        {
-            .reg .u64 smem_ptr64;
-            cvta.shared.u64 smem_ptr64, 0;
-            cvt.u32.u64 $0, smem_ptr64;
-        }
-        """,
-        "=r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return Int32(result)
 
 
 # =============================================================================
@@ -125,6 +92,8 @@ class MegakernelConfig:
     page_size: int = PAGE_SIZE
     num_pages: Optional[int] = None  # None = auto-detect max for GPU
     tracing: bool = False
+    dma_reg_count: int = 40
+    mma_reg_count: int = 232
 
     @property
     def warps_per_block(self) -> int:
@@ -480,21 +449,28 @@ class Megakernel:
 
         return dispatch_load, dispatch_compute, dispatch_store
 
-    def _build_exec_dispatch_fn(self, phase_fns, phase_name, op_tensor_args, all_canonical):
+    def _build_exec_dispatch_fn(self, phase_fns, phase_name, op_tensor_args,
+                                all_canonical):
         """Build a dispatch function via exec() with tensor parameters.
+
+        For load phase (phase_name="load"), all compiled load functions
+        receive work_mbar uniformly. Sync ops have mbarrier_arrive baked
+        into their compiled body by compile_load; async ops signal it
+        themselves via mbarrier_arrive_expect_tx + cute.copy.
 
         Generates source like:
             @cute.jit
-            def dispatch_compute(op_idx, page_ptr, tile_m, tile_n, tile_l,
-                                 op_config_ptr, t0, t1, t2, t3, t4):
+            def dispatch_load(op_idx, page_ptr, tile_m, tile_n, tile_l,
+                              op_config_ptr, work_mbar, t0, t1, t2):
                 if op_idx == Int32(0):
-                    _fn_0(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, t0, t1, t2)
+                    _fn_0(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar, t0, t1)
                 if op_idx == Int32(1):
-                    _fn_1(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, t2, t3, t4)
+                    _fn_1(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar, t2)
         """
         import linecache
         import machete.megakernel.compile as compile_mod
 
+        is_load = phase_name == "load"
         tensor_params = ", ".join(all_canonical)
 
         # Build dispatch branches
@@ -503,18 +479,26 @@ class Megakernel:
             args_str = ", ".join(args)
             if args_str:
                 args_str = ", " + args_str
-            lines.append(
-                f"    if op_idx == Int32({i}):\n"
-                f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{args_str})"
-            )
+
+            if is_load:
+                lines.append(
+                    f"    if op_idx == Int32({i}):\n"
+                    f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar{args_str})"
+                )
+            else:
+                lines.append(
+                    f"    if op_idx == Int32({i}):\n"
+                    f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{args_str})"
+                )
 
         body = "\n".join(lines) if lines else "    pass"
         fn_name = f"dispatch_{phase_name}"
         tensor_sig = f", {tensor_params}" if tensor_params else ""
+        work_mbar_sig = ", work_mbar" if is_load else ""
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, tile_m, tile_n, tile_l, "
-            f"op_config_ptr{tensor_sig}):\n"
+            f"op_config_ptr{work_mbar_sig}{tensor_sig}):\n"
             f"{body}\n"
         )
 
@@ -564,7 +548,7 @@ class Megakernel:
         body = _extract_body(kernel_loop_fn)
         if tensor_params:
             body = re.sub(
-                r'(dispatch_(?:load|compute|store)\([^)]*?config_ptr)\s*\)',
+                r'(dispatch_(?:load|compute|store)\([^)]+)\)',
                 lambda m: m.group(1) + ', ' + tensor_params + ')',
                 body,
             )
@@ -813,6 +797,10 @@ class Megakernel:
         # Warp specialization constants
         num_mma_warps = (threads_per_block // 32) - 1
         num_compute_threads = num_mma_warps * 32
+        dma_reg_count = self.config.dma_reg_count
+        mma_reg_count = self.config.mma_reg_count
+
+        from cutlass.cute.arch import setmaxregister_increase, setmaxregister_decrease
 
         # Build pipelined dispatch functions (with barrier replacement for compute)
         dispatch_load, dispatch_compute, dispatch_store = self._build_pipelined_dispatch_fns()
@@ -858,6 +846,12 @@ class Megakernel:
             lane_id = tidx % Int32(32)
             is_dma_warp = warp_id == Int32(num_mma_warps)
 
+            # Register reallocation: DMA warp frees registers, MMA warps gain
+            if is_dma_warp:
+                setmaxregister_decrease(dma_reg_count)
+            if warp_id < Int32(num_mma_warps):
+                setmaxregister_increase(mma_reg_count)
+
             # Scratch pointer for instruction decode
             scratch_ptr = smem_base + Int32(scratch_offset)
             flags_ptr = smem_base + Int32(flags_offset)
@@ -887,59 +881,96 @@ class Megakernel:
                 store_idx = Int32(0)
                 next_instr_idx = block_id
                 done = Int32(0)
+                has_pending_store = Int32(0)
+                _ps_op = Int32(0)
+                _ps_m = Int32(0)
+                _ps_n = Int32(0)
+                _ps_l = Int32(0)
+
+                # Instruction cache: load once from gmem, reuse across
+                # iterations when barriers aren't ready yet.
+                _instr_cached = Int32(0)
+                _ic_op = Int32(0)
+                _ic_m = Int32(0)
+                _ic_n = Int32(0)
+                _ic_l = Int32(0)
 
                 while done == Int32(0):
                     if lane_id == Int32(0):
                         iter_done = Int32(0)
 
-                        # TRY STORE: non-blocking check if oldest slot is done
-                        if store_idx < produce_idx:
-                            _s_slot = store_idx % Int32(num_pages)
-                            _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
-                            if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
-                                _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(16)
-                                _s_op = ld_shared_i32(_s_ti)
-                                _s_m = ld_shared_i32(_s_ti + 4)
-                                _s_n = ld_shared_i32(_s_ti + 8)
-                                _s_l = ld_shared_i32(_s_ti + 12)
-                                _s_config_ptr = ld_global_i64(op_configs_ptr, _s_op)
-                                _s_pp = _get_page_ptr(smem_base, _s_slot)
-                                dispatch_store(_s_op, _s_pp, _s_m, _s_n, _s_l, _s_config_ptr)
-                                signal_barriers(_s_op, _s_m, _s_n, _s_l, barriers_ptr)
-                                store_idx = store_idx + Int32(1)
+                        # STEP 1: COMPLETE PREVIOUS STORE
+                        # Wait for S2G copy issued last iteration to finish,
+                        # then signal barriers and free the page.
+                        if has_pending_store == Int32(1):
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            signal_barriers(_ps_op, _ps_m, _ps_n, _ps_l, barriers_ptr)
+                            store_idx = store_idx + Int32(1)
+                            has_pending_store = Int32(0)
 
-                        # TRY PRODUCE: fetch instruction, check deps, load
+                        # STEP 2: TRY PRODUCE (G2S load) — runs before store
+                        # so the async G2S copy starts earlier and has more
+                        # time to complete before MMA warps need the data.
                         _can_produce = Int32(0)
                         if (produce_idx - store_idx) < Int32(num_pages):
                             if next_instr_idx < num_instructions:
                                 _can_produce = Int32(1)
                         if _can_produce == Int32(1):
-                            load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
-                            _f_op = ld_shared_i32(scratch_ptr)
-                            if _f_op == Int32(TileInstruction.END_MARKER):
-                                next_instr_idx = num_instructions
-                            if _f_op != Int32(TileInstruction.END_MARKER):
-                                _f_m = ld_shared_i32(scratch_ptr + 4)
-                                _f_n = ld_shared_i32(scratch_ptr + 8)
-                                _f_l = ld_shared_i32(scratch_ptr + 12)
-                                if check_barriers(_f_op, _f_m, _f_n, _f_l, barriers_ptr) == Int32(1):
+                            # Load instruction once; reuse cached copy on
+                            # subsequent iterations while deps aren't ready.
+                            if _instr_cached == Int32(0):
+                                load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
+                                _ic_op = ld_shared_i32(scratch_ptr)
+                                if _ic_op == Int32(TileInstruction.END_MARKER):
+                                    next_instr_idx = num_instructions
+                                if _ic_op != Int32(TileInstruction.END_MARKER):
+                                    _ic_m = ld_shared_i32(scratch_ptr + 4)
+                                    _ic_n = ld_shared_i32(scratch_ptr + 8)
+                                    _ic_l = ld_shared_i32(scratch_ptr + 12)
+                                    _instr_cached = Int32(1)
+                            if _instr_cached == Int32(1):
+                                if check_barriers(_ic_op, _ic_m, _ic_n, _ic_l, barriers_ptr) == Int32(1):
                                     _p_slot = produce_idx % Int32(num_pages)
                                     _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(16)
-                                    st_shared_i32(_p_ti, _f_op)
-                                    st_shared_i32(_p_ti + 4, _f_m)
-                                    st_shared_i32(_p_ti + 8, _f_n)
-                                    st_shared_i32(_p_ti + 12, _f_l)
-                                    _p_config_ptr = ld_global_i64(op_configs_ptr, _f_op)
+                                    st_shared_i32(_p_ti, _ic_op)
+                                    st_shared_i32(_p_ti + 4, _ic_m)
+                                    st_shared_i32(_p_ti + 8, _ic_n)
+                                    st_shared_i32(_p_ti + 12, _ic_l)
+                                    _p_config_ptr = ld_global_i64(op_configs_ptr, _ic_op)
                                     _p_pp = _get_page_ptr(smem_base, _p_slot)
-                                    dispatch_load(_f_op, _p_pp, _f_m, _f_n, _f_l, _p_config_ptr)
-                                    mbarrier_arrive(_work_notify_mbar(smem_base, _p_slot))
+                                    _p_wn = _work_notify_mbar(smem_base, _p_slot)
+                                    dispatch_load(_ic_op, _p_pp, _ic_m, _ic_n, _ic_l, _p_config_ptr, _p_wn)
                                     produce_idx = produce_idx + Int32(1)
                                     next_instr_idx = next_instr_idx + num_blocks
+                                    _instr_cached = Int32(0)
 
-                        # DONE: all fetched and all stored
+                        # STEP 3: TRY ISSUE STORE (S2G copy) — after produce
+                        # so the G2S from step 2 starts before the S2G here.
+                        if has_pending_store == Int32(0):
+                            if store_idx < produce_idx:
+                                _s_slot = store_idx % Int32(num_pages)
+                                _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
+                                if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
+                                    _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(16)
+                                    _s_op = ld_shared_i32(_s_ti)
+                                    _s_m = ld_shared_i32(_s_ti + 4)
+                                    _s_n = ld_shared_i32(_s_ti + 8)
+                                    _s_l = ld_shared_i32(_s_ti + 12)
+                                    _s_config_ptr = ld_global_i64(op_configs_ptr, _s_op)
+                                    _s_pp = _get_page_ptr(smem_base, _s_slot)
+                                    dispatch_store(_s_op, _s_pp, _s_m, _s_n, _s_l, _s_config_ptr)
+                                    cute.arch.cp_async_bulk_commit_group()
+                                    _ps_op = _s_op
+                                    _ps_m = _s_m
+                                    _ps_n = _s_n
+                                    _ps_l = _s_l
+                                    has_pending_store = Int32(1)
+
+                        # STEP 4: DONE — all fetched, all stored, nothing pending
                         if next_instr_idx >= num_instructions:
                             if store_idx >= produce_idx:
-                                iter_done = Int32(1)
+                                if has_pending_store == Int32(0):
+                                    iter_done = Int32(1)
                         st_shared_i32(flags_ptr, iter_done)
 
                     done = ld_shared_i32(flags_ptr)
@@ -1012,6 +1043,10 @@ class Megakernel:
                 "num_mma_warps": num_mma_warps,
                 "num_compute_threads": num_compute_threads,
                 "threads_per_block": threads_per_block,
+                "setmaxregister_increase": setmaxregister_increase,
+                "setmaxregister_decrease": setmaxregister_decrease,
+                "dma_reg_count": dma_reg_count,
+                "mma_reg_count": mma_reg_count,
             },
         )
 
@@ -1047,6 +1082,8 @@ class Megakernel:
             self.config.page_size,
             self.config.num_pages,
             self.config.tracing,
+            self.config.dma_reg_count,
+            self.config.mma_reg_count,
         )
 
         # Tensors are runtime parameters (not compile-time constants), so
@@ -1266,6 +1303,4 @@ __all__ = [
     "MegakernelConfig",
     "Megakernel",
     "create_megakernel",
-    # Utilities
-    "get_smem_base_ptr",
 ]

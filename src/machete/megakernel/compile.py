@@ -100,7 +100,7 @@ def _is_pass_only(fn):
 
 
 def _build_phase_fn(body_source, exec_globals, tensor_param_names,
-                    filename="<compile_phase>"):
+                    extra_params=None, filename="<compile_phase>"):
     """Build a @cute.jit phase function with optional tensor parameters.
 
     Adds tensor parameter names to the function signature when provided.
@@ -108,18 +108,25 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
     function using the op's local tensor names.
 
     Signature:
-        fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, x, weight, y) -> None
+        fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, [work_mbar,] x, weight, y) -> None
 
     Args:
         body_source: Combined init + op body source code.
         exec_globals: Globals dict for exec(). May include 'compute_barrier'
             for warp-specialized compute phases.
         tensor_param_names: List of tensor parameter names (e.g., ['x', 'weight', 'y']).
+        extra_params: Extra parameter names inserted before tensor params
+            (e.g., ['work_mbar'] for async load phases).
         filename: Base filename for linecache registration.
     """
     global _compile_counter
     _compile_counter += 1
     unique_filename = f"{filename}_{_compile_counter}"
+
+    # Build extra params (e.g., work_mbar for async load)
+    extra_params_str = ", ".join(extra_params or [])
+    if extra_params_str:
+        extra_params_str = ", " + extra_params_str
 
     # Build tensor params string for the function signature
     tensor_params_str = ", ".join(tensor_param_names)
@@ -128,7 +135,7 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
 
     fn_source = (
         "@cute.jit\n"
-        f"def phase_fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{tensor_params_str}):\n"
+        f"def phase_fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{extra_params_str}{tensor_params_str}):\n"
         + textwrap.indent(body_source, "    ")
         + "\n"
     )
@@ -147,7 +154,8 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
 
 
 def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
-                  replace_barrier=False, num_compute_threads=None):
+                  replace_barrier=False, num_compute_threads=None,
+                  extra_params=None):
     """Compile a PipelinedOp's phase method into a @cute.jit function.
 
     Generates a function that accepts cute.Tensor objects as additional
@@ -163,10 +171,12 @@ def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
             __syncthreads would deadlock (DMA warp doesn't participate).
         num_compute_threads: Number of MMA warp threads for the named barrier.
             Required when replace_barrier=True.
+        extra_params: Extra parameter names inserted before tensor params
+            (e.g., ['work_mbar'] for async load phases).
 
     Returns:
         @cute.jit function with signature:
-            (page_ptr, tile_m, tile_n, tile_l, op_config_ptr, x, weight, ...) -> None
+            (page_ptr, tile_m, tile_n, tile_l, op_config_ptr, [work_mbar,] x, weight, ...) -> None
     """
     if tensor_param_names is None:
         tensor_param_names = []
@@ -201,13 +211,44 @@ def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
         combined,
         exec_globals,
         tensor_param_names,
+        extra_params=extra_params,
         filename="<compile_phase>",
     )
 
 
 def compile_load(op_cls, init_source=None, tensor_param_names=None):
-    """Compile load phase."""
-    return compile_phase(op_cls.load, init_source, tensor_param_names)
+    """Compile load phase. Always includes work_mbar in the signature.
+
+    Detection is automatic via the load method's signature:
+    - If load declares ``work_mbar`` as a parameter, the op signals it
+      itself (async TMA load).
+    - Otherwise, ``mbarrier_arrive(work_mbar)`` is appended automatically.
+    """
+    is_async = "work_mbar" in inspect.signature(op_cls.load).parameters
+
+    if is_async:
+        return compile_phase(op_cls.load, init_source, tensor_param_names,
+                             extra_params=["work_mbar"])
+
+    # Sync load: build manually so we can append mbarrier_arrive(work_mbar)
+    if tensor_param_names is None:
+        tensor_param_names = []
+
+    parts = []
+    if init_source is not None:
+        parts.append(init_source)
+    if not _is_pass_only(op_cls.load):
+        parts.append(_extract_body(op_cls.load))
+    parts.append("mbarrier_arrive(work_mbar)")
+    combined = "\n".join(parts)
+
+    exec_globals = _merge_globals(op_cls.load)
+    from .interpreter import mbarrier_arrive
+    exec_globals["mbarrier_arrive"] = mbarrier_arrive
+
+    return _build_phase_fn(combined, exec_globals, tensor_param_names,
+                           extra_params=["work_mbar"],
+                           filename="<compile_load>")
 
 
 def compile_compute(op_cls, init_source=None, tensor_param_names=None,

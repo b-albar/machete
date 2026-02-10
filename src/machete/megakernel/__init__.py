@@ -36,7 +36,6 @@ from .megakernel import (
     MegakernelConfig,
     Megakernel,
     create_megakernel,
-    get_smem_base_ptr,
 )
 
 from .interpreter import (
@@ -44,6 +43,7 @@ from .interpreter import (
     global_barrier_signal,
     load_instruction_to_smem,
     st_global_i32,
+    get_smem_base_ptr,
 )
 
 from .autograd_op import AutogradOp, TensorSpec

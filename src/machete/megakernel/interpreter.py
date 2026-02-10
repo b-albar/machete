@@ -10,7 +10,7 @@ megakernel kernel:
 """
 
 from cutlass import Int32, Int64
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 # Counter for unique PTX labels across inline asm invocations.
@@ -388,28 +388,6 @@ def mbarrier_init_fence(
 
 
 @dsl_user_op
-def fence_acq_rel_cta(
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """CTA-scope acquire-release fence for shared memory ordering.
-
-    Ensures all prior shared memory writes are visible to all threads
-    in the CTA before any subsequent shared memory reads.
-    """
-    llvm.inline_asm(
-        None,
-        [],
-        "fence.acq_rel.cta;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
 def mbarrier_arrive(
     smem_addr: Int32,
     *,
@@ -434,6 +412,39 @@ def mbarrier_arrive(
         }
         """,
         "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def mbarrier_arrive_expect_tx(
+    smem_addr: Int32,
+    tx_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Signal arrival at an mbarrier with expected async transaction bytes.
+
+    Combines arrival with setting the expected number of bytes that will
+    be delivered by async copy operations (cp.async.bulk). The mbarrier
+    only completes when both all arrivals have occurred AND all expected
+    bytes have been delivered.
+
+    Used by async G2S bulk copy loads that signal the mbarrier via
+    cute.copy(..., mbar_ptr=...).
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier
+        tx_bytes: Number of bytes expected from async transactions
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), tx_bytes.ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared.b64 _, [$0], $1;",
+        "r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -585,6 +596,38 @@ def named_barrier_sync(
     )
 
 
+# =============================================================================
+# Shared Memory Base Pointer
+# =============================================================================
+
+
+@dsl_user_op
+def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
+    """Get the base pointer to shared memory using PTX.
+
+    Returns:
+        32-bit unsigned integer address of shared memory base.
+    """
+    result = llvm.inline_asm(
+        T.i32(),
+        [],
+        """
+        {
+            .reg .u64 smem_ptr64;
+            cvta.shared.u64 smem_ptr64, 0;
+            cvt.u32.u64 $0, smem_ptr64;
+        }
+        """,
+        "=r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
@@ -597,10 +640,13 @@ __all__ = [
     "mbarrier_init",
     "mbarrier_init_fence",
     "mbarrier_arrive",
+    "mbarrier_arrive_expect_tx",
     "mbarrier_wait",
     "mbarrier_try_wait",
     # Named barrier
     "named_barrier_sync",
+    # Shared memory
+    "get_smem_base_ptr",
     # Misc
     "nanosleep",
 ]

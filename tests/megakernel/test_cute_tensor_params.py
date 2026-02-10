@@ -10,7 +10,6 @@ inside @cute.kernel functions.
 """
 
 import linecache
-import textwrap
 
 import pytest
 import torch

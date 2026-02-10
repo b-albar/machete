@@ -545,8 +545,10 @@ class Op:
     ) -> None:
         """Load data from global memory to shared memory page.
 
-        Called by DMA warp thread 0. For TMA-based ops, issue
-        cute.copy(tma_atom, ..., tma_bar_ptr=...) here.
+        Called by DMA warp thread 0. For TMA-based ops (async_load = True),
+        receives an additional work_mbar parameter — issue
+        mbarrier_arrive_expect_tx(work_mbar, nbytes) + cute.copy(..., mbar_ptr=...)
+        and return immediately (async).
 
         Default: no-op (for ops that access global memory directly in compute).
 
@@ -679,7 +681,6 @@ class Op:
     def tiles_l(**tensors) -> int:
         """Compute tiles_l from input tensor shapes. Default: 1."""
         return 1
-
 
 
 # =============================================================================
