@@ -38,8 +38,8 @@ NUM_BITS = TILE_ELEMS * 16  # bits per tile for copy atom
 # -- Ops -----------------------------------------------------------------------
 
 class MulTwoOp(Op):
-    reads = {"x": (None, "M")}
-    writes = {"y": (None, "M")}
+    reads = {"x": (None, ("M",))}
+    writes = {"y": (None, ("M",))}
     tile = (("M", TILE_ELEMS),)
 
     @staticmethod
@@ -99,8 +99,8 @@ class MulTwoOp(Op):
 
 
 class AddTwoOp(Op):
-    reads = {"a": (None, "M")}
-    writes = {"b": (None, "M")}
+    reads = {"a": (None, ("M",))}
+    writes = {"b": (None, ("M",))}
     tile = (("M", TILE_ELEMS),)
 
     @staticmethod

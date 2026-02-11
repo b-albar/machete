@@ -47,11 +47,11 @@ class RopeOp(Op):
 
     # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
     reads = {
-        "q": (None, "M, H, D"),
-        "cos": (None, "S, D2"),
-        "sin": (None, "S, D2"),
+        "q": (None, ("M", "H", "D")),
+        "cos": (None, ("S", "D2")),
+        "sin": (None, ("S", "D2")),
     }
-    writes = {"q": (None, "M, H, D")}
+    writes = {"q": (None, ("M", "H", "D"))}
     tile = ("M",)
 
     # --- Forward (Compute Phase) ---
@@ -69,6 +69,11 @@ class RopeOp(Op):
         Zero-page op: all data accessed directly from global memory.
         page_ptr is unused.
         """
+        # Flatten N-D tensors for scalar indexing
+        q = cute.make_tensor(q.iterator, cute.make_layout(M * H * D))
+        cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
+        sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
+
         s = tile_m % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):
@@ -105,6 +110,11 @@ class RopeOp(Op):
         Zero-page op: all data accessed directly from global memory.
         page_ptr is unused.
         """
+        # Flatten N-D tensors for scalar indexing
+        q = cute.make_tensor(q.iterator, cute.make_layout(M * H * D))
+        cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
+        sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
+
         s = tile_m % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):

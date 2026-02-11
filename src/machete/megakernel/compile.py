@@ -265,8 +265,36 @@ def compile_store(op_cls, init_source=None, tensor_param_names=None):
 
 
 def compile_backward_load(op_cls, init_source=None, tensor_param_names=None):
-    """Compile backward_load phase."""
-    return compile_phase(op_cls.backward_load, init_source, tensor_param_names)
+    """Compile backward_load phase. Always includes work_mbar in the signature.
+
+    Mirrors compile_load: detects async (work_mbar in signature) vs sync,
+    and for sync loads appends mbarrier_arrive(work_mbar) automatically.
+    """
+    is_async = "work_mbar" in inspect.signature(op_cls.backward_load).parameters
+
+    if is_async:
+        return compile_phase(op_cls.backward_load, init_source, tensor_param_names,
+                             extra_params=["work_mbar"])
+
+    # Sync backward load: append mbarrier_arrive(work_mbar)
+    if tensor_param_names is None:
+        tensor_param_names = []
+
+    parts = []
+    if init_source is not None:
+        parts.append(init_source)
+    if not _is_pass_only(op_cls.backward_load):
+        parts.append(_extract_body(op_cls.backward_load))
+    parts.append("mbarrier_arrive(work_mbar)")
+    combined = "\n".join(parts)
+
+    exec_globals = _merge_globals(op_cls.backward_load)
+    from .interpreter import mbarrier_arrive
+    exec_globals["mbarrier_arrive"] = mbarrier_arrive
+
+    return _build_phase_fn(combined, exec_globals, tensor_param_names,
+                           extra_params=["work_mbar"],
+                           filename="<compile_backward_load>")
 
 
 def compile_backward_compute(op_cls, init_source=None, tensor_param_names=None,

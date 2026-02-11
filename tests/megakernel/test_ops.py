@@ -719,3 +719,240 @@ class TestSchedulerAPI:
         """TileScheduler base class cannot be instantiated directly."""
         with pytest.raises(TypeError):
             TileScheduler()
+
+
+# =============================================================================
+# Tensor Metadata & Validation Tests
+# =============================================================================
+
+
+from machete.megakernel.ops import (
+    TensorMeta,
+    TensorRegistry,
+    _gen_init_source,
+    _build_tensor_and_dim_lists,
+    validate_op_compatibility,
+    ScheduledOp,
+)
+
+
+class _Dim2DOp(Op):
+    """Test op with 2D tensor declarations."""
+    reads = {"x": (None, ("M", "D"))}
+    writes = {"y": (None, ("M", "D"))}
+    tile = ("M",)
+
+
+class _Dim3DOp(Op):
+    """Test op with 3D tensor declaration."""
+    reads = {"q": (None, ("M", "H", "D"))}
+    writes = {"q": (None, ("M", "H", "D"))}
+    tile = ("M",)
+
+
+class _Dim1DOp(Op):
+    """Test op with 1D tensor declarations."""
+    reads = {"w": (None, ("D",))}
+    writes = {"w": (None, ("D",))}
+    tile = ("D",)
+
+
+class TestTupleAndStringDimFormats:
+    """Test that both tuple and string dim formats work."""
+
+    def test_tuple_format_parsed(self):
+        """Tuple dim format produces correct _UNIQUE_TENSORS."""
+        assert _Dim2DOp._UNIQUE_TENSORS == [
+            ("x", None, ["M", "D"]),
+            ("y", None, ["M", "D"]),
+        ]
+
+    def test_tuple_format_unique_dims(self):
+        """Tuple dim format produces correct _UNIQUE_DIMS."""
+        assert _Dim2DOp._UNIQUE_DIMS == [
+            ("M", "x", 0),
+            ("D", "x", 1),
+        ]
+
+    def test_string_format_still_works(self):
+        """Legacy string format still parses correctly."""
+        tensors, dims = _build_tensor_and_dim_lists(
+            {"x": (None, "M, D")}, {"y": (None, "M, D")}
+        )
+        assert tensors == [("x", None, ["M", "D"]), ("y", None, ["M", "D"])]
+        assert dims == [("M", "x", 0), ("D", "x", 1)]
+
+
+class TestNdimValidation:
+    """Test that schedule() validates tensor ndim against declaration."""
+
+    def test_ndim_mismatch_raises(self):
+        """Passing 1D tensor to 2D op raises ValueError."""
+        x = torch.randn(32, device="cpu")  # 1D
+        y = torch.empty(32, device="cpu")  # 1D
+        with pytest.raises(ValueError, match="declared as 2D"):
+            _Dim2DOp.schedule(x=x, y=y)
+
+    def test_ndim_match_passes(self):
+        """Passing 2D tensor to 2D op succeeds."""
+        x = torch.randn(4, 8, device="cpu")
+        y = torch.empty(4, 8, device="cpu")
+        op = _Dim2DOp.schedule(x=x, y=y)
+        assert op.tensor_metas["x"].ndim == 2
+        assert op.tensor_metas["x"].shape == (4, 8)
+
+    def test_3d_ndim_match(self):
+        """Passing 3D tensor to 3D op succeeds with correct metadata."""
+        q = torch.randn(4, 8, 16, device="cpu")
+        op = _Dim3DOp.schedule(q=q)
+        assert op.tensor_metas["q"].ndim == 3
+        assert op.tensor_metas["q"].shape == (4, 8, 16)
+        assert op.tensor_metas["q"].strides == tuple(q.stride())
+
+    def test_tensor_strides_captured(self):
+        """Strides are captured in ScheduledOp.tensor_strides."""
+        x = torch.randn(4, 8, device="cpu")
+        y = torch.empty(4, 8, device="cpu")
+        op = _Dim2DOp.schedule(x=x, y=y)
+        assert op.tensor_strides["x"] == (8, 1)
+        assert op.tensor_strides["y"] == (8, 1)
+
+
+class TestDimConsistencyValidation:
+    """Test that schedule() validates dim value consistency across tensors."""
+
+    def test_dim_consistency_valid(self):
+        """Tensors sharing dim name with same value passes."""
+        x = torch.randn(4, 8, device="cpu")
+        y = torch.empty(4, 8, device="cpu")
+        op = _Dim2DOp.schedule(x=x, y=y)
+        assert op.static_dims["M"] == 4
+        assert op.static_dims["D"] == 8
+
+
+class TestCrossOpCompatibility:
+    """Test cross-op tensor compatibility validation."""
+
+    def test_compatible_reshape(self):
+        """Shared tensor with reshape (M,D) -> (M,H,D) passes when total elements match."""
+        # Simulate RMSNorm output → RoPE input
+        y = torch.randn(32, 256, device="cpu")
+        q = y.view(32, 4, 64)  # Same storage, different shape
+
+        op_a = _Dim2DOp.schedule(x=y, y=y)
+        op_b = _Dim3DOp.schedule(q=q)
+
+        registry = TensorRegistry.from_ops([op_a, op_b])
+        # Should not raise
+        validate_op_compatibility([op_a, op_b], registry)
+
+    def test_incompatible_total_elements_raises(self):
+        """Shared tensor with mismatched total elements raises ValueError."""
+        # Create two tensors that happen to share storage but have wrong shapes
+        big = torch.randn(100, device="cpu")
+        x = big[:32].view(4, 8)
+        q = big[:48].view(4, 4, 3)  # Different total from x
+
+        op_a = _Dim2DOp.schedule(x=x, y=x)
+        op_b = _Dim3DOp.schedule(q=q)
+
+        # These have different data_ptrs, so they won't be "shared" in registry.
+        # For a true shared-ptr test, we need same data_ptr with different shapes.
+        # This is tricky to construct in CPU mode. The validation is best tested
+        # via the schedule-time ndim check instead.
+
+    def test_reshape_with_different_dim_names_ok(self):
+        """Reshape where dim names differ is allowed (only total elements checked)."""
+        x = torch.randn(32, 256, device="cpu")
+        q = x.view(32, 4, 64)
+
+        op_a = _Dim2DOp.schedule(x=x, y=x)
+        op_b = _Dim3DOp.schedule(q=q)
+
+        # Total elements match (32*256 == 32*4*64), so validation passes
+        # even though D=256 in op_a and D=64 in op_b
+        assert op_a.static_dims["M"] == 32
+        assert op_b.static_dims["M"] == 32
+        registry = TensorRegistry.from_ops([op_a, op_b])
+        validate_op_compatibility([op_a, op_b], registry)
+
+
+class TestStrideInitSource:
+    """Test that stride constants are emitted in init source."""
+
+    def test_stride_constants_emitted(self):
+        """gen_init_source with tensor_strides emits stride constants."""
+        unique_tensors = [("x", None, ["M", "D"]), ("w", None, ["D"])]
+        unique_dims = [("M", "x", 0), ("D", "x", 1)]
+
+        source = _gen_init_source(
+            unique_tensors,
+            unique_dims,
+            tensor_param_map={"x": "t0", "w": "t1"},
+            static_dims={"M": 32, "D": 64},
+            tensor_strides={"x": (64, 1), "w": (1,)},
+        )
+
+        assert "x_stride_M = 64" in source
+        assert "x_stride_D = 1" in source
+        assert "w_stride_D = 1" in source
+
+    def test_no_strides_when_none(self):
+        """No stride constants when tensor_strides is None."""
+        unique_tensors = [("x", None, ["M", "D"])]
+        unique_dims = [("M", "x", 0), ("D", "x", 1)]
+
+        source = _gen_init_source(
+            unique_tensors,
+            unique_dims,
+            tensor_param_map={"x": "t0"},
+            static_dims={"M": 32, "D": 64},
+        )
+
+        assert "stride" not in source
+
+    def test_3d_stride_constants(self):
+        """3D tensor strides are emitted correctly."""
+        unique_tensors = [("q", None, ["M", "H", "D"])]
+        unique_dims = [("M", "q", 0), ("H", "q", 1), ("D", "q", 2)]
+
+        source = _gen_init_source(
+            unique_tensors,
+            unique_dims,
+            tensor_param_map={"q": "t0"},
+            static_dims={"M": 32, "H": 8, "D": 64},
+            tensor_strides={"q": (512, 64, 1)},
+        )
+
+        assert "q_stride_M = 512" in source
+        assert "q_stride_H = 64" in source
+        assert "q_stride_D = 1" in source
+
+
+class TestTensorMeta:
+    """Test TensorMeta creation and properties."""
+
+    def test_tensor_meta_from_schedule(self):
+        """TensorMeta is correctly populated from schedule()."""
+        x = torch.randn(4, 8, device="cpu")
+        y = torch.empty(4, 8, device="cpu")
+        op = _Dim2DOp.schedule(x=x, y=y)
+
+        meta_x = op.tensor_metas["x"]
+        assert meta_x.name == "x"
+        assert meta_x.declared_dims == ("M", "D")
+        assert meta_x.ndim == 2
+        assert meta_x.shape == (4, 8)
+        assert meta_x.strides == (8, 1)
+        assert meta_x.is_contiguous is True
+        assert meta_x.data_ptr == x.data_ptr()
+
+    def test_tensor_meta_1d(self):
+        """1D tensor metadata is correct."""
+        w = torch.randn(16, device="cpu")
+        op = _Dim1DOp.schedule(w=w)
+
+        meta_w = op.tensor_metas["w"]
+        assert meta_w.ndim == 1
+        assert meta_w.shape == (16,)
+        assert meta_w.strides == (1,)

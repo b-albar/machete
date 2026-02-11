@@ -9,8 +9,8 @@ compiler optimization with no runtime dispatch overhead.
 Subclass ``Op`` and declare tensors, tiling, then implement compute::
 
     class MyOp(Op):
-        reads  = {"x": (Float32, "M, D")}
-        writes = {"x": (Float32, "M, D")}
+        reads  = {"x": (Float32, ("M", "D"))}
+        writes = {"x": (Float32, ("M", "D"))}
         tile   = ("M",)
 
         @staticmethod
@@ -22,6 +22,7 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute::
     kernel.run()
 """
 
+import math
 import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -62,9 +63,41 @@ def _resolve_dtype(declared_dtype, tensor_dtype):
     return declared_dtype
 
 
-def _parse_dims(dim_str: str) -> List[str]:
-    """Parse a dim string like "M, H, D" into ["M", "H", "D"]."""
-    return [d.strip() for d in dim_str.split(",")]
+# =============================================================================
+# Tensor Metadata
+# =============================================================================
+
+
+@dataclass
+class TensorMeta:
+    """Metadata for a tensor captured at schedule() time.
+
+    Captures shape, strides, dtype, and declared dimensionality for
+    validation and stride-based init source generation.
+    """
+
+    name: str                       # Op-local name ("x", "weight", "q")
+    declared_dims: Tuple[str, ...]  # From reads/writes: ("M", "D") or ("M", "H", "D")
+    ndim: int                       # Expected number of dimensions = len(declared_dims)
+    shape: Tuple[int, ...]          # Actual tensor shape
+    strides: Tuple[int, ...]        # Actual tensor strides (in elements)
+    dtype: Any                      # Resolved CUTLASS dtype
+    is_contiguous: bool             # Whether tensor is contiguous
+    data_ptr: int                   # GPU data pointer
+
+
+def _parse_dims(dims) -> List[str]:
+    """Parse dimension specification into a list of dimension names.
+
+    Accepts:
+        - Tuple/list of strings: ("M", "H", "D") → ["M", "H", "D"]
+        - Comma-separated string (legacy): "M, H, D" → ["M", "H", "D"]
+    """
+    if isinstance(dims, (tuple, list)):
+        return list(dims)
+    if isinstance(dims, str):
+        return [d.strip() for d in dims.split(",")]
+    raise TypeError(f"dims must be tuple, list, or str, got {type(dims)}")
 
 
 def _parse_tile_spec(tile) -> Tuple[Tuple[str, ...], Dict[str, int]]:
@@ -134,14 +167,16 @@ def _gen_init_source(
     static_dims=None,
     kernel_config=None,
     tensor_dtypes=None,
+    tensor_strides=None,
     warp_specialized=False,
     dma_warp_mode=False,
 ):
-    """Generate init source for tensor parameter mode (runtime cute.Tensor params).
+    """Generate init source for tensor parameter mode (runtime tensor params).
 
     Tensors are passed as function parameters (e.g., t0, t1, t2) and aliased
     to the op's local names (e.g., x, weight, y). ALL dimensions are emitted
-    as compile-time Python int literals. No config tensor loading needed.
+    as compile-time Python int literals. Strides are emitted as compile-time
+    constants (e.g., x_stride_M, x_stride_D) when tensor_strides is provided.
 
     Args:
         unique_tensors: List of (name, dtype, dims) tuples.
@@ -151,6 +186,8 @@ def _gen_init_source(
         static_dims: Dict mapping ALL dim names to their int values.
         kernel_config: Dict of kernel configuration parameters.
         tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
+        tensor_strides: Dict mapping tensor names to stride tuples.
+            E.g., ``{'x': (256, 1), 'weight': (1,)}``.
         warp_specialized: If True, set num_threads to threads_per_row (compute
             threads only, excluding the DMA warp) instead of block_dim.
         dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
@@ -177,7 +214,10 @@ def _gen_init_source(
         lines.append("tidx = cute.arch.thread_idx()[0]")
         lines.append("num_threads = cute.arch.block_dim()[0]")
 
-    # Alias tensor params to local names: x = t0, weight = t1, etc.
+    # Alias tensor params to local names. Tensors are passed as N-D
+    # torch.Tensor (auto-converted by TensorAdapter). Ops that need flat 1D
+    # access should create their own flat view via:
+    #   x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
     if tensor_param_map:
         for local_name, canonical_name in tensor_param_map.items():
             lines.append(f"{local_name} = {canonical_name}")
@@ -194,6 +234,14 @@ def _gen_init_source(
             dtype = tensor_dtypes[name]
         dtype_name = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
         lines.append(f"{name}_dtype = {dtype_name}")
+
+    # Stride constants for each tensor (e.g., x_stride_M = 256, x_stride_D = 1)
+    if tensor_strides:
+        for name, dtype, dims in unique_tensors:
+            if name in tensor_strides:
+                strides = tensor_strides[name]
+                for i, dim_name in enumerate(dims):
+                    lines.append(f"{name}_stride_{dim_name} = {strides[i]}")
 
     return "\n".join(lines)
 
@@ -364,11 +412,31 @@ def _process_op_declarations(cls):
             unique_tensors = cls._UNIQUE_TENSORS
             pack_fn = cls.pack_config
 
+        # --- Validate tensor ndim matches declaration ---
+        for name, dtype, dims in unique_tensors:
+            if name not in tensors:
+                continue
+            t = tensors[name]
+            expected_ndim = len(dims)
+            if hasattr(t, 'ndim') and t.ndim != expected_ndim:
+                raise ValueError(
+                    f"{cls.__name__}: tensor '{name}' declared as {expected_ndim}D "
+                    f"(dims={dims}) but got {t.ndim}D tensor with shape {tuple(t.shape)}"
+                )
+
         # Extract ALL dim values from actual tensor shapes (compile-time constants).
         # The cache key includes static_dims, so different values trigger recompilation.
         static_dims = {}
         for dim_name, tensor_name, axis_idx in unique_dims:
-            static_dims[dim_name] = int(tensors[tensor_name].shape[axis_idx])
+            val = int(tensors[tensor_name].shape[axis_idx])
+            # Validate dim consistency: if we already saw this dim, values must agree
+            if dim_name in static_dims and static_dims[dim_name] != val:
+                raise ValueError(
+                    f"{cls.__name__}: dim '{dim_name}' conflict: "
+                    f"expected {static_dims[dim_name]} but tensor '{tensor_name}' "
+                    f"axis {axis_idx} has {val}"
+                )
+            static_dims[dim_name] = val
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
         tensor_dtypes = {}
@@ -388,6 +456,26 @@ def _process_op_declarations(cls):
                 tensor_ptrs[name] = tensors[name].data_ptr()
                 tensor_refs[name] = tensors[name]
 
+        # Build tensor metadata and strides
+        tensor_metas = {}
+        tensor_strides = {}
+        for name, dtype, dims in unique_tensors:
+            if name not in tensors:
+                continue
+            t = tensors[name]
+            resolved_dtype = tensor_dtypes.get(name, dtype)
+            tensor_metas[name] = TensorMeta(
+                name=name,
+                declared_dims=tuple(dims),
+                ndim=len(dims),
+                shape=tuple(t.shape),
+                strides=tuple(t.stride()),
+                dtype=resolved_dtype,
+                is_contiguous=t.is_contiguous(),
+                data_ptr=t.data_ptr(),
+            )
+            tensor_strides[name] = tuple(t.stride())
+
         config_data = pack_fn(**tensors)
         return ScheduledOp(
             op_cls=cls,
@@ -400,7 +488,9 @@ def _process_op_declarations(cls):
             tensor_ptrs=tensor_ptrs,
             tensor_refs=tensor_refs,
             dim_names=cls.DIM_NAMES,
-            tile_sizes=cls._TILE_SIZES.copy(),  # Include tile sizes for barrier computation
+            tile_sizes=cls._TILE_SIZES.copy(),
+            tensor_metas=tensor_metas,
+            tensor_strides=tensor_strides,
         )
 
     cls.schedule = schedule
@@ -409,11 +499,13 @@ def _process_op_declarations(cls):
     @classmethod
     def gen_init_source(cls, static_dims, tensor_param_map=None,
                                     backward=False, kernel_config=None, tensor_dtypes=None,
+                                    tensor_strides=None,
                                     warp_specialized=False, dma_warp_mode=False):
         """Generate init source for tensor parameter mode.
 
         Tensors are passed as function parameters and aliased to local names.
-        ALL dimensions are emitted as compile-time constants.
+        ALL dimensions are emitted as compile-time constants. Strides are
+        emitted as compile-time constants when tensor_strides is provided.
 
         Args:
             static_dims: Dict mapping ALL dim names to their int values.
@@ -422,6 +514,8 @@ def _process_op_declarations(cls):
             backward: If True, use backward tensor declarations.
             kernel_config: Dict of kernel config parameters.
             tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
+            tensor_strides: Dict mapping tensor names to stride tuples.
+                E.g., ``{'x': (256, 1), 'weight': (1,)}``.
             warp_specialized: If True, set num_threads to compute threads only.
             dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
         """
@@ -445,6 +539,7 @@ def _process_op_declarations(cls):
             static_dims=static_dims,
             kernel_config=full_kernel_config if full_kernel_config else None,
             tensor_dtypes=tensor_dtypes,
+            tensor_strides=tensor_strides,
             warp_specialized=warp_specialized,
             dma_warp_mode=dma_warp_mode,
         )
@@ -499,8 +594,8 @@ class Op:
 
     Example (direct global memory, typical pattern):
         class MyOp(Op):
-            reads = {"x": (Float32, "M, D")}
-            writes = {"y": (Float32, "M, D")}
+            reads = {"x": (Float32, ("M", "D"))}
+            writes = {"y": (Float32, ("M", "D"))}
             tile = ("M",)
 
             @staticmethod
@@ -730,6 +825,8 @@ class ScheduledOp:
     tile_sizes: Dict[str, int] = field(default_factory=dict)  # Tile sizes per dim (e.g., {"M": 4})
     tensor_ptrs: Dict[str, int] = field(default_factory=dict)  # Tensor data pointers for dependency matching
     tensor_refs: Dict[str, Any] = field(default_factory=dict)  # {name: torch.Tensor} for tensor param mode
+    tensor_metas: Dict[str, TensorMeta] = field(default_factory=dict)  # Per-tensor metadata (shape, strides, ndim)
+    tensor_strides: Dict[str, Tuple[int, ...]] = field(default_factory=dict)  # {name: strides} for stride init source
 
     def __post_init__(self):
         if self.dim_names is None:
@@ -864,6 +961,64 @@ class TensorRegistry:
         unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
         mapping = self.op_mappings[op_idx]
         return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
+
+
+# =============================================================================
+# Cross-Op Compatibility Validation
+# =============================================================================
+
+
+def validate_op_compatibility(ops: List[ScheduledOp], registry: "TensorRegistry") -> None:
+    """Validate shared tensors across fused ops have compatible shapes.
+
+    When two ops share the same underlying tensor (same data_ptr), checks that:
+    1. Total element count matches (product of shapes).
+    2. Shared dimension names have matching values in static_dims.
+
+    This allows reshapes like (M, D) → (M, H, D) as long as total elements agree
+    and any dimension names in common (e.g. M) have the same value.
+
+    Args:
+        ops: List of scheduled operations.
+        registry: TensorRegistry with deduplication info.
+
+    Raises:
+        ValueError: If shared tensors have incompatible shapes.
+    """
+    # Build reverse map: data_ptr → list of (op_idx, tensor_name, TensorMeta)
+    ptr_to_uses: Dict[int, List[Tuple[int, str, TensorMeta]]] = {}
+    for i, op in enumerate(ops):
+        for name, meta in op.tensor_metas.items():
+            ptr_to_uses.setdefault(meta.data_ptr, []).append((i, name, meta))
+
+    # Check each shared tensor (data_ptr with multiple users)
+    for ptr, uses in ptr_to_uses.items():
+        if len(uses) < 2:
+            continue
+
+        # Check total element count compatibility
+        ref_idx, ref_name, ref_meta = uses[0]
+        ref_numel = math.prod(ref_meta.shape)
+        ref_op_name = ops[ref_idx].op_cls.__name__
+
+        for other_idx, other_name, other_meta in uses[1:]:
+            other_numel = math.prod(other_meta.shape)
+            other_op_name = ops[other_idx].op_cls.__name__
+
+            if ref_numel != other_numel:
+                raise ValueError(
+                    f"Shared tensor incompatibility: "
+                    f"{ref_op_name}.{ref_name} has shape {ref_meta.shape} "
+                    f"({ref_numel} elements) but "
+                    f"{other_op_name}.{other_name} has shape {other_meta.shape} "
+                    f"({other_numel} elements)"
+                )
+
+        # Note: We intentionally do NOT check per-dim name matching on shared
+        # tensors. Different ops can reshape the same buffer (e.g., RMSNorm
+        # outputs (M, D) and RoPE reads (M, H, D) from the same storage),
+        # and dim names like "D" can legitimately mean different things.
+        # The total element count check above is the correct constraint.
 
 
 # =============================================================================

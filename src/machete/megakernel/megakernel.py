@@ -35,6 +35,7 @@ from .ops import (
     TensorRegistry,
     InstructionStreamBuilder,
     TileInstruction,
+    validate_op_compatibility,
 )
 from .compile import (
     compile_load,
@@ -193,9 +194,10 @@ class Megakernel:
         self._num_instructions: Optional[int] = None
         self._compiled_kernel = None
 
-        # Tensor parameter mode: build registry and prepare cute.Tensors
+        # Tensor parameter mode: build registry, validate compatibility, prepare tensors
         self._tensor_registry = TensorRegistry.from_ops(ops, backward=backward)
-        self._cute_tensors: Optional[List] = None  # cute.Tensor objects for kernel params
+        validate_op_compatibility(ops, self._tensor_registry)
+        self._cute_tensors: Optional[List] = None  # torch.Tensor objects for kernel params
 
         # Trace setup
         self._trace_builder = None
@@ -256,24 +258,26 @@ class Megakernel:
             self._op_configs_tensor = torch.tensor(config_ptrs, dtype=torch.int64, device=self.device)
 
     def _prepare_cute_tensors(self) -> None:
-        """Prepare cute.Tensor objects for kernel parameters.
+        """Prepare tensor objects for kernel parameters.
 
-        Creates 1D flat cute.Tensor views from the torch.Tensors in the
-        tensor registry. These are passed as runtime kernel parameters,
-        threaded through PersistentKernel -> kernel_loop -> dispatch -> phase_fn.
+        Passes torch.Tensor objects directly — CuTe DSL's TensorAdapter
+        (registered for torch.Tensor) auto-converts via from_dlpack +
+        mark_layout_dynamic, preserving N-D shape with dynamic layout.
+
+        Tensors are threaded as runtime parameters through:
+        PersistentKernel -> kernel_loop -> dispatch -> phase_fn.
         """
         if self._cute_tensors is not None:
             return
 
-        from cutlass.cute.runtime import from_dlpack
-
         self._cute_tensors = []
         for canonical_name, tensor, dtype in self._tensor_registry.tensors:
-            # Flatten to 1D for backward compat with flat indexing (x[row_offset + i])
-            # detach() needed because from_dlpack can't export gradient-tracking tensors
-            flat = tensor.detach().contiguous().view(-1)
-            ct = from_dlpack(flat, assumed_align=16)
-            self._cute_tensors.append(ct)
+            # detach() for gradient-tracking tensors, contiguous() for layout.
+            # Pass N-D torch.Tensor directly — TensorAdapter auto-converts
+            # via from_dlpack + mark_layout_dynamic, preserving shape for TMA.
+            # Ops that need flat 1D access get a flat alias in init source.
+            t = tensor.detach().contiguous()
+            self._cute_tensors.append(t)
 
     def _validate_requirements(self) -> None:
         """Validate GPU requirements."""
@@ -405,6 +409,7 @@ class Megakernel:
                     backward=use_backward,
                     kernel_config=kernel_config,
                     tensor_dtypes=op.tensor_dtypes,
+                    tensor_strides=op.tensor_strides,
                     warp_specialized=True,
                 )
                 dma_init = op.op_cls.gen_init_source(
@@ -413,6 +418,7 @@ class Megakernel:
                     backward=use_backward,
                     kernel_config=kernel_config,
                     tensor_dtypes=op.tensor_dtypes,
+                    tensor_strides=op.tensor_strides,
                     dma_warp_mode=True,
                 )
 
@@ -1095,7 +1101,13 @@ class Megakernel:
             )
             # Include tile counts - barrier formulas are baked into the kernel
             tile_counts = (op.tiles_m, op.tiles_n, op.tiles_l)
-            op_keys.append((op.op_cls, static_dims_tuple, tensor_dtypes_tuple, tile_counts))
+            # Include strides - different stride patterns require different compiled code
+            strides_tuple = (
+                tuple(sorted((k, v) for k, v in op.tensor_strides.items()))
+                if op.tensor_strides else ()
+            )
+            op_keys.append((op.op_cls, static_dims_tuple, tensor_dtypes_tuple,
+                            tile_counts, strides_tuple))
 
         config_key = (
             self.config.num_sms,
@@ -1167,6 +1179,31 @@ class Megakernel:
             Megakernel._compiled_kernel_cache[cache_key] = self._compiled_kernel
             print("Compilation complete.")
 
+    def _validate_tensors(self) -> None:
+        """Validate tensors match op requirements before kernel launch.
+
+        Checks that tensors haven't been resized or reallocated since
+        schedule() was called.
+        """
+        for op in self.ops:
+            if not op.tensor_metas:
+                continue
+            for name, meta in op.tensor_metas.items():
+                ref = op.tensor_refs.get(name)
+                if ref is None:
+                    continue
+                if ref.data_ptr() != meta.data_ptr:
+                    raise RuntimeError(
+                        f"Op {op.op_cls.__name__}: tensor '{name}' data_ptr changed "
+                        f"since schedule() (was 0x{meta.data_ptr:x}, "
+                        f"now 0x{ref.data_ptr():x}). Re-schedule the op."
+                    )
+                if tuple(ref.shape) != meta.shape:
+                    raise RuntimeError(
+                        f"Op {op.op_cls.__name__}: tensor '{name}' shape changed "
+                        f"since schedule() (was {meta.shape}, now {tuple(ref.shape)})."
+                    )
+
     def run(self, stream=None, sync: bool = True) -> None:
         """Run the persistent megakernel.
 
@@ -1175,6 +1212,9 @@ class Megakernel:
             sync: If True (default), synchronize after launch. Set to False
                 for benchmarking or when managing synchronization externally.
         """
+        # Validate tensors haven't changed since schedule()
+        self._validate_tensors()
+
         # Compile on first call (no-op if already compiled).
         # Always call compile() to ensure tensors are prepared, even when
         # _compiled_kernel was injected externally (e.g., autograd cache).

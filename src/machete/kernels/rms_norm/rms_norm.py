@@ -79,18 +79,18 @@ class RMSNormOp(Op):
 
     # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
     reads = {
-        "x": (None, "M, D"),
-        "weight": (None, "D"),
+        "x": (None, ("M", "D")),
+        "weight": (None, ("D",)),
     }
-    writes = {"y": (None, "M, D")}
+    writes = {"y": (None, ("M", "D"))}
     tile = (("M", 4),)  # Process 4 rows per tile (matches 4 warps = 128 threads)
 
     backward_reads = {
-        "dout": (None, "M, D"),
-        "x": (None, "M, D"),
-        "weight": (None, "D"),
+        "dout": (None, ("M", "D")),
+        "x": (None, ("M", "D")),
+        "weight": (None, ("D",)),
     }
-    backward_writes = {"dx": (None, "M, D")}
+    backward_writes = {"dx": (None, ("M", "D"))}
 
     # --- Forward (compute phase) ---
 
@@ -260,6 +260,10 @@ class RMSNormOp(Op):
 
         else:
             # === Scalar path: D < 32 (small hidden dim) ===
+            # Flatten 2D tensors for scalar indexing
+            x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
+            y = cute.make_tensor(y.iterator, cute.make_layout(M * D))
+
             for local_row in range(warp_idx, tile_size_M, num_warps):
                 row_idx = row_start + local_row
 
@@ -381,6 +385,11 @@ class RMSNormOp(Op):
 
         else:
             # === Scalar path ===
+            # Flatten 2D tensors for scalar indexing
+            x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
+            dout = cute.make_tensor(dout.iterator, cute.make_layout(M * D))
+            dx = cute.make_tensor(dx.iterator, cute.make_layout(M * D))
+
             for local_row in range(warp_idx, tile_size_M, num_warps):
                 row_idx = row_start + local_row
 

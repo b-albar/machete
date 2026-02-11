@@ -22,10 +22,12 @@ from .ops import (
     Op,
     NOPOp,
     ScheduledOp,
+    TensorMeta,
     BarrierFormula,
     INSTRUCTION_WORDS,
     TileInstruction,
     InstructionStreamBuilder,
+    validate_op_compatibility,
 )
 
 from .compile import (
@@ -56,6 +58,8 @@ __all__ = [
     "Op",
     "NOPOp",
     "ScheduledOp",
+    "TensorMeta",
+    "validate_op_compatibility",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
