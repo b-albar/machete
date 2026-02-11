@@ -66,15 +66,11 @@ _output_ptr = 0
 
 class OpA(Op):
     """Root producer: writes (tile_0 + 1) to data[tile_0]."""
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             st_global_i32(Int64(_data_ptr), tile_0, tile_0 + Int32(1))
@@ -82,15 +78,11 @@ class OpA(Op):
 
 class OpB(Op):
     """Branch B: reads data[tile_0], writes data[tile_0] * 2 to buf_b[tile_0]."""
-
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = ["buf_b"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             val = ld_global_i32(Int64(_data_ptr), tile_0)
@@ -99,15 +91,11 @@ class OpB(Op):
 
 class OpC(Op):
     """Branch C: reads data[tile_0], writes data[tile_0] * 3 to buf_c[tile_0]."""
-
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = ["buf_c"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             val = ld_global_i32(Int64(_data_ptr), tile_0)
@@ -116,15 +104,11 @@ class OpC(Op):
 
 class OpD(Op):
     """Join: reads buf_b and buf_c, writes sum to output."""
-
     INPUTS: ClassVar[List[str]] = ["buf_b", "buf_c"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             b_val = ld_global_i32(Int64(_buf_b_ptr), tile_0)
@@ -260,59 +244,54 @@ class TestDiamondDependencyGPU:
         num_tiles = 4
 
         class OpA3(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_a_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB3(Op):
-
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_0)
                     st_global_i32(Int64(_b_ptr), tile_0, val * Int32(2))
 
         class OpC3(Op):
-
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_0)
                     st_global_i32(Int64(_c_ptr), tile_0, val * Int32(3))
 
         class OpD3(Op):
-
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["d"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_0)
                     st_global_i32(Int64(_d_ptr), tile_0, val * Int32(4))
 
         class OpE3(Op):
-
             INPUTS: ClassVar[List[str]] = ["b", "c", "d"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     b_val = ld_global_i32(Int64(_b_ptr), tile_0)

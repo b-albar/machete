@@ -35,6 +35,7 @@ from .ops import (
     TileInstruction,
     INSTRUCTION_WORDS,
     validate_op_compatibility,
+    build_op_config,
 )
 from .compile import (
     compile_load,
@@ -389,59 +390,30 @@ class Megakernel:
         num_compute_threads = threads_per_block - 32  # Exclude DMA warp
 
         for i, op in enumerate(ops):
-            # Build tensor param map: local name -> canonical name
-            mapping = registry.op_mappings[i]
             # Get canonical names in declaration order for this op
             tensor_args = registry.get_op_tensor_args(i, op.op_cls, backward=use_backward)
             op_tensor_args.append(tensor_args)
 
             kernel_config = {"threads_per_row": num_compute_threads}
-            has_init = hasattr(op.op_cls, "gen_init_source") and (op.static_dims or op.tensor_dtypes)
 
-            # Separate init sources: compute (MMA warps) vs load/store (DMA warp)
-            compute_init = None
-            dma_init = None
-            if has_init:
-                compute_init = op.op_cls.gen_init_source(
-                    op.static_dims,
-                    tensor_param_map=mapping,
-                    backward=use_backward,
-                    kernel_config=kernel_config,
-                    tensor_dtypes=op.tensor_dtypes,
-                    tensor_strides=op.tensor_strides,
-                    warp_specialized=True,
-                    tile_sizes=op.tile_sizes,
-                )
-                dma_init = op.op_cls.gen_init_source(
-                    op.static_dims,
-                    tensor_param_map=mapping,
-                    backward=use_backward,
-                    kernel_config=kernel_config,
-                    tensor_dtypes=op.tensor_dtypes,
-                    tensor_strides=op.tensor_strides,
-                    dma_warp_mode=True,
-                    tile_sizes=op.tile_sizes,
-                )
+            # Create Op instance with compile-time config, wrap its methods.
+            config = build_op_config(op, kernel_config=kernel_config)
+            instance = op.op_cls(**config)
 
-            # Compile each phase with tensor params in signature
-            # Compute phases get barrier replacement (named barrier instead of __syncthreads)
-            # Load/store phases get DMA warp init (tidx remapped to 0-31, num_threads=32)
             if use_backward:
                 load_fns.append(compile_backward_load(
-                    op.op_cls, dma_init, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args))
                 compute_fns.append(compile_backward_compute(
-                    op.op_cls, compute_init, tensor_param_names=tensor_args,
-                    replace_barrier=True, num_compute_threads=num_compute_threads))
+                    instance, tensor_param_names=tensor_args))
                 store_fns.append(compile_backward_store(
-                    op.op_cls, dma_init, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args))
             else:
                 load_fns.append(compile_load(
-                    op.op_cls, dma_init, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args))
                 compute_fns.append(compile_compute(
-                    op.op_cls, compute_init, tensor_param_names=tensor_args,
-                    replace_barrier=True, num_compute_threads=num_compute_threads))
+                    instance, tensor_param_names=tensor_args))
                 store_fns.append(compile_store(
-                    op.op_cls, dma_init, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args))
 
         # Generate dispatch functions via exec() — each accepts ALL canonical
         # tensor names and routes the op-specific subset to each phase fn.

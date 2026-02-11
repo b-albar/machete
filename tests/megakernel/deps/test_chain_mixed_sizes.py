@@ -68,24 +68,22 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     idx = tile_0 * Int32(_num_cols) + tile_1
                     st_global_i32(Int64(_matrix_ptr), idx, tile_0 * Int32(1000) + tile_1)
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["matrix"]
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this dim 0 to verify all producers completed
@@ -93,12 +91,11 @@ class TestChainMixedDimsGPU:
                     st_global_i32(Int64(_buf_ptr), tile_0, tile_0 * Int32(100) + Int32(1))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf_ptr), tile_0)
@@ -148,23 +145,21 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_buf1_ptr), tile_0, tile_0 * Int32(10) + Int32(1))
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf1_ptr), tile_0)
@@ -172,12 +167,11 @@ class TestChainMixedDimsGPU:
                     st_global_i32(Int64(_matrix_ptr), out_idx, val * (tile_1 + Int32(1)))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["matrix"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this dim 0
@@ -229,23 +223,21 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_a_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_a_ptr), tile_0)
@@ -253,12 +245,11 @@ class TestChainMixedDimsGPU:
                     st_global_i32(Int64(_b_ptr), out_idx, val * Int32(10))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["b"]
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     in_idx = tile_0 * Int32(_num_cols) + tile_1
@@ -266,12 +257,11 @@ class TestChainMixedDimsGPU:
                     st_global_i32(Int64(_c_ptr), in_idx, val + tile_1)
 
         class OpD(Op):
-
             INPUTS: ClassVar[List[str]] = ["c"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this dim 0

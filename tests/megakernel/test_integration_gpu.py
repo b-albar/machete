@@ -30,13 +30,6 @@ from cutlass import Int32, Int64
 
 from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 from machete.megakernel.ops import Op
-
-
-def _pack_ptr(config, offset, ptr):
-    """Pack a 64-bit pointer into two int32 slots using struct (handles sign correctly)."""
-    lo, hi = struct.unpack("ii", struct.pack("Q", ptr))
-    config[offset] = lo
-    config[offset + 1] = hi
 from machete.megakernel.paged_memory import (
     st_shared_i32,
     ld_shared_i32,
@@ -45,9 +38,16 @@ from machete.megakernel.interpreter import st_global_i32, ld_global_i32, ld_glob
 from machete.utils.testing import is_hopper_available
 
 
+def _pack_ptr(config, offset, ptr):
+    """Pack a 64-bit pointer into two int32 slots using struct (handles sign correctly)."""
+    lo, hi = struct.unpack("ii", struct.pack("Q", ptr))
+    config[offset] = lo
+    config[offset + 1] = hi
+
+
 # =============================================================================
-# Global result tensor pointers (set before kernel launch, captured by
-# _merge_globals during compilation)
+# Global result tensor pointers (set before kernel launch, resolved at
+# compile time from the method's module globals)
 # =============================================================================
 
 _stamp_result_ptr = 0
@@ -63,46 +63,36 @@ _check_stale_ptr = 0
 class StampOp(Op):
     """Writes tile_0 * 100 + 42 to output page, stores readback to global tensor."""
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(100) + Int32(42)
             st_shared_i32(page_ptr, value)
-        cute.arch.sync_threads()
-        if tidx == Int32(0):
             readback = ld_shared_i32(page_ptr)
-            # Write readback to global results tensor
             st_global_i32(Int64(_stamp_result_ptr), tile_0, readback)
             cute.printf("[StampOp] tile_0=%d wrote=%d readback=%d",
-                        tile_0, tile_0 * Int32(100) + Int32(42), readback)
+                        tile_0, value, readback)
 
 
 class CheckOp(Op):
     """Reads stale page data, writes tile_0 * 200 + 7, stores results to global tensors."""
 
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
-        # Read stale value for verification
         if tidx == Int32(0):
+            # Read stale value for verification
             stale = ld_shared_i32(page_ptr)
             st_global_i32(Int64(_check_stale_ptr), tile_0, stale)
             cute.printf("[CheckOp] tile_0=%d START stale_page_value=%d", tile_0, stale)
-        cute.arch.sync_threads()
-        # Write and verify
-        if tidx == Int32(0):
+            # Write and verify
             value = tile_0 * Int32(200) + Int32(7)
             st_shared_i32(page_ptr, value)
-        cute.arch.sync_threads()
-        if tidx == Int32(0):
             readback = ld_shared_i32(page_ptr)
             st_global_i32(Int64(_check_result_ptr), tile_0, readback)
             cute.printf("[CheckOp] tile_0=%d wrote=%d readback=%d",
-                        tile_0, tile_0 * Int32(200) + Int32(7), readback)
+                        tile_0, value, readback)
 
 
 # =============================================================================
@@ -237,43 +227,34 @@ _opc_result_ptr = 0
 class OpA(Op):
     """Zero-page op: writes tile_0 * 100 + 1 to global tensor."""
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(100) + Int32(1)
             st_global_i32(Int64(_opa_result_ptr), tile_0, value)
 
 
-
 class OpB(Op):
     """Zero-page op: writes tile_0 * 200 + 2 to global tensor."""
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(200) + Int32(2)
             st_global_i32(Int64(_opb_result_ptr), tile_0, value)
 
 
-
 class OpC(Op):
     """Zero-page op: writes tile_0 * 300 + 3 to global tensor."""
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(300) + Int32(3)
             st_global_i32(Int64(_opc_result_ptr), tile_0, value)
-
 
 
 # --- Tag2DOp globals (for 2D tile grid tests) ---
@@ -288,10 +269,8 @@ class Tag2DOp(Op):
     the instruction stream ordering from InstructionStreamBuilder).
     """
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(1000) + tile_1
@@ -299,20 +278,16 @@ class Tag2DOp(Op):
             st_global_i32(Int64(_tag2d_result_ptr), idx, value)
 
 
-
 class Tag2DOpB(Op):
     """Second 2D zero-page op: writes tile_0 * 2000 + tile_1 to separate tensor."""
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(2000) + tile_1
             idx = tile_1 * Int32(_tag2d_cols) + tile_0
             st_global_i32(Int64(_opb_result_ptr), idx, value)
-
 
 
 # =============================================================================
@@ -328,65 +303,57 @@ _nfanin_result_ptr = 0
 class NamedProducerOp(Op):
     """Produces buffer 'x'. Writes tile_0 * 100 + 42."""
 
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(100) + Int32(42)
             st_global_i32(Int64(_nprod_result_ptr), tile_0, value)
 
 
-
 class NamedConsumerOp(Op):
     """Consumes buffer 'x'. Writes tile_0 * 200 + 7."""
-
 
     INPUTS: ClassVar[List[str]] = ["x"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(200) + Int32(7)
             st_global_i32(Int64(_ncons_result_ptr), tile_0, value)
 
 
-
 class NamedProducerY(Op):
     """Produces buffer 'y'. Writes tile_0 * 300 + 11."""
-
 
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["y"]
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(300) + Int32(11)
             st_global_i32(Int64(_nprody_result_ptr), tile_0, value)
 
 
-
 class NamedFanInOp(Op):
     """Consumes both 'x' and 'y'. Writes tile_0 * 400 + 13."""
-
 
     INPUTS: ClassVar[List[str]] = ["x", "y"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(400) + Int32(13)
             st_global_i32(Int64(_nfanin_result_ptr), tile_0, value)
-
 
 
 # =============================================================================
@@ -401,33 +368,29 @@ _mto_result_ptr = 0    # 1D result tensor for consumer
 class ManyToOneProducerOp(Op):
     """2D producer for many-to-one: writes 1 to matrix[tile_0, tile_1] for each tile."""
 
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["x"]
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             idx = tile_0 * Int32(_mto_cols) + tile_1
             st_global_i32(Int64(_mto_matrix_ptr), idx, Int32(1))
 
 
-
 class ManyToOneConsumerOp(Op):
     """1D consumer for many-to-one: writes tile_0 * 500 + 17."""
-
 
     INPUTS: ClassVar[List[str]] = ["x"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             value = tile_0 * Int32(500) + Int32(17)
             st_global_i32(Int64(_mto_result_ptr), tile_0, value)
-
 
 
 # =============================================================================
@@ -912,10 +875,8 @@ class ScaleOp(Op):
         [2] scale      (int64, lower 32 bits used) — scale factor
     """
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -923,7 +884,6 @@ class ScaleOp(Op):
             scale = ld_global_i32(op_config_ptr, Int32(4))  # word offset 4 = byte offset 16
             val = ld_global_i32(input_ptr, tile_0)
             st_global_i32(output_ptr, tile_0, val * scale)
-
 
 
 class AddOp(Op):
@@ -935,12 +895,11 @@ class AddOp(Op):
         [2] output_ptr  (int64)
     """
 
-
     INPUTS: ClassVar[List[str]] = ["scaled"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             input_a_ptr = ld_global_i64(op_config_ptr, Int32(0))
@@ -949,7 +908,6 @@ class AddOp(Op):
             a = ld_global_i32(input_a_ptr, tile_0)
             b = ld_global_i32(input_b_ptr, tile_0)
             st_global_i32(output_ptr, tile_0, a + b)
-
 
 
 class TensorScaleOp(Op):
@@ -964,10 +922,8 @@ class TensorScaleOp(Op):
         [2] scale      (int64, lower 32 bits used) — scale factor
     """
 
-
-
-    @staticmethod
-    def compute(page_ptr, op_config_ptr):
+    @cute.jit
+    def compute(self, page_ptr, tile_0, op_config_ptr):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read pointers and scale from config
@@ -987,7 +943,6 @@ class TensorScaleOp(Op):
 
             # Access via tensor indexing
             out_tensor[tile_0] = in_tensor[tile_0] * scale
-
 
 
 @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")

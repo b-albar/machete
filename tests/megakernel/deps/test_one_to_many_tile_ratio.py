@@ -62,15 +62,11 @@ class Producer1DOp(Op):
 
     This producer only iterates over dimension 0.
     """
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             val = tile_0 + Int32(1)
@@ -84,15 +80,11 @@ class Consumer2DOp(Op):
     This consumer iterates over dimensions 0 x 1.
     Multiple consumer tiles with the same dim 0 read from the same producer output.
     """
-
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             val = ld_global_i32(Int64(_producer_data_ptr), tile_0)
@@ -241,35 +233,32 @@ class TestOneToManyPatternGPU:
         total_output = tiles_m * tiles_n
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_buf1_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf1_ptr), tile_0)
                     st_global_i32(Int64(_buf2_ptr), tile_0, val * Int32(2))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf2"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf2_ptr), tile_0)

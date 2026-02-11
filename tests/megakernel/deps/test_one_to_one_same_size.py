@@ -55,15 +55,11 @@ class ProducerOp(Op):
     This simple operation allows verifying that the producer ran
     and wrote the expected value before the consumer reads it.
     """
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Write (tile_0 + 1) to producer result
@@ -78,15 +74,11 @@ class ConsumerOp(Op):
     If barrier synchronization works correctly, the consumer will read
     the value written by the producer (tile_0 + 1) and write (tile_0 + 1) * 2.
     """
-
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read from producer, multiply by 2, write to consumer result
@@ -215,35 +207,32 @@ class TestOneToOneSameSizeGPU:
         _opc_result_ptr = 0
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     st_global_i32(Int64(_opa_result_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_opa_result_ptr), tile_0)
                     st_global_i32(Int64(_opb_result_ptr), tile_0, val * Int32(2))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf2"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_opb_result_ptr), tile_0)

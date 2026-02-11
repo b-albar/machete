@@ -511,7 +511,7 @@ class TestLinecacheCleanup:
         import linecache
 
         before = len(_linecache_entries)
-        compile_compute(_NOPOp)
+        compile_compute(_NOPOp())
         assert len(_linecache_entries) > before
 
         # Verify entries exist in linecache
@@ -708,7 +708,6 @@ class TestSchedulerAPI:
 from machete.megakernel.ops import (
     TensorMeta,
     TensorRegistry,
-    _gen_init_source,
     _build_tensor_and_dim_lists,
     validate_op_compatibility,
     ScheduledOp,
@@ -842,55 +841,29 @@ class TestCrossOpCompatibility:
 
 
 class TestStrideInitSource:
-    """Test that stride constants are emitted in init source."""
+    """Test that stride constants are included in op config."""
 
-    def test_stride_constants_emitted(self):
-        """gen_init_source with tensor_strides emits stride constants."""
-        unique_tensors = [("x", None, ["M", "D"]), ("w", None, ["D"])]
-        unique_dims = [("M", "x", 0), ("D", "x", 1)]
-
-        source = _gen_init_source(
-            unique_tensors,
-            unique_dims,
-            tensor_param_map={"x": "t0", "w": "t1"},
-            static_dims={"M": 32, "D": 64},
-            tensor_strides={"x": (64, 1), "w": (1,)},
-        )
-
-        assert "x_stride_M = 64" in source
-        assert "x_stride_D = 1" in source
-        assert "w_stride_D = 1" in source
-
-    def test_no_strides_when_none(self):
-        """No stride constants when tensor_strides is None."""
-        unique_tensors = [("x", None, ["M", "D"])]
-        unique_dims = [("M", "x", 0), ("D", "x", 1)]
-
-        source = _gen_init_source(
-            unique_tensors,
-            unique_dims,
-            tensor_param_map={"x": "t0"},
-            static_dims={"M": 32, "D": 64},
-        )
-
-        assert "stride" not in source
+    def test_stride_constants_in_config(self):
+        """build_op_config with tensor_strides produces stride constants."""
+        from machete.megakernel.ops import build_op_config
+        x = torch.randn(32, 64, device="cpu")
+        y = torch.empty(32, 64, device="cpu")
+        op = _Dim2DOp.schedule(x=x, y=y)
+        config = build_op_config(op)
+        assert config["x_stride_M"] == 64
+        assert config["x_stride_D"] == 1
+        assert config["y_stride_M"] == 64
+        assert config["y_stride_D"] == 1
 
     def test_3d_stride_constants(self):
-        """3D tensor strides are emitted correctly."""
-        unique_tensors = [("q", None, ["M", "H", "D"])]
-        unique_dims = [("M", "q", 0), ("H", "q", 1), ("D", "q", 2)]
-
-        source = _gen_init_source(
-            unique_tensors,
-            unique_dims,
-            tensor_param_map={"q": "t0"},
-            static_dims={"M": 32, "H": 8, "D": 64},
-            tensor_strides={"q": (512, 64, 1)},
-        )
-
-        assert "q_stride_M = 512" in source
-        assert "q_stride_H = 64" in source
-        assert "q_stride_D = 1" in source
+        """3D tensor strides are in config correctly."""
+        from machete.megakernel.ops import build_op_config
+        q = torch.randn(32, 8, 64, device="cpu")
+        op = _Dim3DOp.schedule(q=q)
+        config = build_op_config(op)
+        assert config["q_stride_M"] == 512
+        assert config["q_stride_H"] == 64
+        assert config["q_stride_D"] == 1
 
 
 class TestTensorMeta:
@@ -956,31 +929,23 @@ class TestTileSizesScheduleAPI:
         assert op.tile_counts == (4,)  # ceil(30 / 8) = 4
         assert op.tile_sizes == {"M": 8}
 
-    def test_tile_size_emitted_in_init_source(self):
-        """gen_init_source emits tile_size_X constants."""
+    def test_tile_size_in_config(self):
+        """build_op_config includes tile_size_X constants."""
+        from machete.megakernel.ops import build_op_config
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
         op = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 4})
+        config = build_op_config(op)
+        assert config["tile_size_M"] == 4
 
-        source = _Dim2DOp.gen_init_source(
-            op.static_dims,
-            tensor_param_map={"x": "t0", "y": "t1"},
-            tile_sizes=op.tile_sizes,
-        )
-        assert "tile_size_M = 4" in source
-
-    def test_full_extent_tile_size_emitted(self):
-        """Full-extent tile size is emitted as the dim's full value."""
+    def test_full_extent_tile_size_in_config(self):
+        """Full-extent tile size appears in config as the dim's full value."""
+        from machete.megakernel.ops import build_op_config
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
         op = _Dim2DOp.schedule(x=x, y=y)  # No tile_sizes → full extent
-
-        source = _Dim2DOp.gen_init_source(
-            op.static_dims,
-            tensor_param_map={"x": "t0", "y": "t1"},
-            tile_sizes=op.tile_sizes,
-        )
-        assert "tile_size_M = 32" in source
+        config = build_op_config(op)
+        assert config["tile_size_M"] == 32
 
 
 class TestParseTileSpecErrors:

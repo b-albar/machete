@@ -31,7 +31,6 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
 import cutlass
 import torch
-from cutlass import Int32, Int64
 
 
 # =============================================================================
@@ -157,102 +156,6 @@ def _build_tensor_and_dim_lists(reads, writes):
     return unique_tensors, unique_dims
 
 
-def _gen_init_source(
-    unique_tensors,
-    unique_dims,
-    tensor_param_map=None,
-    static_dims=None,
-    kernel_config=None,
-    tensor_dtypes=None,
-    tensor_strides=None,
-    warp_specialized=False,
-    dma_warp_mode=False,
-    dim_names=None,
-):
-    """Generate init source for tensor parameter mode (runtime tensor params).
-
-    Tensors are passed as function parameters (e.g., t0, t1, t2) and aliased
-    to the op's local names (e.g., x, weight, y). ALL dimensions are emitted
-    as compile-time Python int literals. Strides are emitted as compile-time
-    constants (e.g., x_stride_M, x_stride_D) when tensor_strides is provided.
-    Tile indices are mapped from positional (tile_0, tile_1, ...) to named
-    variables (tile_M, tile_D, ...) based on dim_names.
-
-    Args:
-        unique_tensors: List of (name, dtype, dims) tuples.
-        unique_dims: List of (dim_name, tensor_name, axis_idx) tuples.
-        tensor_param_map: Dict mapping local tensor name to canonical parameter
-            name. E.g., ``{'x': 't0', 'weight': 't1', 'y': 't2'}``.
-        static_dims: Dict mapping ALL dim names to their int values.
-        kernel_config: Dict of kernel configuration parameters.
-        tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
-        tensor_strides: Dict mapping tensor names to stride tuples.
-            E.g., ``{'x': (256, 1), 'weight': (1,)}``.
-        warp_specialized: If True, set num_threads to threads_per_row (compute
-            threads only, excluding the DMA warp) instead of block_dim.
-        dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
-            tidx is offset so DMA warp threads become 0-31, num_threads=32.
-        dim_names: Dict mapping dim name -> axis index (e.g., {"M": 0, "D": 1}).
-            Used to generate named tile index aliases (tile_M = tile_0, etc.).
-    """
-    lines = []
-
-    # Kernel config params first (threads_per_row, tile_size_M, etc.)
-    # Must come before tidx/num_threads since warp_specialized mode references threads_per_row
-    if kernel_config:
-        for name, value in kernel_config.items():
-            lines.append(f"{name} = {value}")
-
-    if dma_warp_mode:
-        # DMA warp: remap tidx to 0-31 (subtract compute thread count)
-        compute_threads = kernel_config.get("threads_per_row", 0) if kernel_config else 0
-        lines.append(f"tidx = cute.arch.thread_idx()[0] - Int32({compute_threads})")
-        lines.append("num_threads = 32")
-    elif warp_specialized:
-        lines.append("tidx = cute.arch.thread_idx()[0]")
-        # In warp-specialized mode, num_threads = compute threads only
-        lines.append("num_threads = threads_per_row")
-    else:
-        lines.append("tidx = cute.arch.thread_idx()[0]")
-        lines.append("num_threads = cute.arch.block_dim()[0]")
-
-    # Map positional tile indices to named variables (tile_M = tile_0, etc.)
-    if dim_names:
-        for dim_name, axis_idx in dim_names.items():
-            lines.append(f"tile_{dim_name} = tile_{axis_idx}")
-
-    # Alias tensor params to local names. Tensors are passed as N-D
-    # torch.Tensor (auto-converted by TensorAdapter). Ops that need flat 1D
-    # access should create their own flat view via:
-    #   x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
-    if tensor_param_map:
-        for local_name, canonical_name in tensor_param_map.items():
-            lines.append(f"{local_name} = {canonical_name}")
-
-    # ALL dims as compile-time Python int literals
-    if static_dims:
-        for dim_name, _, _ in unique_dims:
-            if dim_name in static_dims:
-                lines.append(f"{dim_name} = {static_dims[dim_name]}")
-
-    # Dtype constants for each tensor
-    for name, dtype, dims in unique_tensors:
-        if tensor_dtypes and name in tensor_dtypes:
-            dtype = tensor_dtypes[name]
-        dtype_name = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
-        lines.append(f"{name}_dtype = {dtype_name}")
-
-    # Stride constants for each tensor (e.g., x_stride_M = 256, x_stride_D = 1)
-    if tensor_strides:
-        for name, dtype, dims in unique_tensors:
-            if name in tensor_strides:
-                strides = tensor_strides[name]
-                for i, dim_name in enumerate(dims):
-                    lines.append(f"{name}_stride_{dim_name} = {strides[i]}")
-
-    return "\n".join(lines)
-
-
 def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=None):
     """Generate and attach pack_config / pack_backward_config staticmethods.
 
@@ -304,7 +207,7 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
 def _process_op_declarations(cls):
     """Process reads/writes/tile declarations on an Op subclass.
 
-    Auto-generates: INPUTS, OUTPUTS, NUM_INPUT_PAGES, NUM_OUTPUT_PAGES,
+    Auto-generates: INPUTS, OUTPUTS,
     DIM_NAMES, pack_config, pack_backward_config, load/store stubs,
     and schedule() classmethod.
 
@@ -362,10 +265,6 @@ def _process_op_declarations(cls):
     # Set INPUTS / OUTPUTS
     cls.INPUTS = list(reads.keys())
     cls.OUTPUTS = list(writes.keys())
-
-    # Zero-page (global memory) ops
-    cls.NUM_INPUT_PAGES = 0
-    cls.NUM_OUTPUT_PAGES = 0
 
     # DIM_NAMES: map tile dim names to axis indices (0..4)
     cls.DIM_NAMES = {tile[i]: i for i in range(len(tile))}
@@ -501,64 +400,6 @@ def _process_op_declarations(cls):
 
     cls.schedule = schedule
 
-    # Add gen_init_source classmethod for deferred init generation
-    @classmethod
-    def gen_init_source(cls, static_dims, tensor_param_map=None,
-                                    backward=False, kernel_config=None, tensor_dtypes=None,
-                                    tensor_strides=None,
-                                    warp_specialized=False, dma_warp_mode=False,
-                                    tile_sizes=None):
-        """Generate init source for tensor parameter mode.
-
-        Tensors are passed as function parameters and aliased to local names.
-        ALL dimensions are emitted as compile-time constants. Strides are
-        emitted as compile-time constants when tensor_strides is provided.
-
-        Args:
-            static_dims: Dict mapping ALL dim names to their int values.
-            tensor_param_map: Dict mapping local tensor name to canonical
-                param name. E.g., ``{'x': 't0', 'weight': 't1', 'y': 't2'}``.
-            backward: If True, use backward tensor declarations.
-            kernel_config: Dict of kernel config parameters.
-            tensor_dtypes: Dict mapping tensor names to CUTLASS dtypes.
-            tensor_strides: Dict mapping tensor names to stride tuples.
-                E.g., ``{'x': (256, 1), 'weight': (1,)}``.
-            warp_specialized: If True, set num_threads to compute threads only.
-            dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
-            tile_sizes: Dict mapping tile dim names to resolved tile sizes.
-                E.g., ``{'M': 4, 'D': 256}``. All values must be ints
-                (no None — resolve full-extent before calling).
-        """
-        if backward:
-            tensors = cls._BWD_UNIQUE_TENSORS
-            dims = cls._BWD_UNIQUE_DIMS
-        else:
-            tensors = cls._UNIQUE_TENSORS
-            dims = cls._UNIQUE_DIMS
-
-        full_kernel_config = {}
-        if kernel_config:
-            full_kernel_config.update(kernel_config)
-        # Emit tile_size_X as compile-time constants
-        if tile_sizes:
-            for dim_name, size in tile_sizes.items():
-                full_kernel_config[f"tile_size_{dim_name}"] = size
-
-        return _gen_init_source(
-            tensors,
-            dims,
-            tensor_param_map=tensor_param_map,
-            static_dims=static_dims,
-            kernel_config=full_kernel_config if full_kernel_config else None,
-            tensor_dtypes=tensor_dtypes,
-            tensor_strides=tensor_strides,
-            warp_specialized=warp_specialized,
-            dma_warp_mode=dma_warp_mode,
-            dim_names=cls.DIM_NAMES,
-        )
-
-    cls.gen_init_source = gen_init_source
-
     # Add gen_tensor_param_names classmethod
     @classmethod
     def gen_tensor_param_names(cls, backward=False):
@@ -584,11 +425,14 @@ def _process_op_declarations(cls):
 class Op:
     """Base class for GPU-executable operations with pipelined execution.
 
-    Each operation implements static methods that get inlined into the
-    megakernel at compile time. The methods receive raw CuTe DSL types
-    (Int32 pointers and indices) so they can execute on the GPU.
+    Methods are ``@cute.jit`` instance methods on a class in a real .py file.
+    The framework creates an instance at compile time with config stored as
+    ``self`` attributes. Methods access config via ``self.M``,
+    ``self.tile_size_M``, etc. Tensors and tile indices are explicit method
+    parameters.
 
-    Subclasses declare tensors and tiling via class attributes:
+    Declare tensors and tiling via class attributes::
+
         reads:  Dict of tensor name → (dtype, dim_string)
         writes: Dict of tensor name → (dtype, dim_string)
         tile:   Tuple of dim names that define the tile grid
@@ -605,33 +449,41 @@ class Op:
         For ops that don't use shared memory staging, put all logic in compute()
         and leave load()/store() as pass.
 
-    Example (direct global memory, typical pattern):
+    Example:
         class MyOp(Op):
             reads = {"x": (Float32, ("M", "D"))}
             writes = {"y": (Float32, ("M", "D"))}
             tile = ("M", "D")
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
-                # tile_M, tile_D, x, y, M, D available from init_source
-                for i in range(tidx, D, num_threads):
-                    y[tile_M * D + i] = x[tile_M * D + i] * 2.0
+            @cute.jit
+            def compute(self, page_ptr, tile_M, tile_D, x, y):
+                tidx = cute.arch.thread_idx()[0]
+                for i in range(tidx, self.D, self.threads_per_row):
+                    y[tile_M * self.D + i] = x[tile_M * self.D + i] * 2.0
 
     Class attributes:
-        NUM_INPUT_PAGES: Number of input shared memory pages needed
-        NUM_OUTPUT_PAGES: Number of output shared memory pages needed
         INPUTS: Named global memory buffers this op reads from
         OUTPUTS: Named global memory buffers this op produces
     """
-
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
 
     # Named buffer declarations for automatic dependency inference.
     # Each string names a global memory buffer. The builder matches
     # producer OUTPUTS to consumer INPUTS to build the dependency DAG.
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = []
+
+    def __init__(self, **config):
+        """Initialize Op instance with compile-time configuration.
+
+        For class-based Ops, the framework calls this at compile time
+        with all config as keyword arguments. Config includes dim values
+        (M, D), tile sizes (tile_size_M), thread config (threads_per_row),
+        tensor dtypes (x_dtype) and strides (x_stride_M).
+
+        Subclasses can override for explicit parameter validation.
+        """
+        for key, value in config.items():
+            setattr(self, key, value)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -641,20 +493,12 @@ class Op:
     # =========================================================================
     # Pipelined Execution Interface
     # =========================================================================
-    #
-    # Op method signatures: (page_ptr, op_config_ptr)
-    # Tile indices (tile_M, tile_D, etc.) and dimensions (M, D, etc.)
-    # are injected via init_source as named variables.
 
-    @staticmethod
-    def load(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def load(self, page_ptr) -> None:
         """Load data from global memory to shared memory page.
 
         Called by DMA warp thread 0. For TMA-based ops (async_load = True),
-        receives an additional work_mbar parameter — issue
+        add ``work_mbar`` parameter — issue
         mbarrier_arrive_expect_tx(work_mbar, nbytes) + cute.copy(..., mbar_ptr=...)
         and return immediately (async).
 
@@ -662,27 +506,20 @@ class Op:
         """
         pass
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def compute(self, page_ptr) -> None:
         """Main computation for one tile.
 
         This is where the op's core logic goes. Can access:
         - Shared memory via page_ptr (if load staged data there)
-        - Global memory directly via tensor pointers from init_source
-        - Tile indices via tile_M, tile_D, etc. from init_source
+        - Global memory directly via tensor parameters
+        - Tile indices via tile_M, tile_D, etc. parameters
+        - Config via self.M, self.D, self.threads_per_row, etc.
 
         Called by MMA warps after DMA warp completes the load phase.
         """
         pass
 
-    @staticmethod
-    def store(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def store(self, page_ptr) -> None:
         """Store results from shared memory page to global memory.
 
         Called by DMA warp thread 0. For TMA-based ops, issue
@@ -696,42 +533,80 @@ class Op:
     # Backward Pass Interface
     # =========================================================================
 
-    @staticmethod
-    def backward_load(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def backward_load(self, page_ptr) -> None:
         """Load data for backward pass.
 
         Default: no-op (for ops that don't use shared memory staging).
         """
         pass
 
-    @staticmethod
-    def backward_compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def backward_compute(self, page_ptr) -> None:
         """Backward computation for one tile.
 
         Default: no-op.
         """
         pass
 
-    @staticmethod
-    def backward_store(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    def backward_store(self, page_ptr) -> None:
         """Store backward results from shared memory to global memory.
 
         Default: no-op.
         """
         pass
 
-    # =========================================================================
-    # Host-side tiling (used by autograd and scheduling)
-    # =========================================================================
+
+def build_op_config(
+    op: "ScheduledOp",
+    kernel_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build config dict for creating a class-based Op instance.
+
+    The config dict contains all compile-time constants that the instance
+    stores as ``self`` attributes: dim values, tile sizes, thread config,
+    tensor dtypes, and tensor strides.
+
+    Args:
+        op: Scheduled operation with static_dims, tile_sizes, tensor info.
+        kernel_config: Kernel-level config (threads_per_row, etc.).
+    """
+    config: Dict[str, Any] = {}
+
+    # Kernel config (threads_per_row, etc.)
+    if kernel_config:
+        config.update(kernel_config)
+
+    # Tile sizes (tile_size_M, tile_size_D, ...)
+    if op.tile_sizes:
+        for dim_name, size in op.tile_sizes.items():
+            config[f"tile_size_{dim_name}"] = size
+
+    # Dim values (M, D, S, H, ...)
+    if op.static_dims:
+        config.update(op.static_dims)
+
+    # Tensor dtypes (x_dtype, weight_dtype, dout_dtype, ...)
+    # Include both forward and backward tensor declarations since the same
+    # instance is used for all phases.
+    for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
+        if hasattr(op.op_cls, attr):
+            for name, dtype, dims in getattr(op.op_cls, attr):
+                key = f"{name}_dtype"
+                if key not in config:
+                    resolved = op.tensor_dtypes.get(name, dtype) if op.tensor_dtypes else dtype
+                    if resolved is not None:
+                        config[key] = resolved
+
+    # Tensor strides (x_stride_M, x_stride_D, ...)
+    if op.tensor_strides:
+        for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
+            if hasattr(op.op_cls, attr):
+                for name, dtype, dims in getattr(op.op_cls, attr):
+                    if name in op.tensor_strides:
+                        for i, dim_name in enumerate(dims):
+                            config[f"{name}_stride_{dim_name}"] = op.tensor_strides[name][i]
+
+    return config
+
 
 # =============================================================================
 # Scheduled Operation
@@ -1976,6 +1851,7 @@ class InstructionStreamBuilder:
 __all__ = [
     # Protocol
     "Op",
+    "build_op_config",
     # Scheduling
     "ScheduledOp",
     "TensorRegistry",

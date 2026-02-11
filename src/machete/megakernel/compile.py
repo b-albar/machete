@@ -3,14 +3,15 @@
 Phase Function Compilation for Megakernel.
 
 Compiles an Op's pipelined phase methods (load, compute, store) into
-@cute.jit functions. The op method body is extracted via inspect and inlined
-with init_source prepended. This allows CuTe DSL's AST preprocessor to
-transform all control flow (if/while over dynamic values) in a single pass.
+@cute.jit wrapper functions. The wrapper delegates to the Op instance's
+method, mapping positional tile indices to named parameters.
 
 Usage:
     from machete.megakernel.compile import compile_compute
 
-    tile_fn = compile_compute(MyOp, init_source, tensor_param_names=['t0', 't1'])
+    config = build_op_config(scheduled_op, kernel_config=kernel_config)
+    instance = MyOp(**config)
+    tile_fn = compile_compute(instance, tensor_param_names=['t0', 't1'])
 
     # Returns @cute.jit function with signature:
     #   fn(page_ptr: Int32, tile_0..tile_4: Int32,
@@ -33,7 +34,7 @@ _linecache_entries: list = []
 
 
 # =============================================================================
-# Source Extraction & Function Building
+# Source Extraction
 # =============================================================================
 
 
@@ -62,92 +63,119 @@ def _extract_body(fn):
     return textwrap.dedent("\n".join(lines[body_start:body_end]))
 
 
-def _merge_globals(*fns):
-    """Merge __globals__ from multiple functions.
-
-    Always includes cutlass dtypes so that generated init source strings
-    (dtype references like BFloat16) work without needing a function
-    object to extract globals from.
-    """
-    merged = {}
-    for fn in fns:
-        if hasattr(fn, "__globals__"):
-            merged.update(fn.__globals__)
-    merged["cute"] = cute
-    merged["Int32"] = Int32
-    merged["Int64"] = Int64
-
-    # Cutlass dtype names used in tensor declarations
-    import cutlass
-    for name in dir(cutlass):
-        obj = getattr(cutlass, name)
-        if isinstance(obj, type) or (hasattr(obj, '__name__') and
-                                      name[0].isupper()):
-            merged[name] = obj
-
-    return merged
-
-
-def _is_pass_only(fn):
-    """Check if a function body is just 'pass' (no-op)."""
-    body = _extract_body(fn).strip()
-    return body == "pass"
-
-
 # =============================================================================
-# Phase Compilation
+# Phase Compilation (Class-Based)
 # =============================================================================
 
 
-def _build_phase_fn(body_source, exec_globals, tensor_param_names,
-                    extra_params=None, filename="<compile_phase>"):
-    """Build a @cute.jit phase function with optional tensor parameters.
+def _build_phase_wrapper(
+    instance,
+    phase_name,
+    tensor_param_names=None,
+    extra_params=None,
+    append_mbar=False,
+    filename="<compile_phase>",
+):
+    """Build a @cute.jit wrapper that delegates to an Op instance method.
 
-    Adds tensor parameter names to the function signature when provided.
-    The tensors are cute.Tensor objects passed from the dispatch
-    function using the op's local tensor names.
+    The wrapper has the standard dispatch signature (page_ptr, tile_0..4,
+    op_config_ptr, [work_mbar,] t0, t1, ...) and maps positional tile
+    indices and canonical tensor names to the instance method's named
+    parameters.
 
-    Signature:
-        fn(page_ptr, tile_0, tile_1, tile_2, tile_3, tile_4, op_config_ptr,
-           [work_mbar,] x, weight, y) -> None
+    The instance method signature convention:
+        def phase(self, page_ptr, tile_M, [tile_D, ...], x, [weight, ...], y,
+                  [work_mbar]):
+
+    CuTe DSL traces through the wrapper into the real instance method,
+    which is in a real .py file and has full source access.
 
     Args:
-        body_source: Combined init + op body source code.
-        exec_globals: Globals dict for exec(). May include 'compute_barrier'
-            for warp-specialized compute phases.
-        tensor_param_names: List of tensor parameter names (e.g., ['x', 'weight', 'y']).
-        extra_params: Extra parameter names inserted before tensor params
-            (e.g., ['work_mbar'] for async load phases).
+        instance: Op instance with config stored as self attributes.
+        phase_name: Method name ('load', 'compute', 'store', etc.).
+        tensor_param_names: Canonical tensor parameter names for dispatch.
+        extra_params: Extra params in wrapper signature (e.g., ['work_mbar']).
+        append_mbar: If True, append mbarrier_arrive(work_mbar) after call.
         filename: Base filename for linecache registration.
     """
     global _compile_counter
     _compile_counter += 1
     unique_filename = f"{filename}_{_compile_counter}"
 
-    # Build extra params (e.g., work_mbar for async load)
-    extra_params_str = ", ".join(extra_params or [])
-    if extra_params_str:
-        extra_params_str = ", " + extra_params_str
+    op_cls = instance.__class__
+    method = getattr(instance, phase_name)
+    method_params = set(inspect.signature(method).parameters.keys())
 
-    # Build tensor params string for the function signature
-    tensor_params_str = ", ".join(tensor_param_names)
-    if tensor_params_str:
-        tensor_params_str = ", " + tensor_params_str
+    # Build instance method call arguments:
+    # page_ptr, then tile indices (mapped to positional tile_i), then tensors.
+    # Only pass args that the method signature actually accepts (base Op
+    # default methods only take page_ptr).
+    call_args = ["page_ptr"]
 
+    # Map tile dims to positional tile_i params
+    if hasattr(op_cls, "_TILE_DIM_NAMES_ORDERED"):
+        for dim_name in op_cls._TILE_DIM_NAMES_ORDERED:
+            if f"tile_{dim_name}" in method_params:
+                axis = op_cls.DIM_NAMES[dim_name]
+                call_args.append(f"tile_{axis}")
+    else:
+        # Raw op (no reads/writes/tile declarations): detect tile_N params
+        # from method signature and pass them through positionally.
+        for i in range(5):
+            if f"tile_{i}" in method_params:
+                call_args.append(f"tile_{i}")
+
+    # Add tensor params only if method expects them (has params beyond
+    # page_ptr, tile_*, op_config_ptr, work_mbar)
+    if tensor_param_names:
+        known_special = {"page_ptr", "op_config_ptr", "work_mbar"}
+        expects_tensors = any(
+            p not in known_special and not p.startswith("tile_")
+            for p in method_params
+        )
+        if expects_tensors:
+            call_args.extend(tensor_param_names)
+
+    # Check if method expects op_config_ptr
+    if "op_config_ptr" in method_params:
+        call_args.append("op_config_ptr")
+
+    # Check if method expects work_mbar
+    if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
+        call_args.append("work_mbar")
+
+    call_str = ", ".join(call_args)
+
+    # Build wrapper function signature (standard dispatch format)
     tile_params = ", ".join(f"tile_{i}" for i in range(5))
+    extra_str = ""
+    if extra_params:
+        extra_str = ", " + ", ".join(extra_params)
+    tensor_str = ""
+    if tensor_param_names:
+        tensor_str = ", " + ", ".join(tensor_param_names)
+
+    body = f"    _instance.{phase_name}({call_str})\n"
+    if append_mbar:
+        body += "    mbarrier_arrive(work_mbar)\n"
+
     fn_source = (
         "@cute.jit\n"
         f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
-        f"{extra_params_str}{tensor_params_str}):\n"
-        + textwrap.indent(body_source, "    ")
-        + "\n"
+        f"{extra_str}{tensor_str}):\n"
+        f"{body}"
     )
 
+    exec_globals = {
+        "cute": cute, "Int32": Int32, "Int64": Int64,
+        "_instance": instance,
+    }
+    if append_mbar:
+        from .interpreter import mbarrier_arrive
+        exec_globals["mbarrier_arrive"] = mbarrier_arrive
+
     linecache.cache[unique_filename] = (
-        len(fn_source),
-        None,
-        fn_source.splitlines(True),
-        unique_filename,
+        len(fn_source), None, fn_source.splitlines(True), unique_filename,
     )
     _linecache_entries.append(unique_filename)
 
@@ -156,161 +184,85 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
     return exec_globals["phase_fn"]
 
 
-def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
-                  replace_barrier=False, num_compute_threads=None,
-                  extra_params=None):
-    """Compile a PipelinedOp's phase method into a @cute.jit function.
+def compile_load(instance, tensor_param_names=None):
+    """Compile Op's load method.
 
-    Generates a function that accepts cute.Tensor objects as additional
-    parameters (passed through the dispatch chain from the kernel).
-
-    Args:
-        phase_fn: PipelinedOp.load, .compute, or .store static method.
-        init_source: Pre-generated init source string (tensor aliases, dims, dtypes).
-        tensor_param_names: List of tensor parameter names for the signature.
-        replace_barrier: If True, replace cute.arch.barrier() and
-            cute.arch.sync_threads() calls with compute_barrier() in the
-            extracted body. Used for warp-specialized compute phases where
-            __syncthreads would deadlock (DMA warp doesn't participate).
-        num_compute_threads: Number of MMA warp threads for the named barrier.
-            Required when replace_barrier=True.
-        extra_params: Extra parameter names inserted before tensor params
-            (e.g., ['work_mbar'] for async load phases).
-
-    Returns:
-        @cute.jit function with signature:
-            (page_ptr, tile_0..4, op_config_ptr, [work_mbar,] x, weight, ...) -> None
+    Detects async vs sync load from method signature.
+    Always includes work_mbar in wrapper signature.
     """
-    if tensor_param_names is None:
-        tensor_param_names = []
+    method = getattr(instance, "load")
+    is_async = "work_mbar" in inspect.signature(method).parameters
 
-    parts = []
-    if init_source is not None:
-        parts.append(init_source)
-    if not _is_pass_only(phase_fn):
-        body = _extract_body(phase_fn)
-        if replace_barrier:
-            body = body.replace("cute.arch.barrier()", "compute_barrier()")
-            body = body.replace("cute.arch.sync_threads()", "compute_barrier()")
-        parts.append(body)
+    if is_async:
+        return _build_phase_wrapper(
+            instance, "load", tensor_param_names,
+            extra_params=["work_mbar"],
+            filename="<compile_load>",
+        )
+    else:
+        return _build_phase_wrapper(
+            instance, "load", tensor_param_names,
+            extra_params=["work_mbar"],
+            append_mbar=True,
+            filename="<compile_load>",
+        )
 
-    combined = "\n".join(parts) if parts else "pass"
 
-    exec_globals = _merge_globals(phase_fn)
-
-    # Inject compute_barrier function for warp-specialized compute phases
-    if replace_barrier and num_compute_threads is not None:
-        from .interpreter import named_barrier_sync as _nbs
-
-        _count = num_compute_threads
-
-        @cute.jit
-        def compute_barrier():
-            _nbs(Int32(1), Int32(_count))
-
-        exec_globals["compute_barrier"] = compute_barrier
-
-    return _build_phase_fn(
-        combined,
-        exec_globals,
-        tensor_param_names,
-        extra_params=extra_params,
-        filename="<compile_phase>",
+def compile_compute(instance, tensor_param_names=None):
+    """Compile Op's compute method."""
+    return _build_phase_wrapper(
+        instance, "compute", tensor_param_names,
+        filename="<compile_compute>",
     )
 
 
-def compile_load(op_cls, init_source=None, tensor_param_names=None):
-    """Compile load phase. Always includes work_mbar in the signature.
-
-    Detection is automatic via the load method's signature:
-    - If load declares ``work_mbar`` as a parameter, the op signals it
-      itself (async TMA load).
-    - Otherwise, ``mbarrier_arrive(work_mbar)`` is appended automatically.
-    """
-    is_async = "work_mbar" in inspect.signature(op_cls.load).parameters
-
-    if is_async:
-        return compile_phase(op_cls.load, init_source, tensor_param_names,
-                             extra_params=["work_mbar"])
-
-    # Sync load: build manually so we can append mbarrier_arrive(work_mbar)
-    if tensor_param_names is None:
-        tensor_param_names = []
-
-    parts = []
-    if init_source is not None:
-        parts.append(init_source)
-    if not _is_pass_only(op_cls.load):
-        parts.append(_extract_body(op_cls.load))
-    parts.append("mbarrier_arrive(work_mbar)")
-    combined = "\n".join(parts)
-
-    exec_globals = _merge_globals(op_cls.load)
-    from .interpreter import mbarrier_arrive
-    exec_globals["mbarrier_arrive"] = mbarrier_arrive
-
-    return _build_phase_fn(combined, exec_globals, tensor_param_names,
-                           extra_params=["work_mbar"],
-                           filename="<compile_load>")
+def compile_store(instance, tensor_param_names=None):
+    """Compile Op's store method."""
+    return _build_phase_wrapper(
+        instance, "store", tensor_param_names,
+        filename="<compile_store>",
+    )
 
 
-def compile_compute(op_cls, init_source=None, tensor_param_names=None,
-                    replace_barrier=False, num_compute_threads=None):
-    """Compile compute phase."""
-    return compile_phase(op_cls.compute, init_source, tensor_param_names,
-                         replace_barrier=replace_barrier,
-                         num_compute_threads=num_compute_threads)
-
-
-def compile_store(op_cls, init_source=None, tensor_param_names=None):
-    """Compile store phase."""
-    return compile_phase(op_cls.store, init_source, tensor_param_names)
-
-
-def compile_backward_load(op_cls, init_source=None, tensor_param_names=None):
-    """Compile backward_load phase. Always includes work_mbar in the signature.
-
-    Mirrors compile_load: detects async (work_mbar in signature) vs sync,
-    and for sync loads appends mbarrier_arrive(work_mbar) automatically.
-    """
-    is_async = "work_mbar" in inspect.signature(op_cls.backward_load).parameters
+def compile_backward_load(instance, tensor_param_names=None):
+    """Compile Op's backward_load method."""
+    method = getattr(instance, "backward_load")
+    is_async = "work_mbar" in inspect.signature(method).parameters
 
     if is_async:
-        return compile_phase(op_cls.backward_load, init_source, tensor_param_names,
-                             extra_params=["work_mbar"])
-
-    # Sync backward load: append mbarrier_arrive(work_mbar)
-    if tensor_param_names is None:
-        tensor_param_names = []
-
-    parts = []
-    if init_source is not None:
-        parts.append(init_source)
-    if not _is_pass_only(op_cls.backward_load):
-        parts.append(_extract_body(op_cls.backward_load))
-    parts.append("mbarrier_arrive(work_mbar)")
-    combined = "\n".join(parts)
-
-    exec_globals = _merge_globals(op_cls.backward_load)
-    from .interpreter import mbarrier_arrive
-    exec_globals["mbarrier_arrive"] = mbarrier_arrive
-
-    return _build_phase_fn(combined, exec_globals, tensor_param_names,
-                           extra_params=["work_mbar"],
-                           filename="<compile_backward_load>")
+        return _build_phase_wrapper(
+            instance, "backward_load", tensor_param_names,
+            extra_params=["work_mbar"],
+            filename="<compile_backward_load>",
+        )
+    else:
+        return _build_phase_wrapper(
+            instance, "backward_load", tensor_param_names,
+            extra_params=["work_mbar"],
+            append_mbar=True,
+            filename="<compile_backward_load>",
+        )
 
 
-def compile_backward_compute(op_cls, init_source=None, tensor_param_names=None,
-                             replace_barrier=False, num_compute_threads=None):
-    """Compile backward_compute phase."""
-    return compile_phase(op_cls.backward_compute, init_source, tensor_param_names,
-                         replace_barrier=replace_barrier,
-                         num_compute_threads=num_compute_threads)
+def compile_backward_compute(instance, tensor_param_names=None):
+    """Compile Op's backward_compute method."""
+    return _build_phase_wrapper(
+        instance, "backward_compute", tensor_param_names,
+        filename="<compile_backward_compute>",
+    )
 
 
-def compile_backward_store(op_cls, init_source=None, tensor_param_names=None):
-    """Compile backward_store phase."""
-    return compile_phase(op_cls.backward_store, init_source, tensor_param_names)
+def compile_backward_store(instance, tensor_param_names=None):
+    """Compile Op's backward_store method."""
+    return _build_phase_wrapper(
+        instance, "backward_store", tensor_param_names,
+        filename="<compile_backward_store>",
+    )
+
+
+# =============================================================================
+# Cleanup
+# =============================================================================
 
 
 def cleanup_linecache() -> int:
@@ -328,7 +280,6 @@ def cleanup_linecache() -> int:
 
 
 __all__ = [
-    "compile_phase",
     "compile_load",
     "compile_compute",
     "compile_store",
@@ -338,7 +289,5 @@ __all__ = [
     "cleanup_linecache",
     # Internals
     "_extract_body",
-    "_build_phase_fn",
-    "_merge_globals",
-    "_is_pass_only",
+    "_build_phase_wrapper",
 ]

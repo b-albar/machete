@@ -5,11 +5,11 @@ RMSNorm Op for the Megakernel.
 Applies Root Mean Square Layer Normalization:
     y = x / sqrt(mean(x²) + eps) * weight
 
-Optimized for high throughput with adaptive parallelism:
-- Small/medium D (< 4096): Warp-parallel (each warp processes one row)
-- Large D (>= 4096): Block-parallel (all threads cooperate on one row)
+Optimized for high throughput with warp-parallel execution:
+- D >= 32: Each warp processes one row independently (warp reduction only)
+- D < 32: Scalar fallback with lane-strided access
 
-Both modes use:
+Uses:
 - Vectorized memory access via CuTe local_partition + autovec_copy
 - Minimal synchronization (warp-only or block-level as needed)
 
@@ -35,10 +35,9 @@ import operator
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32
+from cutlass import Float32
 
 from machete.megakernel.ops import Op
-from machete.kernels.utils.reduce import block_reduce_named_barrier
 
 
 # =============================================================================
@@ -59,12 +58,11 @@ class RMSNormOp(Op):
     Applies Root Mean Square Layer Normalization:
         y = x / sqrt(mean(x²) + eps) * weight
 
-    Adaptive parallelism based on hidden dimension D:
-    - D >= 4096: Block-parallel (all threads cooperate on one row, block reduction)
+    Parallelism modes based on hidden dimension D:
     - D >= 32: Warp-parallel (each warp processes one row, warp reduction only)
     - D < 32: Scalar fallback (lane-strided access)
 
-    All modes use vectorized memory access via CuTe local_partition + autovec_copy
+    Both modes use vectorized memory access via CuTe local_partition + autovec_copy
     where applicable, with weight loaded directly to registers from global memory.
 
     Tensor declarations:
@@ -94,137 +92,51 @@ class RMSNormOp(Op):
 
     # --- Forward (compute phase) ---
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_M, tile_D, x, weight, y):
         """RMSNorm forward with adaptive parallelism.
 
-        For large D (>= 4096): Block-parallel mode
-        - All threads cooperate on one row at a time
-        - Block-level reduction for sum of squares
-        - Rows processed serially within tile
-
-        For small/medium D (< 4096): Warp-parallel mode
+        Warp-parallel mode (D >= 32):
         - Each warp processes a separate row independently
         - Warp-level reduction only (no barriers)
         - Maximum parallelism within tile
 
-        Uses compile-time constants from init_source:
-            threads_per_row: from MegakernelConfig.threads_per_block
-            tile_size_M: from tile declaration
-            D: hidden dimension (static)
+        Scalar fallback (D < 32):
+        - Lane-strided access within a single warp
         """
-        tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
-        num_warps = threads_per_row // 32
+        num_warps = self.threads_per_row // 32
 
-        row_start = tile_M * tile_size_M
+        row_start = tile_M * self.tile_size_M
 
         # Branch resolved at trace time since D is compile-time constant
-        if cutlass.const_expr(D >= 4096):
-            # === Block-parallel mode: all threads cooperate on one row ===
-            # Better for large D: D/threads_per_row elements per thread
-            # For D=4096, 128 threads: 32 elements per thread (vs 128 for warp-parallel)
-
-            thr_layout = cute.make_layout(threads_per_row)
-
-            # Allocate reduction buffer in shared memory: (1, num_warps)
-            reduction_buffer = cute.make_tensor(
-                cute.make_ptr(Float32, page_ptr, cute.AddressSpace.smem),
-                cute.make_layout((1, num_warps)),
-            )
-
-            # Load weight into registers (all threads cooperate)
-            w_row = cute.make_tensor(
-                weight.iterator,
-                cute.make_layout(D),
-            )
-            w_part = cute.local_partition(w_row, thr_layout, tidx)
-            w_reg = cute.make_fragment_like(w_part)
-            cute.autovec_copy(w_part, w_reg)
-
-            # Process rows serially (tile_size_M is compile-time constant)
-            for local_row in range(tile_size_M):
-                row_idx = row_start + local_row
-
-                if row_idx < M:
-                    # Load x row (all threads cooperate)
-                    x_row = cute.make_tensor(
-                        x.iterator + row_idx * D,
-                        cute.make_layout(D),
-                    )
-                    y_row = cute.make_tensor(
-                        y.iterator + row_idx * D,
-                        cute.make_layout(D),
-                    )
-
-                    x_part = cute.local_partition(x_row, thr_layout, tidx)
-                    y_part = cute.local_partition(y_row, thr_layout, tidx)
-
-                    # Load x into registers
-                    x_reg = cute.make_fragment_like(x_part)
-                    cute.autovec_copy(x_part, x_reg)
-
-                    # Local reduction: sum of x² (accumulate in fp32 for precision)
-                    partial_sq = Float32(0.0)
-                    for i in range(cute.size(x_reg)):
-                        val = x_reg[i].to(Float32)
-                        partial_sq = partial_sq + val * val
-
-                    # Warp reduction first
-                    warp_sum = cute.arch.warp_reduction(partial_sq, operator.add)
-
-                    # Block reduction across warps (named barrier for warp-specialized mode)
-                    sum_sq = block_reduce_named_barrier(
-                        warp_sum, operator.add, reduction_buffer, Float32(0.0),
-                        Int32(threads_per_row),
-                    )
-
-                    # rstd = 1 / sqrt(mean(x²) + eps)
-                    rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
-
-                    # Normalize: y = x * rstd * weight (compute in fp32, store in input dtype)
-                    y_reg = cute.make_fragment_like(x_reg)
-                    for i in range(cute.size(x_reg)):
-                        val = x_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
-                        y_reg[i] = val.to(x_dtype)
-
-                    # Store result
-                    cute.autovec_copy(y_reg, y_part)
-
-        elif cutlass.const_expr(D >= 32):
+        if cutlass.const_expr(self.D >= 32):
             # === Warp-parallel mode: each warp processes one row ===
-            # Better for small/medium D: no cross-warp synchronization
-
             thr_layout = cute.make_layout(32)  # 32 threads per warp
 
             # Load weight into registers (outside dynamic if for CuTe tracing)
             w_row = cute.make_tensor(
                 weight.iterator,
-                cute.make_layout(D),
+                cute.make_layout(self.D),
             )
             w_part = cute.local_partition(w_row, thr_layout, lane_idx)
             w_reg = cute.make_fragment_like(w_part)
             cute.autovec_copy(w_part, w_reg)
 
             # Each warp processes rows in a strided pattern across the tile.
-            # With warp specialization, num_warps may be less than tile_size_M,
-            # so each warp may handle multiple rows.
-            for local_row in range(warp_idx, tile_size_M, num_warps):
+            for local_row in range(warp_idx, self.tile_size_M, num_warps):
                 row_idx = row_start + local_row
 
-                if row_idx < M:
+                if row_idx < self.M:
                     # Load x row
                     x_row = cute.make_tensor(
-                        x.iterator + row_idx * D,
-                        cute.make_layout(D),
+                        x.iterator + row_idx * self.D,
+                        cute.make_layout(self.D),
                     )
                     y_row = cute.make_tensor(
-                        y.iterator + row_idx * D,
-                        cute.make_layout(D),
+                        y.iterator + row_idx * self.D,
+                        cute.make_layout(self.D),
                     )
 
                     x_part = cute.local_partition(x_row, thr_layout, lane_idx)
@@ -244,13 +156,13 @@ class RMSNormOp(Op):
                     sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
 
                     # rstd = 1 / sqrt(mean(x²) + eps)
-                    rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
+                    rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
                     # Normalize: y = x * rstd * weight (compute in fp32, store in input dtype)
                     y_reg = cute.make_fragment_like(x_reg)
                     for i in range(cute.size(x_reg)):
                         val = x_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
-                        y_reg[i] = val.to(x_dtype)
+                        y_reg[i] = val.to(self.x_dtype)
 
                     # Store result (vectorized 128-bit stores)
                     cute.autovec_copy(y_reg, y_part)
@@ -258,37 +170,34 @@ class RMSNormOp(Op):
         else:
             # === Scalar path: D < 32 (small hidden dim) ===
             # Flatten 2D tensors for scalar indexing
-            x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
-            y = cute.make_tensor(y.iterator, cute.make_layout(M * D))
+            x = cute.make_tensor(x.iterator, cute.make_layout(self.M * self.D))
+            y = cute.make_tensor(y.iterator, cute.make_layout(self.M * self.D))
 
-            for local_row in range(warp_idx, tile_size_M, num_warps):
+            for local_row in range(warp_idx, self.tile_size_M, num_warps):
                 row_idx = row_start + local_row
 
-                if row_idx < M:
-                    row_offset = row_idx * D
+                if row_idx < self.M:
+                    row_offset = row_idx * self.D
 
                     # Pass 1: sum of squares (accumulate in fp32)
                     partial_sq = Float32(0.0)
-                    for i in range(lane_idx, D, 32):
+                    for i in range(lane_idx, self.D, 32):
                         val = x[row_offset + i].to(Float32)
                         partial_sq = partial_sq + val * val
 
                     sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                    rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
+                    rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
                     # Pass 2: normalize and apply weight (compute in fp32, store in input dtype)
-                    for i in range(lane_idx, D, 32):
+                    for i in range(lane_idx, self.D, 32):
                         val = x[row_offset + i].to(Float32)
                         w = weight[i].to(Float32)
-                        y[row_offset + i] = (val * rstd * w).to(x_dtype)
+                        y[row_offset + i] = (val * rstd * w).to(self.x_dtype)
 
     # --- Backward (compute phase) ---
 
-    @staticmethod
-    def backward_compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def backward_compute(self, page_ptr, tile_M, tile_D, dout, x, weight, dx):
         """RMSNorm backward with warp-parallel row processing.
 
         dx = (dout * weight - x * rstd² * mean(dout * weight * x)) * rstd
@@ -297,39 +206,39 @@ class RMSNormOp(Op):
         """
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
-        num_warps = threads_per_row // 32
+        num_warps = self.threads_per_row // 32
 
-        row_start = tile_M * tile_size_M
+        row_start = tile_M * self.tile_size_M
 
-        if cutlass.const_expr(D >= 32):
+        if cutlass.const_expr(self.D >= 32):
             # === Vectorized path ===
             thr_layout = cute.make_layout(32)
 
             # Load weight into registers
             w_row = cute.make_tensor(
                 weight.iterator,
-                cute.make_layout(D),
+                cute.make_layout(self.D),
             )
             w_part = cute.local_partition(w_row, thr_layout, lane_idx)
             w_reg = cute.make_fragment_like(w_part)
             cute.autovec_copy(w_part, w_reg)
 
-            for local_row in range(warp_idx, tile_size_M, num_warps):
+            for local_row in range(warp_idx, self.tile_size_M, num_warps):
                 row_idx = row_start + local_row
 
-                if row_idx < M:
+                if row_idx < self.M:
                     # Load x row
                     x_row = cute.make_tensor(
-                        x.iterator + row_idx * D,
-                        cute.make_layout(D),
+                        x.iterator + row_idx * self.D,
+                        cute.make_layout(self.D),
                     )
                     dout_row = cute.make_tensor(
-                        dout.iterator + row_idx * D,
-                        cute.make_layout(D),
+                        dout.iterator + row_idx * self.D,
+                        cute.make_layout(self.D),
                     )
                     dx_row = cute.make_tensor(
-                        dx.iterator + row_idx * D,
-                        cute.make_layout(D),
+                        dx.iterator + row_idx * self.D,
+                        cute.make_layout(self.D),
                     )
 
                     x_part = cute.local_partition(x_row, thr_layout, lane_idx)
@@ -347,7 +256,7 @@ class RMSNormOp(Op):
                         partial_sq = partial_sq + val * val
 
                     sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                    rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
+                    rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
                     # Load dout
                     dout_reg = cute.make_fragment_like(dout_part)
@@ -362,7 +271,7 @@ class RMSNormOp(Op):
                         partial_grad = partial_grad + d * w * x_val
 
                     sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
-                    mean_grad = sum_grad / D
+                    mean_grad = sum_grad / self.D
 
                     # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd
                     dx_reg = cute.make_fragment_like(x_reg)
@@ -372,7 +281,7 @@ class RMSNormOp(Op):
                         x_val = x_reg[i].to(Float32)
                         dw_x = d * w
                         result = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
-                        dx_reg[i] = result.to(dout_dtype)
+                        dx_reg[i] = result.to(self.dout_dtype)
 
                     # Store dx
                     cute.autovec_copy(dx_reg, dx_part)
@@ -380,44 +289,44 @@ class RMSNormOp(Op):
         else:
             # === Scalar path ===
             # Flatten 2D tensors for scalar indexing
-            x = cute.make_tensor(x.iterator, cute.make_layout(M * D))
-            dout = cute.make_tensor(dout.iterator, cute.make_layout(M * D))
-            dx = cute.make_tensor(dx.iterator, cute.make_layout(M * D))
+            x = cute.make_tensor(x.iterator, cute.make_layout(self.M * self.D))
+            dout = cute.make_tensor(dout.iterator, cute.make_layout(self.M * self.D))
+            dx = cute.make_tensor(dx.iterator, cute.make_layout(self.M * self.D))
 
-            for local_row in range(warp_idx, tile_size_M, num_warps):
+            for local_row in range(warp_idx, self.tile_size_M, num_warps):
                 row_idx = row_start + local_row
 
-                if row_idx < M:
-                    row_offset = row_idx * D
+                if row_idx < self.M:
+                    row_offset = row_idx * self.D
 
                     # Pass 1: Compute rstd (accumulate in fp32)
                     partial_sq = Float32(0.0)
-                    for i in range(lane_idx, D, 32):
+                    for i in range(lane_idx, self.D, 32):
                         val = x[row_offset + i].to(Float32)
                         partial_sq = partial_sq + val * val
 
                     sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                    rstd = cute.math.rsqrt(sum_sq / D + RMSNORM_EPS, fastmath=True)
+                    rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
                     # Pass 2: Compute sum(dout * weight * x)
                     partial_grad = Float32(0.0)
-                    for i in range(lane_idx, D, 32):
+                    for i in range(lane_idx, self.D, 32):
                         d = dout[row_offset + i].to(Float32)
                         w = weight[i].to(Float32)
                         x_val = x[row_offset + i].to(Float32)
                         partial_grad = partial_grad + d * w * x_val
 
                     sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
-                    mean_grad = sum_grad / D
+                    mean_grad = sum_grad / self.D
 
                     # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd
-                    for i in range(lane_idx, D, 32):
+                    for i in range(lane_idx, self.D, 32):
                         d = dout[row_offset + i].to(Float32)
                         w = weight[i].to(Float32)
                         x_val = x[row_offset + i].to(Float32)
                         dw_x = d * w
                         result = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
-                        dx[row_offset + i] = result.to(dout_dtype)
+                        dx[row_offset + i] = result.to(self.dout_dtype)
 
 
 __all__ = ["RMSNormOp"]

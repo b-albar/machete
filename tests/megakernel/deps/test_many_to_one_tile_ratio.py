@@ -62,15 +62,11 @@ class Producer2DOp(Op):
     This producer iterates over dimensions 0 x 1.
     Each producer tile writes to a unique location in the matrix.
     """
-
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Write tile_0 * 1000 + tile_1 to uniquely identify this producer
@@ -86,15 +82,11 @@ class Consumer1DOp(Op):
     If barrier synchronization works correctly, the last producer tile
     (m, N-1) will have already written its value before the consumer runs.
     """
-
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read the last producer's value to verify it completed
@@ -241,24 +233,22 @@ class TestManyToOnePatternGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["data"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     idx = tile_0 * Int32(_num_cols) + tile_1
                     st_global_i32(Int64(_matrix_ptr), idx, tile_0 * Int32(1000) + tile_1)
 
         class OpB(Op):
-
             INPUTS: ClassVar[List[str]] = ["data"]
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     # Read last value for this dim 0 to verify producers completed
@@ -266,12 +256,11 @@ class TestManyToOnePatternGPU:
                     st_global_i32(Int64(_buf_ptr), tile_0, tile_0 * Int32(200) + Int32(1))
 
         class OpC(Op):
-
             INPUTS: ClassVar[List[str]] = ["buf"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def compute(page_ptr, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
                     val = ld_global_i32(Int64(_buf_ptr), tile_0)

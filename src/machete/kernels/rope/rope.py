@@ -24,7 +24,8 @@ Usage:
     kernel.run()
 """
 
-from cutlass import Int32, Int64, Float32
+import cutlass.cute as cute
+from cutlass import Float32
 
 from machete.megakernel.ops import Op
 
@@ -34,7 +35,7 @@ class RopeOp(Op):
 
     Applies rotary position embedding in-place to a query tensor.
     Zero-page op: all data accessed directly from global memory via
-    typed CuTe tensor views constructed from op_config_ptr.
+    typed CuTe tensor views.
 
     Tensor declarations:
         q:   (M, H, D)   — query tensor, bf16/fp16/fp32, modified in-place
@@ -56,30 +57,24 @@ class RopeOp(Op):
 
     # --- Forward (Compute Phase) ---
 
-    @staticmethod
-    def compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Apply RoPE rotation for one position (tile_M) across all heads.
-
-        Zero-page op: all data accessed directly from global memory.
-        page_ptr is unused.
-        """
+    @cute.jit
+    def compute(self, page_ptr, tile_M, q, cos, sin):
+        """Apply RoPE rotation for one position (tile_M) across all heads."""
         # Flatten N-D tensors for scalar indexing
-        q = cute.make_tensor(q.iterator, cute.make_layout(M * H * D))
-        cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
-        sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
+        q = cute.make_tensor(q.iterator, cute.make_layout(self.M * self.H * self.D))
+        cos = cute.make_tensor(cos.iterator, cute.make_layout(self.S * self.D2))
+        sin = cute.make_tensor(sin.iterator, cute.make_layout(self.S * self.D2))
 
-        s = tile_M % S
-        total_work = H * D2
-        for work_idx in range(tidx, total_work, num_threads):
-            h = work_idx // D2
-            i = work_idx % D2
+        tidx = cute.arch.thread_idx()[0]
+        s = tile_M % self.S
+        total_work = self.H * self.D2
+        for work_idx in range(tidx, total_work, self.threads_per_row):
+            h = work_idx // self.D2
+            i = work_idx % self.D2
 
-            cs_idx = s * D2 + i
-            q0_idx = tile_M * H * D + h * D + i
-            q1_idx = q0_idx + D2
+            cs_idx = s * self.D2 + i
+            q0_idx = tile_M * self.H * self.D + h * self.D + i
+            q1_idx = q0_idx + self.D2
 
             # Load and convert to fp32 for computation
             c = cos[cs_idx].to(Float32)
@@ -88,36 +83,29 @@ class RopeOp(Op):
             q1 = q[q1_idx].to(Float32)
 
             # Forward rotation: [[cos, -sin], [sin, cos]]
-            # Store back in input dtype
-            q[q0_idx] = (q0 * c - q1 * sn).to(q_dtype)
-            q[q1_idx] = (q1 * c + q0 * sn).to(q_dtype)
+            q[q0_idx] = (q0 * c - q1 * sn).to(self.q_dtype)
+            q[q1_idx] = (q1 * c + q0 * sn).to(self.q_dtype)
 
     # --- Backward (Compute Phase) ---
 
-    @staticmethod
-    def backward_compute(
-        page_ptr: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
-        """Inverse RoPE rotation (transpose of forward rotation matrix).
-
-        Zero-page op: all data accessed directly from global memory.
-        page_ptr is unused.
-        """
+    @cute.jit
+    def backward_compute(self, page_ptr, tile_M, q, cos, sin):
+        """Inverse RoPE rotation (transpose of forward rotation matrix)."""
         # Flatten N-D tensors for scalar indexing
-        q = cute.make_tensor(q.iterator, cute.make_layout(M * H * D))
-        cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
-        sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
+        q = cute.make_tensor(q.iterator, cute.make_layout(self.M * self.H * self.D))
+        cos = cute.make_tensor(cos.iterator, cute.make_layout(self.S * self.D2))
+        sin = cute.make_tensor(sin.iterator, cute.make_layout(self.S * self.D2))
 
-        s = tile_M % S
-        total_work = H * D2
-        for work_idx in range(tidx, total_work, num_threads):
-            h = work_idx // D2
-            i = work_idx % D2
+        tidx = cute.arch.thread_idx()[0]
+        s = tile_M % self.S
+        total_work = self.H * self.D2
+        for work_idx in range(tidx, total_work, self.threads_per_row):
+            h = work_idx // self.D2
+            i = work_idx % self.D2
 
-            cs_idx = s * D2 + i
-            q0_idx = tile_M * H * D + h * D + i
-            q1_idx = q0_idx + D2
+            cs_idx = s * self.D2 + i
+            q0_idx = tile_M * self.H * self.D + h * self.D + i
+            q1_idx = q0_idx + self.D2
 
             # Load and convert to fp32 for computation
             c = cos[cs_idx].to(Float32)
@@ -126,9 +114,8 @@ class RopeOp(Op):
             q1 = q[q1_idx].to(Float32)
 
             # Inverse rotation: [[cos, sin], [-sin, cos]]
-            # Store back in input dtype
-            q[q0_idx] = (q0 * c + q1 * sn).to(q_dtype)
-            q[q1_idx] = (q1 * c - q0 * sn).to(q_dtype)
+            q[q0_idx] = (q0 * c + q1 * sn).to(self.q_dtype)
+            q[q1_idx] = (q1 * c - q0 * sn).to(self.q_dtype)
 
 
 __all__ = ["RopeOp"]

@@ -24,6 +24,7 @@ from .ops import (
     TileInstruction,
     InstructionStreamBuilder,
     validate_op_compatibility,
+    build_op_config,
 )
 
 from .compile import (
@@ -55,6 +56,7 @@ __all__ = [
     "ScheduledOp",
     "TensorMeta",
     "validate_op_compatibility",
+    "build_op_config",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation

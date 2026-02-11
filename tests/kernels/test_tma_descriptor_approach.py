@@ -5,6 +5,7 @@ Test: Can TMA descriptors be pre-computed on host and loaded in kernel?
 Minimal test to validate Option B for TMA in machete.
 """
 
+import pytest
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -34,8 +35,6 @@ def test_tensor_dynamic_marking():
 
     print(f"  After marking - dynamic shapes: {a_tensor.dynamic_shapes_mask}")
     print(f"  After marking - dynamic strides: {a_tensor.dynamic_strides_mask}")
-
-    return True
 
 
 def test_tma_atom_creation():
@@ -74,16 +73,9 @@ def test_tma_atom_creation():
         result["success"] = True
         return tma_atom
 
-    try:
-        tma_atom = create_tma(a_tensor)
-        print(f"  TMA atom created: {type(tma_atom)}")
-        print(f"  Success: {result['success']}")
-        return result["success"]
-    except Exception as e:
-        print(f"  Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    tma_atom = create_tma(a_tensor)
+    print(f"  TMA atom created: {type(tma_atom)}")
+    assert result["success"], "TMA atom creation failed"
 
 
 class TMAKernelTest:
@@ -181,6 +173,7 @@ class TMAKernelTest:
         cute.arch.barrier()
 
 
+@pytest.mark.xfail(reason="tma_partition requires static gmem shape (CUTLASS DSL limitation)")
 def test_full_tma_kernel():
     """Test 3: Full TMA kernel with dynamic tensor."""
     print("\nTest 3: Full TMA kernel with dynamic tensor")
@@ -189,49 +182,33 @@ def test_full_tma_kernel():
     a_tensor = from_dlpack(a_torch, assumed_align=16)
     a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1)
 
-    try:
-        torch_stream = torch.cuda.Stream()
-        stream = cuda.CUstream(torch_stream.cuda_stream)
+    torch_stream = torch.cuda.Stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
 
-        test = TMAKernelTest()
-        test(a_tensor, stream)
-        torch.cuda.synchronize()
-        print("  TMA kernel executed successfully!")
-        return True
-
-    except Exception as e:
-        print(f"  Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    test = TMAKernelTest()
+    test(a_tensor, stream)
+    torch.cuda.synchronize()
+    print("  TMA kernel executed successfully!")
 
 
+@pytest.mark.xfail(reason="tma_partition requires static gmem shape (CUTLASS DSL limitation)")
 def test_different_m_values():
     """Test 4: Same kernel works with different M values."""
     print("\nTest 4: Same kernel, different M values")
 
-    try:
-        torch_stream = torch.cuda.Stream()
-        stream = cuda.CUstream(torch_stream.cuda_stream)
+    torch_stream = torch.cuda.Stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
 
-        test = TMAKernelTest()
+    test = TMAKernelTest()
 
-        for m in [128, 256, 512]:
-            a_torch = torch.randn(m, K, dtype=torch.float16, device="cuda")
-            a_tensor = from_dlpack(a_torch, assumed_align=16)
-            a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1)
+    for m in [128, 256, 512]:
+        a_torch = torch.randn(m, K, dtype=torch.float16, device="cuda")
+        a_tensor = from_dlpack(a_torch, assumed_align=16)
+        a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1)
 
-            test(a_tensor, stream)
-            torch.cuda.synchronize()
-            print(f"  M={m}: SUCCESS")
-
-        return True
-
-    except Exception as e:
-        print(f"  Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        test(a_tensor, stream)
+        torch.cuda.synchronize()
+        print(f"  M={m}: SUCCESS")
 
 
 if __name__ == "__main__":

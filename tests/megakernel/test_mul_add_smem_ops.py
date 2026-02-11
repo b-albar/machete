@@ -38,27 +38,38 @@ NUM_BITS = TILE_ELEMS * 16  # bits per tile for copy atom
 # -- Ops -----------------------------------------------------------------------
 
 class MulTwoOp(Op):
+    """MulTwo: x * 2, using class-based @cute.jit pattern.
+
+    Config via self (set by framework at compile time):
+        self.tile_size_M, self.x_dtype, self.y_dtype, self.threads_per_row
+
+    Method params:
+        page_ptr: shared memory page pointer
+        tile_M: tile index for M dimension
+        x, y: tensor parameters (CuTe DSL tensors from dispatch)
+        work_mbar: mbarrier pointer (load only, async)
+    """
+
     reads = {"x": (None, ("M",))}
     writes = {"y": (None, ("M",))}
     tile = ("M",)
 
-    @staticmethod
-    def load(page_ptr, op_config_ptr, work_mbar,
-             x=None, x_dtype=None, tile_size_M=0):
-        nbytes = Int32(tile_size_M * ELEM_BYTES)
+    @cute.jit
+    def load(self, page_ptr, tile_M, x, y, work_mbar):
+        nbytes = Int32(self.tile_size_M * ELEM_BYTES)
 
         # CuTe copy atom for bulk G->S
-        g2s = cute.make_copy_atom(CopyBulkG2SOp(), x_dtype, num_bits_per_copy=NUM_BITS)
+        g2s = cute.make_copy_atom(CopyBulkG2SOp(), self.x_dtype, num_bits_per_copy=NUM_BITS)
 
         # Smem tile in page
         s_tile = cute.make_tensor(
-            cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
         # Gmem tile at offset
         g_tile = cute.make_tensor(
-            x.iterator + tile_0 * Int32(tile_size_M),
-            cute.make_layout((tile_size_M,)),
+            x.iterator + tile_M * Int32(self.tile_size_M),
+            cute.make_layout((self.tile_size_M,)),
         )
 
         # Signal work_mbar with expected tx bytes + issue async copy
@@ -66,32 +77,29 @@ class MulTwoOp(Op):
         mbarrier_arrive_expect_tx(work_mbar, nbytes)
         gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
-        # Returns immediately — MMA warps wait on work_mbar before compute
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr,
-                x_dtype=None, tile_size_M=0, tidx=0, num_threads=0):
+    @cute.jit
+    def compute(self, page_ptr, tile_M, x, y):
+        tidx = cute.arch.thread_idx()[0]
         s = cute.make_tensor(
-            cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
-        for i in range(tidx, tile_size_M, num_threads):
+        for i in range(tidx, self.tile_size_M, self.threads_per_row):
             val = s[i]
             s[i] = val + val
 
-    @staticmethod
-    def store(page_ptr, op_config_ptr,
-              y=None, y_dtype=None, tile_size_M=0):
-        nbytes = Int32(tile_size_M * ELEM_BYTES)
-        s2g = cute.make_copy_atom(CopyBulkS2GOp(), y_dtype, num_bits_per_copy=NUM_BITS)
+    @cute.jit
+    def store(self, page_ptr, tile_M, x, y):
+        s2g = cute.make_copy_atom(CopyBulkS2GOp(), self.y_dtype, num_bits_per_copy=NUM_BITS)
 
         s_tile = cute.make_tensor(
-            cute.make_ptr(y_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            y.iterator + tile_0 * Int32(tile_size_M),
-            cute.make_layout((tile_size_M,)),
+            y.iterator + tile_M * Int32(self.tile_size_M),
+            cute.make_layout((self.tile_size_M,)),
         )
 
         ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
@@ -99,23 +107,24 @@ class MulTwoOp(Op):
 
 
 class AddTwoOp(Op):
+    """AddTwo: a + 2, using class-based @cute.jit pattern."""
+
     reads = {"a": (None, ("M",))}
     writes = {"b": (None, ("M",))}
     tile = ("M",)
 
-    @staticmethod
-    def load(page_ptr, op_config_ptr, work_mbar,
-             a=None, a_dtype=None, tile_size_M=0):
-        nbytes = Int32(tile_size_M * ELEM_BYTES)
-        g2s = cute.make_copy_atom(CopyBulkG2SOp(), a_dtype, num_bits_per_copy=NUM_BITS)
+    @cute.jit
+    def load(self, page_ptr, tile_M, a, b, work_mbar):
+        nbytes = Int32(self.tile_size_M * ELEM_BYTES)
+        g2s = cute.make_copy_atom(CopyBulkG2SOp(), self.a_dtype, num_bits_per_copy=NUM_BITS)
 
         s_tile = cute.make_tensor(
-            cute.make_ptr(a_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            a.iterator + tile_0 * Int32(tile_size_M),
-            cute.make_layout((tile_size_M,)),
+            a.iterator + tile_M * Int32(self.tile_size_M),
+            cute.make_layout((self.tile_size_M,)),
         )
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
@@ -123,30 +132,28 @@ class AddTwoOp(Op):
         gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
-    @staticmethod
-    def compute(page_ptr, op_config_ptr,
-                a_dtype=None, tile_size_M=0, tidx=0, num_threads=0):
+    @cute.jit
+    def compute(self, page_ptr, tile_M, a, b):
+        tidx = cute.arch.thread_idx()[0]
         s = cute.make_tensor(
-            cute.make_ptr(a_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
-        two = a_dtype(2.0)
-        for i in range(tidx, tile_size_M, num_threads):
+        two = self.a_dtype(2.0)
+        for i in range(tidx, self.tile_size_M, self.threads_per_row):
             s[i] = s[i] + two
 
-    @staticmethod
-    def store(page_ptr, op_config_ptr,
-              b=None, b_dtype=None, tile_size_M=0):
-        nbytes = Int32(tile_size_M * ELEM_BYTES)
-        s2g = cute.make_copy_atom(CopyBulkS2GOp(), b_dtype, num_bits_per_copy=NUM_BITS)
+    @cute.jit
+    def store(self, page_ptr, tile_M, a, b):
+        s2g = cute.make_copy_atom(CopyBulkS2GOp(), self.b_dtype, num_bits_per_copy=NUM_BITS)
 
         s_tile = cute.make_tensor(
-            cute.make_ptr(b_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((tile_size_M,)),
+            cute.make_ptr(self.b_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            b.iterator + tile_0 * Int32(tile_size_M),
-            cute.make_layout((tile_size_M,)),
+            b.iterator + tile_M * Int32(self.tile_size_M),
+            cute.make_layout((self.tile_size_M,)),
         )
 
         ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)

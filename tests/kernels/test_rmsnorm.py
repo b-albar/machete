@@ -90,6 +90,7 @@ class TestRMSNormForward:
         (32, 256),
         (128, 512),
         (256, 1024),
+        (32, 4096),
     ])
     def test_forward_shapes(self, M, D):
         """RMSNorm forward produces correct output for various shapes."""
@@ -173,6 +174,7 @@ class TestRMSNormBackward:
         (4, 128),
         (32, 256),
         (128, 512),
+        (32, 4096),
     ])
     def test_backward_shapes(self, M, D):
         """RMSNorm backward produces correct gradients for various shapes."""
