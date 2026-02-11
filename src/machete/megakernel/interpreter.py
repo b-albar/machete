@@ -172,16 +172,17 @@ def load_instruction_to_smem(
     loc=None,
     ip=None,
 ) -> None:
-    """Load a full instruction (4 words) from global memory to shared memory.
+    """Load a full instruction (6 words) from global memory to shared memory.
 
-    Uses ld.global.v4.b32 to load all 4 instruction words in a single
-    vector load, then st.shared.v4.b32 to write them to shared memory
-    in a single store. Both require 16-byte alignment.
+    Uses 3x ld.global.v2.b32 to load all 6 instruction words (op_idx + 5
+    tile indices), then 3x st.shared.v2.b32 to write them to shared memory.
+    v2 loads require only 8-byte alignment, which is satisfied for all
+    instruction indices with 24-byte stride (24 % 8 == 0).
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
-        instr_idx: Instruction index (word offset = instr_idx * 4)
-        smem_dest: Shared memory destination address (must be 16-byte aligned)
+        instr_idx: Instruction index (byte offset = instr_idx * 24)
+        smem_dest: Shared memory destination address (must be 8-byte aligned)
     """
     llvm.inline_asm(
         None,
@@ -193,10 +194,14 @@ def load_instruction_to_smem(
         """
         {
             .reg .u64 %gaddr;
-            .reg .u32 %w0, %w1, %w2, %w3;
-            mad.wide.u32 %gaddr, $1, 16, $0;
-            ld.global.v4.b32 {%w0, %w1, %w2, %w3}, [%gaddr];
-            st.shared.v4.b32 [$2], {%w0, %w1, %w2, %w3};
+            .reg .u32 %w0, %w1, %w2, %w3, %w4, %w5;
+            mad.wide.u32 %gaddr, $1, 24, $0;
+            ld.global.v2.b32 {%w0, %w1}, [%gaddr];
+            ld.global.v2.b32 {%w2, %w3}, [%gaddr+8];
+            ld.global.v2.b32 {%w4, %w5}, [%gaddr+16];
+            st.shared.v2.b32 [$2], {%w0, %w1};
+            st.shared.v2.b32 [$2+8], {%w2, %w3};
+            st.shared.v2.b32 [$2+16], {%w4, %w5};
         }
         """,
         "l,r,r",

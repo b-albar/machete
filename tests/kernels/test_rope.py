@@ -10,7 +10,7 @@ Tests cover:
 2. Forward RoPE matches Triton (Unsloth) reference
 3. Backward (inverse) RoPE roundtrip: backward(forward(q)) ≈ q
 4. Backward RoPE matches PyTorch inverse reference
-5. Multi-batch correctness (position wrapping via tile_m % seq_len)
+5. Multi-batch correctness (position wrapping via tile_M % seq_len)
 6. Autograd forward + backward through megakernel_apply
 """
 
@@ -67,7 +67,7 @@ def run_rope_megakernel(q_4d, cos, sin, backward=False, num_sms=2):
     cos_f32 = cos.float().contiguous()
     sin_f32 = sin.float().contiguous()
 
-    ops = [RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)]
+    ops = [RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32, tile_sizes={"M": 1})]
     mk_config = MegakernelConfig(num_sms=num_sms)
     kernel = Megakernel(ops, config=mk_config, backward=backward)
     kernel.run()

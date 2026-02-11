@@ -8,7 +8,7 @@ tensors are rebuilt per call (cheap CPU work).
 
 The cache key captures everything that affects the compiled MLIR/PTX:
 - Op class types and their execution modes
-- Tile dimensions (barrier formulas bake tiles_m/n into coefficients)
+- Tile counts (barrier formulas bake tile_counts into coefficients)
 - num_sms, threads_per_block, page_size, num_pages, backward flag
 
 Usage:
@@ -62,16 +62,14 @@ class KernelCache:
     ) -> CacheKey:
         """Build a cache key from op structure and config.
 
-        Includes tile dimensions because barrier formula coefficients
-        (computed in ``_compute_formula_coeffs``) use ``tiles_m``/``tiles_n``
+        Includes tile counts because barrier formula coefficients
+        (computed in ``_compute_formula_coeffs``) use ``tile_counts``
         at JIT compile time.
         """
         op_structure = tuple(
             (
                 op.op_cls,
-                op.tiles_m,
-                op.tiles_n,
-                op.tiles_l,
+                op.tile_counts,
                 tuple(sorted(op.static_dims.items())) if op.static_dims else (),
             )
             for op in ops

@@ -15,7 +15,7 @@ Both modes use:
 
 Configuration:
     - threads_per_row: from MegakernelConfig.threads_per_block (compile-time constant)
-    - tile_size_M: from tile declaration, e.g., tile = (("M", 4),) for 4 rows/tile
+    - tile_size_M: from tile_sizes at schedule time, e.g., tile_sizes={"M": 4} for 4 rows/tile
 
 Forward:
     rstd = 1 / sqrt(mean(x²) + eps)
@@ -26,7 +26,7 @@ Usage:
     from machete.megakernel import Megakernel
 
     x_2d = x.view(-1, D).contiguous()
-    ops = [RMSNormOp.schedule(x=x_2d, weight=w, y=y)]
+    ops = [RMSNormOp.schedule(x=x_2d, weight=w, y=y, tile_sizes={"M": 4})]
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -73,7 +73,7 @@ class RMSNormOp(Op):
         y:      (M, D)  — output tensor (bf16/fp16/fp32)
 
     Tiling:
-        tile_m indexes row groups (ceil(M / tile_size_M) tiles).
+        tile_M indexes row groups (ceil(M / tile_size_M) tiles).
         Each tile processes tile_size_M rows (default 4, matching 4 warps).
     """
 
@@ -83,7 +83,7 @@ class RMSNormOp(Op):
         "weight": (None, ("D",)),
     }
     writes = {"y": (None, ("M", "D"))}
-    tile = (("M", 4),)  # Process 4 rows per tile (matches 4 warps = 128 threads)
+    tile = ("M", "D")
 
     backward_reads = {
         "dout": (None, ("M", "D")),
@@ -97,9 +97,6 @@ class RMSNormOp(Op):
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """RMSNorm forward with adaptive parallelism.
@@ -124,7 +121,7 @@ class RMSNormOp(Op):
         lane_idx = cute.arch.lane_idx()
         num_warps = threads_per_row // 32
 
-        row_start = tile_m * tile_size_M
+        row_start = tile_M * tile_size_M
 
         # Branch resolved at trace time since D is compile-time constant
         if cutlass.const_expr(D >= 4096):
@@ -290,9 +287,6 @@ class RMSNormOp(Op):
     @staticmethod
     def backward_compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """RMSNorm backward with warp-parallel row processing.
@@ -305,7 +299,7 @@ class RMSNormOp(Op):
         lane_idx = cute.arch.lane_idx()
         num_warps = threads_per_row // 32
 
-        row_start = tile_m * tile_size_M
+        row_start = tile_M * tile_size_M
 
         if cutlass.const_expr(D >= 32):
             # === Vectorized path ===

@@ -7,20 +7,16 @@ instruction stream and fine-grained tile-level barriers for maximum
 pipeline overlap between operations.
 
 Usage:
-    from machete.megakernel import ScheduledOp, Megakernel, NOPOp
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormOp
 
-    ops = [
-        ScheduledOp(NOPOp, tiles_m=32),
-        ScheduledOp(NOPOp, tiles_m=32),  # Overlaps with first op!
-    ]
-
+    ops = [RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})]
     kernel = Megakernel(ops)
     kernel.run()
 """
 
 from .ops import (
     Op,
-    NOPOp,
     ScheduledOp,
     TensorMeta,
     BarrierFormula,
@@ -56,7 +52,6 @@ from .functional import megakernel_apply, MegakernelModule
 __all__ = [
     # Operation Protocol
     "Op",
-    "NOPOp",
     "ScheduledOp",
     "TensorMeta",
     "validate_op_compatibility",

@@ -108,6 +108,14 @@ class AutogradOp(ABC):
         """
         return tensors
 
+    def get_tile_sizes(self) -> Optional[Dict[str, int]]:
+        """Return tile_sizes for Op.schedule().
+
+        Subclasses should override to specify tile sizes.
+        Default: None (all dims use full extent).
+        """
+        return None
+
     # --- Helpers ---
 
     def input_specs(self) -> List[TensorSpec]:

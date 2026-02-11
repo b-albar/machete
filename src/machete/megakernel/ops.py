@@ -11,13 +11,14 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute::
     class MyOp(Op):
         reads  = {"x": (Float32, ("M", "D"))}
         writes = {"x": (Float32, ("M", "D"))}
-        tile   = ("M",)
+        tile   = ("M", "D")  # dimension names only
 
         @staticmethod
-        def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-            ...  # M is dynamic (tile dim), D is a static compile-time int
+        def compute(page_ptr, op_config_ptr):
+            ...  # tile_M, tile_D, M, D available from init_source
 
-    ops = [MyOp.schedule(x=tensor)]
+    # Tile sizes passed at schedule time; tile_counts deduced
+    ops = [MyOp.schedule(x=tensor, tile_sizes={"M": 4})]
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -31,6 +32,13 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 import cutlass
 import torch
 from cutlass import Int32, Int64
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+MAX_TILE_DIMS = 5  # Matches TMA's 5D tensor capability
 
 
 # =============================================================================
@@ -100,37 +108,26 @@ def _parse_dims(dims) -> List[str]:
     raise TypeError(f"dims must be tuple, list, or str, got {type(dims)}")
 
 
-def _parse_tile_spec(tile) -> Tuple[Tuple[str, ...], Dict[str, int]]:
-    """Parse tile specification into dimension names and tile sizes.
+def _parse_tile_spec(tile) -> Tuple[str, ...]:
+    """Parse tile specification into dimension names.
 
-    Supports two formats:
-    - Simple: tile = ("M", "N") - all tile sizes default to 1
-    - With sizes: tile = (("M", 2), ("N", 4)) - explicit tile sizes
-
-    Mixed format is also supported:
-    - tile = ("M", ("N", 4)) - M has size 1, N has size 4
+    Format: tile = ("M", "D") — a tuple of dimension name strings.
 
     Returns:
-        (dim_names, tile_sizes) where tile_sizes maps dim_name -> size
+        Tuple of dimension name strings.
     """
     if isinstance(tile, str):
         tile = (tile,)
 
-    dim_names = []
-    tile_sizes = {}
-
     for item in tile:
-        if isinstance(item, str):
-            dim_names.append(item)
-            tile_sizes[item] = 1
-        elif isinstance(item, tuple) and len(item) == 2:
-            dim_name, size = item
-            dim_names.append(dim_name)
-            tile_sizes[dim_name] = size
-        else:
-            raise ValueError(f"Invalid tile spec item: {item}. Expected str or (str, int) tuple.")
+        if not isinstance(item, str):
+            raise ValueError(
+                f"Invalid tile spec item: {item}. "
+                f"Expected dimension name string. "
+                f"Tile sizes are now passed at schedule() time via tile_sizes=."
+            )
 
-    return tuple(dim_names), tile_sizes
+    return tuple(tile)
 
 
 def _build_tensor_and_dim_lists(reads, writes):
@@ -170,6 +167,7 @@ def _gen_init_source(
     tensor_strides=None,
     warp_specialized=False,
     dma_warp_mode=False,
+    dim_names=None,
 ):
     """Generate init source for tensor parameter mode (runtime tensor params).
 
@@ -177,6 +175,8 @@ def _gen_init_source(
     to the op's local names (e.g., x, weight, y). ALL dimensions are emitted
     as compile-time Python int literals. Strides are emitted as compile-time
     constants (e.g., x_stride_M, x_stride_D) when tensor_strides is provided.
+    Tile indices are mapped from positional (tile_0, tile_1, ...) to named
+    variables (tile_M, tile_D, ...) based on dim_names.
 
     Args:
         unique_tensors: List of (name, dtype, dims) tuples.
@@ -192,6 +192,8 @@ def _gen_init_source(
             threads only, excluding the DMA warp) instead of block_dim.
         dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
             tidx is offset so DMA warp threads become 0-31, num_threads=32.
+        dim_names: Dict mapping dim name -> axis index (e.g., {"M": 0, "D": 1}).
+            Used to generate named tile index aliases (tile_M = tile_0, etc.).
     """
     lines = []
 
@@ -213,6 +215,11 @@ def _gen_init_source(
     else:
         lines.append("tidx = cute.arch.thread_idx()[0]")
         lines.append("num_threads = cute.arch.block_dim()[0]")
+
+    # Map positional tile indices to named variables (tile_M = tile_0, etc.)
+    if dim_names:
+        for dim_name, axis_idx in dim_names.items():
+            lines.append(f"tile_{dim_name} = tile_{axis_idx}")
 
     # Alias tensor params to local names. Tensors are passed as N-D
     # torch.Tensor (auto-converted by TensorAdapter). Ops that need flat 1D
@@ -278,7 +285,7 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
 
         return staticmethod(pack_config)
 
-    # All dims are dynamic if no classification provided (e.g. NOPOp)
+    # All dims are dynamic if no classification provided
     if dynamic_dim_names is None:
         dynamic_dim_names = {d for d, _, _ in unique_dims}
 
@@ -298,34 +305,41 @@ def _process_op_declarations(cls):
     """Process reads/writes/tile declarations on an Op subclass.
 
     Auto-generates: INPUTS, OUTPUTS, NUM_INPUT_PAGES, NUM_OUTPUT_PAGES,
-    DIM_NAMES, compute_tiles, tiles_n, tiles_l, pack_config,
-    pack_backward_config, load/store stubs, and schedule() classmethod.
+    DIM_NAMES, pack_config, pack_backward_config, load/store stubs,
+    and schedule() classmethod.
 
     Stores tensor/dim metadata on the class for deferred init generation
     at compile time (when static dim values are known).
 
-    Tile declaration format:
-        tile = ("M",)              # Simple: tile_size defaults to 1
-        tile = (("M", 2),)         # With size: M tiles process 2 items each
-        tile = ("M", ("N", 4))     # Mixed: M size 1, N size 4
+    Tile declaration format (up to 5 dimensions, matching TMA):
+        tile = ("M",)             # single dimension
+        tile = ("M", "D")         # two dimensions
+        tile = ("M", "N", "D")    # three dimensions
+
+    Tile sizes are passed at schedule() time via tile_sizes={"M": 4}.
+    Unspecified dims default to full extent (1 tile covering entire dim).
     """
     reads = cls.reads
     writes = cls.writes
     tile = cls.tile
 
-    # Parse tile spec into dim names and sizes
-    tile, tile_sizes = _parse_tile_spec(tile)
+    # Parse tile spec into dim names
+    tile = _parse_tile_spec(tile)
+
+    if len(tile) > MAX_TILE_DIMS:
+        raise ValueError(f"Tile spec has {len(tile)} dims, max is {MAX_TILE_DIMS}")
 
     # Build tensor and dim lists
     unique_tensors, unique_dims = _build_tensor_and_dim_lists(reads, writes)
 
     # --- Classify dims as static or dynamic ---
-    # Tile dims are always dynamic (they determine grid size and change per input).
-    # All other dims are static by default (model constants baked into compiled kernel).
-    # Ops can override with dynamic_dims = ("S",) to keep specific dims dynamic.
+    # Tile dims are static (their sizes are compile-time constants).
+    # Non-tile dims are dynamic by default (packed into config tensor).
+    # Ops can override with dynamic_dims = ("S",) to force specific dims dynamic.
     tile_dim_names = set(tile)
     dynamic_dim_overrides = set(getattr(cls, "dynamic_dims", ()))
-    dynamic_dim_names = tile_dim_names | dynamic_dim_overrides
+    non_tile_dims = {d for d, _, _ in unique_dims if d not in tile_dim_names}
+    dynamic_dim_names = non_tile_dims | dynamic_dim_overrides
     static_dim_names = [d for d, _, _ in unique_dims if d not in dynamic_dim_names]
 
     # Store metadata for deferred init generation at compile time
@@ -334,7 +348,7 @@ def _process_op_declarations(cls):
     cls._TILE_DIM_NAMES = tile_dim_names
     cls._DYNAMIC_DIM_OVERRIDES = dynamic_dim_overrides
     cls._STATIC_DIM_NAMES = static_dim_names
-    cls._TILE_SIZES = tile_sizes  # {dim_name: tile_size}
+    cls._TILE_DIM_NAMES_ORDERED = tile  # ordered tuple of tile dim names
 
     # Backward tensor/dim metadata (may differ from forward)
     bwd_reads = getattr(cls, "backward_reads", None) or reads
@@ -353,54 +367,33 @@ def _process_op_declarations(cls):
     cls.NUM_INPUT_PAGES = 0
     cls.NUM_OUTPUT_PAGES = 0
 
-    # DIM_NAMES: map tile dim names to axes
-    axis_names = ("m", "n", "l")
-    cls.DIM_NAMES = {tile[i]: axis_names[i] for i in range(len(tile))}
+    # DIM_NAMES: map tile dim names to axis indices (0..4)
+    cls.DIM_NAMES = {tile[i]: i for i in range(len(tile))}
 
-    # compute_tiles / tiles_n / tiles_l
-    # Find which tensor and axis each tile dim comes from
+    # Validate tile dims exist in tensor declarations
     dim_lookup = {d: (tname, idx) for d, tname, idx in unique_dims}
-
-    tile_dims = []
     for t in tile:
         if t not in dim_lookup:
             raise ValueError(f"Tile dim '{t}' not found in any tensor shape declaration")
-        tile_dims.append(dim_lookup[t])
-
-    def _make_tile_fn(tensor_name, axis_idx, dim_name, tile_size):
-        def tile_fn(**tensors):
-            dim_size = tensors[tensor_name].shape[axis_idx]
-            # Ceiling division: (dim_size + tile_size - 1) // tile_size
-            return (dim_size + tile_size - 1) // tile_size
-
-        return staticmethod(tile_fn)
-
-    # Create tile functions with appropriate tile_size for each dimension
-    tile_dim_0 = tile[0]
-    cls.compute_tiles = _make_tile_fn(*tile_dims[0], tile_dim_0, tile_sizes[tile_dim_0])
-    if len(tile) > 1:
-        tile_dim_1 = tile[1]
-        cls.tiles_n = _make_tile_fn(*tile_dims[1], tile_dim_1, tile_sizes[tile_dim_1])
-    if len(tile) > 2:
-        tile_dim_2 = tile[2]
-        cls.tiles_l = _make_tile_fn(*tile_dims[2], tile_dim_2, tile_sizes[tile_dim_2])
 
     # Generate pack_config / pack_backward_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
     # Add schedule() classmethod
     @classmethod
-    def schedule(cls, backward=False, **tensors):
+    def schedule(cls, backward=False, tile_sizes=None, **tensors):
         """Create a ScheduledOp from tensor kwargs.
 
         Args:
             backward: If True, use backward_reads/backward_writes tensor
                       declarations for packing and dim extraction.
+            tile_sizes: Dict mapping tile dim names to tile sizes.
+                E.g., {"M": 4}. Unspecified dims default to full extent
+                (1 tile covering entire dimension).
             **tensors: Tensor keyword arguments matching the declared reads/writes.
         """
-        tiles_m = cls.compute_tiles(**tensors)
-        tiles_n = cls.tiles_n(**tensors)
-        tiles_l = cls.tiles_l(**tensors)
+        if tile_sizes is None:
+            tile_sizes = {}
 
         # Select forward or backward dim/tensor declarations
         if backward and hasattr(cls, "_BWD_UNIQUE_DIMS"):
@@ -437,6 +430,21 @@ def _process_op_declarations(cls):
                     f"axis {axis_idx} has {val}"
                 )
             static_dims[dim_name] = val
+
+        # Compute tile_counts from tile_sizes and static_dims
+        resolved_tile_sizes = {}
+        tile_counts = []
+        for dim_name in cls._TILE_DIM_NAMES_ORDERED:
+            ts = tile_sizes.get(dim_name)
+            dim_size = static_dims[dim_name]
+            if ts is None:
+                # Full extent: 1 tile covering entire dimension
+                tile_counts.append(1)
+                resolved_tile_sizes[dim_name] = dim_size
+            else:
+                tile_counts.append((dim_size + ts - 1) // ts)
+                resolved_tile_sizes[dim_name] = ts
+        tile_counts = tuple(tile_counts)
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
         tensor_dtypes = {}
@@ -479,16 +487,14 @@ def _process_op_declarations(cls):
         config_data = pack_fn(**tensors)
         return ScheduledOp(
             op_cls=cls,
-            tiles_m=tiles_m,
-            tiles_n=tiles_n,
-            tiles_l=tiles_l,
+            tile_counts=tile_counts,
             config_data=config_data,
             static_dims=static_dims,
             tensor_dtypes=tensor_dtypes,
             tensor_ptrs=tensor_ptrs,
             tensor_refs=tensor_refs,
             dim_names=cls.DIM_NAMES,
-            tile_sizes=cls._TILE_SIZES.copy(),
+            tile_sizes=resolved_tile_sizes,
             tensor_metas=tensor_metas,
             tensor_strides=tensor_strides,
         )
@@ -500,7 +506,8 @@ def _process_op_declarations(cls):
     def gen_init_source(cls, static_dims, tensor_param_map=None,
                                     backward=False, kernel_config=None, tensor_dtypes=None,
                                     tensor_strides=None,
-                                    warp_specialized=False, dma_warp_mode=False):
+                                    warp_specialized=False, dma_warp_mode=False,
+                                    tile_sizes=None):
         """Generate init source for tensor parameter mode.
 
         Tensors are passed as function parameters and aliased to local names.
@@ -518,6 +525,9 @@ def _process_op_declarations(cls):
                 E.g., ``{'x': (256, 1), 'weight': (1,)}``.
             warp_specialized: If True, set num_threads to compute threads only.
             dma_warp_mode: If True, remap tidx for DMA warp (32 threads).
+            tile_sizes: Dict mapping tile dim names to resolved tile sizes.
+                E.g., ``{'M': 4, 'D': 256}``. All values must be ints
+                (no None — resolve full-extent before calling).
         """
         if backward:
             tensors = cls._BWD_UNIQUE_TENSORS
@@ -529,8 +539,10 @@ def _process_op_declarations(cls):
         full_kernel_config = {}
         if kernel_config:
             full_kernel_config.update(kernel_config)
-        for dim_name, size in cls._TILE_SIZES.items():
-            full_kernel_config[f"tile_size_{dim_name}"] = size
+        # Emit tile_size_X as compile-time constants
+        if tile_sizes:
+            for dim_name, size in tile_sizes.items():
+                full_kernel_config[f"tile_size_{dim_name}"] = size
 
         return _gen_init_source(
             tensors,
@@ -542,6 +554,7 @@ def _process_op_declarations(cls):
             tensor_strides=tensor_strides,
             warp_specialized=warp_specialized,
             dma_warp_mode=dma_warp_mode,
+            dim_names=cls.DIM_NAMES,
         )
 
     cls.gen_init_source = gen_init_source
@@ -596,14 +609,13 @@ class Op:
         class MyOp(Op):
             reads = {"x": (Float32, ("M", "D"))}
             writes = {"y": (Float32, ("M", "D"))}
-            tile = ("M",)
+            tile = ("M", "D")
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                # x, y are cute.Tensor params aliased via init_source
-                # M, D are compile-time constants from init_source
+            def compute(page_ptr, op_config_ptr):
+                # tile_M, tile_D, x, y, M, D available from init_source
                 for i in range(tidx, D, num_threads):
-                    y[tile_m * D + i] = x[tile_m * D + i] * 2.0
+                    y[tile_M * D + i] = x[tile_M * D + i] * 2.0
 
     Class attributes:
         NUM_INPUT_PAGES: Number of input shared memory pages needed
@@ -629,13 +641,14 @@ class Op:
     # =========================================================================
     # Pipelined Execution Interface
     # =========================================================================
+    #
+    # Op method signatures: (page_ptr, op_config_ptr)
+    # Tile indices (tile_M, tile_D, etc.) and dimensions (M, D, etc.)
+    # are injected via init_source as named variables.
 
     @staticmethod
     def load(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Load data from global memory to shared memory page.
@@ -646,22 +659,12 @@ class Op:
         and return immediately (async).
 
         Default: no-op (for ops that access global memory directly in compute).
-
-        Args:
-            page_ptr: Shared memory page base address (32-bit)
-            tile_m: M tile index
-            tile_n: N tile index
-            tile_l: L tile index
-            op_config_ptr: Pointer to op-specific config in global memory
         """
         pass
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Main computation for one tile.
@@ -669,24 +672,15 @@ class Op:
         This is where the op's core logic goes. Can access:
         - Shared memory via page_ptr (if load staged data there)
         - Global memory directly via tensor pointers from init_source
+        - Tile indices via tile_M, tile_D, etc. from init_source
 
         Called by MMA warps after DMA warp completes the load phase.
-
-        Args:
-            page_ptr: Shared memory page base address (32-bit)
-            tile_m: M tile index
-            tile_n: N tile index
-            tile_l: L tile index
-            op_config_ptr: Pointer to op-specific config in global memory
         """
         pass
 
     @staticmethod
     def store(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Store results from shared memory page to global memory.
@@ -695,13 +689,6 @@ class Op:
         cute.copy(tma_store_atom, ...) here (S2G does not need mbarrier).
 
         Default: no-op (for ops that write directly to global memory in compute).
-
-        Args:
-            page_ptr: Shared memory page with computed results (32-bit)
-            tile_m: M tile index
-            tile_n: N tile index
-            tile_l: L tile index
-            op_config_ptr: Pointer to op-specific config in global memory
         """
         pass
 
@@ -712,9 +699,6 @@ class Op:
     @staticmethod
     def backward_load(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Load data for backward pass.
@@ -726,9 +710,6 @@ class Op:
     @staticmethod
     def backward_compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Backward computation for one tile.
@@ -740,9 +721,6 @@ class Op:
     @staticmethod
     def backward_store(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Store backward results from shared memory to global memory.
@@ -754,41 +732,6 @@ class Op:
     # =========================================================================
     # Host-side tiling (used by autograd and scheduling)
     # =========================================================================
-
-    @staticmethod
-    def compute_tiles(**tensors) -> int:
-        """Compute tiles_m from input tensor shapes.
-
-        Args:
-            **tensors: Named input tensors (e.g., q=q_tensor, cos=cos_tensor).
-
-        Returns:
-            tiles_m for the ScheduledOp.
-        """
-        raise NotImplementedError("Op subclasses must implement compute_tiles()")
-
-    @staticmethod
-    def tiles_n(**tensors) -> int:
-        """Compute tiles_n from input tensor shapes. Default: 1."""
-        return 1
-
-    @staticmethod
-    def tiles_l(**tensors) -> int:
-        """Compute tiles_l from input tensor shapes. Default: 1."""
-        return 1
-
-
-# =============================================================================
-# NOP Operation
-# =============================================================================
-
-
-class NOPOp(Op):
-    """No-operation for synchronization barriers. Requires 0 pages."""
-
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
-
 
 # =============================================================================
 # Scheduled Operation
@@ -803,22 +746,18 @@ class ScheduledOp:
 
     Attributes:
         op_cls: Operation class (must be Op subclass)
-        tiles_m: Number of tiles in M dimension
-        tiles_n: Number of tiles in N dimension
-        tiles_l: Number of tiles in L dimension
+        tile_counts: Number of tiles per dimension (up to MAX_TILE_DIMS).
         params: Operation-specific parameters
-        dim_names: Maps semantic dimension names to tile axes ("m", "n", "l").
-            Example: {"batch": "m", "seqlen": "n"} means tile_m indexes batch
-            and tile_n indexes seqlen. Used by the builder to compute tile
+        dim_names: Maps semantic dimension names to tile axis indices (0..4).
+            Example: {"M": 0, "D": 1} means tile_0 indexes M
+            and tile_1 indexes D. Used by the builder to compute tile
             mappings between ops with different grid shapes.
     """
 
     op_cls: Type[Op]
-    tiles_m: int
-    tiles_n: int = 1
-    tiles_l: int = 1
+    tile_counts: Tuple[int, ...] = (1,)  # Variable length, up to MAX_TILE_DIMS
     params: Dict[str, Any] = field(default_factory=dict)
-    dim_names: Dict[str, str] = None
+    dim_names: Dict[str, int] = None  # Maps dim name -> axis index (0..4)
     config_data: Any = None  # Optional torch.Tensor with per-op config in global memory
     static_dims: Dict[str, int] = field(default_factory=dict)  # Compile-time dim values
     tensor_dtypes: Dict[str, Any] = field(default_factory=dict)  # Compile-time tensor dtypes
@@ -833,24 +772,30 @@ class ScheduledOp:
             self.dim_names = getattr(self.op_cls, "DIM_NAMES", {})
 
     @property
+    def ndims(self) -> int:
+        """Number of tile dimensions."""
+        return len(self.tile_counts)
+
+    @property
     def total_tiles(self) -> int:
         """Total number of tiles for this operation."""
-        return self.tiles_m * self.tiles_n * self.tiles_l
+        return math.prod(self.tile_counts)
 
-    def tiles_for_axis(self, axis: str) -> int:
-        """Get tile count for a given axis ("m", "n", or "l")."""
-        return {"m": self.tiles_m, "n": self.tiles_n, "l": self.tiles_l}[axis]
+    def tiles_for_axis(self, axis: int) -> int:
+        """Get tile count for a given axis index (0..4)."""
+        if axis < len(self.tile_counts):
+            return self.tile_counts[axis]
+        return 1
 
-    def tile_size_for_axis(self, axis: str) -> int:
-        """Get tile size for a given axis ("m", "n", or "l"). Default is 1."""
-        # Find the dim name that maps to this axis, then look up its tile size
+    def tile_size_for_axis(self, axis: int) -> int:
+        """Get tile size for a given axis index. Default is 1."""
         for dim_name, ax in self.dim_names.items():
             if ax == axis and dim_name in self.tile_sizes:
                 return self.tile_sizes[dim_name]
-        return 1  # Default tile size
+        return 1
 
-    def axis_for_dim(self, dim_name: str) -> Optional[str]:
-        """Get the tile axis for a semantic dimension name, or None."""
+    def axis_for_dim(self, dim_name: str) -> Optional[int]:
+        """Get the tile axis index for a semantic dimension name, or None."""
         return self.dim_names.get(dim_name)
 
 
@@ -1030,8 +975,7 @@ def validate_op_compatibility(ops: List[ScheduledOp], registry: "TensorRegistry"
 class BarrierFormula:
     """Compile-time formula for computing a barrier index from tile coordinates.
 
-    barrier_idx = base + (coeff_m * tile_m) // div_m + (coeff_n * tile_n) // div_n
-                       + (coeff_l * tile_l) // div_l
+    barrier_idx = base + sum((coeffs[i] * tile_i) // divs[i] for i in range(ndims))
 
     Used by the megakernel handler to bake barrier wait/signal calls directly
     into each op's handler at JIT compile time. No per-instruction encoding
@@ -1040,44 +984,34 @@ class BarrierFormula:
 
     Attributes:
         base: Barrier base offset
-        coeff_m: Multiplier for tile_m
-        coeff_n: Multiplier for tile_n
-        coeff_l: Multiplier for tile_l
-        div_m: Divisor for tile_m (for tile size ratio handling, default 1)
-        div_n: Divisor for tile_n (for tile size ratio handling, default 1)
-        div_l: Divisor for tile_l (for tile size ratio handling, default 1)
+        coeffs: Per-axis multipliers for tile indices (up to MAX_TILE_DIMS)
+        divs: Per-axis divisors for tile indices (for tile size ratios, default 1)
         expected: For wait deps: how many signals to wait for (default 1)
-        guard_max: Only execute when the computed linear index
-            (coeff_m * tile_m + coeff_n * tile_n + coeff_l * tile_l)
-            is less than this value. Defaults to NO_GUARD (always passes).
-            Used for linear chain mode with mismatched tile counts.
+        guard_max: Only execute when the computed linear index is less than
+            this value. Defaults to NO_GUARD (always passes).
     """
 
     # Sentinel: guard_max value that always passes (larger than any tile count)
     NO_GUARD: ClassVar[int] = 2**30
 
     base: int
-    coeff_m: int = 0
-    coeff_n: int = 0
-    coeff_l: int = 0
-    div_m: int = 1  # Divisor for tile_m (for tile size ratios)
-    div_n: int = 1  # Divisor for tile_n (for tile size ratios)
-    div_l: int = 1  # Divisor for tile_l (for tile size ratios)
+    coeffs: Tuple[int, ...] = (0,) * MAX_TILE_DIMS
+    divs: Tuple[int, ...] = (1,) * MAX_TILE_DIMS
     expected: int = 1
     guard_max: int = NO_GUARD
 
-    def compute_index(self, tile_m: int, tile_n: int, tile_l: int) -> int:
+    def compute_index(self, tiles: Tuple[int, ...]) -> int:
         """Compute barrier index for a given tile (host-side, for testing)."""
-        return (
-            self.base
-            + (self.coeff_m * tile_m) // self.div_m
-            + (self.coeff_n * tile_n) // self.div_n
-            + (self.coeff_l * tile_l) // self.div_l
-        )
+        padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
+        result = self.base
+        for i in range(MAX_TILE_DIMS):
+            result += (self.coeffs[i] * padded[i]) // self.divs[i]
+        return result
 
-    def is_guarded(self, tile_m: int, tile_n: int, tile_l: int) -> bool:
+    def is_guarded(self, tiles: Tuple[int, ...]) -> bool:
         """Check if the guard passes for a given tile (host-side, for testing)."""
-        linear = self.coeff_m * tile_m + self.coeff_n * tile_n + self.coeff_l * tile_l
+        padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
+        linear = sum(self.coeffs[i] * padded[i] for i in range(MAX_TILE_DIMS))
         return linear < self.guard_max
 
     @property
@@ -1091,44 +1025,56 @@ class BarrierFormula:
 # Instruction Stream (Lightweight — barriers baked into handlers)
 # =============================================================================
 
-INSTRUCTION_WORDS = 4
+INSTRUCTION_WORDS = 1 + MAX_TILE_DIMS  # op_idx + up to 5 tile indices = 6
 
 
 @dataclass
 class TileInstruction:
     """A single tile work instruction for the persistent megakernel.
 
-    Lightweight encoding in global memory (4 x int32):
+    Lightweight encoding in global memory (6 x int32):
     [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
-    [1]  tile_m: M tile index within this op
-    [2]  tile_n: N tile index within this op
-    [3]  tile_l: L tile index within this op
+    [1..5]  tile indices: Up to 5 tile dimension indices
 
     Barrier wait/signal logic is baked into op handlers at compile time
     via BarrierFormula, not encoded in the instruction stream.
     """
 
     op_idx: int
-    tile_m: int
-    tile_n: int
-    tile_l: int
+    tiles: Tuple[int, ...]  # Up to MAX_TILE_DIMS tile indices
 
     # Sentinel for end of stream
     END_MARKER: int = -1
 
     def pack(self) -> List[int]:
-        """Pack into list of int32."""
-        return [self.op_idx, self.tile_m, self.tile_n, self.tile_l]
+        """Pack into list of int32 (padded to INSTRUCTION_WORDS)."""
+        padded = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
+        return [self.op_idx] + padded
 
     @classmethod
     def end_instruction(cls) -> "TileInstruction":
         """Create end-of-stream marker."""
-        return cls(op_idx=cls.END_MARKER, tile_m=0, tile_n=0, tile_l=0)
+        return cls(op_idx=cls.END_MARKER, tiles=(0,) * MAX_TILE_DIMS)
 
 
 # =============================================================================
 # Dependency Resolution Helpers
 # =============================================================================
+
+
+def _linear_strides(tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Compute row-major linear strides from tile counts, padded to MAX_TILE_DIMS.
+
+    For tile_counts = (4, 8, 2): strides = (16, 2, 1, 0, 0)
+    stride[i] = product of tile_counts[i+1:]
+    """
+    ndims = len(tile_counts)
+    strides = [0] * MAX_TILE_DIMS
+    stride = 1
+    for i in range(ndims - 1, -1, -1):
+        strides[i] = stride
+        stride *= tile_counts[i]
+    return tuple(strides)
 
 
 @dataclass
@@ -1137,8 +1083,8 @@ class _OpRecord:
 
     op_idx: int
     op: ScheduledOp
-    # Flat list of tile coordinate tuples: [(m, n, l), ...]
-    tiles: List[Tuple[int, int, int]]
+    # Flat list of tile coordinate tuples: [(i0, i1, ...), ...]
+    tiles: List[Tuple[int, ...]]
 
 
 @dataclass
@@ -1164,46 +1110,46 @@ def _compute_formula_coeffs(
     source_op: ScheduledOp,
     target_op: ScheduledOp,
     shared_dims: Set[str],
-) -> Tuple[int, int, int]:
-    """Compute (coeff_m, coeff_n, coeff_l) for source computing target's barrier index.
+) -> Tuple[int, ...]:
+    """Compute coefficients for source computing target's barrier index.
 
     Maps shared dimension values from source tile coordinates to target's
-    linear index. The target's strides are: m=1, n=target.tiles_m,
-    l=target.tiles_m * target.tiles_n.
+    linear index. The target's strides are computed from tile_counts
+    (row-major: stride[i] = product of tile_counts[i+1:]).
 
     For each shared dim, find which axis it maps to on each side, then
     accumulate the target stride onto the source axis coefficient.
+
+    Returns:
+        Tuple of MAX_TILE_DIMS coefficients.
     """
     s_dims = source_op.dim_names
     t_dims = target_op.dim_names
 
-    t_strides = {
-        "m": 1,
-        "n": target_op.tiles_m,
-        "l": target_op.tiles_m * target_op.tiles_n,
-    }
+    # Compute target strides from tile_counts (row-major linearization)
+    t_counts = target_op.tile_counts
+    t_strides = {}
+    stride = 1
+    for i in range(len(t_counts) - 1, -1, -1):
+        t_strides[i] = stride
+        stride *= t_counts[i]
 
-    cm, cn, cl = 0, 0, 0
+    coeffs = [0] * MAX_TILE_DIMS
 
     if shared_dims:
         for dim in shared_dims:
             s_axis = s_dims[dim]
             t_axis = t_dims[dim]
-            stride = t_strides[t_axis]
-
-            if s_axis == "m":
-                cm += stride
-            elif s_axis == "n":
-                cn += stride
-            elif s_axis == "l":
-                cl += stride
+            coeffs[s_axis] += t_strides[t_axis]
     else:
         # No dim_names: use source's own linear index
-        cm = 1
-        cn = source_op.tiles_m
-        cl = source_op.tiles_m * source_op.tiles_n
+        s_counts = source_op.tile_counts
+        stride = 1
+        for i in range(len(s_counts) - 1, -1, -1):
+            coeffs[i] = stride
+            stride *= s_counts[i]
 
-    return cm, cn, cl
+    return tuple(coeffs)
 
 
 # =============================================================================
@@ -1299,14 +1245,7 @@ class LevelBatchedScheduler(TileScheduler):
             idx = rec.op_idx
             if idx not in consumer_deps:
                 for tile in rec.tiles:
-                    instructions.append(
-                        TileInstruction(
-                            op_idx=idx,
-                            tile_m=tile[0],
-                            tile_n=tile[1],
-                            tile_l=tile[2],
-                        )
-                    )
+                    instructions.append(TileInstruction(op_idx=idx, tiles=tile))
                 cursors[idx] = rec.op.total_tiles
 
         # Phase 2: Greedy wavefront for remaining ops
@@ -1332,14 +1271,7 @@ class LevelBatchedScheduler(TileScheduler):
 
                 if can_emit:
                     tile = rec.tiles[cursors[idx]]
-                    instructions.append(
-                        TileInstruction(
-                            op_idx=idx,
-                            tile_m=tile[0],
-                            tile_n=tile[1],
-                            tile_l=tile[2],
-                        )
-                    )
+                    instructions.append(TileInstruction(op_idx=idx, tiles=tile))
                     cursors[idx] += 1
                     progress = True
 
@@ -1475,14 +1407,7 @@ class BackwardScheduler(TileScheduler):
                     # Verify this is the next tile for this op
                     expected_tile = op_records[op_idx].tiles[cursors[op_idx]]
                     if tile == expected_tile:
-                        instructions.append(
-                            TileInstruction(
-                                op_idx=op_idx,
-                                tile_m=tile[0],
-                                tile_n=tile[1],
-                                tile_l=tile[2],
-                            )
-                        )
+                        instructions.append(TileInstruction(op_idx=op_idx, tiles=tile))
                         emitted.add(tile_global_idx)
                         cursors[op_idx] += 1
                         progress = True
@@ -1510,14 +1435,7 @@ class BackwardScheduler(TileScheduler):
 
                         if can_emit:
                             actual_tile = op_records[op_idx].tiles[cursors[op_idx]]
-                            instructions.append(
-                                TileInstruction(
-                                    op_idx=op_idx,
-                                    tile_m=actual_tile[0],
-                                    tile_n=actual_tile[1],
-                                    tile_l=actual_tile[2],
-                                )
-                            )
+                            instructions.append(TileInstruction(op_idx=op_idx, tiles=actual_tile))
                             cursors[op_idx] += 1
                             progress = True
                             break
@@ -1569,10 +1487,10 @@ class InstructionStreamBuilder:
 
     Example with named buffers:
         builder = InstructionStreamBuilder()
-        builder.add_op(OpA, tiles_m=4, tiles_n=32,
-                       dim_names={"batch": "m", "seqlen": "n"})
-        builder.add_op(OpB, tiles_m=4,
-                       dim_names={"batch": "m"})
+        builder.add_op(OpA, tile_counts=(4, 32),
+                       dim_names={"batch": 0, "seqlen": 1})
+        builder.add_op(OpB, tile_counts=(4,),
+                       dim_names={"batch": 0})
         # OpB reads OpA's output → OpB batch=0 waits for all 32 seqlen tiles
 
     Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
@@ -1591,10 +1509,8 @@ class InstructionStreamBuilder:
     def add_op(
         self,
         op_or_cls: Union[ScheduledOp, Type[Op]],
-        tiles_m: Optional[int] = None,
-        tiles_n: int = 1,
-        tiles_l: int = 1,
-        dim_names: Optional[Dict[str, str]] = None,
+        tile_counts: Optional[Tuple[int, ...]] = None,
+        dim_names: Optional[Dict[str, int]] = None,
         **params,
     ) -> "InstructionStreamBuilder":
         """Add an operation to the stream.
@@ -1602,16 +1518,14 @@ class InstructionStreamBuilder:
         Can be called in two ways:
         1. With a ScheduledOp: add_op(scheduled_op)
            Preserves all fields including tensor_ptrs for dependency detection.
-        2. With an Op class: add_op(OpClass, tiles_m=4, tiles_n=1, ...)
+        2. With an Op class: add_op(OpClass, tile_counts=(4, 1), ...)
            Creates a new ScheduledOp from the parameters.
 
         Args:
             op_or_cls: Either a ScheduledOp instance or an Op class
-            tiles_m: Number of M tiles (required when passing Op class)
-            tiles_n: Number of N tiles (default: 1)
-            tiles_l: Number of L tiles (default: 1)
-            dim_names: Maps semantic dimension names to tile axes.
-                Example: {"batch": "m", "seqlen": "n"}
+            tile_counts: Tuple of tile counts per axis (required when passing Op class)
+            dim_names: Maps semantic dimension names to tile axis indices.
+                Example: {"M": 0, "D": 1}
             **params: Operation-specific parameters (only used with Op class)
         """
         # Handle ScheduledOp instance
@@ -1619,34 +1533,38 @@ class InstructionStreamBuilder:
             op = op_or_cls
         else:
             # Handle Op class with parameters
-            if tiles_m is None:
-                raise ValueError("tiles_m is required when passing an Op class")
+            if tile_counts is None:
+                raise ValueError("tile_counts is required when passing an Op class")
             op = ScheduledOp(
                 op_cls=op_or_cls,
-                tiles_m=tiles_m,
-                tiles_n=tiles_n,
-                tiles_l=tiles_l,
+                tile_counts=tile_counts,
                 params=params,
                 dim_names=dim_names or {},
             )
 
         # Validate dim_names
-        _valid_axes = {"m", "n", "l"}
         if op.dim_names:
             for dim, axis in op.dim_names.items():
-                if axis not in _valid_axes:
-                    raise ValueError(f"Invalid axis '{axis}' for dim '{dim}'. Must be one of {_valid_axes}")
+                if not isinstance(axis, int) or axis < 0 or axis >= MAX_TILE_DIMS:
+                    raise ValueError(f"Invalid axis {axis} for dim '{dim}'. Must be int in [0, {MAX_TILE_DIMS})")
             axes = list(op.dim_names.values())
             if len(axes) != len(set(axes)):
                 raise ValueError(f"dim_names maps multiple dims to the same axis: {op.dim_names}")
 
-        # Pre-compute flat tile list
+        # Pre-compute flat tile list using row-major linearization
         tiles = []
-        for tile_idx in range(op.total_tiles):
-            tile_l_idx = tile_idx // (op.tiles_m * op.tiles_n)
-            tile_n_idx = (tile_idx // op.tiles_m) % op.tiles_n
-            tile_m_idx = tile_idx % op.tiles_m
-            tiles.append((tile_m_idx, tile_n_idx, tile_l_idx))
+        counts = op.tile_counts
+        ndims = len(counts)
+        for linear_idx in range(op.total_tiles):
+            # Decompose linear index into multi-dim tile coordinates (row-major)
+            tile = []
+            remainder = linear_idx
+            for i in range(ndims):
+                # Stride for axis i = product of counts[i+1:]
+                stride = math.prod(counts[i + 1:]) if i + 1 < ndims else 1
+                tile.append(remainder // stride)
+                remainder %= stride
+            tiles.append(tuple(tile))
 
         record = _OpRecord(
             op_idx=len(self._op_records),
@@ -1755,19 +1673,12 @@ class InstructionStreamBuilder:
             op = rec.op
             signal_base = barrier_counter
 
-            # Own linear index strides
-            cm = 1
-            cn = op.tiles_m
-            cl = op.tiles_m * op.tiles_n
+            # Own linear index strides (row-major)
+            coeffs = _linear_strides(op.tile_counts)
 
             # Signal: own barrier
             signal_formulas = [
-                BarrierFormula(
-                    base=signal_base,
-                    coeff_m=cm,
-                    coeff_n=cn,
-                    coeff_l=cl,
-                )
+                BarrierFormula(base=signal_base, coeffs=coeffs)
             ]
 
             # Wait: previous op's barrier (if exists)
@@ -1780,9 +1691,7 @@ class InstructionStreamBuilder:
                 wait_formulas.append(
                     BarrierFormula(
                         base=prev_base,
-                        coeff_m=cm,
-                        coeff_n=cn,
-                        coeff_l=cl,
+                        coeffs=coeffs,
                         expected=1,
                         guard_max=guard,
                     )
@@ -1880,27 +1789,73 @@ class InstructionStreamBuilder:
 
                 # Determine target side and compute barrier count / expected
                 # Also compute divisors for tile size ratio handling
-                p_div_m, p_div_n, p_div_l = 1, 1, 1  # Producer divisors
-                c_div_m, c_div_n, c_div_l = 1, 1, 1  # Consumer divisors
+                p_divs = [1] * MAX_TILE_DIMS  # Producer divisors
+                c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
                 expected = 1
 
                 if producer_only and not consumer_only:
-                    # Many-to-one: barriers indexed by consumer tiles
+                    # Many-to-one: producer has extra dims not in consumer
                     target_op = c_op
-                    num_barriers = c_op.total_tiles
+
+                    # Handle tile size ratios on shared dims
+                    for dim in shared_dims:
+                        p_axis = p_op.dim_names[dim]
+                        c_axis = c_op.dim_names[dim]
+                        p_ts = p_op.tile_sizes.get(dim, 1)
+                        c_ts = c_op.tile_sizes.get(dim, 1)
+                        if p_ts > c_ts:
+                            ratio = p_ts // c_ts
+                            c_divs[c_axis] = ratio
+                        elif c_ts > p_ts:
+                            ratio = c_ts // p_ts
+                            p_divs[p_axis] = ratio
+                            expected *= ratio
+
+                    # Barrier count: min tile counts on shared dims
+                    num_barriers = 1
+                    for dim in shared_dims:
+                        p_axis = p_op.dim_names[dim]
+                        c_axis = c_op.dim_names[dim]
+                        num_barriers *= min(
+                            p_op.tiles_for_axis(p_axis),
+                            c_op.tiles_for_axis(c_axis),
+                        )
+
+                    # Collapse producer-only dims
                     collapsed = 1
                     for dim in producer_only:
                         axis = p_op.dim_names[dim]
                         collapsed *= p_op.tiles_for_axis(axis)
-                    expected = collapsed
+                    expected *= collapsed
                 elif consumer_only and not producer_only:
-                    # One-to-many: barriers indexed by producer tiles
+                    # One-to-many: producer has fewer dims
                     target_op = p_op
-                    num_barriers = p_op.total_tiles
+
+                    # Handle tile size ratios on shared dims
+                    for dim in shared_dims:
+                        p_axis = p_op.dim_names[dim]
+                        c_axis = c_op.dim_names[dim]
+                        p_ts = p_op.tile_sizes.get(dim, 1)
+                        c_ts = c_op.tile_sizes.get(dim, 1)
+                        if p_ts > c_ts:
+                            ratio = p_ts // c_ts
+                            c_divs[c_axis] = ratio
+                        elif c_ts > p_ts:
+                            ratio = c_ts // p_ts
+                            p_divs[p_axis] = ratio
+
+                    # Barrier count: min tile counts on shared dims
+                    num_barriers = 1
+                    for dim in shared_dims:
+                        p_axis = p_op.dim_names[dim]
+                        c_axis = c_op.dim_names[dim]
+                        num_barriers *= min(
+                            p_op.tiles_for_axis(p_axis),
+                            c_op.tiles_for_axis(c_axis),
+                        )
                     expected = 1
                 else:
                     # Same dims (or no dims) - check for tile size differences
-                    # Compute per-axis tile size ratios for shared dimensions
                     for dim in shared_dims:
                         p_axis = p_op.dim_names[dim]
                         c_axis = c_op.dim_names[dim]
@@ -1908,68 +1863,35 @@ class InstructionStreamBuilder:
                         c_ts = c_op.tile_sizes.get(dim, 1)
 
                         if p_ts > c_ts:
-                            # Producer has coarser granularity (larger tile size)
-                            # One producer tile → many consumer tiles
-                            # Consumer needs divisor to map to producer's barrier
                             ratio = p_ts // c_ts
-                            if c_axis == "m":
-                                c_div_m = ratio
-                            elif c_axis == "n":
-                                c_div_n = ratio
-                            elif c_axis == "l":
-                                c_div_l = ratio
+                            c_divs[c_axis] = ratio
                         elif c_ts > p_ts:
-                            # Consumer has coarser granularity (larger tile size)
-                            # Many producer tiles → one consumer tile
-                            # Producer needs divisor, expected increases
                             ratio = c_ts // p_ts
-                            if p_axis == "m":
-                                p_div_m = ratio
-                            elif p_axis == "n":
-                                p_div_n = ratio
-                            elif p_axis == "l":
-                                p_div_l = ratio
+                            p_divs[p_axis] = ratio
                             expected *= ratio
 
-                    # Use min total tiles for barrier count (the coarser granularity)
                     target_op = c_op
                     num_barriers = min(p_op.total_tiles, c_op.total_tiles)
 
                 # Compute formula coefficients
-                p_cm, p_cn, p_cl = _compute_formula_coeffs(
-                    p_op,
-                    target_op,
-                    shared_dims,
-                )
-                c_cm, c_cn, c_cl = _compute_formula_coeffs(
-                    c_op,
-                    target_op,
-                    shared_dims,
-                )
+                p_coeffs = _compute_formula_coeffs(p_op, target_op, shared_dims)
+                c_coeffs = _compute_formula_coeffs(c_op, target_op, shared_dims)
 
-                # Producer signal formula (with divisors for fine-grained producer)
+                # Producer signal formula
                 formulas[prod_idx][1].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeff_m=p_cm,
-                        coeff_n=p_cn,
-                        coeff_l=p_cl,
-                        div_m=p_div_m,
-                        div_n=p_div_n,
-                        div_l=p_div_l,
+                        coeffs=p_coeffs,
+                        divs=tuple(p_divs),
                     )
                 )
 
-                # Consumer wait formula (with divisors for fine-grained consumer)
+                # Consumer wait formula
                 formulas[rec.op_idx][0].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeff_m=c_cm,
-                        coeff_n=c_cn,
-                        coeff_l=c_cl,
-                        div_m=c_div_m,
-                        div_n=c_div_n,
-                        div_l=c_div_l,
+                        coeffs=c_coeffs,
+                        divs=tuple(c_divs),
                         expected=expected,
                     )
                 )
@@ -2054,8 +1976,6 @@ class InstructionStreamBuilder:
 __all__ = [
     # Protocol
     "Op",
-    # Built-in Operations
-    "NOPOp",
     # Scheduling
     "ScheduledOp",
     "TensorRegistry",

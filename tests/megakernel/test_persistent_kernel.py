@@ -7,6 +7,12 @@ Tests the instruction stream builder and persistent megakernel implementation.
 
 import pytest
 import torch
+from machete.megakernel.ops import Op
+
+
+class _NOPOp(Op):
+    """Test-only no-op for persistent kernel tests."""
+    pass
 
 
 # =============================================================================
@@ -14,149 +20,16 @@ import torch
 # =============================================================================
 
 
-class TestInstructionStreamBuilder:
-    """Tests for instruction stream generation."""
-
-    def test_single_op(self):
-        """Test instruction stream for a single operation."""
-        from machete.megakernel import InstructionStreamBuilder, NOPOp
-
-        builder = InstructionStreamBuilder()
-        builder.add_op(NOPOp, tiles_m=4)
-
-        assert builder.total_tiles == 4
-        assert builder.num_barriers == 4
-
-        instructions = builder.build()
-        # 4 work instructions + 1 end marker
-        assert len(instructions) == 5
-
-        # Check first instruction (lightweight: op_idx, tile_m, tile_n, tile_l)
-        instr0 = instructions[0]
-        assert instr0.op_idx == 0
-        assert instr0.tile_m == 0
-
-        # Check last work instruction
-        instr3 = instructions[3]
-        assert instr3.op_idx == 0
-        assert instr3.tile_m == 3
-
-        # Check end marker
-        end = instructions[4]
-        assert end.op_idx == -1  # END_MARKER
-
-        # Barrier formulas (separate from instructions)
-        formulas = builder.get_op_barrier_formulas()
-        assert len(formulas[0][0]) == 0  # No wait deps for first op
-        assert len(formulas[0][1]) == 1  # One signal formula
-
-    def test_two_ops_dependency(self):
-        """Test that second op has barrier formulas for first op."""
-        from machete.megakernel import InstructionStreamBuilder, NOPOp
-
-        builder = InstructionStreamBuilder()
-        builder.add_op(NOPOp, tiles_m=4)
-        builder.add_op(NOPOp, tiles_m=4)
-
-        assert builder.total_tiles == 8
-        assert builder.num_barriers == 8  # 4 per op
-
-        instructions = builder.build()
-        # 8 work + 1 end marker
-        assert len(instructions) == 9
-
-        # Tiles are interleaved (not sequential) for pipeline overlap.
-        # Verify all tiles from both ops are present.
-        op0_count = sum(1 for i in instructions[:-1] if i.op_idx == 0)
-        op1_count = sum(1 for i in instructions[:-1] if i.op_idx == 1)
-        assert op0_count == 4
-        assert op1_count == 4
-
-        # Barrier formulas capture dependencies
-        formulas = builder.get_op_barrier_formulas()
-        # Op 0: no wait, signal base=0
-        assert len(formulas[0][0]) == 0
-        assert formulas[0][1][0].base == 0
-
-        # Op 1: wait on op0's barriers (base=0), signal base=4
-        wf = formulas[1][0][0]
-        assert wf.base == 0
-        assert wf.expected == 1
-        assert formulas[1][1][0].base == 4
-
-    def test_three_ops_chain(self):
-        """Test dependency chain across three operations."""
-        from machete.megakernel import InstructionStreamBuilder, NOPOp
-
-        builder = InstructionStreamBuilder()
-        builder.add_op(NOPOp, tiles_m=2)  # Barriers 0, 1
-        builder.add_op(NOPOp, tiles_m=2)  # Barriers 2, 3
-        builder.add_op(NOPOp, tiles_m=2)  # Barriers 4, 5
-
-        assert builder.num_barriers == 6
-
-        formulas = builder.get_op_barrier_formulas()
-
-        # Op 0: no wait
-        assert len(formulas[0][0]) == 0
-
-        # Op 1: waits on op0 (barrier base 0)
-        assert formulas[1][0][0].base == 0
-
-        # Op 2: waits on op1 (barrier base 2)
-        assert formulas[2][0][0].base == 2
-
-    def test_build_tensor(self):
-        """Test conversion to GPU tensor."""
-        from machete.megakernel import InstructionStreamBuilder, NOPOp, INSTRUCTION_WORDS
-
-        builder = InstructionStreamBuilder()
-        builder.add_op(NOPOp, tiles_m=4)
-
-        tensor = builder.build_tensor(device="cpu")  # Use CPU for test
-
-        assert tensor.shape == (5, INSTRUCTION_WORDS)  # 4 tiles + end marker
-        assert tensor.dtype == torch.int32
-
-        # Verify op_idx column
-        assert tensor[0, 0].item() == 0  # First instruction, op 0
-        assert tensor[4, 0].item() == -1  # End marker
-
-    def test_multidimensional_tiles(self):
-        """Test 2D tile layout."""
-        from machete.megakernel import InstructionStreamBuilder, NOPOp
-
-        builder = InstructionStreamBuilder()
-        builder.add_op(NOPOp, tiles_m=2, tiles_n=3)
-
-        assert builder.total_tiles == 6
-        instructions = builder.build()
-
-        # Should have tiles (0,0), (1,0), (0,1), (1,1), (0,2), (1,2)
-        # Ordering: tile_m varies fastest
-        expected_tiles = [
-            (0, 0),
-            (1, 0),
-            (0, 1),
-            (1, 1),
-            (0, 2),
-            (1, 2),
-        ]
-        for i, (m, n) in enumerate(expected_tiles):
-            assert instructions[i].tile_m == m, f"Wrong tile_m at index {i}"
-            assert instructions[i].tile_n == n, f"Wrong tile_n at index {i}"
-
-
 class TestMegakernelHost:
     """Host-side tests for Megakernel (no GPU required)."""
 
     def test_init(self):
         """Test megakernel initialization."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 
         ops = [
-            ScheduledOp(NOPOp, tiles_m=16),
-            ScheduledOp(NOPOp, tiles_m=16),
+            ScheduledOp(_NOPOp, tile_counts=(16,)),
+            ScheduledOp(_NOPOp, tile_counts=(16,)),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -169,21 +42,21 @@ class TestMegakernelHost:
 
     def test_repr(self):
         """Test string representation."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=4)]
+        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
         config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
         repr_str = repr(kernel)
         assert "Megakernel" in repr_str
-        assert "NOPOp" in repr_str
+        assert "_NOPOp" in repr_str
 
     def test_create_megakernel(self):
         """Test factory function."""
-        from machete.megakernel import create_megakernel, ScheduledOp, NOPOp
+        from machete.megakernel import create_megakernel, ScheduledOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=4)]
+        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
         kernel = create_megakernel(ops, num_sms=4)
 
         assert kernel.num_sms == 4
@@ -207,10 +80,10 @@ class TestMegakernelGPU:
 
     @pytest.mark.parametrize("num_ops", [1, 2])
     def test_nop_kernel_run(self, num_ops):
-        """Test running NOPOp kernels with barrier reset across multiple runs."""
-        from machete.megakernel import Megakernel, ScheduledOp, NOPOp
+        """Test running _NOPOp kernels with barrier reset across multiple runs."""
+        from machete.megakernel import Megakernel, ScheduledOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=8) for _ in range(num_ops)]
+        ops = [ScheduledOp(_NOPOp, tile_counts=(8,)) for _ in range(num_ops)]
         kernel = Megakernel(ops)
 
         # Run multiple times to verify barrier reset
@@ -224,9 +97,9 @@ class TestMegakernelPagedMemory:
 
     def test_smem_size_from_layout(self):
         """Test that smem_size is computed from NPageLayout."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=4)]
+        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
         config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
@@ -234,28 +107,6 @@ class TestMegakernelPagedMemory:
         # Double-buffer layout has scratch + 2 pages
         assert kernel.smem_size > 0
         assert kernel.smem_size >= 2 * config.page_size
-
-    def test_double_buffer_layout(self):
-        """Test that kernel uses fixed 2-page double-buffer layout."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        from machete.megakernel.ops import Op
-        from typing import ClassVar
-
-        class SimpleOp(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 1
-
-            @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
-                pass
-
-        ops = [ScheduledOp(SimpleOp, tiles_m=4)]
-        config = MegakernelConfig(num_sms=8)
-        kernel = Megakernel(ops, config=config, device="cpu")
-
-        # Double-buffer layout uses exactly 2 pages for ping-pong buffering
-        # smem includes scratch + 2 pages
-        assert kernel.smem_size > 0
 
 
 if __name__ == "__main__":

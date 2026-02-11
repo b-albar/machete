@@ -10,7 +10,7 @@ Usage:
     # q_rotated is q modified in-place, with autograd support.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -42,6 +42,9 @@ class RopeAutogradOp(AutogradOp):
             TensorSpec("sin"),
             TensorSpec("q_rotated", is_output=True, mutated_from="q"),
         ]
+
+    def get_tile_sizes(self) -> Optional[Dict[str, int]]:
+        return {"M": 1}
 
     def prepare_tensors(self, q, cos, sin, **kw) -> Dict[str, torch.Tensor]:
         b, s, h, d = q.shape

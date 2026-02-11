@@ -40,10 +40,10 @@ NUM_BITS = TILE_ELEMS * 16  # bits per tile for copy atom
 class MulTwoOp(Op):
     reads = {"x": (None, ("M",))}
     writes = {"y": (None, ("M",))}
-    tile = (("M", TILE_ELEMS),)
+    tile = ("M",)
 
     @staticmethod
-    def load(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar,
+    def load(page_ptr, op_config_ptr, work_mbar,
              x=None, x_dtype=None, tile_size_M=0):
         nbytes = Int32(tile_size_M * ELEM_BYTES)
 
@@ -57,7 +57,7 @@ class MulTwoOp(Op):
         )
         # Gmem tile at offset
         g_tile = cute.make_tensor(
-            x.iterator + tile_m * Int32(tile_size_M),
+            x.iterator + tile_0 * Int32(tile_size_M),
             cute.make_layout((tile_size_M,)),
         )
 
@@ -69,7 +69,7 @@ class MulTwoOp(Op):
         # Returns immediately — MMA warps wait on work_mbar before compute
 
     @staticmethod
-    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr,
+    def compute(page_ptr, op_config_ptr,
                 x_dtype=None, tile_size_M=0, tidx=0, num_threads=0):
         s = cute.make_tensor(
             cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem),
@@ -80,7 +80,7 @@ class MulTwoOp(Op):
             s[i] = val + val
 
     @staticmethod
-    def store(page_ptr, tile_m, tile_n, tile_l, op_config_ptr,
+    def store(page_ptr, op_config_ptr,
               y=None, y_dtype=None, tile_size_M=0):
         nbytes = Int32(tile_size_M * ELEM_BYTES)
         s2g = cute.make_copy_atom(CopyBulkS2GOp(), y_dtype, num_bits_per_copy=NUM_BITS)
@@ -90,7 +90,7 @@ class MulTwoOp(Op):
             cute.make_layout((tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            y.iterator + tile_m * Int32(tile_size_M),
+            y.iterator + tile_0 * Int32(tile_size_M),
             cute.make_layout((tile_size_M,)),
         )
 
@@ -101,10 +101,10 @@ class MulTwoOp(Op):
 class AddTwoOp(Op):
     reads = {"a": (None, ("M",))}
     writes = {"b": (None, ("M",))}
-    tile = (("M", TILE_ELEMS),)
+    tile = ("M",)
 
     @staticmethod
-    def load(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar,
+    def load(page_ptr, op_config_ptr, work_mbar,
              a=None, a_dtype=None, tile_size_M=0):
         nbytes = Int32(tile_size_M * ELEM_BYTES)
         g2s = cute.make_copy_atom(CopyBulkG2SOp(), a_dtype, num_bits_per_copy=NUM_BITS)
@@ -114,7 +114,7 @@ class AddTwoOp(Op):
             cute.make_layout((tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            a.iterator + tile_m * Int32(tile_size_M),
+            a.iterator + tile_0 * Int32(tile_size_M),
             cute.make_layout((tile_size_M,)),
         )
 
@@ -124,7 +124,7 @@ class AddTwoOp(Op):
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @staticmethod
-    def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr,
+    def compute(page_ptr, op_config_ptr,
                 a_dtype=None, tile_size_M=0, tidx=0, num_threads=0):
         s = cute.make_tensor(
             cute.make_ptr(a_dtype, page_ptr, cute.AddressSpace.smem),
@@ -135,7 +135,7 @@ class AddTwoOp(Op):
             s[i] = s[i] + two
 
     @staticmethod
-    def store(page_ptr, tile_m, tile_n, tile_l, op_config_ptr,
+    def store(page_ptr, op_config_ptr,
               b=None, b_dtype=None, tile_size_M=0):
         nbytes = Int32(tile_size_M * ELEM_BYTES)
         s2g = cute.make_copy_atom(CopyBulkS2GOp(), b_dtype, num_bits_per_copy=NUM_BITS)
@@ -145,7 +145,7 @@ class AddTwoOp(Op):
             cute.make_layout((tile_size_M,)),
         )
         g_tile = cute.make_tensor(
-            b.iterator + tile_m * Int32(tile_size_M),
+            b.iterator + tile_0 * Int32(tile_size_M),
             cute.make_layout((tile_size_M,)),
         )
 
@@ -161,20 +161,20 @@ class TestSmemPipelinedOps:
     def test_mul_two(self):
         x = torch.randn(1024, dtype=torch.float16, device="cuda")
         y = torch.empty_like(x)
-        Megakernel([MulTwoOp.schedule(x=x, y=y)]).run()
+        Megakernel([MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})]).run()
         torch.testing.assert_close(y, x * 2, atol=1e-3, rtol=1e-3)
 
     def test_add_two(self):
         a = torch.randn(1024, dtype=torch.float16, device="cuda")
         b = torch.empty_like(a)
-        Megakernel([AddTwoOp.schedule(a=a, b=b)]).run()
+        Megakernel([AddTwoOp.schedule(a=a, b=b, tile_sizes={"M": TILE_ELEMS})]).run()
         torch.testing.assert_close(b, a + 2, atol=1e-3, rtol=1e-3)
 
     def test_mul_then_add(self):
         x = torch.randn(1024, dtype=torch.float16, device="cuda")
         y = torch.empty_like(x)
         z = torch.empty_like(x)
-        ops = [MulTwoOp.schedule(x=x, y=y), AddTwoOp.schedule(a=y, b=z)]
+        ops = [MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS}), AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})]
         Megakernel(ops).run()
         torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
 
@@ -183,7 +183,7 @@ class TestSmemPipelinedOps:
         x = torch.randn(1024, dtype=dtype, device="cuda")
         y = torch.empty_like(x)
         z = torch.empty_like(x)
-        ops = [MulTwoOp.schedule(x=x, y=y), AddTwoOp.schedule(a=y, b=z)]
+        ops = [MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS}), AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})]
         Megakernel(ops).run()
         tol = dict(atol=5e-2, rtol=5e-2) if dtype == torch.bfloat16 else dict(atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(z, x * 2 + 2, **tol)

@@ -24,8 +24,8 @@ Barrier Mapping:
     - expected = 1 per barrier
 
 Test Strategy:
-    Producer: writes value (tile_m + 1) to data[tile_m]
-    Consumer: reads data[tile_m], writes data[tile_m] * (tile_n + 1) to output[tile_m * N + tile_n]
+    Producer: writes value (tile_0 + 1) to data[tile_0]
+    Consumer: reads data[tile_0], writes data[tile_0] * (tile_1 + 1) to output[tile_0 * N + tile_1]
     Verify: output[m * N + n] = (m + 1) * (n + 1)
 """
 
@@ -58,50 +58,46 @@ _num_cols = 4  # N dimension for output linearization
 
 class Producer1DOp(Op):
     """
-    Writes (tile_m + 1) to data[tile_m].
+    Writes (tile_0 + 1) to data[tile_0].
 
-    This producer only iterates over M dimension.
+    This producer only iterates over dimension 0.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            val = tile_m + Int32(1)
-            st_global_i32(Int64(_producer_data_ptr), tile_m, val)
+            val = tile_0 + Int32(1)
+            st_global_i32(Int64(_producer_data_ptr), tile_0, val)
 
 
 class Consumer2DOp(Op):
     """
-    Reads data[tile_m], writes data[tile_m] * (tile_n + 1) to output[tile_m * N + tile_n].
+    Reads data[tile_0], writes data[tile_0] * (tile_1 + 1) to output[tile_0 * N + tile_1].
 
-    This consumer iterates over M x N dimensions.
-    Multiple consumer tiles with the same M read from the same producer output.
+    This consumer iterates over dimensions 0 x 1.
+    Multiple consumer tiles with the same dim 0 read from the same producer output.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            val = ld_global_i32(Int64(_producer_data_ptr), tile_m)
-            out_idx = tile_m * Int32(_num_cols) + tile_n
-            st_global_i32(Int64(_consumer_result_ptr), out_idx, val * (tile_n + Int32(1)))
+            val = ld_global_i32(Int64(_producer_data_ptr), tile_0)
+            out_idx = tile_0 * Int32(_num_cols) + tile_1
+            st_global_i32(Int64(_consumer_result_ptr), out_idx, val * (tile_1 + Int32(1)))
 
 
 # =============================================================================
@@ -129,8 +125,8 @@ class TestOneToManyPatternGPU:
         │ (3,0) (3,1) (3,2) (3,3) ← M=3   │
         └─────────────────────────────────┘
 
-    Producer m writes (m+1) to data[m].
-    Consumer (m, n) reads data[m] and writes data[m] * (n+1) to output[m * N + n].
+    Producer tile_0 writes (tile_0+1) to data[tile_0].
+    Consumer (tile_0, tile_1) reads data[tile_0] and writes data[tile_0] * (tile_1+1) to output[tile_0 * N + tile_1].
     Expected: output[m * N + n] = (m+1) * (n+1)
     """
 
@@ -155,12 +151,12 @@ class TestOneToManyPatternGPU:
 
         ops = [
             ScheduledOp(
-                Producer1DOp, tiles_m=tiles_m,
-                dim_names={"batch": "m"}
+                Producer1DOp, tile_counts=(tiles_m,),
+                dim_names={"batch": 0}
             ),
             ScheduledOp(
-                Consumer2DOp, tiles_m=tiles_m, tiles_n=tiles_n,
-                dim_names={"batch": "m", "seq": "n"}
+                Consumer2DOp, tile_counts=(tiles_m, tiles_n),
+                dim_names={"batch": 0, "seq": 1}
             ),
         ]
 
@@ -202,12 +198,12 @@ class TestOneToManyPatternGPU:
 
         ops = [
             ScheduledOp(
-                Producer1DOp, tiles_m=tiles_m,
-                dim_names={"batch": "m"}
+                Producer1DOp, tile_counts=(tiles_m,),
+                dim_names={"batch": 0}
             ),
             ScheduledOp(
-                Consumer2DOp, tiles_m=tiles_m, tiles_n=tiles_n,
-                dim_names={"batch": "m", "seq": "n"}
+                Consumer2DOp, tile_counts=(tiles_m, tiles_n),
+                dim_names={"batch": 0, "seq": 1}
             ),
         ]
 
@@ -228,7 +224,7 @@ class TestOneToManyPatternGPU:
         """
         Three-op chain: A(1D) -> B(1D) -> C(2D)
 
-        Op A (1D): writes (tile_m + 1) to buf1[tile_m]
+        Op A (1D): writes (tile_0 + 1) to buf1[tile_0]
         Op B (1D): reads buf1[m], writes buf1[m] * 2 to buf2[m]
         Op C (2D): reads buf2[m], writes buf2[m] * (n+1) to buf3[m * N + n]
 
@@ -245,43 +241,40 @@ class TestOneToManyPatternGPU:
         total_output = tiles_m * tiles_n
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    st_global_i32(Int64(_buf1_ptr), tile_m, tile_m + Int32(1))
+                    st_global_i32(Int64(_buf1_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_buf1_ptr), tile_m)
-                    st_global_i32(Int64(_buf2_ptr), tile_m, val * Int32(2))
+                    val = ld_global_i32(Int64(_buf1_ptr), tile_0)
+                    st_global_i32(Int64(_buf2_ptr), tile_0, val * Int32(2))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["buf2"]
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_buf2_ptr), tile_m)
-                    out_idx = tile_m * Int32(_num_cols) + tile_n
-                    st_global_i32(Int64(_buf3_ptr), out_idx, val * (tile_n + Int32(1)))
+                    val = ld_global_i32(Int64(_buf2_ptr), tile_0)
+                    out_idx = tile_0 * Int32(_num_cols) + tile_1
+                    st_global_i32(Int64(_buf3_ptr), out_idx, val * (tile_1 + Int32(1)))
 
         buf1 = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
         buf2 = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
@@ -292,9 +285,9 @@ class TestOneToManyPatternGPU:
         _buf3_ptr = buf3.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
+            ScheduledOp(OpA, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
         ]
 
         config = MegakernelConfig(num_sms=2)

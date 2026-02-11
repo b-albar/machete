@@ -23,9 +23,9 @@ Barrier Mapping:
     - expected = N (number of producer signals per barrier)
 
 Test Strategy:
-    Producer: writes (tile_m * 1000 + tile_n) to matrix[tile_m * N + tile_n]
-    Consumer: reads matrix[tile_m * N + (N-1)], verifies last producer ran, writes to output
-    Verify: consumer results indicate all producers for that M completed
+    Producer: writes (tile_0 * 1000 + tile_1) to matrix[tile_0 * N + tile_1]
+    Consumer: reads matrix[tile_0 * N + (N-1)], verifies last producer ran, writes to output
+    Verify: consumer results indicate all producers for that dim 0 completed
 """
 
 import pytest
@@ -57,56 +57,52 @@ _num_cols = 4  # N dimension
 
 class Producer2DOp(Op):
     """
-    Writes (tile_m * 1000 + tile_n) to matrix[tile_m * N + tile_n].
+    Writes (tile_0 * 1000 + tile_1) to matrix[tile_0 * N + tile_1].
 
-    This producer iterates over M x N dimensions.
+    This producer iterates over dimensions 0 x 1.
     Each producer tile writes to a unique location in the matrix.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            # Write tile_m * 1000 + tile_n to uniquely identify this producer
-            idx = tile_m * Int32(_num_cols) + tile_n
-            val = tile_m * Int32(1000) + tile_n
+            # Write tile_0 * 1000 + tile_1 to uniquely identify this producer
+            idx = tile_0 * Int32(_num_cols) + tile_1
+            val = tile_0 * Int32(1000) + tile_1
             st_global_i32(Int64(_producer_matrix_ptr), idx, val)
 
 
 class Consumer1DOp(Op):
     """
-    Reads the last producer value for this M, writes m * 100 + 7 to output.
+    Reads the last producer value for this dim 0, writes m * 100 + 7 to output.
 
     If barrier synchronization works correctly, the last producer tile
     (m, N-1) will have already written its value before the consumer runs.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read the last producer's value to verify it completed
             last_n = Int32(_num_cols) - Int32(1)
-            idx = tile_m * Int32(_num_cols) + last_n
+            idx = tile_0 * Int32(_num_cols) + last_n
             _ = ld_global_i32(Int64(_producer_matrix_ptr), idx)
             # Write consumer result
-            st_global_i32(Int64(_consumer_result_ptr), tile_m, tile_m * Int32(100) + Int32(7))
+            st_global_i32(Int64(_consumer_result_ptr), tile_0, tile_0 * Int32(100) + Int32(7))
 
 
 # =============================================================================
@@ -157,12 +153,12 @@ class TestManyToOnePatternGPU:
 
         ops = [
             ScheduledOp(
-                Producer2DOp, tiles_m=tiles_m, tiles_n=tiles_n,
-                dim_names={"batch": "m", "seq": "n"}
+                Producer2DOp, tile_counts=(tiles_m, tiles_n),
+                dim_names={"batch": 0, "seq": 1}
             ),
             ScheduledOp(
-                Consumer1DOp, tiles_m=tiles_m,
-                dim_names={"batch": "m"}
+                Consumer1DOp, tile_counts=(tiles_m,),
+                dim_names={"batch": 0}
             ),
         ]
 
@@ -205,12 +201,12 @@ class TestManyToOnePatternGPU:
 
         ops = [
             ScheduledOp(
-                Producer2DOp, tiles_m=tiles_m, tiles_n=tiles_n,
-                dim_names={"batch": "m", "seq": "n"}
+                Producer2DOp, tile_counts=(tiles_m, tiles_n),
+                dim_names={"batch": 0, "seq": 1}
             ),
             ScheduledOp(
-                Consumer1DOp, tiles_m=tiles_m,
-                dim_names={"batch": "m"}
+                Consumer1DOp, tile_counts=(tiles_m,),
+                dim_names={"batch": 0}
             ),
         ]
 
@@ -229,7 +225,7 @@ class TestManyToOnePatternGPU:
         """
         Three-op chain: A(2D) -> B(1D) -> C(1D)
 
-        Op A (2D): writes (tile_m * 1000 + tile_n) to matrix[m * N + n]
+        Op A (2D): writes (tile_0 * 1000 + tile_1) to matrix[m * N + n]
         Op B (1D): reads matrix, writes m * 200 + 1 to buf[m]
         Op C (1D): reads buf[m], writes buf[m] * 3 to output[m]
 
@@ -245,44 +241,41 @@ class TestManyToOnePatternGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["data"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    idx = tile_m * Int32(_num_cols) + tile_n
-                    st_global_i32(Int64(_matrix_ptr), idx, tile_m * Int32(1000) + tile_n)
+                    idx = tile_0 * Int32(_num_cols) + tile_1
+                    st_global_i32(Int64(_matrix_ptr), idx, tile_0 * Int32(1000) + tile_1)
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["data"]
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    # Read last value for this M to verify producers completed
-                    _ = ld_global_i32(Int64(_matrix_ptr), tile_m * Int32(_num_cols) + Int32(_num_cols - 1))
-                    st_global_i32(Int64(_buf_ptr), tile_m, tile_m * Int32(200) + Int32(1))
+                    # Read last value for this dim 0 to verify producers completed
+                    _ = ld_global_i32(Int64(_matrix_ptr), tile_0 * Int32(_num_cols) + Int32(_num_cols - 1))
+                    st_global_i32(Int64(_buf_ptr), tile_0, tile_0 * Int32(200) + Int32(1))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["buf"]
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_buf_ptr), tile_m)
-                    st_global_i32(Int64(_output_ptr), tile_m, val * Int32(3))
+                    val = ld_global_i32(Int64(_buf_ptr), tile_0)
+                    st_global_i32(Int64(_output_ptr), tile_0, val * Int32(3))
 
         matrix = torch.zeros(tiles_m * tiles_n, dtype=torch.int32, device="cuda")
         buf = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
@@ -293,9 +286,9 @@ class TestManyToOnePatternGPU:
         _output_ptr = output.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
-            ScheduledOp(OpB, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=tiles_m, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
+            ScheduledOp(OpB, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(tiles_m,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)

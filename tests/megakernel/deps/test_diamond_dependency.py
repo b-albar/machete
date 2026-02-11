@@ -29,10 +29,10 @@ Barrier Mapping:
     - C → D: barrier set 4
 
 Test Strategy:
-    A: writes (tile_m + 1) to data[tile_m]
-    B: reads data[tile_m], writes data[tile_m] * 2 to buf_b[tile_m]
-    C: reads data[tile_m], writes data[tile_m] * 3 to buf_c[tile_m]
-    D: reads buf_b[tile_m] and buf_c[tile_m], writes sum to output[tile_m]
+    A: writes (tile_0 + 1) to data[tile_0]
+    B: reads data[tile_0], writes data[tile_0] * 2 to buf_b[tile_0]
+    C: reads data[tile_0], writes data[tile_0] * 3 to buf_c[tile_0]
+    D: reads buf_b[tile_0] and buf_c[tile_0], writes sum to output[tile_0]
     Verify: output[m] = (m+1)*2 + (m+1)*3 = (m+1)*5
 """
 
@@ -65,79 +65,71 @@ _output_ptr = 0
 
 
 class OpA(Op):
-    """Root producer: writes (tile_m + 1) to data[tile_m]."""
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+    """Root producer: writes (tile_0 + 1) to data[tile_0]."""
+
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            st_global_i32(Int64(_data_ptr), tile_m, tile_m + Int32(1))
+            st_global_i32(Int64(_data_ptr), tile_0, tile_0 + Int32(1))
 
 
 class OpB(Op):
-    """Branch B: reads data[tile_m], writes data[tile_m] * 2 to buf_b[tile_m]."""
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+    """Branch B: reads data[tile_0], writes data[tile_0] * 2 to buf_b[tile_0]."""
+
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = ["buf_b"]
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            val = ld_global_i32(Int64(_data_ptr), tile_m)
-            st_global_i32(Int64(_buf_b_ptr), tile_m, val * Int32(2))
+            val = ld_global_i32(Int64(_data_ptr), tile_0)
+            st_global_i32(Int64(_buf_b_ptr), tile_0, val * Int32(2))
 
 
 class OpC(Op):
-    """Branch C: reads data[tile_m], writes data[tile_m] * 3 to buf_c[tile_m]."""
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+    """Branch C: reads data[tile_0], writes data[tile_0] * 3 to buf_c[tile_0]."""
+
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = ["buf_c"]
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            val = ld_global_i32(Int64(_data_ptr), tile_m)
-            st_global_i32(Int64(_buf_c_ptr), tile_m, val * Int32(3))
+            val = ld_global_i32(Int64(_data_ptr), tile_0)
+            st_global_i32(Int64(_buf_c_ptr), tile_0, val * Int32(3))
 
 
 class OpD(Op):
     """Join: reads buf_b and buf_c, writes sum to output."""
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
     INPUTS: ClassVar[List[str]] = ["buf_b", "buf_c"]
     OUTPUTS: ClassVar[List[str]] = []
 
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            b_val = ld_global_i32(Int64(_buf_b_ptr), tile_m)
-            c_val = ld_global_i32(Int64(_buf_c_ptr), tile_m)
-            st_global_i32(Int64(_output_ptr), tile_m, b_val + c_val)
+            b_val = ld_global_i32(Int64(_buf_b_ptr), tile_0)
+            c_val = ld_global_i32(Int64(_buf_c_ptr), tile_0)
+            st_global_i32(Int64(_output_ptr), tile_0, b_val + c_val)
 
 
 # =============================================================================
@@ -195,10 +187,10 @@ class TestDiamondDependencyGPU:
         _output_ptr = output.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpD, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpD, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)
@@ -231,10 +223,10 @@ class TestDiamondDependencyGPU:
         _output_ptr = output.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpD, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpD, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)
@@ -268,70 +260,65 @@ class TestDiamondDependencyGPU:
         num_tiles = 4
 
         class OpA3(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    st_global_i32(Int64(_a_ptr), tile_m, tile_m + Int32(1))
+                    st_global_i32(Int64(_a_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB3(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_a_ptr), tile_m)
-                    st_global_i32(Int64(_b_ptr), tile_m, val * Int32(2))
+                    val = ld_global_i32(Int64(_a_ptr), tile_0)
+                    st_global_i32(Int64(_b_ptr), tile_0, val * Int32(2))
 
         class OpC3(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_a_ptr), tile_m)
-                    st_global_i32(Int64(_c_ptr), tile_m, val * Int32(3))
+                    val = ld_global_i32(Int64(_a_ptr), tile_0)
+                    st_global_i32(Int64(_c_ptr), tile_0, val * Int32(3))
 
         class OpD3(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["d"]
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_a_ptr), tile_m)
-                    st_global_i32(Int64(_d_ptr), tile_m, val * Int32(4))
+                    val = ld_global_i32(Int64(_a_ptr), tile_0)
+                    st_global_i32(Int64(_d_ptr), tile_0, val * Int32(4))
 
         class OpE3(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
+
             INPUTS: ClassVar[List[str]] = ["b", "c", "d"]
             OUTPUTS: ClassVar[List[str]] = []
 
             @staticmethod
-            def compute(page_ptr, tile_m, tile_n, tile_l, op_config_ptr):
+            def compute(page_ptr, op_config_ptr):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    b_val = ld_global_i32(Int64(_b_ptr), tile_m)
-                    c_val = ld_global_i32(Int64(_c_ptr), tile_m)
-                    d_val = ld_global_i32(Int64(_d_ptr), tile_m)
-                    st_global_i32(Int64(_e_ptr), tile_m, b_val + c_val + d_val)
+                    b_val = ld_global_i32(Int64(_b_ptr), tile_0)
+                    c_val = ld_global_i32(Int64(_c_ptr), tile_0)
+                    d_val = ld_global_i32(Int64(_d_ptr), tile_0)
+                    st_global_i32(Int64(_e_ptr), tile_0, b_val + c_val + d_val)
 
         a = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
         b = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
@@ -346,11 +333,11 @@ class TestDiamondDependencyGPU:
         _e_ptr = e.data_ptr()
 
         ops = [
-            ScheduledOp(OpA3, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpB3, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpC3, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpD3, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpE3, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(OpA3, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpB3, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpC3, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpD3, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpE3, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)

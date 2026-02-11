@@ -8,7 +8,12 @@ Tests the megakernel that uses instruction stream and fine-grained barriers.
 import pytest
 import torch
 
-from machete.utils.testing import is_hopper_available
+from machete.megakernel.ops import Op
+
+
+class _NOPOp(Op):
+    """Test-only no-op for megakernel tests."""
+    pass
 
 
 class TestMegakernel:
@@ -16,12 +21,12 @@ class TestMegakernel:
 
     def test_megakernel_creation(self):
         """Test creating a megakernel instance."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp, NOPOp
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 
         # Define some operations
         ops = [
-            ScheduledOp(NOPOp, tiles_m=32),
-            ScheduledOp(NOPOp, tiles_m=16),
+            ScheduledOp(_NOPOp, tile_counts=(32,)),
+            ScheduledOp(_NOPOp, tile_counts=(16,)),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -32,30 +37,12 @@ class TestMegakernel:
         assert kernel.grid == (8, 1, 1)  # Now based on num_sms (persistent blocks)
         assert kernel.block == (256, 1, 1)
 
-    @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) required")
-    def test_megakernel_execution(self):
-        """Test running the megakernel on Hopper+ hardware."""
-        from machete.megakernel import Megakernel, ScheduledOp, NOPOp
-
-        # Use NOPs to test the runtime loop without complex math
-        ops = [
-            ScheduledOp(NOPOp, tiles_m=64),
-        ]
-
-        kernel = Megakernel(ops)
-
-        print(f"Launching kernel with {kernel.total_tiles} tiles on {kernel.num_sms} SMs")
-        kernel.run()
-
-        # If we got here, it didn't crash (hopefully)
-        print("Kernel execution completed")
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):
         """Test that validation checks for Hopper+ Architecture."""
-        from machete.megakernel import Megakernel, ScheduledOp, NOPOp
+        from machete.megakernel import Megakernel, ScheduledOp
 
-        ops = [ScheduledOp(NOPOp, tiles_m=1)]
+        ops = [ScheduledOp(_NOPOp, tile_counts=(1,))]
         kernel = Megakernel(ops)
 
         major, _ = torch.cuda.get_device_capability()

@@ -42,7 +42,7 @@ class RopeOp(Op):
         sin: (S, D2)     — sine table, same dtype as q
 
     Tiling:
-        tile_m indexes M (one tile per position, M = batch * seqlen).
+        tile_M indexes M (one tile per position, M = batch * seqlen).
     """
 
     # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
@@ -59,12 +59,9 @@ class RopeOp(Op):
     @staticmethod
     def compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
-        """Apply RoPE rotation for one position (tile_m) across all heads.
+        """Apply RoPE rotation for one position (tile_M) across all heads.
 
         Zero-page op: all data accessed directly from global memory.
         page_ptr is unused.
@@ -74,14 +71,14 @@ class RopeOp(Op):
         cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
         sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
 
-        s = tile_m % S
+        s = tile_M % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):
             h = work_idx // D2
             i = work_idx % D2
 
             cs_idx = s * D2 + i
-            q0_idx = tile_m * H * D + h * D + i
+            q0_idx = tile_M * H * D + h * D + i
             q1_idx = q0_idx + D2
 
             # Load and convert to fp32 for computation
@@ -100,9 +97,6 @@ class RopeOp(Op):
     @staticmethod
     def backward_compute(
         page_ptr: Int32,
-        tile_m: Int32,
-        tile_n: Int32,
-        tile_l: Int32,
         op_config_ptr: Int64,
     ) -> None:
         """Inverse RoPE rotation (transpose of forward rotation matrix).
@@ -115,14 +109,14 @@ class RopeOp(Op):
         cos = cute.make_tensor(cos.iterator, cute.make_layout(S * D2))
         sin = cute.make_tensor(sin.iterator, cute.make_layout(S * D2))
 
-        s = tile_m % S
+        s = tile_M % S
         total_work = H * D2
         for work_idx in range(tidx, total_work, num_threads):
             h = work_idx // D2
             i = work_idx % D2
 
             cs_idx = s * D2 + i
-            q0_idx = tile_m * H * D + h * D + i
+            q0_idx = tile_M * H * D + h * D + i
             q1_idx = q0_idx + D2
 
             # Load and convert to fp32 for computation

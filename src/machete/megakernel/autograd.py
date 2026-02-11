@@ -86,7 +86,9 @@ class MegakernelFunction(Function):
         scheduled_ops = []
         for i, aop in enumerate(autograd_ops):
             prepared = aop.prepare_tensors(**per_op_tensors[i])
-            scheduled_ops.append(aop.op_cls.schedule(**prepared))
+            scheduled_ops.append(aop.op_cls.schedule(
+                tile_sizes=aop.get_tile_sizes(), **prepared
+            ))
 
         # ---- Step 4: Run forward megakernel (in-place, cached) ----
         if mk_config is None:
@@ -150,7 +152,9 @@ class MegakernelFunction(Function):
                     backward_tensors[spec.mutated_from] = per_op_grads[i][spec.name]
 
             prepared = aop.prepare_tensors(**backward_tensors)
-            scheduled_ops.append(aop.op_cls.schedule(**prepared))
+            scheduled_ops.append(aop.op_cls.schedule(
+                tile_sizes=aop.get_tile_sizes(), **prepared
+            ))
 
         # ---- Step 4: Run backward megakernel (in-place on grad, cached) ----
         _run_cached(scheduled_ops, mk_config, backward=True)

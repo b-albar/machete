@@ -13,7 +13,7 @@ Usage:
     tile_fn = compile_compute(MyOp, init_source, tensor_param_names=['t0', 't1'])
 
     # Returns @cute.jit function with signature:
-    #   fn(page_ptr: Int32, tile_m: Int32, tile_n: Int32, tile_l: Int32,
+    #   fn(page_ptr: Int32, tile_0..tile_4: Int32,
     #      op_config_ptr: Int64, t0, t1) -> None
 """
 
@@ -108,7 +108,8 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
     function using the op's local tensor names.
 
     Signature:
-        fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, [work_mbar,] x, weight, y) -> None
+        fn(page_ptr, tile_0, tile_1, tile_2, tile_3, tile_4, op_config_ptr,
+           [work_mbar,] x, weight, y) -> None
 
     Args:
         body_source: Combined init + op body source code.
@@ -133,9 +134,11 @@ def _build_phase_fn(body_source, exec_globals, tensor_param_names,
     if tensor_params_str:
         tensor_params_str = ", " + tensor_params_str
 
+    tile_params = ", ".join(f"tile_{i}" for i in range(5))
     fn_source = (
         "@cute.jit\n"
-        f"def phase_fn(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{extra_params_str}{tensor_params_str}):\n"
+        f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
+        f"{extra_params_str}{tensor_params_str}):\n"
         + textwrap.indent(body_source, "    ")
         + "\n"
     )
@@ -176,7 +179,7 @@ def compile_phase(phase_fn, init_source=None, tensor_param_names=None,
 
     Returns:
         @cute.jit function with signature:
-            (page_ptr, tile_m, tile_n, tile_l, op_config_ptr, [work_mbar,] x, weight, ...) -> None
+            (page_ptr, tile_0..4, op_config_ptr, [work_mbar,] x, weight, ...) -> None
     """
     if tensor_param_names is None:
         tensor_param_names = []

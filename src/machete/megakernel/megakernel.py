@@ -12,13 +12,10 @@ This module implements a "No Bubbles" megakernel architecture:
 6. Barrier wait/signal logic is baked into op handlers at compile time
 
 Usage:
-    from machete.megakernel import Megakernel, ScheduledOp, NOPOp
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormOp
 
-    ops = [
-        ScheduledOp(NOPOp, tiles_m=32),
-        ScheduledOp(NOPOp, tiles_m=32),
-    ]
-
+    ops = [RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})]
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -31,10 +28,12 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64
 
 from .ops import (
+    MAX_TILE_DIMS,
     ScheduledOp,
     TensorRegistry,
     InstructionStreamBuilder,
     TileInstruction,
+    INSTRUCTION_WORDS,
     validate_op_compatibility,
 )
 from .compile import (
@@ -132,8 +131,8 @@ class Megakernel:
 
     Example:
         ops = [
-            ScheduledOp(RMSNormOp, tiles_m=32),
-            ScheduledOp(MatVecOp, tiles_m=32),  # Can overlap with RMSNorm!
+            ScheduledOp(RMSNormOp, tile_counts=(32,)),
+            ScheduledOp(MatVecOp, tile_counts=(32,)),  # Can overlap with RMSNorm!
         ]
         kernel = Megakernel(ops)
         kernel.run()
@@ -411,6 +410,7 @@ class Megakernel:
                     tensor_dtypes=op.tensor_dtypes,
                     tensor_strides=op.tensor_strides,
                     warp_specialized=True,
+                    tile_sizes=op.tile_sizes,
                 )
                 dma_init = op.op_cls.gen_init_source(
                     op.static_dims,
@@ -420,6 +420,7 @@ class Megakernel:
                     tensor_dtypes=op.tensor_dtypes,
                     tensor_strides=op.tensor_strides,
                     dma_warp_mode=True,
+                    tile_sizes=op.tile_sizes,
                 )
 
             # Compile each phase with tensor params in signature
@@ -465,18 +466,20 @@ class Megakernel:
 
         Generates source like:
             @cute.jit
-            def dispatch_load(op_idx, page_ptr, tile_m, tile_n, tile_l,
+            def dispatch_load(op_idx, page_ptr, tile_0, ..., tile_4,
                               op_config_ptr, work_mbar, t0, t1, t2):
                 if op_idx == Int32(0):
-                    _fn_0(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar, t0, t1)
+                    _fn_0(page_ptr, tile_0, ..., tile_4, op_config_ptr, work_mbar, t0, t1)
                 if op_idx == Int32(1):
-                    _fn_1(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar, t2)
+                    _fn_1(page_ptr, tile_0, ..., tile_4, op_config_ptr, work_mbar, t2)
         """
         import linecache
         import machete.megakernel.compile as compile_mod
 
         is_load = phase_name == "load"
         tensor_params = ", ".join(all_canonical)
+
+        tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
 
         # Build dispatch branches (if/elif chain so only the matching op executes)
         lines = []
@@ -489,12 +492,12 @@ class Megakernel:
             if is_load:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr, work_mbar{args_str})"
+                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar{args_str})"
                 )
             else:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, tile_m, tile_n, tile_l, op_config_ptr{args_str})"
+                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr{args_str})"
                 )
 
         body = "\n".join(lines) if lines else "    pass"
@@ -503,7 +506,7 @@ class Megakernel:
         work_mbar_sig = ", work_mbar" if is_load else ""
         fn_source = (
             "@cute.jit\n"
-            f"def {fn_name}(op_idx, page_ptr, tile_m, tile_n, tile_l, "
+            f"def {fn_name}(op_idx, page_ptr, {tile_params}, "
             f"op_config_ptr{work_mbar_sig}{tensor_sig}):\n"
             f"{body}\n"
         )
@@ -554,8 +557,12 @@ class Megakernel:
         body = _extract_body(kernel_loop_fn)
         if tensor_params:
             body = re.sub(
-                r'(dispatch_(?:load|compute|store)\([^)]+)\)',
-                lambda m: m.group(1) + ', ' + tensor_params + ')',
+                r'(dispatch_(?:load|compute|store))\(([^)]*)\)',
+                lambda m: (
+                    m.group(1) + '('
+                    + m.group(2).rstrip().rstrip(',')
+                    + ', ' + tensor_params + ')'
+                ),
                 body,
             )
 
@@ -684,6 +691,7 @@ class Megakernel:
         import machete.megakernel.compile as compile_mod
 
         barrier_formulas = self._builder.get_op_barrier_formulas()
+        tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
 
         if mode == "check":
             fn_name = "check_barriers"
@@ -696,6 +704,25 @@ class Megakernel:
             preamble = ""
             epilogue = ""
 
+        def _barrier_idx_expr(wf):
+            """Generate barrier_idx expression from formula coefficients."""
+            parts = [f"Int32({wf.base})"]
+            for j in range(MAX_TILE_DIMS):
+                if wf.coeffs[j] != 0:
+                    parts.append(
+                        f"(Int32({wf.coeffs[j]}) * tile_{j}) "
+                        f"// Int32({wf.divs[j]})"
+                    )
+            return " + ".join(parts)
+
+        def _linear_expr(wf):
+            """Generate linear combination for guard check."""
+            parts = []
+            for j in range(MAX_TILE_DIMS):
+                if wf.coeffs[j] != 0:
+                    parts.append(f"Int32({wf.coeffs[j]}) * tile_{j}")
+            return " + ".join(parts) if parts else "Int32(0)"
+
         # Build if/elif branches for each op
         branches = []
         first = True
@@ -705,37 +732,30 @@ class Megakernel:
 
             formulas = wait_formulas if mode == "check" else signal_formulas
             if not formulas:
-                branches.append(f"    {keyword} op_idx == Int32({i}):\n        pass")
+                branches.append(
+                    f"    {keyword} op_idx == Int32({i}):\n"
+                    f"        pass"
+                )
                 continue
 
             lines = [f"    {keyword} op_idx == Int32({i}):"]
             for wf in formulas:
                 if mode == "signal":
                     lines.append(
-                        f"        barrier_idx = ("
-                        f"Int32({wf.base})"
-                        f" + (Int32({wf.coeff_m}) * tile_m) // Int32({wf.div_m})"
-                        f" + (Int32({wf.coeff_n}) * tile_n) // Int32({wf.div_n})"
-                        f" + (Int32({wf.coeff_l}) * tile_l) // Int32({wf.div_l})"
-                        f")"
+                        f"        barrier_idx = ({_barrier_idx_expr(wf)})"
                     )
-                    lines.append("        global_barrier_signal(barriers_ptr, barrier_idx)")
+                    lines.append(
+                        "        global_barrier_signal(barriers_ptr, barrier_idx)"
+                    )
                 else:  # check
                     lines.append(
-                        f"        _linear = ("
-                        f"Int32({wf.coeff_m}) * tile_m"
-                        f" + Int32({wf.coeff_n}) * tile_n"
-                        f" + Int32({wf.coeff_l}) * tile_l"
-                        f")"
+                        f"        _linear = ({_linear_expr(wf)})"
                     )
-                    lines.append(f"        if _linear < Int32({wf.guard_max}):")
                     lines.append(
-                        f"            barrier_idx = ("
-                        f"Int32({wf.base})"
-                        f" + (Int32({wf.coeff_m}) * tile_m) // Int32({wf.div_m})"
-                        f" + (Int32({wf.coeff_n}) * tile_n) // Int32({wf.div_n})"
-                        f" + (Int32({wf.coeff_l}) * tile_l) // Int32({wf.div_l})"
-                        f")"
+                        f"        if _linear < Int32({wf.guard_max}):"
+                    )
+                    lines.append(
+                        f"            barrier_idx = ({_barrier_idx_expr(wf)})"
                     )
                     lines.append(
                         f"            r = check_barrier_ready("
@@ -750,7 +770,7 @@ class Megakernel:
 
         fn_source = (
             "@cute.jit\n"
-            f"def {fn_name}(op_idx, tile_m, tile_n, tile_l, barriers_ptr){ret_type}:\n"
+            f"def {fn_name}(op_idx, {tile_params}, barriers_ptr){ret_type}:\n"
             f"{preamble}"
             f"{body}\n"
             f"{epilogue}"
@@ -837,6 +857,9 @@ class Megakernel:
         def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
             return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(8)
 
+        # Tile info size in bytes: INSTRUCTION_WORDS int32s per slot
+        tile_info_bytes = INSTRUCTION_WORDS * 4  # 6 * 4 = 24 bytes
+
         # Ring buffer kernel loop
         def _kernel_loop_ring(
             instructions_ptr: Int64,
@@ -894,18 +917,23 @@ class Megakernel:
                 next_instr_idx = block_id
                 done = Int32(0)
                 has_pending_store = Int32(0)
+                # Pending store tile info (op_idx + 5 tile indices)
                 _ps_op = Int32(0)
-                _ps_m = Int32(0)
-                _ps_n = Int32(0)
-                _ps_l = Int32(0)
+                _ps_0 = Int32(0)
+                _ps_1 = Int32(0)
+                _ps_2 = Int32(0)
+                _ps_3 = Int32(0)
+                _ps_4 = Int32(0)
 
                 # Instruction cache: load once from gmem, reuse across
                 # iterations when barriers aren't ready yet.
                 _instr_cached = Int32(0)
                 _ic_op = Int32(0)
-                _ic_m = Int32(0)
-                _ic_n = Int32(0)
-                _ic_l = Int32(0)
+                _ic_0 = Int32(0)
+                _ic_1 = Int32(0)
+                _ic_2 = Int32(0)
+                _ic_3 = Int32(0)
+                _ic_4 = Int32(0)
 
                 while done == Int32(0):
                     if lane_id == Int32(0):
@@ -916,7 +944,10 @@ class Megakernel:
                         # then signal barriers and free the page.
                         if has_pending_store == Int32(1):
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
-                            signal_barriers(_ps_op, _ps_m, _ps_n, _ps_l, barriers_ptr)
+                            signal_barriers(
+                                _ps_op, _ps_0, _ps_1, _ps_2, _ps_3, _ps_4,
+                                barriers_ptr,
+                            )
                             store_idx = store_idx + Int32(1)
                             has_pending_store = Int32(0)
 
@@ -936,22 +967,30 @@ class Megakernel:
                                 if _ic_op == Int32(TileInstruction.END_MARKER):
                                     next_instr_idx = num_instructions
                                 if _ic_op != Int32(TileInstruction.END_MARKER):
-                                    _ic_m = ld_shared_i32(scratch_ptr + 4)
-                                    _ic_n = ld_shared_i32(scratch_ptr + 8)
-                                    _ic_l = ld_shared_i32(scratch_ptr + 12)
+                                    _ic_0 = ld_shared_i32(scratch_ptr + 4)
+                                    _ic_1 = ld_shared_i32(scratch_ptr + 8)
+                                    _ic_2 = ld_shared_i32(scratch_ptr + 12)
+                                    _ic_3 = ld_shared_i32(scratch_ptr + 16)
+                                    _ic_4 = ld_shared_i32(scratch_ptr + 20)
                                     _instr_cached = Int32(1)
                             if _instr_cached == Int32(1):
-                                if check_barriers(_ic_op, _ic_m, _ic_n, _ic_l, barriers_ptr) == Int32(1):
+                                if check_barriers(_ic_op, _ic_0, _ic_1, _ic_2, _ic_3, _ic_4, barriers_ptr) == Int32(1):
                                     _p_slot = produce_idx % Int32(num_pages)
-                                    _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(16)
+                                    _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
                                     st_shared_i32(_p_ti, _ic_op)
-                                    st_shared_i32(_p_ti + 4, _ic_m)
-                                    st_shared_i32(_p_ti + 8, _ic_n)
-                                    st_shared_i32(_p_ti + 12, _ic_l)
+                                    st_shared_i32(_p_ti + 4, _ic_0)
+                                    st_shared_i32(_p_ti + 8, _ic_1)
+                                    st_shared_i32(_p_ti + 12, _ic_2)
+                                    st_shared_i32(_p_ti + 16, _ic_3)
+                                    st_shared_i32(_p_ti + 20, _ic_4)
                                     _p_config_ptr = ld_global_i64(op_configs_ptr, _ic_op)
                                     _p_pp = _get_page_ptr(smem_base, _p_slot)
                                     _p_wn = _work_notify_mbar(smem_base, _p_slot)
-                                    dispatch_load(_ic_op, _p_pp, _ic_m, _ic_n, _ic_l, _p_config_ptr, _p_wn)
+                                    dispatch_load(
+                                        _ic_op, _p_pp,
+                                        _ic_0, _ic_1, _ic_2, _ic_3, _ic_4,
+                                        _p_config_ptr, _p_wn,
+                                    )
                                     produce_idx = produce_idx + Int32(1)
                                     next_instr_idx = next_instr_idx + num_blocks
 
@@ -966,9 +1005,11 @@ class Megakernel:
                                         if _ic_op == Int32(TileInstruction.END_MARKER):
                                             next_instr_idx = num_instructions
                                         if _ic_op != Int32(TileInstruction.END_MARKER):
-                                            _ic_m = ld_shared_i32(scratch_ptr + 4)
-                                            _ic_n = ld_shared_i32(scratch_ptr + 8)
-                                            _ic_l = ld_shared_i32(scratch_ptr + 12)
+                                            _ic_0 = ld_shared_i32(scratch_ptr + 4)
+                                            _ic_1 = ld_shared_i32(scratch_ptr + 8)
+                                            _ic_2 = ld_shared_i32(scratch_ptr + 12)
+                                            _ic_3 = ld_shared_i32(scratch_ptr + 16)
+                                            _ic_4 = ld_shared_i32(scratch_ptr + 20)
                                             _instr_cached = Int32(1)
 
                         # STEP 3: TRY ISSUE STORE (S2G copy) — after produce
@@ -978,19 +1019,23 @@ class Megakernel:
                                 _s_slot = store_idx % Int32(num_pages)
                                 _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
                                 if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
-                                    _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(16)
+                                    _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                                     _s_op = ld_shared_i32(_s_ti)
-                                    _s_m = ld_shared_i32(_s_ti + 4)
-                                    _s_n = ld_shared_i32(_s_ti + 8)
-                                    _s_l = ld_shared_i32(_s_ti + 12)
+                                    _s_0 = ld_shared_i32(_s_ti + 4)
+                                    _s_1 = ld_shared_i32(_s_ti + 8)
+                                    _s_2 = ld_shared_i32(_s_ti + 12)
+                                    _s_3 = ld_shared_i32(_s_ti + 16)
+                                    _s_4 = ld_shared_i32(_s_ti + 20)
                                     _s_config_ptr = ld_global_i64(op_configs_ptr, _s_op)
                                     _s_pp = _get_page_ptr(smem_base, _s_slot)
-                                    dispatch_store(_s_op, _s_pp, _s_m, _s_n, _s_l, _s_config_ptr)
+                                    dispatch_store(_s_op, _s_pp, _s_0, _s_1, _s_2, _s_3, _s_4, _s_config_ptr)
                                     cute.arch.cp_async_bulk_commit_group()
                                     _ps_op = _s_op
-                                    _ps_m = _s_m
-                                    _ps_n = _s_n
-                                    _ps_l = _s_l
+                                    _ps_0 = _s_0
+                                    _ps_1 = _s_1
+                                    _ps_2 = _s_2
+                                    _ps_3 = _s_3
+                                    _ps_4 = _s_4
                                     has_pending_store = Int32(1)
 
                         # STEP 4: DONE — all fetched, all stored, nothing pending
@@ -1006,7 +1051,7 @@ class Megakernel:
                 if lane_id == Int32(0):
                     _sent = produce_idx % Int32(num_pages)
                     st_shared_i32(
-                        smem_base + Int32(ring_state_offset) + _sent * Int32(16),
+                        smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
                         Int32(TileInstruction.END_MARKER),
                     )
                     mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
@@ -1025,7 +1070,8 @@ class Megakernel:
 
                     # Read tile info (page == slot, no work queue indirection)
                     tile_info_ptr = (
-                        smem_base + Int32(ring_state_offset) + slot * Int32(16)
+                        smem_base + Int32(ring_state_offset)
+                        + slot * Int32(tile_info_bytes)
                     )
                     op_idx = ld_shared_i32(tile_info_ptr)
 
@@ -1034,15 +1080,21 @@ class Megakernel:
                         mma_running = Int32(0)
 
                     if op_idx != Int32(TileInstruction.END_MARKER):
-                        tile_m = ld_shared_i32(tile_info_ptr + 4)
-                        tile_n = ld_shared_i32(tile_info_ptr + 8)
-                        tile_l = ld_shared_i32(tile_info_ptr + 12)
+                        tile_0 = ld_shared_i32(tile_info_ptr + 4)
+                        tile_1 = ld_shared_i32(tile_info_ptr + 8)
+                        tile_2 = ld_shared_i32(tile_info_ptr + 12)
+                        tile_3 = ld_shared_i32(tile_info_ptr + 16)
+                        tile_4 = ld_shared_i32(tile_info_ptr + 20)
 
                         page_ptr = _get_page_ptr(smem_base, slot)
                         op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
 
                         # Compute
-                        dispatch_compute(op_idx, page_ptr, tile_m, tile_n, tile_l, op_config_ptr)
+                        dispatch_compute(
+                            op_idx, page_ptr,
+                            tile_0, tile_1, tile_2, tile_3, tile_4,
+                            op_config_ptr,
+                        )
 
                         # Sync MMA warps post-compute
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
@@ -1074,6 +1126,7 @@ class Megakernel:
                 "setmaxregister_decrease": setmaxregister_decrease,
                 "dma_reg_count": dma_reg_count,
                 "mma_reg_count": mma_reg_count,
+                "tile_info_bytes": tile_info_bytes,
             },
         )
 
@@ -1085,9 +1138,9 @@ class Megakernel:
         - Config parameters (threads, pages, etc.)
         - Backward flag
 
-        Tile counts (tiles_m, tiles_n, tiles_l) are included because barrier
-        formulas are baked into the kernel at compile time. Different tile
-        counts produce different barrier formulas and instruction streams.
+        Tile counts are included because barrier formulas are baked into
+        the kernel at compile time. Different tile counts produce different
+        barrier formulas and instruction streams.
         """
         op_keys = []
         for op in self.ops:
@@ -1099,15 +1152,13 @@ class Megakernel:
                 if op.tensor_dtypes
                 else ()
             )
-            # Include tile counts - barrier formulas are baked into the kernel
-            tile_counts = (op.tiles_m, op.tiles_n, op.tiles_l)
             # Include strides - different stride patterns require different compiled code
             strides_tuple = (
                 tuple(sorted((k, v) for k, v in op.tensor_strides.items()))
                 if op.tensor_strides else ()
             )
             op_keys.append((op.op_cls, static_dims_tuple, tensor_dtypes_tuple,
-                            tile_counts, strides_tuple))
+                            op.tile_counts, strides_tuple))
 
         config_key = (
             self.config.num_sms,
