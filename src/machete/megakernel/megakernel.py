@@ -1277,13 +1277,15 @@ class Megakernel:
         """Create a KernelBenchSpec for raw GPU kernel timing.
 
         Returns a spec that can be passed to the benchmark framework for
-        precise kernel-only timing (excludes CPU overhead, tensor copies,
-        barrier resets, etc.).
+        precise kernel-only timing via per-iteration CUDA event timing.
+
+        The persistent megakernel requires barrier resets between invocations,
+        so CUDA graph replay cannot be used. Each timed iteration calls
+        launch_fn() which resets barriers and launches the kernel.
 
         Args:
             setup_fn: Optional callable invoked before each timed iteration
-                to reset input tensors or other state. Runs outside the
-                timed region.
+                to reset input tensors or other state.
             keep_alive: Optional list of tensors/objects to prevent from being
                 garbage collected. The kernel references GPU memory via raw
                 pointers in op_configs_tensor — if the original tensors are
@@ -1303,7 +1305,6 @@ class Megakernel:
             spec = kernel.bench_spec(setup_fn=reset, keep_alive=[q, cos, sin])
         """
         import cuda.bindings.driver as cuda
-        from cutlass.cute.testing import JitArguments
         from machete.utils.benchmark_utils import KernelBenchSpec
 
         self.compile()
@@ -1320,11 +1321,11 @@ class Megakernel:
 
         cute_tensors = list(self._cute_tensors) if self._cute_tensors else []
 
-        def gen_workspace():
+        def launch_fn():
             if setup_fn is not None:
                 setup_fn()
             barriers_tensor.zero_()
-            return JitArguments(
+            compiled_kernel(
                 Int64(instructions_tensor.data_ptr()),
                 Int64(barriers_tensor.data_ptr()),
                 Int64(op_configs_tensor.data_ptr()),
@@ -1335,10 +1336,8 @@ class Megakernel:
             )
 
         return KernelBenchSpec(
-            compiled_kernel=compiled_kernel,
-            workspace_generator=gen_workspace,
+            launch_fn=launch_fn,
             stream=(bench_stream, cu_stream),
-            workspace_count=1,
             _keep_alive=(self, keep_alive),  # prevent GC from freeing GPU memory
         )
 

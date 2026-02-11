@@ -115,11 +115,15 @@ class Benchmark:
                 plt.close()
 
     def _bench_kernel_func(self, func_or_spec, warmup, rep):
-        """Benchmark a single function or KernelBenchSpec using CUDA graphs.
+        """Benchmark a single function or KernelBenchSpec.
+
+        For KernelBenchSpec: per-iteration CUDA event timing with barrier
+        resets (persistent megakernel is incompatible with CUDA graph replay).
+        For callables: CUDA graph capture + replay.
 
         Args:
             func_or_spec: A callable (benchmarked with torch CUDA graphs)
-                or a KernelBenchSpec (benchmarked with cute.testing.benchmark).
+                or a KernelBenchSpec (benchmarked with per-iteration events).
             warmup: Number of warmup iterations.
             rep: Number of timed iterations.
 
@@ -127,18 +131,27 @@ class Benchmark:
             Execution time in milliseconds.
         """
         if isinstance(func_or_spec, KernelBenchSpec):
-            torch_stream, cu_stream = func_or_spec.stream
+            torch_stream, _ = func_or_spec.stream
+            launch = func_or_spec.launch_fn
+
             with torch.cuda.stream(torch_stream):
-                time_us = benchmark_jit_kernel(
-                    func_or_spec.compiled_kernel,
-                    workspace_generator=func_or_spec.workspace_generator,
-                    warmup_iterations=warmup,
-                    iterations=rep,
-                    workspace_count=func_or_spec.workspace_count,
-                    stream=cu_stream,
-                    use_cuda_graphs=True,
-                )
-            return time_us / 1000.0
+                # Warmup
+                for _ in range(warmup):
+                    launch()
+                torch_stream.synchronize()
+
+                # Timed iterations with CUDA events
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                times = []
+                for _ in range(rep):
+                    start.record(torch_stream)
+                    launch()
+                    end.record(torch_stream)
+                    torch_stream.synchronize()
+                    times.append(start.elapsed_time(end))
+
+            return sum(times) / len(times)
         else:
             return benchmark_cuda_graph(func_or_spec, warmup=warmup, rep=rep)
 

@@ -30,24 +30,21 @@ except ImportError:
 
 @dataclass
 class KernelBenchSpec:
-    """Wraps a compiled CuTe JIT kernel for benchmarking with CUDA graphs.
+    """Wraps a compiled CuTe JIT kernel for benchmarking.
 
-    Used by Benchmark.run(mode="kernel") to distinguish CuTe JIT kernels
-    (which need cute.testing.benchmark) from regular callables (which use
-    torch.cuda.CUDAGraph).
+    Used by Benchmark.run(mode="kernel") to distinguish megakernel launches
+    from regular callables. The persistent megakernel requires barrier resets
+    between invocations, so CUDA graph replay is NOT used — each iteration
+    calls launch_fn() which resets barriers and launches the kernel.
 
     Attributes:
-        compiled_kernel: A compiled @cute.jit annotated object.
-        workspace_generator: Function returning JitArguments for each iteration.
-        stream: A (torch.cuda.Stream, CUstream) pair. The CUstream must match
-            the stream passed inside JitArguments by workspace_generator.
-        workspace_count: Number of workspaces to rotate through.
+        launch_fn: Callable that resets barriers and launches the kernel.
+            Must be called on the stream specified in ``stream``.
+        stream: A (torch.cuda.Stream, CUstream) pair.
     """
 
-    compiled_kernel: Any
-    workspace_generator: Callable
+    launch_fn: Callable
     stream: Any = None
-    workspace_count: int = 1
     _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
 
 
