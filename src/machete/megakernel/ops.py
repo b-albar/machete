@@ -275,6 +275,35 @@ def _process_op_declarations(cls):
         if t not in dim_lookup:
             raise ValueError(f"Tile dim '{t}' not found in any tensor shape declaration")
 
+    # --- Process TMA declarations ---
+    # tma_loads: set of tensor names to load via TMA G2S
+    # tma_stores: set of tensor names to store via TMA S2G
+    tma_loads = set(getattr(cls, "tma_loads", set()))
+    tma_stores = set(getattr(cls, "tma_stores", set()))
+
+    # Validate TMA tensors exist in reads/writes
+    read_names = set(reads.keys())
+    write_names = set(writes.keys())
+    for name in tma_loads:
+        if name not in read_names:
+            raise ValueError(f"tma_loads tensor '{name}' not found in reads")
+    for name in tma_stores:
+        if name not in write_names:
+            raise ValueError(f"tma_stores tensor '{name}' not found in writes")
+
+    cls._TMA_LOADS = tma_loads
+    cls._TMA_STORES = tma_stores
+
+    # Build TMA tile shape info per tensor.
+    # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
+    # The actual values are filled at schedule() time when static_dims are known.
+    tma_tensor_dims = {}  # {tensor_name: list of dim_names}
+    tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
+    for name in tma_loads | tma_stores:
+        if name in tensor_dims_map:
+            tma_tensor_dims[name] = tensor_dims_map[name]
+    cls._TMA_TENSOR_DIMS = tma_tensor_dims
+
     # Generate pack_config / pack_backward_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
@@ -415,6 +444,35 @@ def _process_op_declarations(cls):
         return [name for name, _, _ in tensors]
 
     cls.gen_tensor_param_names = gen_tensor_param_names
+
+    # Add gen_tma_param_names classmethod
+    @classmethod
+    def gen_tma_param_names(cls, phase="load"):
+        """Get TMA parameter names for a given phase.
+
+        For each TMA tensor in the given phase (load or store), returns pairs
+        of local parameter names: (name_tma, name_tma_gmem).
+
+        Args:
+            phase: "load" or "store"
+
+        Returns:
+            List of (local_atom_name, local_gmem_name, tensor_name) tuples.
+            Example: [("x_tma", "x_tma_gmem", "x")]
+        """
+        if phase == "load":
+            tma_names = cls._TMA_LOADS
+        elif phase == "store":
+            tma_names = cls._TMA_STORES
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
+
+        result = []
+        for name in tma_names:
+            result.append((f"{name}_tma", f"{name}_tma_gmem", name))
+        return result
+
+    cls.gen_tma_param_names = gen_tma_param_names
 
 
 # =============================================================================
@@ -781,6 +839,164 @@ class TensorRegistry:
         unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
         mapping = self.op_mappings[op_idx]
         return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
+
+
+# =============================================================================
+# TMA Registry (Descriptor Management for TMA Parameter Mode)
+# =============================================================================
+
+
+@dataclass
+class TMADescriptorInfo:
+    """Metadata for a single TMA descriptor to create at launch time.
+
+    Attributes:
+        canonical_atom: Canonical name for the TMA copy atom (e.g., "tma0_atom")
+        canonical_gmem: Canonical name for the TMA gmem tensor (e.g., "tma0_gmem")
+        tensor_canonical: Canonical tensor name (e.g., "t0") for the source tensor
+        direction: "g2s" (load) or "s2g" (store)
+        tile_shape: Tuple of ints, TMA tile shape per tensor dimension
+        smem_layout_shape: Tuple of ints, shared memory layout shape
+        dtype: CUTLASS dtype for the tensor
+    """
+
+    canonical_atom: str
+    canonical_gmem: str
+    tensor_canonical: str
+    direction: str  # "g2s" or "s2g"
+    tile_shape: Tuple[int, ...]
+    smem_layout_shape: Tuple[int, ...]
+    dtype: Any
+
+
+@dataclass
+class TMARegistry:
+    """Manages TMA descriptor naming and metadata across fused ops.
+
+    For each TMA load/store declaration, assigns canonical parameter names
+    and records the metadata needed to create TMA descriptors at launch time.
+
+    Usage:
+        registry = TMARegistry.from_ops(ops, tensor_registry)
+        # registry.descriptors → [TMADescriptorInfo(...), ...]
+        # registry.get_op_tma_args(0, "load") → ['tma0_atom', 'tma0_gmem']
+    """
+
+    descriptors: List[TMADescriptorInfo]
+    # Per-op, per-phase mappings: {(op_idx, phase): {local_name: canonical_name}}
+    op_mappings: Dict[Tuple[int, str], Dict[str, str]]
+
+    @classmethod
+    def from_ops(
+        cls,
+        ops: List["ScheduledOp"],
+        tensor_registry: "TensorRegistry",
+    ) -> "TMARegistry":
+        """Build a TMARegistry from scheduled ops.
+
+        For each TMA load/store declaration, computes the TMA tile shape
+        from the op's tile_sizes and static_dims, and assigns canonical names.
+        """
+        descriptors: List[TMADescriptorInfo] = []
+        op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
+        counter = 0
+
+        for i, op in enumerate(ops):
+            op_cls = op.op_cls
+            if not hasattr(op_cls, '_TMA_LOADS'):
+                op_mappings[(i, "load")] = {}
+                op_mappings[(i, "store")] = {}
+                continue
+
+            for phase, tma_names, direction in [
+                ("load", op_cls._TMA_LOADS, "g2s"),
+                ("store", op_cls._TMA_STORES, "s2g"),
+            ]:
+                mapping: Dict[str, str] = {}
+                for tensor_name in tma_names:
+                    # Get canonical tensor name from tensor registry
+                    tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
+                    if tensor_canonical is None:
+                        continue
+
+                    # Compute TMA tile shape from op's dims
+                    tma_dims = op_cls._TMA_TENSOR_DIMS.get(tensor_name, [])
+                    tile_shape = []
+                    for dim_name in tma_dims:
+                        if dim_name in op.tile_sizes:
+                            tile_shape.append(op.tile_sizes[dim_name])
+                        elif dim_name in op.static_dims:
+                            tile_shape.append(op.static_dims[dim_name])
+                        else:
+                            raise ValueError(
+                                f"TMA tensor '{tensor_name}' dim '{dim_name}' "
+                                f"not found in tile_sizes or static_dims"
+                            )
+                    tile_shape = tuple(tile_shape)
+
+                    # TMA requires CuTe mode 0 to be contiguous. Since
+                    # PyTorch tensors are row-major, the gmem tensor is
+                    # transposed before from_dlpack (so mode 0 = last dim).
+                    # Reverse tile_shape to match the transposed dimension
+                    # order: original (tile_M, N) -> transposed (N, tile_M).
+                    tma_tile_shape = tuple(reversed(tile_shape))
+
+                    # Resolve dtype
+                    meta = op.tensor_metas.get(tensor_name)
+                    dtype = meta.dtype if meta else None
+
+                    canonical_atom = f"tma{counter}_atom"
+                    canonical_gmem = f"tma{counter}_gmem"
+
+                    descriptors.append(TMADescriptorInfo(
+                        canonical_atom=canonical_atom,
+                        canonical_gmem=canonical_gmem,
+                        tensor_canonical=tensor_canonical,
+                        direction=direction,
+                        tile_shape=tma_tile_shape,
+                        smem_layout_shape=tma_tile_shape,
+                        dtype=dtype,
+                    ))
+
+                    # Map op-local names to canonical
+                    mapping[f"{tensor_name}_tma"] = canonical_atom
+                    mapping[f"{tensor_name}_tma_gmem"] = canonical_gmem
+                    counter += 1
+
+                op_mappings[(i, phase)] = mapping
+
+        return cls(descriptors=descriptors, op_mappings=op_mappings)
+
+    @property
+    def has_tma(self) -> bool:
+        """Whether any ops use TMA."""
+        return len(self.descriptors) > 0
+
+    @property
+    def all_canonical_names(self) -> List[str]:
+        """All canonical TMA parameter names (atoms + gmems) in order."""
+        names = []
+        for d in self.descriptors:
+            names.append(d.canonical_atom)
+            names.append(d.canonical_gmem)
+        return names
+
+    def get_op_tma_args(self, op_idx: int, phase: str) -> List[str]:
+        """Get canonical TMA param names for an op's phase function.
+
+        Args:
+            op_idx: Index of the op
+            phase: "load" or "store"
+
+        Returns:
+            List of canonical names in order: [atom, gmem, atom, gmem, ...]
+        """
+        mapping = self.op_mappings.get((op_idx, phase), {})
+        # Return in consistent order: for each TMA tensor, atom then gmem
+        result = []
+        for local_name, canonical in sorted(mapping.items()):
+            result.append(canonical)
+        return result
 
 
 # =============================================================================
@@ -1855,6 +2071,8 @@ __all__ = [
     # Scheduling
     "ScheduledOp",
     "TensorRegistry",
+    "TMARegistry",
+    "TMADescriptorInfo",
     "TileScheduler",
     "LevelBatchedScheduler",
     "BackwardScheduler",
