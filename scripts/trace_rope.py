@@ -43,7 +43,7 @@ def main():
 
     # Schedule and run with tracing
     q_flat = q.view(b * s, h, d)
-    ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin)]
+    ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 1})]
     config = MegakernelConfig(tracing=True)
     kernel = Megakernel(ops, config=config)
 

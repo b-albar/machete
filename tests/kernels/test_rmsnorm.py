@@ -40,13 +40,20 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
+def _tile_size_M(D, elem_bytes=4):
+    """Compute largest tile_size_M that fits in PAGE_SIZE (16KB)."""
+    return min(4, max(1, 16384 // (D * elem_bytes)))
+
+
 def _run_rmsnorm_forward(x_2d, weight, eps=1e-6):
     """Run RMSNormOp forward and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.rms_norm import RMSNormOp
 
+    D = x_2d.shape[1]
+    tile_m = _tile_size_M(D)
     y = torch.zeros_like(x_2d)
-    ops = [RMSNormOp.schedule(x=x_2d, weight=weight, y=y, tile_sizes={"M": 4})]
+    ops = [RMSNormOp.schedule(x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m})]
     kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -61,10 +68,12 @@ def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6):
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.rms_norm import RMSNormOp
 
+    D = x_2d.shape[1]
+    tile_m = _tile_size_M(D)
     dx = torch.zeros_like(x_2d)
     ops = [RMSNormOp.schedule(
         backward=True, dout=dout_2d, x=x_2d, weight=weight, dx=dx,
-        tile_sizes={"M": 4},
+        tile_sizes={"M": tile_m},
     )]
     kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
 

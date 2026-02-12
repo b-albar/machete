@@ -92,7 +92,7 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
         q_mk = q.clone()
         q_flat = q_mk.view(b * s, h, d)
 
-        ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin)]
+        ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 2, "H": 8})]
         kernel = Megakernel(ops, config=MegakernelConfig())
 
         # Trigger compilation + first run

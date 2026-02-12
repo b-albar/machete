@@ -1705,7 +1705,9 @@ class InstructionStreamBuilder:
                 producer_only = p_dims - c_dims
                 consumer_only = c_dims - p_dims
 
-                if producer_only and not consumer_only:
+                if producer_only:
+                    # Producer has extra dims (many-to-one on shared dims).
+                    # Applies whether or not consumer also has extra dims.
                     kind = "many_to_one"
                 elif consumer_only and not producer_only:
                     kind = "one_to_many"
@@ -1871,22 +1873,18 @@ class InstructionStreamBuilder:
                 producer_only = p_dims - c_dims
                 consumer_only = c_dims - p_dims
 
-                if producer_only and consumer_only:
-                    raise ValueError(
-                        f"Unsupported dependency: producer has extra dims "
-                        f"{producer_only} and consumer has extra dims "
-                        f"{consumer_only}. Both-sides-extra is not supported."
-                    )
-
                 # Determine target side and compute barrier count / expected
                 # Also compute divisors for tile size ratio handling
                 p_divs = [1] * MAX_TILE_DIMS  # Producer divisors
                 c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
                 expected = 1
 
-                if producer_only and not consumer_only:
-                    # Many-to-one: producer has extra dims not in consumer
-                    target_op = c_op
+                if producer_only:
+                    # Many-to-one: producer has extra dims not in consumer.
+                    # Also handles both-sides-extra: consumer extra dims are
+                    # broadcast (all consumer tiles with same shared-dim values
+                    # wait on the same barrier, so extra consumer dims get
+                    # coefficient 0 in the formula).
 
                     # Handle tile size ratios on shared dims
                     for dim in shared_dims:
@@ -1918,6 +1916,54 @@ class InstructionStreamBuilder:
                         axis = p_op.dim_names[dim]
                         collapsed *= p_op.tiles_for_axis(axis)
                     expected *= collapsed
+
+                    if consumer_only:
+                        # Both-sides-extra: compute coefficients using
+                        # shared-dim-only strides (not target_op strides)
+                        # so consumer extra dims get coefficient 0.
+                        shared_dims_sorted = sorted(shared_dims)
+                        shared_strides: Dict[str, int] = {}
+                        stride = 1
+                        for dim in reversed(shared_dims_sorted):
+                            shared_strides[dim] = stride
+                            p_axis = p_op.dim_names[dim]
+                            c_axis = c_op.dim_names[dim]
+                            stride *= min(
+                                p_op.tiles_for_axis(p_axis),
+                                c_op.tiles_for_axis(c_axis),
+                            )
+
+                        p_coeffs_list = [0] * MAX_TILE_DIMS
+                        for dim in shared_dims:
+                            p_coeffs_list[p_op.dim_names[dim]] = shared_strides[dim]
+                        p_coeffs = tuple(p_coeffs_list)
+
+                        c_coeffs_list = [0] * MAX_TILE_DIMS
+                        for dim in shared_dims:
+                            c_coeffs_list[c_op.dim_names[dim]] = shared_strides[dim]
+                        c_coeffs = tuple(c_coeffs_list)
+
+                        # Skip _compute_formula_coeffs below
+                        formulas[prod_idx][1].append(
+                            BarrierFormula(
+                                base=barrier_counter,
+                                coeffs=p_coeffs,
+                                divs=tuple(p_divs),
+                            )
+                        )
+                        formulas[rec.op_idx][0].append(
+                            BarrierFormula(
+                                base=barrier_counter,
+                                coeffs=c_coeffs,
+                                divs=tuple(c_divs),
+                                expected=expected,
+                            )
+                        )
+                        barrier_counter += num_barriers
+                        continue
+                    else:
+                        target_op = c_op
+
                 elif consumer_only and not producer_only:
                     # One-to-many: producer has fewer dims
                     target_op = p_op

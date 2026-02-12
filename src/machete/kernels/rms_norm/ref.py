@@ -202,7 +202,7 @@ if HAS_TRITON:
 
 # Import from the dedicated CUTLASS reference file
 try:
-    from machete.kernels.rms_norm.rmsnorm_ref_cutlass import (
+    from machete.kernels.rms_norm.rmsnorm_cutlass import (
         rmsnorm_cutlass,
         HAS_CUTLASS_RMSNORM,
     )
