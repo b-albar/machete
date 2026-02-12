@@ -20,6 +20,9 @@ from machete.kernels.rope.ref import rope_pytorch
 from machete.utils.testing import is_hopper_available
 
 
+PAGE_SIZE = 16384  # 16KB
+
+
 def get_tolerances(dtype):
     """Get appropriate rtol/atol for dtype.
 
@@ -30,16 +33,52 @@ def get_tolerances(dtype):
     return {"rtol": 1e-2, "atol": 1e-2}
 
 
+def _compute_tile_sizes(n_heads, head_dim, dtype):
+    """Compute tile sizes for both RMSNorm and RoPE that fit in PAGE_SIZE."""
+    elem_bytes = 4 if dtype == torch.float32 else 2
+    hidden_dim = n_heads * head_dim
+
+    # RMSNorm: tile_m_rms * hidden_dim * elem_bytes <= PAGE_SIZE
+    tile_m_rms = min(4, max(1, PAGE_SIZE // (hidden_dim * elem_bytes)))
+
+    # RoPE tile_size_H: largest <= 8 that divides n_heads
+    tile_h = min(n_heads, 8)
+    while n_heads % tile_h != 0:
+        tile_h -= 1
+
+    # RoPE smem: q (tile_m * tile_h * D) + cos (tile_m * D/2) + sin (tile_m * D/2)
+    rope_row_bytes = (tile_h * head_dim + head_dim) * elem_bytes
+    tile_m_rope = min(4, max(1, PAGE_SIZE // rope_row_bytes))
+
+    return tile_m_rms, tile_h, tile_m_rope
+
+
+# (batch, seq_len, n_heads, head_dim)
+SHAPE_PARAMS = [
+    (1, 8, 1, 64),      # minimal: single head
+    (2, 16, 4, 64),      # original test shape
+    (1, 32, 8, 64),      # many heads
+    (4, 16, 2, 128),     # larger head_dim
+    (2, 64, 4, 64),      # longer sequence
+    (1, 16, 16, 64),     # 16 heads
+    (2, 8, 4, 128),      # 4 heads x 128 head_dim
+    (1, 32, 2, 256),     # large head_dim (hidden=512)
+    (4, 32, 8, 64),      # larger batch
+    (1, 128, 4, 64),     # long sequence
+    (2, 16, 32, 64),     # many heads (hidden=2048)
+    (1, 8, 8, 128),      # 8 heads x 128 head_dim (hidden=1024)
+    (1, 16, 20, 64),     # non-divisible tile_m: rms=3, rope=4 (fp32)
+]
+
+
 @pytest.mark.skipif(not is_hopper_available(), reason="Hopper (SM90+) GPU required")
 class TestFusedRMSNormRoPE:
     """Tests for fused RMSNorm + RoPE in a single megakernel."""
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_fused_rmsnorm_rope(self, dtype):
+    @pytest.mark.parametrize("batch,seq_len,n_heads,head_dim", SHAPE_PARAMS)
+    def test_fused_rmsnorm_rope(self, batch, seq_len, n_heads, head_dim, dtype):
         """Test fused RMSNorm -> RoPE in single megakernel.
-
-        This tests the core use case: normalizing query vectors then applying
-        rotary position embedding, all in one kernel launch.
 
         Data flow:
             x (M, hidden_dim) -> RMSNorm -> y (M, hidden_dim)
@@ -50,9 +89,9 @@ class TestFusedRMSNormRoPE:
 
         Also verifies barrier reset by running the kernel multiple times.
         """
-        batch, seq_len, n_heads, head_dim = 2, 16, 4, 64
         M = batch * seq_len
         hidden_dim = n_heads * head_dim
+        tile_m_rms, tile_h, tile_m_rope = _compute_tile_sizes(n_heads, head_dim, dtype)
 
         # Input for RMSNorm
         x = torch.randn(M, hidden_dim, dtype=dtype, device="cuda")
@@ -69,8 +108,8 @@ class TestFusedRMSNormRoPE:
         # Fused megakernel: RMSNorm -> RoPE
         # Dependency is auto-detected via tensor pointer matching
         ops = [
-            RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": 4}),
-            RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"M": 1}),
+            RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m_rms}),
+            RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"M": tile_m_rope, "H": tile_h}),
         ]
         config = MegakernelConfig(threads_per_block=128)
         kernel = Megakernel(ops, config=config)

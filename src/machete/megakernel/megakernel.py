@@ -205,12 +205,11 @@ class Megakernel:
         self._tma_cute_tensors: Optional[List] = None  # CuTe tensors with static layout for TMA
 
         # Trace setup
-        self._trace_builder = None
-        self._trace_types = {}
-        self._trace_block_type = None
-        self._trace_format_ids = []  # format_id per op index
+        from .tracing import setup_tracing
+        self._tracing_state = None
         if self.config.tracing:
-            self._setup_tracing()
+            self._tracing_state = setup_tracing(
+                self.ops, self.num_sms, self.total_tiles)
 
     @property
     def num_sms(self) -> int:
@@ -346,67 +345,10 @@ class Megakernel:
                 f"Reduce num_pages or page_size in MegakernelConfig."
             )
 
-    def _setup_tracing(self):
-        """Set up cutedsl-trace builder and trace types."""
-        import math
-        from cutedsl_trace import (
-            TraceType,
-            BlockType,
-            TrackType,
-            DynamicTraceBuilder,
-        )
-        from cutedsl_trace.types import LaneType
-
-        # One TraceType per unique op class
-        seen_classes = {}
-        for i, op in enumerate(self.ops):
-            cls_name = op.op_cls.__name__
-            if cls_name not in seen_classes:
-                tt = TraceType(
-                    name=cls_name,
-                    label_string=cls_name,
-                    tooltip_string=f"{cls_name} op_idx={{0}}",
-                    param_count=1,
-                    lane_type=LaneType.DYNAMIC,
-                )
-                seen_classes[cls_name] = tt
-                self._trace_types[cls_name] = tt
-            self._trace_format_ids.append(seen_classes[cls_name].id)
-
-        self._trace_block_type = BlockType(
-            name="CTA",
-            label_string="CTA {blockLinear}",
-            tooltip_string="CTA {blockLinear} on SM {smId}",
-        )
-
-        track_type = TrackType(
-            name="SM",
-            label_string="SM {lane}",
-            tooltip_string="SM lane {lane}",
-        )
-
-        # 1 lane per CTA, enough events for the instruction stream
-        max_events = math.ceil(self.total_tiles / self.num_sms) * 2 + 16
-        self._trace_builder = DynamicTraceBuilder(
-            num_lanes=1,
-            max_events_per_lane=max_events,
-            grid_dims=(self.num_sms, 1, 1),
-        )
-        self._trace_builder.set_track_type(track_type, lane=0)
-
     def write_trace(self, filename: str) -> None:
         """Write trace to .nanotrace file. Only valid after run() with tracing=True."""
-        if self._trace_builder is None:
-            raise RuntimeError("Tracing not enabled. Set MegakernelConfig(tracing=True).")
-        from cutedsl_trace import TraceWriter
-
-        self._trace_builder.copy_to_host()
-        writer = TraceWriter("megakernel")
-        writer.set_block_type(self._trace_block_type)
-        writer.add_tensor(self._trace_builder)
-        for tt in self._trace_types.values():
-            writer.register_trace_type(tt)
-        writer.write(filename)
+        from .tracing import write_trace
+        write_trace(self._tracing_state, filename)
 
     def _build_pipelined_dispatch_fns(self):
         """Build dispatch functions for pipelined execution phases.
@@ -622,12 +564,17 @@ class Megakernel:
                 body,
             )
 
+        # Resolve `if tracing:` blocks at source level. CuTe DSL has no
+        # constexpr-if, so we strip blocks when disabled / inline when enabled.
+        from .tracing import resolve_tracing_blocks
+        body = resolve_tracing_blocks(body, self.config.tracing)
+
         # Build kernel loop with tensor + TMA params in signature
         fn_source = (
             "@cute.jit\n"
             "def _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             "                  num_instructions, tidx, block_id, num_blocks,\n"
-            f"                  smem_base{tensor_sig}{tma_sig}):\n"
+            f"                  smem_base, trace_buffer_ptr{tensor_sig}{tma_sig}):\n"
             + textwrap.indent(body, "    ")
             + "\n"
         )
@@ -727,7 +674,7 @@ class Megakernel:
             f"                 trace_buffer_ptr, num_instructions{tensor_sig}{tma_tensor_sig}, stream):\n"
             f"{tma_creation_code}"
             "        self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                    num_instructions{tensor_sig}{tma_kernel_args_sig}).launch(\n"
+            f"                    trace_buffer_ptr, num_instructions{tensor_sig}{tma_kernel_args_sig}).launch(\n"
             "            grid=[self.num_sms, 1, 1],\n"
             "            block=[self.threads_per_block, 1, 1],\n"
             "            smem=self.smem_size,\n"
@@ -736,14 +683,14 @@ class Megakernel:
             "\n"
             "    @cute.kernel\n"
             "    def kernel(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"               num_instructions{tensor_sig}{tma_sig}):\n"
+            f"               trace_buffer_ptr, num_instructions{tensor_sig}{tma_sig}):\n"
             "        tidx = cute.arch.thread_idx()[0]\n"
             "        block_id = cute.arch.block_idx()[0]\n"
             "        num_blocks = cute.arch.grid_dim()[0]\n"
             "        smem_base = get_smem_base_ptr()\n"
             "        _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             "                     num_instructions, tidx, block_id, num_blocks,\n"
-            f"                     smem_base{tensor_sig}{tma_sig})\n"
+            f"                     smem_base, trace_buffer_ptr{tensor_sig}{tma_sig})\n"
         )
 
         pk_globals = {
@@ -967,6 +914,12 @@ class Megakernel:
         check_barriers = self._build_check_barriers()
         signal_barriers = self._build_signal_barriers()
 
+        # Trace exec globals: device-side functions and format_ids.
+        # `if tracing:` blocks are resolved at source level in _build_kernel,
+        # so these globals are only referenced when tracing is enabled.
+        from .tracing import get_trace_exec_globals
+        trace_exec_globals = get_trace_exec_globals(self._tracing_state)
+
         # Helper to get page pointer by index
         @cute.jit
         def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
@@ -995,6 +948,7 @@ class Megakernel:
             block_id: Int32,
             num_blocks: Int32,
             smem_base: Int32,
+            trace_buffer_ptr: Int64,
         ) -> None:
             """Warp-specialized ring buffer loop.
 
@@ -1015,6 +969,13 @@ class Megakernel:
             # Scratch pointer for instruction decode
             scratch_ptr = smem_base + Int32(scratch_offset)
             flags_ptr = smem_base + Int32(flags_offset)
+
+            # ========== TRACE INIT ==========
+            if tracing:
+                _trace_buf = cute.make_tensor(
+                    cute.make_ptr(cute.Uint8, trace_buffer_ptr),
+                    cute.make_layout(1 << 24),
+                )
 
             # ========== INIT (DMA warp thread 0) ==========
             if is_dma_warp:
@@ -1037,6 +998,13 @@ class Megakernel:
 
             # ========== DMA WARP LOOP (non-blocking polling) ==========
             if is_dma_warp:
+                if tracing:
+                    _dma_lane = begin_lane_dynamic_raw(
+                        Int32(2), Int32(trace_row_stride),
+                        block_id, Int32(0),
+                        lane_id == Int32(0),
+                    )
+
                 produce_idx = Int32(0)
                 store_idx = Int32(0)
                 next_instr_idx = block_id
@@ -1182,11 +1150,20 @@ class Megakernel:
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
+                        if tracing:
+                            _tl = trace_start()
                         dispatch_load(
                             _dl_op, _dl_pp,
                             _dl_0, _dl_1, _dl_2, _dl_3, _dl_4,
                             _dl_config, _dl_mbar,
                         )
+                        if tracing:
+                            for _i in range_constexpr(num_ops):
+                                if _dl_op == Int32(_i):
+                                    _dma_lane = end_event_dynamic_raw_1(
+                                        _tl, _trace_buf, Int32(trace_row_stride),
+                                        _dma_lane, Int32(trace_load_fmts[_i]), _dl_op,
+                                    )
 
                     # ALL DMA WARP THREADS: dispatch store if thread 0
                     # flagged a slot. Same pattern as dispatch_load —
@@ -1203,6 +1180,8 @@ class Megakernel:
                         _ds_4 = ld_shared_i32(_ds_ti + 20)
                         _ds_pp = _get_page_ptr(smem_base, _ds_slot)
                         _ds_config = ld_global_i64(op_configs_ptr, _ds_op)
+                        if tracing:
+                            _ts2 = trace_start()
                         dispatch_store(
                             _ds_op, _ds_pp,
                             _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
@@ -1210,6 +1189,13 @@ class Megakernel:
                         )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0)
+                        if tracing:
+                            for _i in range_constexpr(num_ops):
+                                if _ds_op == Int32(_i):
+                                    _dma_lane = end_event_dynamic_raw_1(
+                                        _ts2, _trace_buf, Int32(trace_row_stride),
+                                        _dma_lane, Int32(trace_store_fmts[_i]), _ds_op,
+                                    )
 
                     done = ld_shared_i32(flags_ptr)
 
@@ -1222,8 +1208,18 @@ class Megakernel:
                     )
                     mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
 
+                if tracing:
+                    finish_lane_dynamic_raw(_trace_buf, _dma_lane)
+
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
+                if tracing:
+                    _mma_lane = begin_lane_dynamic_raw(
+                        Int32(2), Int32(trace_row_stride),
+                        block_id, Int32(1),
+                        (warp_id == Int32(0)) & (lane_id == Int32(0)),
+                    )
+
                 consume_ptr = Int32(0)
                 mma_running = Int32(1)
 
@@ -1232,6 +1228,8 @@ class Megakernel:
 
                     # Wait for work (phase alternates with each ring buffer pass)
                     _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
+                    if tracing:
+                        _tw = trace_start()
                     mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
 
                     # Read tile info (page == slot, no work queue indirection)
@@ -1246,6 +1244,12 @@ class Megakernel:
                         mma_running = Int32(0)
 
                     if op_idx != Int32(TileInstruction.END_MARKER):
+                        if tracing:
+                            _mma_lane = end_event_dynamic_raw_1(
+                                _tw, _trace_buf, Int32(trace_row_stride),
+                                _mma_lane, Int32(trace_data_wait_fmt), op_idx,
+                            )
+
                         tile_0 = ld_shared_i32(tile_info_ptr + 4)
                         tile_1 = ld_shared_i32(tile_info_ptr + 8)
                         tile_2 = ld_shared_i32(tile_info_ptr + 12)
@@ -1254,6 +1258,9 @@ class Megakernel:
 
                         page_ptr = _get_page_ptr(smem_base, slot)
                         op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
+
+                        if tracing:
+                            _tc = trace_start()
 
                         # Compute
                         dispatch_compute(
@@ -1265,14 +1272,22 @@ class Megakernel:
                         # Sync MMA warps post-compute
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
+                        if tracing:
+                            for _i in range_constexpr(num_ops):
+                                if op_idx == Int32(_i):
+                                    _mma_lane = end_event_dynamic_raw_1(
+                                        _tc, _trace_buf, Int32(trace_row_stride),
+                                        _mma_lane, Int32(trace_compute_fmts[_i]), op_idx,
+                                    )
+
                         # Signal compute_done for this slot
                         if lane_id == Int32(0):
                             mbarrier_arrive(_compute_done_mbar(smem_base, slot))
 
                         consume_ptr = consume_ptr + Int32(1)
 
-        if tracing:
-            raise NotImplementedError("Tracing not yet supported with warp-specialized kernel")
+                if tracing:
+                    finish_lane_dynamic_raw(_trace_buf, _mma_lane)
 
         return self._build_kernel(
             _kernel_loop_ring,
@@ -1293,6 +1308,7 @@ class Megakernel:
                 "dma_reg_count": dma_reg_count,
                 "mma_reg_count": mma_reg_count,
                 "tile_info_bytes": tile_info_bytes,
+                **trace_exec_globals,
             },
         )
 
@@ -1458,8 +1474,8 @@ class Megakernel:
         # Launch (trace_buffer_ptr is always passed; trace calls compile
         # to nothing when tracing is disabled via constexpr elimination)
         if self.config.tracing:
-            self._trace_builder.reset()
-            trace_buffer_ptr = Int64(self._trace_builder._buffer.data_ptr())
+            self._tracing_state.builder.reset()
+            trace_buffer_ptr = Int64(self._tracing_state.builder._buffer.data_ptr())
         else:
             trace_buffer_ptr = Int64(0)
 

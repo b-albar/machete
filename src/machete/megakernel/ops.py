@@ -1232,13 +1232,14 @@ def _compute_formula_coeffs(
             s_axis = s_dims[dim]
             t_axis = t_dims[dim]
             coeffs[s_axis] += t_strides[t_axis]
-    else:
-        # No dim_names: use source's own linear index
+    elif not s_dims and not t_dims:
+        # Raw ops (no named dimensions): use source's own linear index
         s_counts = source_op.tile_counts
         stride = 1
         for i in range(len(s_counts) - 1, -1, -1):
             coeffs[i] = stride
             stride *= s_counts[i]
+    # else: named ops with no shared dims → all zeros (all tiles map to same barrier)
 
     return tuple(coeffs)
 
@@ -1872,6 +1873,22 @@ class InstructionStreamBuilder:
                 shared_dims = p_dims & c_dims
                 producer_only = p_dims - c_dims
                 consumer_only = c_dims - p_dims
+
+                # Handle non-divisible tile sizes on shared dims.
+                # When tile sizes don't divide evenly (e.g., producer M=4,
+                # consumer M=3), the integer division in BarrierFormula can't
+                # express the correct per-tile mapping. Move such dims to
+                # producer_only so all producer tiles on that dim get collapsed
+                # into a single barrier group (conservative but correct).
+                non_divisible = set()
+                for dim in shared_dims:
+                    p_ts = p_op.tile_sizes.get(dim, 1)
+                    c_ts = c_op.tile_sizes.get(dim, 1)
+                    if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
+                        non_divisible.add(dim)
+                if non_divisible:
+                    shared_dims = shared_dims - non_divisible
+                    producer_only = producer_only | non_divisible
 
                 # Determine target side and compute barrier count / expected
                 # Also compute divisors for tile size ratio handling
