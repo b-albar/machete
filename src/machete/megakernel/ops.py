@@ -919,20 +919,26 @@ class TMARegistry:
                     if tensor_canonical is None:
                         continue
 
-                    # Compute TMA tile shape from op's dims
-                    tma_dims = op_cls._TMA_TENSOR_DIMS.get(tensor_name, [])
-                    tile_shape = []
-                    for dim_name in tma_dims:
-                        if dim_name in op.tile_sizes:
-                            tile_shape.append(op.tile_sizes[dim_name])
-                        elif dim_name in op.static_dims:
-                            tile_shape.append(op.static_dims[dim_name])
-                        else:
-                            raise ValueError(
-                                f"TMA tensor '{tensor_name}' dim '{dim_name}' "
-                                f"not found in tile_sizes or static_dims"
-                            )
-                    tile_shape = tuple(tile_shape)
+                    # Compute TMA tile shape from op's dims.
+                    # Ops can override via get_tma_tile_shape() for dims
+                    # that need custom sub-tiling (e.g., K in GEMM).
+                    if hasattr(op_cls, 'get_tma_tile_shape'):
+                        tile_shape = tuple(op_cls.get_tma_tile_shape(
+                            tensor_name, op.tile_sizes, op.static_dims))
+                    else:
+                        tma_dims = op_cls._TMA_TENSOR_DIMS.get(tensor_name, [])
+                        tile_shape = []
+                        for dim_name in tma_dims:
+                            if dim_name in op.tile_sizes:
+                                tile_shape.append(op.tile_sizes[dim_name])
+                            elif dim_name in op.static_dims:
+                                tile_shape.append(op.static_dims[dim_name])
+                            else:
+                                raise ValueError(
+                                    f"TMA tensor '{tensor_name}' dim '{dim_name}' "
+                                    f"not found in tile_sizes or static_dims"
+                                )
+                        tile_shape = tuple(tile_shape)
 
                     # TMA requires CuTe mode 0 to be contiguous. Since
                     # PyTorch tensors are row-major, the gmem tensor is
