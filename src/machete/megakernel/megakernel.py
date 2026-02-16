@@ -314,9 +314,10 @@ class Megakernel:
                     t = tensor.detach()
                     # TMA requires CuTe mode 0 to be contiguous (stride 1).
                     # PyTorch row-major tensors have mode 0 = rows (stride N),
-                    # so we transpose to get mode 0 = columns (stride 1).
-                    if t.ndim == 2:
-                        t = t.T
+                    # so we reverse dims to get mode 0 = last dim (stride 1).
+                    # For 2D (M,D) → (D,M); for 3D (BH,M,D) → (D,M,BH).
+                    if t.ndim >= 2:
+                        t = t.permute(*reversed(range(t.ndim)))
                     cute_t = from_dlpack(t, assumed_align=16)
                     self._tma_cute_tensors.append((desc.tensor_canonical, cute_t))
                     break
