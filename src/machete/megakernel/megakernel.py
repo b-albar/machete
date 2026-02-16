@@ -637,8 +637,14 @@ class Megakernel:
         if tma_registry.has_tma:
             for desc in tma_registry.descriptors:
                 tma_src = f"tma_{desc.tensor_canonical}"
-                copy_op = ("CopyBulkTensorTileG2SOp()" if desc.direction == "g2s"
-                           else "CopyBulkTensorTileS2GOp()")
+                if desc.direction == "g2s":
+                    copy_op = "CopyBulkTensorTileG2SOp()"
+                elif desc.direction == "s2g":
+                    copy_op = "CopyBulkTensorTileS2GOp()"
+                elif desc.direction == "s2g_reduce":
+                    copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
+                else:
+                    raise ValueError(f"Unknown TMA direction: {desc.direction}")
                 shape_str = ", ".join(str(s) for s in desc.tile_shape)
                 tma_creation_lines.append(
                     f"        _smem_layout_{desc.canonical_atom} = cute.make_layout(({shape_str},))\n"
@@ -706,6 +712,13 @@ class Megakernel:
             )
             pk_globals["CopyBulkTensorTileG2SOp"] = CopyBulkTensorTileG2SOp
             pk_globals["CopyBulkTensorTileS2GOp"] = CopyBulkTensorTileS2GOp
+
+            # Add reduce store op if any descriptor uses s2g_reduce
+            if any(d.direction == "s2g_reduce" for d in tma_registry.descriptors):
+                from cutlass.cute.nvgpu.cpasync import CopyReduceBulkTensorTileS2GOp
+                from cutlass.cute.tensor import ReductionOp
+                pk_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
+                pk_globals["ReductionOp"] = ReductionOp
 
         compile_mod._compile_counter += 1
         pk_filename = f"<persistent_kernel>_{compile_mod._compile_counter}"

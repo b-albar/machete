@@ -278,8 +278,10 @@ def _process_op_declarations(cls):
     # --- Process TMA declarations ---
     # tma_loads: set of tensor names to load via TMA G2S
     # tma_stores: set of tensor names to store via TMA S2G
+    # tma_reduce_stores: set of tensor names to store via TMA S2G with atomic add
     tma_loads = set(getattr(cls, "tma_loads", set()))
     tma_stores = set(getattr(cls, "tma_stores", set()))
+    tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
 
     # Validate TMA tensors exist in reads/writes
     read_names = set(reads.keys())
@@ -290,16 +292,20 @@ def _process_op_declarations(cls):
     for name in tma_stores:
         if name not in write_names:
             raise ValueError(f"tma_stores tensor '{name}' not found in writes")
+    for name in tma_reduce_stores:
+        if name not in write_names:
+            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes")
 
     cls._TMA_LOADS = tma_loads
     cls._TMA_STORES = tma_stores
+    cls._TMA_REDUCE_STORES = tma_reduce_stores
 
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
     tma_tensor_dims = {}  # {tensor_name: list of dim_names}
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    for name in tma_loads | tma_stores:
+    for name in tma_loads | tma_stores | tma_reduce_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
     cls._TMA_TENSOR_DIMS = tma_tensor_dims
@@ -463,7 +469,7 @@ def _process_op_declarations(cls):
         if phase == "load":
             tma_names = cls._TMA_LOADS
         elif phase == "store":
-            tma_names = cls._TMA_STORES
+            tma_names = cls._TMA_STORES | cls._TMA_REDUCE_STORES
         else:
             raise ValueError(f"Unknown phase: {phase}")
 
@@ -908,11 +914,14 @@ class TMARegistry:
                 op_mappings[(i, "store")] = {}
                 continue
 
+            op_mappings[(i, "load")] = {}
+            op_mappings[(i, "store")] = {}
+
             for phase, tma_names, direction in [
                 ("load", op_cls._TMA_LOADS, "g2s"),
                 ("store", op_cls._TMA_STORES, "s2g"),
+                ("store", getattr(op_cls, '_TMA_REDUCE_STORES', set()), "s2g_reduce"),
             ]:
-                mapping: Dict[str, str] = {}
                 for tensor_name in tma_names:
                     # Get canonical tensor name from tensor registry
                     tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
@@ -965,11 +974,9 @@ class TMARegistry:
                     ))
 
                     # Map op-local names to canonical
-                    mapping[f"{tensor_name}_tma"] = canonical_atom
-                    mapping[f"{tensor_name}_tma_gmem"] = canonical_gmem
+                    op_mappings[(i, phase)][f"{tensor_name}_tma"] = canonical_atom
+                    op_mappings[(i, phase)][f"{tensor_name}_tma_gmem"] = canonical_gmem
                     counter += 1
-
-                op_mappings[(i, phase)] = mapping
 
         return cls(descriptors=descriptors, op_mappings=op_mappings)
 
