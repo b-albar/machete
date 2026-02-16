@@ -72,65 +72,105 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32):
 # =============================================================================
 
 
+def _gemm_case(M, K, N, dtype, tile_m=64, tile_n=32, atol=1e-1, rtol=1e-2):
+    """Run a single GEMM test case and assert correctness."""
+    torch.manual_seed(42)
+    a = torch.randn(M, K, dtype=dtype, device="cuda")
+    b = torch.randn(K, N, dtype=dtype, device="cuda")
+    b_t = b.t().contiguous()
+
+    c = _run_gemm(a, b_t, tile_m=tile_m, tile_n=tile_n)
+    ref = _gemm_reference(a, b_t)
+
+    torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
+
+
 @requires_gpu
 class TestGemmForward:
     """GEMM forward pass correctness tests."""
 
+    # ----- Basic sizes -----
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_small_single_k_step(self, dtype):
         """Small GEMM where K fits in a single tile_K step."""
-        M, K, N = 64, 32, 32
-        torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=dtype, device="cuda")
-        b = torch.randn(K, N, dtype=dtype, device="cuda")
-        b_t = b.t().contiguous()  # (N, K)
-
-        c = _run_gemm(a, b_t, tile_m=64, tile_n=32)
-        ref = _gemm_reference(a, b_t)
-
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+        _gemm_case(64, 32, 32, dtype)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_medium_multi_k_steps(self, dtype):
-        """Medium GEMM requiring multiple K-loop iterations."""
-        M, K, N = 128, 128, 64
-        torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=dtype, device="cuda")
-        b = torch.randn(K, N, dtype=dtype, device="cuda")
-        b_t = b.t().contiguous()  # (N, K)
+        """Medium GEMM requiring multiple K-loop iterations (pipeline active)."""
+        _gemm_case(128, 128, 64, dtype)
 
-        c = _run_gemm(a, b_t, tile_m=64, tile_n=32)
-        ref = _gemm_reference(a, b_t)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_large_k(self, dtype):
+        """Large K with many pipeline stages (K=256 → 8 steps with tile_K=32)."""
+        _gemm_case(64, 256, 32, dtype)
 
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_large_k_512(self, dtype):
+        """Very large K (K=512 → 16 pipeline steps)."""
+        _gemm_case(64, 512, 32, dtype)
+
+    # ----- Non-divisible dimensions -----
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_non_divisible_k(self, dtype):
         """K not divisible by tile_K — tests partial last K step."""
-        M, K, N = 64, 48, 32
-        torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=dtype, device="cuda")
-        b = torch.randn(K, N, dtype=dtype, device="cuda")
-        b_t = b.t().contiguous()  # (N, K)
+        _gemm_case(64, 48, 32, dtype)
 
-        c = _run_gemm(a, b_t, tile_m=64, tile_n=32)
-        ref = _gemm_reference(a, b_t)
-
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_non_divisible_k_large(self, dtype):
+        """Large non-divisible K (K=80 → not a multiple of tile_K=32)."""
+        _gemm_case(64, 80, 32, dtype)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_non_divisible_m_n(self, dtype):
-        """M and N not divisible by tile sizes — tests boundary handling.
+        """M and N not divisible by tile sizes.
 
         N must be a multiple of 8 (fp16/bf16) for TMA S2G 16-byte stride alignment.
         """
-        M, K, N = 100, 64, 48
-        torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=dtype, device="cuda")
-        b = torch.randn(K, N, dtype=dtype, device="cuda")
-        b_t = b.t().contiguous()  # (N, K)
+        _gemm_case(100, 64, 48, dtype)
 
-        c = _run_gemm(a, b_t, tile_m=64, tile_n=32)
-        ref = _gemm_reference(a, b_t)
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_non_divisible_all(self, dtype):
+        """M, K, N all non-divisible by their respective tile sizes."""
+        _gemm_case(100, 80, 48, dtype)
 
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+    # ----- Multiple M/N tiles -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_multi_m_tiles(self, dtype):
+        """Multiple tiles along M dimension (M=256 → 4 M-tiles)."""
+        _gemm_case(256, 64, 32, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_multi_n_tiles(self, dtype):
+        """Multiple tiles along N dimension (N=128 → 4 N-tiles)."""
+        _gemm_case(64, 64, 128, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_multi_mn_tiles(self, dtype):
+        """Multiple tiles along both M and N (4x4 tile grid)."""
+        _gemm_case(256, 128, 128, dtype)
+
+    # ----- Edge cases -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_k_equals_16(self, dtype):
+        """Minimum K (K=16 = one MMA K-block, single step, no pipeline)."""
+        _gemm_case(64, 16, 32, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_exactly_two_k_steps(self, dtype):
+        """K chosen so exactly 2 K steps (pipeline prologue + 1 loop iter)."""
+        _gemm_case(64, 64, 32, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_small_m(self, dtype):
+        """M smaller than tile_M — tests M boundary predication."""
+        _gemm_case(16, 64, 32, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_small_n(self, dtype):
+        """N smaller than tile_N — tests N boundary predication."""
+        _gemm_case(64, 64, 16, dtype)
