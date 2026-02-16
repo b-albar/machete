@@ -45,7 +45,7 @@ def _tile_size_M(D, elem_bytes=4):
     return min(4, max(1, 16384 // (D * elem_bytes)))
 
 
-def _run_rmsnorm_forward(x_2d, weight, eps=1e-6):
+def _run_rmsnorm_forward(x_2d, weight, eps=1e-6, residual=False):
     """Run RMSNormOp forward and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.rms_norm import RMSNormOp
@@ -53,7 +53,10 @@ def _run_rmsnorm_forward(x_2d, weight, eps=1e-6):
     D = x_2d.shape[1]
     tile_m = _tile_size_M(D)
     y = torch.zeros_like(x_2d)
-    ops = RMSNormOp.schedule(x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m})
+    ops = RMSNormOp.schedule(
+        x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m},
+        residual=residual,
+    )
     kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -63,7 +66,7 @@ def _run_rmsnorm_forward(x_2d, weight, eps=1e-6):
     return y
 
 
-def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6):
+def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6, residual=False):
     """Run RMSNormOp backward and return dx tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.rms_norm import RMSNormOp
@@ -74,6 +77,7 @@ def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6):
     ops = RMSNormOp.schedule(
         backward=True, dout=dout_2d, x=x_2d, weight=weight, dx=dx,
         tile_sizes={"M": tile_m},
+        residual=residual,
     )
     kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
 
@@ -242,3 +246,87 @@ class TestRMSNormReference:
         # Our reference
         dx_ref = rmsnorm_backward_pytorch(dout, x.detach(), w)
         torch.testing.assert_close(dx_ref, dx_autograd, atol=1e-4, rtol=1e-4)
+
+
+# =============================================================================
+# Residual Forward Tests
+# =============================================================================
+
+
+class TestRMSNormResidualForward:
+    """Forward pass with residual connection: y = rmsnorm(x) + x."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("M,D", [
+        (1, 64),
+        (4, 128),
+        (32, 256),
+        (128, 512),
+        (32, 4096),
+    ])
+    def test_residual_forward_shapes(self, M, D):
+        """Residual forward produces correct output for various shapes."""
+        torch.manual_seed(42)
+        x = torch.randn(M, D, dtype=torch.float32, device="cuda")
+        weight = torch.randn(D, dtype=torch.float32, device="cuda")
+
+        y_mk = _run_rmsnorm_forward(x, weight, residual=True)
+        y_ref = rmsnorm_pytorch(x, weight, eps=1e-6, residual=True)
+
+        torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
+
+    @requires_gpu
+    def test_residual_vs_no_residual(self):
+        """Residual output should equal non-residual + x."""
+        torch.manual_seed(42)
+        M, D = 16, 128
+        x = torch.randn(M, D, dtype=torch.float32, device="cuda")
+        weight = torch.randn(D, dtype=torch.float32, device="cuda")
+
+        y_no_res = _run_rmsnorm_forward(x, weight, residual=False)
+        y_res = _run_rmsnorm_forward(x, weight, residual=True)
+
+        torch.testing.assert_close(y_res, y_no_res + x, atol=1e-3, rtol=1e-3)
+
+
+# =============================================================================
+# Residual Backward Tests
+# =============================================================================
+
+
+class TestRMSNormResidualBackward:
+    """Backward pass with residual: dx = dx_rmsnorm + dout."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("M,D", [
+        (1, 64),
+        (4, 128),
+        (32, 256),
+        (128, 512),
+        (32, 4096),
+    ])
+    def test_residual_backward_shapes(self, M, D):
+        """Residual backward produces correct gradients for various shapes."""
+        torch.manual_seed(42)
+        x = torch.randn(M, D, dtype=torch.float32, device="cuda")
+        weight = torch.randn(D, dtype=torch.float32, device="cuda")
+        dout = torch.randn(M, D, dtype=torch.float32, device="cuda")
+
+        dx_mk = _run_rmsnorm_backward(dout, x, weight, residual=True)
+        dx_ref = rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=True)
+
+        torch.testing.assert_close(dx_mk, dx_ref, atol=1e-3, rtol=1e-3)
+
+    @requires_gpu
+    def test_residual_vs_no_residual_backward(self):
+        """Residual backward should equal non-residual dx + dout."""
+        torch.manual_seed(42)
+        M, D = 16, 128
+        x = torch.randn(M, D, dtype=torch.float32, device="cuda")
+        weight = torch.randn(D, dtype=torch.float32, device="cuda")
+        dout = torch.randn(M, D, dtype=torch.float32, device="cuda")
+
+        dx_no_res = _run_rmsnorm_backward(dout, x, weight, residual=False)
+        dx_res = _run_rmsnorm_backward(dout, x, weight, residual=True)
+
+        torch.testing.assert_close(dx_res, dx_no_res + dout, atol=1e-3, rtol=1e-3)
