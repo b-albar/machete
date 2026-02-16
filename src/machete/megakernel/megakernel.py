@@ -460,6 +460,7 @@ class Megakernel:
         tensor_params = ", ".join(all_canonical)
 
         tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
+        prev_tile_params = ", ".join(f"prev_{i}" for i in range(MAX_TILE_DIMS))
 
         # TMA params for signature
         tma_params = ", ".join(all_tma_canonical) if all_tma_canonical else ""
@@ -480,7 +481,8 @@ class Megakernel:
             if is_load:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar{args_str})"
+                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
+                    f"{prev_tile_params}{args_str})"
                 )
             else:
                 lines.append(
@@ -492,7 +494,9 @@ class Megakernel:
         fn_name = f"dispatch_{phase_name}"
         tensor_sig = f", {tensor_params}" if tensor_params else ""
         tma_sig = f", {tma_params}" if tma_params else ""
-        work_mbar_sig = ", work_mbar" if is_load else ""
+        work_mbar_sig = ""
+        if is_load:
+            work_mbar_sig = f", work_mbar, {prev_tile_params}"
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, {tile_params}, "
@@ -996,6 +1000,9 @@ class Megakernel:
                     # Clear done flag
                     st_shared_i32(flags_ptr, Int32(0))
                     for _ip in range(num_pages):
+                        # Init per-slot op_idx to -1 (no previous op)
+                        _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
+                        st_shared_i32(_slot_ti, Int32(-1))
                         mbarrier_init(
                             _work_notify_mbar(smem_base, Int32(_ip)),
                             Int32(1),
@@ -1092,6 +1099,29 @@ class Megakernel:
                                 if check_barriers(_ic_op, _ic_0, _ic_1, _ic_2, _ic_3, _ic_4, barriers_ptr) == Int32(1):
                                     _p_slot = produce_idx % Int32(num_pages)
                                     _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
+                                    # Read old tile info from this page slot
+                                    # to detect if same op reuses this page.
+                                    _old_op = ld_shared_i32(_p_ti)
+                                    _ep_0 = Int32(-1)
+                                    _ep_1 = Int32(-1)
+                                    _ep_2 = Int32(-1)
+                                    _ep_3 = Int32(-1)
+                                    _ep_4 = Int32(-1)
+                                    if _old_op == _ic_op:
+                                        _ep_0 = ld_shared_i32(_p_ti + 4)
+                                        _ep_1 = ld_shared_i32(_p_ti + 8)
+                                        _ep_2 = ld_shared_i32(_p_ti + 12)
+                                        _ep_3 = ld_shared_i32(_p_ti + 16)
+                                        _ep_4 = ld_shared_i32(_p_ti + 20)
+                                    # Store prev coords in flags area for
+                                    # all DMA warp threads to read at dispatch.
+                                    _prev_base = flags_ptr + 12
+                                    st_shared_i32(_prev_base, _ep_0)
+                                    st_shared_i32(_prev_base + 4, _ep_1)
+                                    st_shared_i32(_prev_base + 8, _ep_2)
+                                    st_shared_i32(_prev_base + 12, _ep_3)
+                                    st_shared_i32(_prev_base + 16, _ep_4)
+                                    # Overwrite slot with new tile info
                                     st_shared_i32(_p_ti, _ic_op)
                                     st_shared_i32(_p_ti + 4, _ic_0)
                                     st_shared_i32(_p_ti + 8, _ic_1)
@@ -1163,12 +1193,22 @@ class Megakernel:
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
+                        # Per-page prev coords: written by thread 0 in produce step.
+                        # Contains old tile coords if same op previously used this
+                        # page slot, -1 otherwise. Lets load skip unchanged data.
+                        _prev_base = flags_ptr + 12
+                        _ep_0 = ld_shared_i32(_prev_base)
+                        _ep_1 = ld_shared_i32(_prev_base + 4)
+                        _ep_2 = ld_shared_i32(_prev_base + 8)
+                        _ep_3 = ld_shared_i32(_prev_base + 12)
+                        _ep_4 = ld_shared_i32(_prev_base + 16)
                         if tracing:
                             _tl = trace_start()
                         dispatch_load(
                             _dl_op, _dl_pp,
                             _dl_0, _dl_1, _dl_2, _dl_3, _dl_4,
                             _dl_config, _dl_mbar,
+                            _ep_0, _ep_1, _ep_2, _ep_3, _ep_4,
                         )
                         if tracing:
                             for _i in range_constexpr(num_ops):

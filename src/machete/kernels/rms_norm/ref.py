@@ -14,23 +14,27 @@ import torch
 # =============================================================================
 
 
-def rmsnorm_pytorch(x, weight, eps=1e-6):
+def rmsnorm_pytorch(x, weight, eps=1e-6, residual=False):
     """Pure PyTorch RMSNorm forward reference.
 
     Args:
         x: (..., D) float32
         weight: (D,) float32
         eps: float
+        residual: if True, compute y = rmsnorm(x) + x
 
     Returns:
         (..., D) float32
     """
     variance = x.float().pow(2).mean(-1, keepdim=True)
     x_normed = x.float() * torch.rsqrt(variance + eps)
-    return (x_normed * weight.float()).to(x.dtype)
+    y = x_normed * weight.float()
+    if residual:
+        y = y + x.float()
+    return y.to(x.dtype)
 
 
-def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6):
+def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=False):
     """Pure PyTorch RMSNorm backward reference.
 
     Args:
@@ -38,6 +42,7 @@ def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6):
         x: (..., D) float32 — saved input
         weight: (D,) float32
         eps: float
+        residual: if True, dx includes identity gradient (dx += dout)
 
     Returns:
         dx: (..., D) float32 — grad_input
@@ -54,6 +59,8 @@ def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6):
     dout_w = dout_f * w_f
     grad_sum = (dout_w * x_hat).mean(-1, keepdim=True)
     dx = (dout_w - x_hat * grad_sum) * rstd
+    if residual:
+        dx = dx + dout_f
 
     return dx.to(x.dtype)
 

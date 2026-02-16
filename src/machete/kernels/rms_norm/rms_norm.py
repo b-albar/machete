@@ -60,7 +60,8 @@ class RMSNormOp(Op):
     """RMSNorm operation for the megakernel framework.
 
     Applies Root Mean Square Layer Normalization:
-        y = x / sqrt(mean(x²) + eps) * weight
+        y = x / sqrt(mean(x²) + eps) * weight       (residual=False)
+        y = x / sqrt(mean(x²) + eps) * weight + x   (residual=True)
 
     Both forward and backward use pipelined load/compute/store:
     - load: TMA G->S for x (DMA warp, elect_one)
@@ -104,6 +105,8 @@ class RMSNormOp(Op):
 
     def __init__(self, **config):
         super().__init__(**config)
+        self.residual = getattr(self, 'residual', 0)
+
         if self.x_dtype == cutlass.Float32:
             self.elem_bytes = 4
         elif self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
@@ -120,6 +123,26 @@ class RMSNormOp(Op):
         )
 
         self.num_warps = self.threads_per_row // 32
+
+    # =========================================================================
+    # Scheduling
+    # =========================================================================
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, residual=False, **tensors):
+        """Schedule RMSNorm forward, optionally with residual connection."""
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        if residual:
+            ops[0].static_dims['residual'] = 1
+        return ops
+
+    @classmethod
+    def schedule_backward(cls, tile_sizes=None, residual=False, **tensors):
+        """Schedule RMSNorm backward, optionally with residual connection."""
+        ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
+        if residual:
+            ops[0].static_dims['residual'] = 1
+        return ops
 
     # =========================================================================
     # Forward Load (G->S)
@@ -210,10 +233,12 @@ class RMSNormOp(Op):
                 # rstd = 1 / sqrt(mean(x²) + eps)
                 rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
-                # y = x * rstd * weight (compute in fp32, store in input dtype)
+                # y = x * rstd * weight [+ x] (compute in fp32, store in input dtype)
                 y_reg = cute.make_fragment_like(x_reg)
                 for i in range(cute.size(x_reg)):
                     val = x_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
+                    if self.residual:
+                        val = val + x_reg[i].to(Float32)
                     y_reg[i] = val.to(self.x_dtype)
 
                 # Write y back to same smem location (x fully consumed into regs)
@@ -330,7 +355,7 @@ class RMSNormOp(Op):
                 sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
                 mean_grad = sum_grad / self.D
 
-                # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd
+                # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd [+ dout]
                 # Write to smem (same region as x, fully consumed into regs)
                 dx_reg = cute.make_fragment_like(x_reg)
                 for i in range(cute.size(x_reg)):
@@ -339,6 +364,8 @@ class RMSNormOp(Op):
                     x_val = x_reg[i].to(Float32)
                     dw_x = d * w
                     result = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
+                    if self.residual:
+                        result = result + d
                     dx_reg[i] = result.to(self.x_dtype)
 
                 # Write dx to smem for TMA store

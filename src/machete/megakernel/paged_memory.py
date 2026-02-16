@@ -129,7 +129,7 @@ class NPageLayout:
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
     _TILE_INFO_SIZE: int = 24  # Per-page: op_idx + 5 tile indices (6 int32s)
     _INSTR_SIZE: int = 24  # Same as tile info: 6 int32s
-    _FLAGS_SIZE: int = 12  # done flag + dispatch_load_slot + dispatch_store_slot
+    _FLAGS_SIZE: int = 32  # done + dispatch slots + prev_tile coords (5 int32s)
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
