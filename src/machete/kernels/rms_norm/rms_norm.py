@@ -28,7 +28,7 @@ Usage:
     from machete.megakernel import Megakernel
 
     x_2d = x.view(-1, D).contiguous()
-    ops = [RMSNormOp.schedule(x=x_2d, weight=w, y=y, tile_sizes={"M": 4})]
+    ops = RMSNormOp.schedule(x=x_2d, weight=w, y=y, tile_sizes={"M": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """

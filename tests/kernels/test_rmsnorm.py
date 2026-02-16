@@ -53,7 +53,7 @@ def _run_rmsnorm_forward(x_2d, weight, eps=1e-6):
     D = x_2d.shape[1]
     tile_m = _tile_size_M(D)
     y = torch.zeros_like(x_2d)
-    ops = [RMSNormOp.schedule(x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m})]
+    ops = RMSNormOp.schedule(x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m})
     kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -71,10 +71,10 @@ def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6):
     D = x_2d.shape[1]
     tile_m = _tile_size_M(D)
     dx = torch.zeros_like(x_2d)
-    ops = [RMSNormOp.schedule(
+    ops = RMSNormOp.schedule(
         backward=True, dout=dout_2d, x=x_2d, weight=weight, dx=dx,
         tile_sizes={"M": tile_m},
-    )]
+    )
     kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
 
     with contextlib.redirect_stdout(io.StringIO()):

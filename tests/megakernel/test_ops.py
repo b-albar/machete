@@ -775,14 +775,14 @@ class TestNdimValidation:
         """Passing 2D tensor to 2D op succeeds."""
         x = torch.randn(4, 8, device="cpu")
         y = torch.empty(4, 8, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
         assert op.tensor_metas["x"].ndim == 2
         assert op.tensor_metas["x"].shape == (4, 8)
 
     def test_3d_ndim_match(self):
         """Passing 3D tensor to 3D op succeeds with correct metadata."""
         q = torch.randn(4, 8, 16, device="cpu")
-        op = _Dim3DOp.schedule(q=q)
+        [op] = _Dim3DOp.schedule(q=q)
         assert op.tensor_metas["q"].ndim == 3
         assert op.tensor_metas["q"].shape == (4, 8, 16)
         assert op.tensor_metas["q"].strides == tuple(q.stride())
@@ -791,7 +791,7 @@ class TestNdimValidation:
         """Strides are captured in ScheduledOp.tensor_strides."""
         x = torch.randn(4, 8, device="cpu")
         y = torch.empty(4, 8, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
         assert op.tensor_strides["x"] == (8, 1)
         assert op.tensor_strides["y"] == (8, 1)
 
@@ -803,7 +803,7 @@ class TestDimConsistencyValidation:
         """Tensors sharing dim name with same value passes."""
         x = torch.randn(4, 8, device="cpu")
         y = torch.empty(4, 8, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
         assert op.static_dims["M"] == 4
         assert op.static_dims["D"] == 8
 
@@ -817,8 +817,8 @@ class TestCrossOpCompatibility:
         y = torch.randn(32, 256, device="cpu")
         q = y.view(32, 4, 64)  # Same storage, different shape
 
-        op_a = _Dim2DOp.schedule(x=y, y=y)
-        op_b = _Dim3DOp.schedule(q=q)
+        [op_a] = _Dim2DOp.schedule(x=y, y=y)
+        [op_b] = _Dim3DOp.schedule(q=q)
 
         registry = TensorRegistry.from_ops([op_a, op_b])
         # Should not raise
@@ -829,8 +829,8 @@ class TestCrossOpCompatibility:
         x = torch.randn(32, 256, device="cpu")
         q = x.view(32, 4, 64)
 
-        op_a = _Dim2DOp.schedule(x=x, y=x)
-        op_b = _Dim3DOp.schedule(q=q)
+        [op_a] = _Dim2DOp.schedule(x=x, y=x)
+        [op_b] = _Dim3DOp.schedule(q=q)
 
         # Total elements match (32*256 == 32*4*64), so validation passes
         # even though D=256 in op_a and D=64 in op_b
@@ -848,7 +848,7 @@ class TestStrideInitSource:
         from machete.megakernel.ops import build_op_config
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
         config = build_op_config(op)
         assert config["x_stride_M"] == 64
         assert config["x_stride_D"] == 1
@@ -859,7 +859,7 @@ class TestStrideInitSource:
         """3D tensor strides are in config correctly."""
         from machete.megakernel.ops import build_op_config
         q = torch.randn(32, 8, 64, device="cpu")
-        op = _Dim3DOp.schedule(q=q)
+        [op] = _Dim3DOp.schedule(q=q)
         config = build_op_config(op)
         assert config["q_stride_M"] == 512
         assert config["q_stride_H"] == 64
@@ -873,7 +873,7 @@ class TestTensorMeta:
         """TensorMeta is correctly populated from schedule()."""
         x = torch.randn(4, 8, device="cpu")
         y = torch.empty(4, 8, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
 
         meta_x = op.tensor_metas["x"]
         assert meta_x.name == "x"
@@ -887,7 +887,7 @@ class TestTensorMeta:
     def test_tensor_meta_1d(self):
         """1D tensor metadata is correct."""
         w = torch.randn(16, device="cpu")
-        op = _Dim1DOp.schedule(w=w)
+        [op] = _Dim1DOp.schedule(w=w)
 
         meta_w = op.tensor_metas["w"]
         assert meta_w.ndim == 1
@@ -909,7 +909,7 @@ class TestTileSizesScheduleAPI:
         y = torch.empty(32, 64, device="cpu")
         # _Dim2DOp has tile = ("M",), so M is the only tile dim.
         # Not passing tile_sizes → M defaults to full extent.
-        op = _Dim2DOp.schedule(x=x, y=y)
+        [op] = _Dim2DOp.schedule(x=x, y=y)
         assert op.tile_counts == (1,)
         assert op.tile_sizes == {"M": 32}
 
@@ -917,7 +917,7 @@ class TestTileSizesScheduleAPI:
         """Passing tile_sizes computes correct tile_counts."""
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 8})
+        [op] = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 8})
         assert op.tile_counts == (4,)  # 32 / 8 = 4
         assert op.tile_sizes == {"M": 8}
 
@@ -925,7 +925,7 @@ class TestTileSizesScheduleAPI:
         """tile_counts uses ceiling division when dim not evenly divisible."""
         x = torch.randn(30, 64, device="cpu")
         y = torch.empty(30, 64, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 8})
+        [op] = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 8})
         assert op.tile_counts == (4,)  # ceil(30 / 8) = 4
         assert op.tile_sizes == {"M": 8}
 
@@ -934,7 +934,7 @@ class TestTileSizesScheduleAPI:
         from machete.megakernel.ops import build_op_config
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 4})
+        [op] = _Dim2DOp.schedule(x=x, y=y, tile_sizes={"M": 4})
         config = build_op_config(op)
         assert config["tile_size_M"] == 4
 
@@ -943,7 +943,7 @@ class TestTileSizesScheduleAPI:
         from machete.megakernel.ops import build_op_config
         x = torch.randn(32, 64, device="cpu")
         y = torch.empty(32, 64, device="cpu")
-        op = _Dim2DOp.schedule(x=x, y=y)  # No tile_sizes → full extent
+        [op] = _Dim2DOp.schedule(x=x, y=y)  # No tile_sizes → full extent
         config = build_op_config(op)
         assert config["tile_size_M"] == 32
 

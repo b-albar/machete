@@ -18,7 +18,7 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute::
             ...  # tile_M, tile_D, M, D available from init_source
 
     # Tile sizes passed at schedule time; tile_counts deduced
-    ops = [MyOp.schedule(x=tensor, tile_sizes={"M": 4})]
+    ops = MyOp.schedule(x=tensor, tile_sizes={"M": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -322,10 +322,10 @@ def _process_op_declarations(cls):
     # Generate pack_config / pack_backward_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
-    # Add schedule() classmethod
+    # Add _schedule_single() classmethod (internal — returns one ScheduledOp)
     @classmethod
-    def schedule(cls, backward=False, tile_sizes=None, **tensors):
-        """Create a ScheduledOp from tensor kwargs.
+    def _schedule_single(cls, backward=False, tile_sizes=None, **tensors):
+        """Create a single ScheduledOp from tensor kwargs (internal).
 
         Args:
             backward: If True, use backward_reads/backward_writes tensor
@@ -444,6 +444,23 @@ def _process_op_declarations(cls):
             tensor_metas=tensor_metas,
             tensor_strides=tensor_strides,
         )
+
+    cls._schedule_single = _schedule_single
+
+    # Add schedule() classmethod (public dispatcher — returns list of ScheduledOps)
+    @classmethod
+    def schedule(cls, backward=False, tile_sizes=None, **tensors):
+        """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
+
+        Checks for schedule_forward / schedule_backward overrides on the
+        subclass. If found, delegates to them. Otherwise wraps a single
+        _schedule_single() call in a list.
+        """
+        if not backward and hasattr(cls, 'schedule_forward'):
+            return cls.schedule_forward(tile_sizes=tile_sizes, **tensors)
+        if backward and hasattr(cls, 'schedule_backward'):
+            return cls.schedule_backward(tile_sizes=tile_sizes, **tensors)
+        return [cls._schedule_single(backward=backward, tile_sizes=tile_sizes, **tensors)]
 
     cls.schedule = schedule
 
@@ -1837,12 +1854,22 @@ class InstructionStreamBuilder:
         2. Compute formula coefficients for both sides
         3. Allocate barriers
         """
-        # Track buffer producers by name
+        # Track buffer producers by name.
+        # When two ops produce the same buffer name but target different
+        # tensors (different data_ptr), they are independent — no conflict.
+        # Only raise if the same buffer name AND same data_ptr are produced
+        # by multiple ops (true conflict).
         buffer_producers: Dict[str, int] = {}
         for rec in self._op_records:
             for buf in rec.op.op_cls.OUTPUTS:
                 if buf in buffer_producers:
-                    raise ValueError(f"Buffer '{buf}' produced by both op {buffer_producers[buf]} and op {rec.op_idx}")
+                    prev_idx = buffer_producers[buf]
+                    prev_ptr = self._op_records[prev_idx].op.tensor_ptrs.get(buf)
+                    curr_ptr = rec.op.tensor_ptrs.get(buf)
+                    if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
+                        # Different tensors — independent, no conflict
+                        continue
+                    raise ValueError(f"Buffer '{buf}' produced by both op {prev_idx} and op {rec.op_idx}")
                 buffer_producers[buf] = rec.op_idx
 
         # Also track buffer producers by tensor data pointer for automatic dependency detection

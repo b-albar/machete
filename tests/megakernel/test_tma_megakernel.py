@@ -128,8 +128,8 @@ class TestTMAMegakernel:
         torch.manual_seed(42)
         x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
         y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
-        op = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        Megakernel([op]).run()
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(ops).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
     def test_tma_add_one_multi_tile(self):
@@ -138,6 +138,6 @@ class TestTMAMegakernel:
         torch.manual_seed(42)
         x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
         y = torch.full((M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
-        op = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        Megakernel([op]).run()
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(ops).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)

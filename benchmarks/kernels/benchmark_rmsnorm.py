@@ -127,7 +127,7 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         y = torch.empty_like(x)
         tile_m = min(4, max(1, 16384 // (D * 4)))
-        ops = [RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m})]
+        ops = RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m})
 
         # Optimal thread config: 128 threads (4 warps) for warp-parallel rows
         # Each warp handles one row independently with warp-level reduction only

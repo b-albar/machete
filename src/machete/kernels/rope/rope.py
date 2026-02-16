@@ -24,7 +24,7 @@ Usage:
     from machete.megakernel import Megakernel
 
     q_flat = q.view(b * s, h, d).contiguous()
-    ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 2, "H": 8})]
+    ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 2, "H": 8})
     kernel = Megakernel(ops)
     kernel.run()
 """

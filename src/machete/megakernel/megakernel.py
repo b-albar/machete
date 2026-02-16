@@ -15,7 +15,7 @@ Usage:
     from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    ops = [RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})]
+    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """

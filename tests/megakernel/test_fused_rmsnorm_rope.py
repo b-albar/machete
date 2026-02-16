@@ -107,10 +107,8 @@ class TestFusedRMSNormRoPE:
 
         # Fused megakernel: RMSNorm -> RoPE
         # Dependency is auto-detected via tensor pointer matching
-        ops = [
-            RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m_rms}),
-            RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"M": tile_m_rope, "H": tile_h}),
-        ]
+        ops = (RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m_rms})
+               + RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"M": tile_m_rope, "H": tile_h}))
         config = MegakernelConfig(threads_per_block=128)
         kernel = Megakernel(ops, config=config)
 

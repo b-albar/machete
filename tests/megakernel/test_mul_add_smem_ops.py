@@ -168,20 +168,21 @@ class TestSmemPipelinedOps:
     def test_mul_two(self):
         x = torch.randn(1024, dtype=torch.float16, device="cuda")
         y = torch.empty_like(x)
-        Megakernel([MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})]).run()
+        Megakernel(MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})).run()
         torch.testing.assert_close(y, x * 2, atol=1e-3, rtol=1e-3)
 
     def test_add_two(self):
         a = torch.randn(1024, dtype=torch.float16, device="cuda")
         b = torch.empty_like(a)
-        Megakernel([AddTwoOp.schedule(a=a, b=b, tile_sizes={"M": TILE_ELEMS})]).run()
+        Megakernel(AddTwoOp.schedule(a=a, b=b, tile_sizes={"M": TILE_ELEMS})).run()
         torch.testing.assert_close(b, a + 2, atol=1e-3, rtol=1e-3)
 
     def test_mul_then_add(self):
         x = torch.randn(1024, dtype=torch.float16, device="cuda")
         y = torch.empty_like(x)
         z = torch.empty_like(x)
-        ops = [MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS}), AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})]
+        ops = (MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})
+               + AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS}))
         Megakernel(ops).run()
         torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
 
@@ -190,7 +191,8 @@ class TestSmemPipelinedOps:
         x = torch.randn(1024, dtype=dtype, device="cuda")
         y = torch.empty_like(x)
         z = torch.empty_like(x)
-        ops = [MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS}), AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})]
+        ops = (MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})
+               + AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS}))
         Megakernel(ops).run()
         tol = dict(atol=5e-2, rtol=5e-2) if dtype == torch.bfloat16 else dict(atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(z, x * 2 + 2, **tol)

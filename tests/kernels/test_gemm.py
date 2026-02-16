@@ -58,10 +58,10 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
     N = b_t.shape[0]
     c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
 
-    ops = [GemmOp.schedule(
+    ops = GemmOp.schedule(
         a=a, b=b_t, c=c,
         tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
-    )]
+    )
     # 5 warps: 4 MMA + 1 DMA = 160 threads
     config = MegakernelConfig(threads_per_block=160)
     kernel = Megakernel(ops, config=config)
@@ -195,3 +195,117 @@ class TestGemmForward:
     def test_tile_k_16(self, dtype):
         """Minimum tile_K=16 (many K tiles, tests atomic add convergence)."""
         _gemm_case(64, 64, 32, dtype, tile_k=16)
+
+
+# =============================================================================
+# Backward Tests
+# =============================================================================
+
+
+def _run_gemm_backward(dout, a, b, da=None, db=None,
+                       tile_m=64, tile_n=32, tile_k=32):
+    """Run GemmOp backward and return (da, db).
+
+    Both dA and dB ops go into the same megakernel. They both produce
+    buffer 'c' but with different data_ptr, so the framework treats
+    them as independent.
+    """
+    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.kernels.gemm import GemmOp
+
+    config = MegakernelConfig(threads_per_block=160)
+    ts = {"M": tile_m, "N": tile_n, "K": tile_k}
+
+    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
+                          tile_sizes=ts)
+    if ops:
+        with contextlib.redirect_stdout(io.StringIO()):
+            Megakernel(ops, config=config).run()
+
+    return da, db
+
+
+def _gemm_backward_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,
+                        compute_da=True, compute_db=True,
+                        atol=1e-1, rtol=1e-2):
+    """Run a single GEMM backward test case and assert correctness."""
+    torch.manual_seed(42)
+    a = torch.randn(M, K, dtype=dtype, device="cuda")
+    b = torch.randn(N, K, dtype=dtype, device="cuda")  # (N, K) layout
+    dout = torch.randn(M, N, dtype=dtype, device="cuda")
+
+    da = torch.zeros(M, K, dtype=dtype, device="cuda") if compute_da else None
+    db = torch.zeros(N, K, dtype=dtype, device="cuda") if compute_db else None
+
+    _run_gemm_backward(dout, a, b, da=da, db=db,
+                       tile_m=tile_m, tile_n=tile_n, tile_k=tile_k)
+
+    # Tolerance scales with K tiles (TMA store_add in output dtype)
+    import math
+
+    if da is not None:
+        # dA = dout @ B, contraction over N → k_tiles_da = ceil(N / tile_n)
+        k_tiles_da = math.ceil(N / tile_n)
+        scaled_atol = atol * max(1, k_tiles_da // 2)
+        scaled_rtol = rtol * max(1, k_tiles_da // 2)
+        da_ref = (dout.float() @ b.float()).to(dtype)
+        torch.testing.assert_close(da, da_ref, atol=scaled_atol, rtol=scaled_rtol)
+
+    if db is not None:
+        # dB = dout^T @ A, contraction over M → k_tiles_db = ceil(M / tile_m)
+        k_tiles_db = math.ceil(M / tile_m)
+        scaled_atol = atol * max(1, k_tiles_db // 2)
+        scaled_rtol = rtol * max(1, k_tiles_db // 2)
+        db_ref = (dout.float().t() @ a.float()).to(dtype)
+        torch.testing.assert_close(db, db_ref, atol=scaled_atol, rtol=scaled_rtol)
+
+
+@requires_gpu
+class TestGemmBackward:
+    """GEMM backward pass correctness tests."""
+
+    # ----- dA only -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_da_basic(self, dtype):
+        """dA only, single K tile (N=32, tile_N=32)."""
+        _gemm_backward_case(64, 32, 32, dtype, compute_db=False)
+
+    # ----- dB only -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_db_basic(self, dtype):
+        """dB only, single K tile (M=64, tile_M=64)."""
+        _gemm_backward_case(64, 32, 32, dtype, compute_da=False)
+
+    # ----- Both dA + dB -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_both(self, dtype):
+        """Both dA and dB (separate megakernels, same buffer name 'c')."""
+        _gemm_backward_case(64, 32, 32, dtype)
+
+    # ----- Multiple tiles -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_multi_tiles(self, dtype):
+        """Larger shapes with multiple tiles along all dims."""
+        _gemm_backward_case(128, 128, 64, dtype)
+
+    # ----- Non-divisible -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_non_divisible(self, dtype):
+        """M, K, N all non-divisible by tile sizes.
+
+        All dims must be multiples of 8 (TMA alignment for fp16/bf16),
+        since backward remaps M→K and N→K for the two gradient GEMMs.
+        """
+        _gemm_backward_case(104, 80, 48, dtype)
+
+    # ----- Large K (many K tiles) -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_backward_large_k(self, dtype):
+        """Large K with many K tiles."""
+        _gemm_backward_case(64, 256, 32, dtype)

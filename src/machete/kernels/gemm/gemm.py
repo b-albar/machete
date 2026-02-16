@@ -231,3 +231,66 @@ class GemmOp(Op):
 
         with cute.arch.elect_one():
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+
+    # =========================================================================
+    # Backward: reuse forward (GEMM backward = two forward GEMMs)
+    # =========================================================================
+
+    backward_reads = {
+        "dout": (None, ("M", "N")),
+        "a": (None, ("M", "K")),
+        "b": (None, ("N", "K")),
+    }
+    backward_writes = {
+        "da": (None, ("M", "K")),
+        "db": (None, ("N", "K")),
+    }
+
+    backward_load = load
+    backward_compute = compute
+    backward_store = store
+
+    @classmethod
+    def schedule_backward(cls, tile_sizes=None, **tensors):
+        """Schedule GEMM backward as forward-equivalent ops.
+
+        dA[M,K] = dout[M,N] @ B[N,K]  (contracts over N)
+        dB[N,K] = dout^T[N,M] @ A[M,K]  (contracts over M)
+
+        Each gradient is a standard GEMM with transposed inputs.
+        Output tensors are zeroed (TMA store_add accumulation).
+        """
+        dout, a, b = tensors['dout'], tensors['a'], tensors['b']
+        da, db = tensors.get('da'), tensors.get('db')
+        ts = tile_sizes or {}
+        tile_m = ts.get("M", 64)
+        tile_n = ts.get("N", 32)
+        tile_k = ts.get("K", 32)
+        ops = []
+
+        if da is not None:
+            # dA = dout(M,N) @ B(N,K) -> GemmOp(a=dout, b=B, c=dA)
+            # Forward GemmOp: C(M,N) = A(M,K) @ B(N,K)^T
+            # Here: dA(M,K) = dout(M,N) @ B(N,K) = dout(M,N) @ B(N,K)
+            # Map: A->dout(M,N), B->B(N,K) transposed->B^T(K,N), C->dA(M,K)
+            # GemmOp dims: M->M, K->N (contraction), N->K (output col)
+            da.zero_()
+            b_t = b.t().contiguous()  # (N,K) -> (K,N)
+            ops.append(cls._schedule_single(
+                a=dout, b=b_t, c=da,
+                tile_sizes={"M": tile_m, "N": tile_k, "K": tile_n},
+            ))
+
+        if db is not None:
+            # dB = dout^T(N,M) @ A(M,K) -> GemmOp(a=dout^T, b=A^T, c=dB)
+            # Map: A->dout^T(N,M), B->A(M,K) transposed->A^T(K,M), C->dB(N,K)
+            # GemmOp dims: M->N, K->M (contraction), N->K (output col)
+            db.zero_()
+            dout_t = dout.t().contiguous()  # (M,N) -> (N,M)
+            a_t = a.t().contiguous()  # (M,K) -> (K,M)
+            ops.append(cls._schedule_single(
+                a=dout_t, b=a_t, c=db,
+                tile_sizes={"M": tile_n, "N": tile_k, "K": tile_m},
+            ))
+
+        return ops

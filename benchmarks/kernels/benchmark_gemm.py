@@ -101,10 +101,10 @@ def bench_gemm(M, K, N, dtype):
         tile_m, tile_n, tile_k = compute_tile_sizes(M, K, N, elem_bytes)
         c = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
 
-        ops = [GemmOp.schedule(
+        ops = GemmOp.schedule(
             a=a, b=b_t, c=c,
             tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
-        )]
+        )
         # 5 warps: 4 MMA + 1 DMA = 160 threads
         config = MegakernelConfig(threads_per_block=160)
         kernel = Megakernel(ops, config=config)
