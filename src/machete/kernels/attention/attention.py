@@ -154,16 +154,17 @@ class FlashAttentionOp(Op):
             f"PAGE_SIZE ({PAGE_SIZE}B). Reduce tile_size_M."
         )
 
-        # Compute phase KV+P layout (overlapping Q/O region)
+        # Compute phase KV layout (overlapping Q/O region)
+        # P stays in registers (rP_mma_view trick) — no sP smem needed
+        # Two mbars: one for K, one for V (enables split-load pipelining)
         kv_block_bytes = self.n_block * self.kv_row_bytes
-        p_bytes = self.tile_size_M * self.n_block * self.elem_bytes
-        self.kv_mbar_offset = 0  # compute-local mbar at page start
-        self.k_block_offset = 16  # 16-byte aligned after mbar
+        self.mbar_k_offset = 0   # mbar for K loads
+        self.mbar_v_offset = 8   # mbar for V loads
+        self.k_block_offset = 16  # 16-byte aligned after mbars
         self.v_block_offset = _align_up(16 + kv_block_bytes, 16)
-        self.p_offset = _align_up(self.v_block_offset + kv_block_bytes, 16)
-        kv_total = self.p_offset + p_bytes
+        kv_total = self.v_block_offset + kv_block_bytes
         assert kv_total <= PAGE_SIZE, (
-            f"FlashAttentionOp MMA: KV+P smem ({kv_total}B) exceeds "
+            f"FlashAttentionOp MMA: KV smem ({kv_total}B) exceeds "
             f"PAGE_SIZE ({PAGE_SIZE}B)."
         )
 
@@ -350,7 +351,7 @@ class FlashAttentionOp(Op):
             # Sync: all MMA threads done reading Q from smem
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-            # === Smem now reused for KV + P (overlapping Q region) ===
+            # === KV smem layouts (overlapping Q region) ===
             # K block: (n_block, D) row-major
             sK = cute.make_tensor(
                 cute.make_ptr(
@@ -374,23 +375,36 @@ class FlashAttentionOp(Op):
                 cute.make_layout((self.D, self.n_block),
                                  stride=(self.n_block, 1)),
             )
-            # P region: (tile_M, n_block) — separate from K/V
-            sP = cute.make_tensor(
-                cute.make_ptr(
-                    self.q_dtype,
-                    page_ptr + Int32(self.p_offset),
-                    cute.AddressSpace.smem),
-                cute.make_layout((self.tile_size_M, self.n_block),
-                                 stride=(self.n_block, 1)),
-            )
 
-            # === MMA partitions for K, V, P ===
+            # === LdMatrix for smem→reg reads (K and Vt) ===
+            smem_copy_atom_K = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(
+                    transpose=False, num_matrices=4),
+                self.q_dtype,
+            )
+            smem_copy_atom_Vt = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(
+                    transpose=True, num_matrices=4),
+                self.q_dtype,
+            )
+            smem_tiled_copy_K = cute.make_tiled_copy_B(
+                smem_copy_atom_K, tiled_mma)
+            smem_tiled_copy_Vt = cute.make_tiled_copy_B(
+                smem_copy_atom_Vt, tiled_mma)
+            smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
+            smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
+
+            # === MMA register fragments for K, V ===
             tCsK = thr_mma.partition_B(sK)
             tCrK = tiled_mma.make_fragment_B(tCsK)
-            tAsP = thr_mma.partition_A(sP)
-            tArP = tiled_mma.make_fragment_A(tAsP)
             tBsVt = thr_mma.partition_B(sVt)
             tBrVt = tiled_mma.make_fragment_B(tBsVt)
+
+            # LdMatrix copy partitions (smem src + register dest views)
+            tKsK = smem_thr_copy_K.partition_S(sK)
+            tKrK_copy_view = smem_thr_copy_K.retile(tCrK)
+            tVsVt = smem_thr_copy_Vt.partition_S(sVt)
+            tVrVt_copy_view = smem_thr_copy_Vt.retile(tBrVt)
 
             # === Accumulators ===
             acc_O = cute.make_fragment(
@@ -423,14 +437,18 @@ class FlashAttentionOp(Op):
             tScS = thr_mma.partition_C(mcS)
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
-            # === Init compute-local mbarrier (overlapping Q smem) ===
-            # Use tidx==0 (not elect_one) to ensure exactly ONE thread
-            # across all warps issues mbar ops.
-            kv_mbar_addr = page_ptr + Int32(self.kv_mbar_offset)
-            mbar_ptr = cute.make_ptr(
-                cutlass.Int64, kv_mbar_addr, cute.AddressSpace.smem)
+            # === Init compute-local mbarriers (overlapping Q smem) ===
+            # Two mbars: K and V loaded separately for pipelined overlap.
+            # Use tidx==0 (not elect_one) for multi-warp correctness.
+            mbar_k_addr = page_ptr + Int32(self.mbar_k_offset)
+            mbar_v_addr = page_ptr + Int32(self.mbar_v_offset)
+            mbar_k_ptr = cute.make_ptr(
+                cutlass.Int64, mbar_k_addr, cute.AddressSpace.smem)
+            mbar_v_ptr = cute.make_ptr(
+                cutlass.Int64, mbar_v_addr, cute.AddressSpace.smem)
             if tidx == Int32(0):
-                mbarrier_init(kv_mbar_addr, Int32(1))
+                mbarrier_init(mbar_k_addr, Int32(1))
+                mbarrier_init(mbar_v_addr, Int32(1))
             mbarrier_init_fence()
 
             # CopyBulkG2SOp for K/V row copies
@@ -440,42 +458,69 @@ class FlashAttentionOp(Op):
             )
             head_offset = tile_BH * Int32(self.N * self.D)
 
-            # === KV block loop ===
+            # === Prefetch K[0] before loop ===
+            if tidx == Int32(0):
+                remaining_0 = Int32(self.N)
+                valid_0 = remaining_0
+                if remaining_0 > Int32(self.n_block):
+                    valid_0 = Int32(self.n_block)
+                mbarrier_arrive_expect_tx(
+                    mbar_k_addr, valid_0 * Int32(self.kv_row_bytes))
+                for row in cutlass.range_constexpr(self.n_block):
+                    if Int32(row) < Int32(self.N):
+                        row_off = head_offset + Int32(row) * Int32(self.D)
+                        g_k = cute.make_tensor(
+                            k.iterator + row_off,
+                            cute.make_layout((self.D,)),
+                        )
+                        s_k = cute.make_tensor(
+                            cute.make_ptr(
+                                self.q_dtype,
+                                page_ptr + Int32(
+                                    self.k_block_offset
+                                    + row * self.kv_row_bytes),
+                                cute.AddressSpace.smem),
+                            cute.make_layout((self.D,)),
+                        )
+                        gk, sk = group_bulk_copy_modes(g_k, s_k)
+                        cute.copy(g2s, gk, sk, mbar_ptr=mbar_k_ptr)
+
+            # === KV block loop (split-load pipeline) ===
+            # Pipeline: wait K[i] → S GEMM → issue V[i]+K[i+1] → softmax
+            #           → wait V[i] → O GEMM (K[i+1] loads concurrently)
             for kv_blk in range(self.num_kv_blocks):
                 phase = kv_blk % Int32(2)
                 kv_start = kv_blk * Int32(self.n_block)
 
-                # -- Load K + V block via CopyBulkG2SOp --
                 remaining = Int32(self.N) - kv_start
                 valid_rows = remaining
                 if remaining > Int32(self.n_block):
                     valid_rows = Int32(self.n_block)
-                tx_bytes = valid_rows * Int32(2 * self.kv_row_bytes)
 
+                # 1. Wait for K[i]
+                mbarrier_wait(mbar_k_addr, phase)
+
+                # 2. S GEMM: acc_S = Q(regs) @ K(smem)^T
+                #    LdMatrix reads K from smem into MMA-compatible registers
+                acc_S.fill(0.0)
+                for kb in cutlass.range_constexpr(self.D // 16):
+                    cute.copy(smem_tiled_copy_K,
+                              tKsK[None, None, kb],
+                              tKrK_copy_view[None, None, kb])
+                    cute.gemm(tiled_mma, acc_S,
+                              tCrQ[None, None, kb],
+                              tCrK[None, None, kb], acc_S)
+
+                # 3. Issue V[i] load (K smem now consumed)
                 if tidx == Int32(0):
-                    mbarrier_arrive_expect_tx(kv_mbar_addr, tx_bytes)
+                    mbarrier_arrive_expect_tx(
+                        mbar_v_addr,
+                        valid_rows * Int32(self.kv_row_bytes))
                     for row in cutlass.range_constexpr(self.n_block):
                         global_kv = kv_start + Int32(row)
                         if global_kv < Int32(self.N):
                             row_off = (
                                 head_offset + global_kv * Int32(self.D))
-                            # K row
-                            g_k = cute.make_tensor(
-                                k.iterator + row_off,
-                                cute.make_layout((self.D,)),
-                            )
-                            s_k = cute.make_tensor(
-                                cute.make_ptr(
-                                    self.q_dtype,
-                                    page_ptr + Int32(
-                                        self.k_block_offset
-                                        + row * self.kv_row_bytes),
-                                    cute.AddressSpace.smem),
-                                cute.make_layout((self.D,)),
-                            )
-                            gk, sk = group_bulk_copy_modes(g_k, s_k)
-                            cute.copy(g2s, gk, sk, mbar_ptr=mbar_ptr)
-                            # V row
                             g_v = cute.make_tensor(
                                 v.iterator + row_off,
                                 cute.make_layout((self.D,)),
@@ -490,21 +535,44 @@ class FlashAttentionOp(Op):
                                 cute.make_layout((self.D,)),
                             )
                             gv, sv = group_bulk_copy_modes(g_v, s_v)
-                            cute.copy(g2s, gv, sv, mbar_ptr=mbar_ptr)
+                            cute.copy(g2s, gv, sv, mbar_ptr=mbar_v_ptr)
 
-                # Wait for K+V data
-                mbarrier_wait(kv_mbar_addr, phase)
+                # 3b. Issue K[i+1] load (overlaps with softmax + O GEMM)
+                if kv_blk < Int32(self.num_kv_blocks - 1):
+                    next_start = kv_start + Int32(self.n_block)
+                    next_remaining = Int32(self.N) - next_start
+                    next_valid = next_remaining
+                    if next_remaining > Int32(self.n_block):
+                        next_valid = Int32(self.n_block)
+                    if tidx == Int32(0):
+                        mbarrier_arrive_expect_tx(
+                            mbar_k_addr,
+                            next_valid * Int32(self.kv_row_bytes))
+                        for row in cutlass.range_constexpr(self.n_block):
+                            next_kv = next_start + Int32(row)
+                            if next_kv < Int32(self.N):
+                                row_off = (
+                                    head_offset
+                                    + next_kv * Int32(self.D))
+                                g_k = cute.make_tensor(
+                                    k.iterator + row_off,
+                                    cute.make_layout((self.D,)),
+                                )
+                                s_k = cute.make_tensor(
+                                    cute.make_ptr(
+                                        self.q_dtype,
+                                        page_ptr + Int32(
+                                            self.k_block_offset
+                                            + row * self.kv_row_bytes),
+                                        cute.AddressSpace.smem),
+                                    cute.make_layout((self.D,)),
+                                )
+                                gk, sk = group_bulk_copy_modes(
+                                    g_k, s_k)
+                                cute.copy(
+                                    g2s, gk, sk, mbar_ptr=mbar_k_ptr)
 
-                # -- S GEMM: acc_S = Q(regs) @ K(smem)^T --
-                acc_S.fill(0.0)
-                for kb in cutlass.range_constexpr(self.D // 16):
-                    cute.autovec_copy(
-                        tCsK[None, None, kb], tCrK[None, None, kb])
-                    cute.gemm(tiled_mma, acc_S,
-                              tCrQ[None, None, kb],
-                              tCrK[None, None, kb], acc_S)
-
-                # -- Mask invalid S scores (N-boundary) --
+                # 4. Mask + online softmax (no smem access needed)
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
                 acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
 
@@ -515,17 +583,14 @@ class FlashAttentionOp(Op):
                         if kv_start + Int32(col_idx) >= Int32(self.N):
                             acc_S_mn[r, c] = Float32(-1e30)
 
-                # -- Online softmax --
                 for r in cutlass.range_constexpr(num_rows):
                     acc_S_row = acc_S_mn[r, None].load()
 
-                    # Row max (local reduce + quad shuffle)
                     row_max_cur = acc_S_row.reduce(
                         cute.ReductionOp.MAX, Float32(-1e30), 0)
                     row_max_cur = self._threadquad_reduce_max(
                         row_max_cur)
 
-                    # Correction factor for running max
                     m_old = row_max[r]
                     m_new = cute.arch.fmax(m_old, row_max_cur)
                     correction = cute.math.exp2(
@@ -533,44 +598,52 @@ class FlashAttentionOp(Op):
                         fastmath=True,
                     )
 
-                    # Rescale running state
                     row_sum[r] = row_sum[r] * correction
                     acc_O_mn[r, None] = (
                         acc_O_mn[r, None].load() * correction)
 
-                    # exp2(score * scale_log2e - max * scale_log2e)
                     acc_S_row_exp = cute.math.exp2(
                         acc_S_row * Float32(self.scale_log2e)
                         - m_new * Float32(self.scale_log2e),
                         fastmath=True,
                     )
 
-                    # Update running sum
                     acc_S_row_sum = acc_S_row_exp.reduce(
                         cute.ReductionOp.ADD, Float32(0.0), 0)
                     row_sum[r] = row_sum[r] + acc_S_row_sum
 
-                    # Update max and store P values
                     row_max[r] = m_new
                     acc_S_mn[r, None] = acc_S_row_exp
 
-                # -- Write P (fp16) to P smem region --
-                tCsP = thr_mma.partition_C(sP)
-                for i in cutlass.range_constexpr(cute.size(acc_S)):
-                    tCsP[i] = acc_S[i].to(self.q_dtype)
+                # 5. P in registers
+                rP = cute.make_fragment_like(acc_S, self.q_dtype)
+                rP.store(acc_S.load().to(self.q_dtype))
+                rP_layout_divided = cute.logical_divide(
+                    rP.layout, (None, None, 2))
+                rP_mma_view = cute.make_layout(
+                    ((rP_layout_divided.shape[0],
+                      rP_layout_divided.shape[2][0]),
+                     rP_layout_divided.shape[1],
+                     rP_layout_divided.shape[2][1]),
+                    stride=(
+                        (rP_layout_divided.stride[0],
+                         rP_layout_divided.stride[2][0]),
+                        rP_layout_divided.stride[1],
+                        rP_layout_divided.stride[2][1]),
+                )
+                tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
-                # Sync so all MMA threads see P in smem
-                named_barrier_sync(
-                    Int32(2), Int32(self.num_mma_threads))
+                # 6. Wait for V[i]
+                mbarrier_wait(mbar_v_addr, phase)
 
-                # -- O GEMM: acc_O += P @ V --
+                # 7. O GEMM: acc_O += P(regs) @ V(smem)
+                #    LdMatrix reads Vt, K[i+1] loads concurrently
                 for kb in cutlass.range_constexpr(self.n_block // 16):
-                    cute.autovec_copy(
-                        tAsP[None, None, kb], tArP[None, None, kb])
-                    cute.autovec_copy(
-                        tBsVt[None, None, kb], tBrVt[None, None, kb])
+                    cute.copy(smem_tiled_copy_Vt,
+                              tVsVt[None, None, kb],
+                              tVrVt_copy_view[None, None, kb])
                     cute.gemm(tiled_mma, acc_O,
-                              tArP[None, None, kb],
+                              tOrS[None, None, kb],
                               tBrVt[None, None, kb], acc_O)
 
             # === Normalize O by row_sum (with quad reduction) ===
