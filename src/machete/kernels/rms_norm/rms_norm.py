@@ -5,13 +5,15 @@ RMSNorm Op for the Megakernel.
 Applies Root Mean Square Layer Normalization:
     y = x / sqrt(mean(x²) + eps) * weight
 
-Pipelined load/compute/store with shared memory staging for the forward pass:
-    load:    async cp.async.bulk G->S (x tile)
-    compute: read x from smem, weight from global->regs, write y to smem
-    store:   cp.async.bulk S->G (y tile)
+Pipelined load/compute/store with shared memory staging:
+    load:    TMA async G->S (x tile)
+    compute: read x from smem, weight from global->regs, write output to smem
+    store:   TMA S->G (y forward / dx backward)
 
 Weight is loaded to registers in compute (small, shared across tiles).
-Backward reads from global memory (x+dout don't fit in one page for large D).
+Both forward and backward use the same pipelining pattern:
+    - Forward: load x, compute y = x * rstd * w, store y
+    - Backward: load x, compute dx from x + dout (global) + w (global), store dx
 
 Configuration:
     - threads_per_row: from MegakernelConfig.threads_per_block (compile-time constant)
@@ -36,11 +38,6 @@ import operator
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
-from cutlass.cute.nvgpu.cpasync import (
-    CopyBulkG2SOp,
-    CopyBulkS2GOp,
-    group_bulk_copy_modes,
-)
 
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -65,15 +62,13 @@ class RMSNormOp(Op):
     Applies Root Mean Square Layer Normalization:
         y = x / sqrt(mean(x²) + eps) * weight
 
-    Forward uses pipelined load/compute/store with shared memory:
-    - load: async G->S for x (DMA warp, elect_one)
-    - compute: warp-parallel normalization, x from smem, weight from global
-    - store: S->G for y (DMA warp, all threads)
+    Both forward and backward use pipelined load/compute/store:
+    - load: TMA G->S for x (DMA warp, elect_one)
+    - compute: x from smem, weight+dout from global, output to smem
+    - store: TMA S->G for y (forward) or dx (backward)
 
-    Backward reads from global memory (no pipelining).
-
-    Shared memory layout per page (forward):
-        [tile_size_M * D elements]  -- x on load, y after compute
+    Shared memory layout per page:
+        [tile_size_M * D elements]  -- x on load, y/dx after compute
 
     Tensor declarations:
         x:      (M, D)  -- input tensor (bf16/fp16/fp32)
@@ -96,6 +91,9 @@ class RMSNormOp(Op):
     }
     writes = {"y": (None, ("M", "D"))}
     tile = ("M", "D")
+
+    tma_loads = {"x"}
+    tma_stores = {"y", "dx"}
 
     backward_reads = {
         "dout": (None, ("M", "D")),
@@ -121,56 +119,40 @@ class RMSNormOp(Op):
             f"Reduce tile_size_M={self.tile_size_M}."
         )
 
-        self.x_nbits_per_row = self.D * self.elem_bytes * 8
+        self.num_warps = self.threads_per_row // 32
 
     # =========================================================================
     # Forward Load (G->S)
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_D, x, weight, y, work_mbar):
-        """Load x tile from global to shared memory (async G->S).
+    def load(self, page_ptr, tile_M, tile_D, x_tma, x_tma_gmem, work_mbar):
+        """TMA load of x tile from global to shared memory.
 
-        Having work_mbar in the signature tells the framework this is an
-        async load. The framework wraps non-TMA loads in elect_one(), so
-        only one DMA-warp thread executes this body.
+        TMA transposes gmem: x(M,D) -> smem (D,M). Handles boundary
+        conditions (partial last M tile) automatically.
         """
-        row_start = tile_M * self.tile_size_M
+        sX = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.D, self.tile_size_M)),
+        )
+        gX = cute.local_tile(
+            x_tma_gmem, (self.D, self.tile_size_M), (None, None),
+        )
+        tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
+            x_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sX, 0, 2),
+            cute.group_modes(gX, 0, 2),
+        )
 
-        # Compute total bytes (handle partial M tiles at boundary)
-        row_bytes = Int32(self.D * self.elem_bytes)
-        total_bytes = Int32(self.tile_size_M) * row_bytes
-        remaining = Int32(self.M) - row_start
-        if remaining < Int32(self.tile_size_M):
-            total_bytes = remaining * row_bytes
-
+        nbytes = Int32(self.x_tile_bytes)
         mbar_ptr = cute.make_ptr(
             cutlass.Int64, work_mbar, cute.AddressSpace.smem
         )
-        mbarrier_arrive_expect_tx(work_mbar, total_bytes)
-
-        g2s = cute.make_copy_atom(
-            CopyBulkG2SOp(), self.x_dtype,
-            num_bits_per_copy=self.x_nbits_per_row,
-        )
-
-        for local_row in range(self.tile_size_M):
-            row_idx = row_start + local_row
-            if row_idx < self.M:
-                g_x = cute.make_tensor(
-                    x.iterator + row_idx * self.D,
-                    cute.make_layout((self.D,)),
-                )
-                s_x = cute.make_tensor(
-                    cute.make_ptr(
-                        self.x_dtype,
-                        page_ptr + Int32(local_row * self.D * self.elem_bytes),
-                        cute.AddressSpace.smem,
-                    ),
-                    cute.make_layout((self.D,)),
-                )
-                gsrc, sdst = group_bulk_copy_modes(g_x, s_x)
-                cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        cute.copy(x_tma, tXgX[(None, tile_D, tile_M)], tXsX,
+                  tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # Forward Compute
@@ -247,58 +229,55 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_D, x, weight, y):
-        """Store y from shared to global memory (S->G).
+    def store(self, page_ptr, tile_M, tile_D, y_tma, y_tma_gmem):
+        """TMA store of y from shared to global memory.
 
-        Runs on all 32 DMA warp threads (no elect_one).
+        Compute writes y as (tile_M, D) row-major stride (D, 1).
+        TMA sees smem as (D, tile_M) col-major — same physical layout.
+        TMA handles boundary conditions for partial last M tile.
         """
-        s2g = cute.make_copy_atom(
-            CopyBulkS2GOp(), self.x_dtype,
-            num_bits_per_copy=self.x_nbits_per_row,
+        sY = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.D, self.tile_size_M)),
         )
-        row_start = tile_M * self.tile_size_M
-
-        for local_row in range(self.tile_size_M):
-            row_idx = row_start + local_row
-            if row_idx < self.M:
-                s_y = cute.make_tensor(
-                    cute.make_ptr(
-                        self.x_dtype,
-                        page_ptr + Int32(local_row * self.D * self.elem_bytes),
-                        cute.AddressSpace.smem,
-                    ),
-                    cute.make_layout((self.D,)),
-                )
-                g_y = cute.make_tensor(
-                    y.iterator + row_idx * self.D,
-                    cute.make_layout((self.D,)),
-                )
-                ssrc, gdst = group_bulk_copy_modes(s_y, g_y)
-                cute.copy(s2g, ssrc, gdst)
+        gY = cute.local_tile(
+            y_tma_gmem, (self.D, self.tile_size_M), (None, None),
+        )
+        tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
+            y_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sY, 0, 2),
+            cute.group_modes(gY, 0, 2),
+        )
+        with cute.arch.elect_one():
+            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_M)])
 
     # =========================================================================
-    # Backward (unchanged — reads from global memory)
+    # Backward Load (G->S) — reuse forward TMA load for x
+    # =========================================================================
+
+    backward_load = load
+
+    # =========================================================================
+    # Backward Compute
     # =========================================================================
 
     @cute.jit
     def backward_compute(self, page_ptr, tile_M, tile_D, dout, x, weight, dx):
-        """RMSNorm backward with warp-parallel row processing.
+        """RMSNorm backward: read x from smem, dout+weight from global.
 
         dx = (dout * weight - x * rstd² * mean(dout * weight * x)) * rstd
 
-        Each warp processes a separate row independently.
-        Reads from global memory (no pipelining — x+dout don't fit in page).
+        x is loaded to smem by backward_load (TMA). dout and weight are
+        read from global memory. dx is written to smem for TMA store.
         """
+        x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
+
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
-
-        row_start = tile_M * self.tile_size_M
-
-        # Vectorized path (D >= 32 guaranteed by __init__ assert)
         thr_layout = cute.make_layout(32)
 
-        # Load weight into registers
+        # Load weight into registers (from global, shared across tiles)
         w_row = cute.make_tensor(
             weight.iterator,
             cute.make_layout(self.D),
@@ -307,29 +286,18 @@ class RMSNormOp(Op):
         w_reg = cute.make_fragment_like(w_part)
         cute.autovec_copy(w_part, w_reg)
 
+        row_start = tile_M * self.tile_size_M
+
         for local_row in range(warp_idx, self.tile_size_M, num_warps):
             row_idx = row_start + local_row
 
             if row_idx < self.M:
-                # Load x row
+                # Read x from smem (loaded by backward_load)
                 x_row = cute.make_tensor(
-                    x.iterator + row_idx * self.D,
+                    x_smem + local_row * self.D,
                     cute.make_layout(self.D),
                 )
-                dout_row = cute.make_tensor(
-                    dout.iterator + row_idx * self.D,
-                    cute.make_layout(self.D),
-                )
-                dx_row = cute.make_tensor(
-                    dx.iterator + row_idx * self.D,
-                    cute.make_layout(self.D),
-                )
-
                 x_part = cute.local_partition(x_row, thr_layout, lane_idx)
-                dout_part = cute.local_partition(dout_row, thr_layout, lane_idx)
-                dx_part = cute.local_partition(dx_row, thr_layout, lane_idx)
-
-                # Load x into registers
                 x_reg = cute.make_fragment_like(x_part)
                 cute.autovec_copy(x_part, x_reg)
 
@@ -342,7 +310,12 @@ class RMSNormOp(Op):
                 sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
                 rstd = cute.math.rsqrt(sum_sq / self.D + RMSNORM_EPS, fastmath=True)
 
-                # Load dout
+                # Load dout from global
+                dout_row = cute.make_tensor(
+                    dout.iterator + row_idx * self.D,
+                    cute.make_layout(self.D),
+                )
+                dout_part = cute.local_partition(dout_row, thr_layout, lane_idx)
                 dout_reg = cute.make_fragment_like(dout_part)
                 cute.autovec_copy(dout_part, dout_reg)
 
@@ -358,6 +331,7 @@ class RMSNormOp(Op):
                 mean_grad = sum_grad / self.D
 
                 # Pass 3: dx = (dout * w - x * rstd² * mean_grad) * rstd
+                # Write to smem (same region as x, fully consumed into regs)
                 dx_reg = cute.make_fragment_like(x_reg)
                 for i in range(cute.size(x_reg)):
                     d = dout_reg[i].to(Float32)
@@ -365,10 +339,37 @@ class RMSNormOp(Op):
                     x_val = x_reg[i].to(Float32)
                     dw_x = d * w
                     result = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
-                    dx_reg[i] = result.to(self.dout_dtype)
+                    dx_reg[i] = result.to(self.x_dtype)
 
-                # Store dx
-                cute.autovec_copy(dx_reg, dx_part)
+                # Write dx to smem for TMA store
+                dx_row_out = cute.make_tensor(
+                    x_smem + local_row * self.D,
+                    cute.make_layout(self.D),
+                )
+                dx_part_out = cute.local_partition(dx_row_out, thr_layout, lane_idx)
+                cute.autovec_copy(dx_reg, dx_part_out)
+
+    # =========================================================================
+    # Backward Store (S->G)
+    # =========================================================================
+
+    @cute.jit
+    def backward_store(self, page_ptr, tile_M, tile_D, dx_tma, dx_tma_gmem):
+        """TMA store of dx from shared to global memory."""
+        sDX = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.D, self.tile_size_M)),
+        )
+        gDX = cute.local_tile(
+            dx_tma_gmem, (self.D, self.tile_size_M), (None, None),
+        )
+        tDXsDX, tDXgDX = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDX, 0, 2),
+            cute.group_modes(gDX, 0, 2),
+        )
+        with cute.arch.elect_one():
+            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_M)])
 
 
 __all__ = ["RMSNormOp"]

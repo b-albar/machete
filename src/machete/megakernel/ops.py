@@ -283,18 +283,22 @@ def _process_op_declarations(cls):
     tma_stores = set(getattr(cls, "tma_stores", set()))
     tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
 
-    # Validate TMA tensors exist in reads/writes
-    read_names = set(reads.keys())
-    write_names = set(writes.keys())
+    # Validate TMA tensors exist in reads/writes (including backward declarations).
+    # TMA names may appear in forward-only or backward-only tensors — the framework
+    # skips non-existent tensors at schedule time (TMARegistry.from_ops).
+    bwd_reads = getattr(cls, "backward_reads", None) or {}
+    bwd_writes = getattr(cls, "backward_writes", None) or {}
+    all_read_names = set(reads.keys()) | set(bwd_reads.keys())
+    all_write_names = set(writes.keys()) | set(bwd_writes.keys())
     for name in tma_loads:
-        if name not in read_names:
-            raise ValueError(f"tma_loads tensor '{name}' not found in reads")
+        if name not in all_read_names:
+            raise ValueError(f"tma_loads tensor '{name}' not found in reads or backward_reads")
     for name in tma_stores:
-        if name not in write_names:
-            raise ValueError(f"tma_stores tensor '{name}' not found in writes")
+        if name not in all_write_names:
+            raise ValueError(f"tma_stores tensor '{name}' not found in writes or backward_writes")
     for name in tma_reduce_stores:
-        if name not in write_names:
-            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes")
+        if name not in all_write_names:
+            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes or backward_writes")
 
     cls._TMA_LOADS = tma_loads
     cls._TMA_STORES = tma_stores
@@ -303,8 +307,13 @@ def _process_op_declarations(cls):
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
+    # Include both forward and backward tensor dims so that TMA tensors
+    # declared in backward_writes (e.g., "dx") get correct tile shapes.
     tma_tensor_dims = {}  # {tensor_name: list of dim_names}
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
+    for name, _, dims in cls._BWD_UNIQUE_TENSORS:
+        if name not in tensor_dims_map:
+            tensor_dims_map[name] = dims
     for name in tma_loads | tma_stores | tma_reduce_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
@@ -376,8 +385,11 @@ def _process_op_declarations(cls):
                 tile_counts.append(1)
                 resolved_tile_sizes[dim_name] = dim_size
             else:
-                tile_counts.append((dim_size + ts - 1) // ts)
-                resolved_tile_sizes[dim_name] = ts
+                # Clamp tile size to dimension extent — TMA descriptors
+                # require box size <= tensor extent in each mode.
+                clamped_ts = min(ts, dim_size)
+                tile_counts.append((dim_size + clamped_ts - 1) // clamped_ts)
+                resolved_tile_sizes[dim_name] = clamped_ts
         tile_counts = tuple(tile_counts)
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
