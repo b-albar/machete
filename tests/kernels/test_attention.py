@@ -53,12 +53,16 @@ def _run_attention_forward(q, k, v, tile_m=None, causal=False):
     from machete.kernels.attention import FlashAttentionOp
 
     BH, M, D = q.shape
-    if tile_m is None:
-        tile_m = _tile_size_M(D, q.element_size())
+    tile_sizes = {}
+    if tile_m is not None:
+        tile_sizes["M"] = tile_m
+    elif q.element_size() == 4:  # fp32 scalar path
+        tile_sizes["M"] = _tile_size_M(D, q.element_size())
+    # For fp16/bf16, let schedule_forward compute optimal tile_M
     o = torch.zeros_like(q)
     ops = FlashAttentionOp.schedule(
         q=q, k=k, v=v, o=o,
-        tile_sizes={"M": tile_m},
+        tile_sizes=tile_sizes,
         causal=causal,
     )
     kernel = Megakernel(ops, config=MegakernelConfig())
@@ -218,6 +222,170 @@ class TestFlashAttentionCausal:
         o_ref = flash_attention_pytorch(q, k, v, causal=True)
 
         torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
+
+
+# =============================================================================
+# fp16 MMA Tests (tensor core path)
+# =============================================================================
+
+
+class TestFlashAttentionMMA:
+    """fp16 tensor core MMA path correctness tests."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH,M,N,D", [
+        (1, 16, 16, 64),     # Exact tile, D=64
+        (1, 16, 16, 128),    # Exact tile, D=128
+        (1, 16, 32, 64),     # Multi KV-block
+        (1, 16, 64, 128),    # 4 KV-blocks
+    ])
+    def test_mma_basic_shapes(self, BH, M, N, D):
+        """MMA attention for various shapes (exact tile_M=16)."""
+        torch.manual_seed(42)
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_mma_non_divisible_n(self):
+        """N not a multiple of n_block=16."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 16, 20, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_mma_multi_head(self):
+        """Multiple attention heads."""
+        torch.manual_seed(42)
+        BH, M, N, D = 4, 16, 32, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_mma_multi_m_tile(self):
+        """Multiple M tiles: M=32, tile_m=16."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 32, 32, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_mma_uniform_attention(self):
+        """Uniform keys -> each output row equals mean of V."""
+        BH, M, N, D = 1, 16, 16, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k_row = torch.randn(1, 1, D, dtype=torch.float16, device="cuda")
+        k = k_row.expand(BH, N, D).contiguous()
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        expected = v.float().mean(dim=1, keepdim=True).expand_as(q).half()
+
+        torch.testing.assert_close(o_mk, expected, atol=5e-2, rtol=5e-2)
+
+
+# =============================================================================
+# Multi-warp MMA Tests (auto tile_M)
+# =============================================================================
+
+
+class TestFlashAttentionMultiWarp:
+    """Multi-warp MMA tests — let schedule_forward pick optimal tile_M."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH,M,N,D", [
+        (1, 64, 64, 64),      # D=64: tile_M=112 (7 warps), M < tile_M
+        (1, 112, 64, 64),     # D=64: M=tile_M (exact)
+        (1, 128, 64, 64),     # D=64: M > tile_M, multiple M tiles
+        (1, 64, 64, 128),     # D=128: tile_M=64 (4 warps), exact
+        (1, 128, 128, 128),   # D=128: 2 M tiles
+        (4, 64, 64, 128),     # Multi-head, D=128
+    ])
+    def test_multi_warp_shapes(self, BH, M, N, D):
+        """Multi-warp MMA with auto tile_M for various shapes."""
+        torch.manual_seed(42)
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_multi_warp_non_divisible_n(self):
+        """Multi-warp with N not divisible by n_block=16."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 64, 50, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_multi_warp_non_divisible_m(self):
+        """Multi-warp with M not divisible by tile_M."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 80, 64, 128  # tile_M=64, so M=80 not divisible
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_multi_warp_decode(self):
+        """Decode with multi-warp: M=16 (single warp min), N large."""
+        torch.manual_seed(42)
+        BH, M, N, D = 4, 16, 128, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
 
 
 # =============================================================================
