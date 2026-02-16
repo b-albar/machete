@@ -199,7 +199,11 @@ def _build_phase_wrapper(
 
     tensor_str = ""
     if tensor_param_names:
-        tensor_str = ", " + ", ".join(tensor_param_names)
+        # Deduplicate for function signature — same canonical tensor may appear
+        # multiple times when reads and writes share the same buffer (in-place ops).
+        # call_args keeps duplicates so each method param gets the tensor.
+        unique_tensor_params = list(dict.fromkeys(tensor_param_names))
+        tensor_str = ", " + ", ".join(unique_tensor_params)
     tma_str = ""
     if tma_param_names:
         tma_str = ", " + ", ".join(tma_param_names)

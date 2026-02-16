@@ -468,8 +468,10 @@ class Megakernel:
         # Build dispatch branches (if/elif chain so only the matching op executes)
         lines = []
         for i, args in enumerate(op_tensor_args):
-            # Combine tensor args and TMA args for this op's phase function call
-            all_args = list(args)
+            # Combine tensor args and TMA args for this op's phase function call.
+            # Deduplicate tensor args — in-place ops may map multiple local names
+            # (e.g., x and y) to the same canonical name.
+            all_args = list(dict.fromkeys(args))
             if op_tma_args and i < len(op_tma_args):
                 all_args.extend(op_tma_args[i])
 
