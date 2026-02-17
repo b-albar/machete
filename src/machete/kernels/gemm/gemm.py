@@ -12,10 +12,11 @@ Architecture (SM_90+ / Hopper+):
     - Supports fp16 and bf16 inputs, fp32 accumulation
     - K is a tile dimension — all (M, N, K) tiles are independent
     - TMA for G->S loads, TMA store_add (atomic) for S->G reduction
+    - LdMatrix for warp-cooperative smem->register reads
 
 Pipelined phases:
     load:    TMA G->S of A[tile_M, tile_K] + B[tile_N, tile_K]
-    compute: Single MMA pass over tile_K. Epilogue: R->S to page.
+    compute: LdMatrix smem->reg, single MMA pass. Epilogue: R->S.
     store:   TMA store_add S->G of C_partial[tile_M, tile_N]
 
 Page layout (16KB):
@@ -43,6 +44,7 @@ class GemmOp(Op):
     B must be in (N, K) layout with K contiguous.
 
     All (M, N, K) tiles are independent. K reduction is via TMA atomic add.
+    Uses LdMatrix for warp-cooperative smem->register reads.
     """
 
     reads = {
@@ -132,13 +134,14 @@ class GemmOp(Op):
         cute.copy(b_tma, tBgB[(None, tile_K, tile_N)], tBsB, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
-    # Forward Compute: Single MMA pass over tile_K
+    # Forward Compute: Single MMA pass over tile_K with LdMatrix
     # =========================================================================
 
     @cute.jit
     def compute(self, page_ptr, tile_M, tile_N, tile_K):
         """GEMM compute: tensor core MMA with fp32 accumulation.
 
+        Reads A/B from smem via LdMatrix (warp-cooperative 128-bit loads).
         Single pass over tile_K (no K-loop). Writes partial C to smem
         for atomic store_add in the store phase.
         """
@@ -153,7 +156,7 @@ class GemmOp(Op):
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
-        # --- Smem tensors (compute layout: row-major, K contiguous) ---
+        # --- Smem tensors (compute layout: M/N mode 0, K mode 1, K contiguous) ---
         sA = cute.make_tensor(
             cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem,
                           assumed_align=128),
@@ -167,11 +170,32 @@ class GemmOp(Op):
                              stride=(self.tile_size_K, 1)),
         )
 
-        # --- Partition and create register fragments ---
+        # --- MMA partitions and register fragments ---
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
         tCrA = tiled_mma.make_fragment_A(tCsA)
         tCrB = tiled_mma.make_fragment_B(tCsB)
+
+        # --- LdMatrix tiled copies (warp-cooperative smem reads) ---
+        smem_copy_atom_A = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                transpose=False, num_matrices=4), self.a_dtype)
+        smem_tiled_copy_A = cute.make_tiled_copy_A(smem_copy_atom_A, tiled_mma)
+        smem_thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
+
+        smem_copy_atom_B = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                transpose=False, num_matrices=4), self.b_dtype)
+        smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
+        smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
+
+        # Partition smem for LdMatrix reads
+        tAsA_ld = smem_thr_copy_A.partition_S(sA)
+        tBsB_ld = smem_thr_copy_B.partition_S(sB)
+
+        # Retile register fragments to match LdMatrix layout
+        tCrA_ld = smem_thr_copy_A.retile(tCrA)
+        tCrB_ld = smem_thr_copy_B.retile(tCrB)
 
         # --- Init fp32 accumulator ---
         acc = cute.make_fragment(
@@ -180,12 +204,14 @@ class GemmOp(Op):
         )
         acc.fill(0.0)
 
-        # --- MMA over tile_K in 16-element k-blocks ---
+        # --- MMA over tile_K in 16-element k-blocks (LdMatrix reads) ---
         for k_block in cutlass.range_constexpr(self.tile_size_K // 16):
-            cute.autovec_copy(tCsA[None, None, k_block],
-                              tCrA[None, None, k_block])
-            cute.autovec_copy(tCsB[None, None, k_block],
-                              tCrB[None, None, k_block])
+            cute.copy(smem_tiled_copy_A,
+                      tAsA_ld[None, None, k_block],
+                      tCrA_ld[None, None, k_block])
+            cute.copy(smem_tiled_copy_B,
+                      tBsB_ld[None, None, k_block],
+                      tCrB_ld[None, None, k_block])
             cute.gemm(tiled_mma, acc,
                       tCrA[None, None, k_block],
                       tCrB[None, None, k_block], acc)
