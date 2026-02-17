@@ -3,10 +3,10 @@
 """Benchmark Flash Attention: Megakernel vs PyTorch vs torch SDPA vs CuTe DSL FA2.
 
 Compares GPU kernel execution time of:
-  - PyTorch manual attention (bmm + softmax + bmm) [fp32]
-  - torch.nn.functional.scaled_dot_product_attention [fp32]
+  - PyTorch manual attention (bmm + softmax + bmm) [fp16]
+  - torch.nn.functional.scaled_dot_product_attention [fp16]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
-  - Megakernel FlashAttentionOp (tensor core MMA) [fp16]
+  - Megakernel FlashAttentionOp (tensor core MMA) [fp16, bf16]
 
 All implementations use direct CUDA event timing (no CUDA graph capture)
 for consistent measurement.
@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.kernels.attention import FlashAttentionOp
 from machete.kernels.attention.ref import flash_attention_pytorch
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 try:
     import cutlass
@@ -56,12 +55,6 @@ def is_hopper_or_newer():
         return False
     major, _ = torch.cuda.get_device_capability()
     return major >= 9
-
-
-def _tile_size_M(D, elem_bytes=4):
-    """Compute tile_size_M that fits double-buffered K/V in PAGE_SIZE."""
-    max_tile = (PAGE_SIZE - 8) // (D * elem_bytes) - 4
-    return min(4, max(1, max_tile))
 
 
 def _fa2_block_sizes(D):
@@ -136,13 +129,14 @@ def _bench_megakernel(kernel, setup_fn, warmup=25, rep=100):
 
 CONFIGS = [
     # (BH, M, N, D) — representative transformer attention shapes
-    # Decode (M=1, single new token attending to KV cache)
-    (32, 1, 128, 128),     # small KV cache, 32 heads
-    (32, 1, 512, 128),     # medium KV cache
-    (32, 1, 1024, 128),    # large KV cache
-    (32, 1, 2048, 128),    # very large KV cache
-    (32, 1, 128, 64),      # D=64 variant
-    (32, 1, 1024, 64),
+    # Note: FlashAttentionOp requires M >= 16 (MMA tile constraint)
+    # Small prefill (M=16, minimum MMA tile)
+    (32, 16, 128, 128),    # small KV cache, 32 heads
+    (32, 16, 512, 128),    # medium KV cache
+    (32, 16, 1024, 128),   # large KV cache
+    (32, 16, 2048, 128),   # very large KV cache
+    (32, 16, 128, 64),     # D=64 variant
+    (32, 16, 1024, 64),
     # Prefill (M=N, processing prompt tokens)
     (32, 64, 64, 128),
     (32, 128, 128, 128),
@@ -167,8 +161,8 @@ def run_benchmarks(warmup=25, rep=100):
     if has_fa2:
         cols.append("cute_fa2")
     if has_megakernel:
-        cols.append("mk_fp32")
         cols.append("mk_fp16")
+        cols.append("mk_bf16")
 
     header = f"{'Config':<28}"
     for c in cols:
@@ -196,10 +190,10 @@ def run_benchmarks(warmup=25, rep=100):
         label = f"BH={BH},M={M},N={N},D={D}"
         torch.manual_seed(42)
 
-        # fp32 tensors for pytorch, sdpa, megakernel
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
+        # fp16 tensors for pytorch, sdpa, megakernel
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
 
         # PyTorch manual
         ms_pt = _bench_fn(
@@ -272,39 +266,13 @@ def run_benchmarks(warmup=25, rep=100):
                 ms_fa2 = None
                 print(f"  [{label}] CuTe FA2 error: {e}")
 
-        # Megakernel fp32 (scalar path)
-        ms_mk32 = None
-        if has_megakernel:
-            try:
-                tile_m = _tile_size_M(D, q.element_size())
-                o = torch.zeros_like(q)
-                ops = FlashAttentionOp.schedule(
-                    q=q, k=k, v=v, o=o,
-                    tile_sizes={"M": tile_m},
-                )
-                kernel = Megakernel(ops, config=MegakernelConfig())
-                with contextlib.redirect_stdout(io.StringIO()):
-                    kernel.run()
-                torch.cuda.synchronize()
-
-                ms_mk32 = _bench_megakernel(
-                    kernel, setup_fn=lambda: o.zero_(),
-                    warmup=warmup, rep=rep,
-                )
-            except Exception as e:
-                ms_mk32 = None
-                print(f"  [{label}] mk_fp32 error: {e}")
-
         # Megakernel fp16 (MMA tensor core path)
         ms_mk16 = None
         if has_megakernel:
             try:
-                q16 = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-                k16 = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-                v16 = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-                o16 = torch.zeros_like(q16)
+                o16 = torch.zeros_like(q)
                 ops16 = FlashAttentionOp.schedule(
-                    q=q16, k=k16, v=v16, o=o16,
+                    q=q, k=k, v=v, o=o16,
                 )
                 kernel16 = Megakernel(ops16, config=MegakernelConfig())
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -319,6 +287,30 @@ def run_benchmarks(warmup=25, rep=100):
                 ms_mk16 = None
                 print(f"  [{label}] mk_fp16 error: {e}")
 
+        # Megakernel bf16 (MMA tensor core path)
+        ms_mkbf = None
+        if has_megakernel:
+            try:
+                qb = torch.randn(BH, M, D, dtype=torch.bfloat16, device="cuda")
+                kb = torch.randn(BH, N, D, dtype=torch.bfloat16, device="cuda")
+                vb = torch.randn(BH, N, D, dtype=torch.bfloat16, device="cuda")
+                ob = torch.zeros_like(qb)
+                opsb = FlashAttentionOp.schedule(
+                    q=qb, k=kb, v=vb, o=ob,
+                )
+                kernelb = Megakernel(opsb, config=MegakernelConfig())
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kernelb.run()
+                torch.cuda.synchronize()
+
+                ms_mkbf = _bench_megakernel(
+                    kernelb, setup_fn=lambda: ob.zero_(),
+                    warmup=warmup, rep=rep,
+                )
+            except Exception as e:
+                ms_mkbf = None
+                print(f"  [{label}] mk_bf16 error: {e}")
+
         # Print results
         line = f"{label:<28}"
         line += f" {ms_pt:>12.4f}"
@@ -326,8 +318,8 @@ def run_benchmarks(warmup=25, rep=100):
         if has_fa2:
             line += f" {ms_fa2:>12.4f}" if ms_fa2 is not None else f" {'error':>12}"
         if has_megakernel:
-            line += f" {ms_mk32:>12.4f}" if ms_mk32 is not None else f" {'error':>12}"
             line += f" {ms_mk16:>12.4f}" if ms_mk16 is not None else f" {'error':>12}"
+            line += f" {ms_mkbf:>12.4f}" if ms_mkbf is not None else f" {'error':>12}"
         if has_megakernel and has_fa2:
             if ms_mk16 is not None and ms_fa2 is not None and ms_fa2 > 0:
                 line += f" {ms_mk16 / ms_fa2:>7.2f}x"
@@ -355,7 +347,7 @@ if __name__ == "__main__":
     print(f"CUTLASS: {CUTLASS_AVAILABLE}")
     print(f"CuTe FA2: {CUTE_FA2_AVAILABLE}")
     print()
-    print("Note: pytorch/sdpa use fp32; cute_fa2/mk_fp16 use fp16 (tensor cores); mk_fp32 uses fp32 (scalar)")
+    print("Note: All implementations use fp16 (tensor cores). mk_bf16 uses bfloat16.")
     print()
 
     run_benchmarks()
