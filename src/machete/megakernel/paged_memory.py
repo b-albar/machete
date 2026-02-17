@@ -125,11 +125,12 @@ class NPageLayout:
     # Scratch area layout (ring buffer):
     # - Per-page tile info: num_pages * 24 bytes [op_idx, tile_0..4] per page
     # - Current instruction: 24 bytes [op_idx, tile_0..4]
-    # - Flags: 12 bytes [done_flag, dispatch_load_slot, dispatch_store_slot]
-    # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
+    # - Flags: 36 bytes [done_flag, dispatch_load_slot, dispatch_store_slot,
+    #                     prev_tile coords (5 int32s), inner_iter_idx]
+    # - Mbarriers: 3 * num_pages * 8 bytes [work_notify + compute_done + smem_consumed]
     _TILE_INFO_SIZE: int = 24  # Per-page: op_idx + 5 tile indices (6 int32s)
     _INSTR_SIZE: int = 24  # Same as tile info: 6 int32s
-    _FLAGS_SIZE: int = 32  # done + dispatch slots + prev_tile coords (5 int32s)
+    _FLAGS_SIZE: int = 36  # done + dispatch slots + prev_tile coords + inner_iter_idx
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
@@ -144,7 +145,8 @@ class NPageLayout:
         self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
         self.flags_offset = self.instr_offset + self._INSTR_SIZE
 
-        # mbarrier array: 2 * num_pages mbarriers (work_notify[0..N-1], compute_done[0..N-1])
+        # mbarrier array: 3 * num_pages mbarriers
+        # [work_notify[0..N-1], compute_done[0..N-1], smem_consumed[0..N-1]]
         # Each mbarrier is 8 bytes and MUST be 8-byte aligned (PTX requirement).
         self.mbarrier_offset = _align_up(
             self.flags_offset + self._FLAGS_SIZE, 8
@@ -152,7 +154,7 @@ class NPageLayout:
 
         raw_scratch_size = (
             self.mbarrier_offset
-            + 2 * self.num_pages * self._MBARRIER_SIZE
+            + 3 * self.num_pages * self._MBARRIER_SIZE
         )
         self.scratch_size = _align_up(raw_scratch_size, 128)
 
@@ -179,6 +181,14 @@ class NPageLayout:
     def compute_done_mbar_offset(self, page_idx: int) -> int:
         """Get offset to the compute_done mbarrier for a given page."""
         return self.mbarrier_offset + self.num_pages * self._MBARRIER_SIZE + page_idx * self._MBARRIER_SIZE
+
+    def smem_consumed_mbar_offset(self, slot_idx: int) -> int:
+        """Get offset to the smem_consumed mbarrier for a given slot.
+
+        Used for inner iterations: MMA warps signal after consuming smem,
+        DMA warp polls before issuing the next inner iteration load.
+        """
+        return self.mbarrier_offset + 2 * self.num_pages * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
 
     @classmethod
     def for_device(

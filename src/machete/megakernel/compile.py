@@ -138,7 +138,10 @@ def _build_phase_wrapper(
     # Add tensor params only if method expects them (has params beyond
     # page_ptr, tile_*, op_config_ptr, work_mbar, and TMA params)
     if tensor_param_names:
-        known_special = {"page_ptr", "op_config_ptr", "work_mbar"}
+        known_special = {
+            "page_ptr", "op_config_ptr", "work_mbar",
+            "inner_iter_idx", "smem_consumed_mbar", "work_mbar_phase",
+        }
         tma_local_names = set(tma_reverse.keys())
         expects_tensors = any(
             p not in known_special
@@ -161,9 +164,15 @@ def _build_phase_wrapper(
     if "op_config_ptr" in method_params:
         call_args.append("op_config_ptr")
 
-    # Check if method expects work_mbar
+    # Check if method expects special framework params
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
+    if "inner_iter_idx" in method_params and extra_params and "inner_iter_idx" in extra_params:
+        call_args.append("inner_iter_idx")
+    if "smem_consumed_mbar" in method_params and extra_params and "smem_consumed_mbar" in extra_params:
+        call_args.append("smem_consumed_mbar")
+    if "work_mbar_phase" in method_params and extra_params and "work_mbar_phase" in extra_params:
+        call_args.append("work_mbar_phase")
 
     is_load_phase = phase_name in ("load", "backward_load")
 
@@ -256,7 +265,7 @@ def compile_load(instance, tensor_param_names=None,
     """Compile Op's load method.
 
     Detects async vs sync load from method signature.
-    Always includes work_mbar in wrapper signature.
+    Always includes work_mbar and inner_iter_idx in wrapper signature.
     """
     method = getattr(instance, "load")
     is_async = "work_mbar" in inspect.signature(method).parameters
@@ -264,7 +273,7 @@ def compile_load(instance, tensor_param_names=None,
     if is_async:
         return _build_phase_wrapper(
             instance, "load", tensor_param_names,
-            extra_params=["work_mbar"],
+            extra_params=["work_mbar", "inner_iter_idx"],
             filename="<compile_load>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
@@ -272,7 +281,7 @@ def compile_load(instance, tensor_param_names=None,
     else:
         return _build_phase_wrapper(
             instance, "load", tensor_param_names,
-            extra_params=["work_mbar"],
+            extra_params=["work_mbar", "inner_iter_idx"],
             append_mbar=True,
             filename="<compile_load>",
             tma_param_names=tma_param_names,
@@ -282,9 +291,15 @@ def compile_load(instance, tensor_param_names=None,
 
 def compile_compute(instance, tensor_param_names=None,
                     tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's compute method."""
+    """Compile Op's compute method.
+
+    Always includes work_mbar, smem_consumed_mbar, and work_mbar_phase
+    in wrapper signature. Ops that need inner iterations (e.g., GEMM K-loop)
+    accept these in their compute method; other ops ignore them.
+    """
     return _build_phase_wrapper(
         instance, "compute", tensor_param_names,
+        extra_params=["work_mbar", "smem_consumed_mbar", "work_mbar_phase"],
         filename="<compile_compute>",
         tma_param_names=tma_param_names,
         tma_local_mapping=tma_local_mapping,
@@ -311,7 +326,7 @@ def compile_backward_load(instance, tensor_param_names=None,
     if is_async:
         return _build_phase_wrapper(
             instance, "backward_load", tensor_param_names,
-            extra_params=["work_mbar"],
+            extra_params=["work_mbar", "inner_iter_idx"],
             filename="<compile_backward_load>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
@@ -319,7 +334,7 @@ def compile_backward_load(instance, tensor_param_names=None,
     else:
         return _build_phase_wrapper(
             instance, "backward_load", tensor_param_names,
-            extra_params=["work_mbar"],
+            extra_params=["work_mbar", "inner_iter_idx"],
             append_mbar=True,
             filename="<compile_backward_load>",
             tma_param_names=tma_param_names,
@@ -332,6 +347,7 @@ def compile_backward_compute(instance, tensor_param_names=None,
     """Compile Op's backward_compute method."""
     return _build_phase_wrapper(
         instance, "backward_compute", tensor_param_names,
+        extra_params=["work_mbar", "smem_consumed_mbar", "work_mbar_phase"],
         filename="<compile_backward_compute>",
         tma_param_names=tma_param_names,
         tma_local_mapping=tma_local_mapping,

@@ -474,6 +474,11 @@ class FlashAttentionOp(Op):
                               tCrQ[None, None, kb],
                               tCrK[None, None, kb], acc_S)
 
+                # Barrier: all warps must finish reading K before
+                # any warp starts V cp.async (overwrites same smem).
+                named_barrier_sync(
+                    Int32(2), Int32(self.num_mma_threads))
+
                 # --- 3. Load V[i] → same smem (async) ---
                 gV = cute.make_tensor(
                     cute.make_ptr(

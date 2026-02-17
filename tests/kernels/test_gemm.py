@@ -4,10 +4,9 @@
 Tests run on GPU (SM_90+) and compare the megakernel GemmOp against
 torch.matmul with fp32 accumulation as reference.
 
-GemmOp tiles on (M, N, K) — all tiles are independent. K reduction
-uses TMA store_add (atomic accumulation), so C must be zeroed before
-kernel launch. Tolerance is slightly higher for large K because the
-reduction across K tiles happens in fp16/bf16.
+GemmOp tiles on (M, N) with an inner K loop in compute. K reduction
+uses fp32 accumulation across all K blocks, followed by a single
+regular TMA store of the final C tile. No output pre-zeroing needed.
 """
 
 import contextlib
@@ -88,13 +87,9 @@ def _gemm_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,
     c = _run_gemm(a, b_t, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k)
     ref = _gemm_reference(a, b_t)
 
-    # TMA store_add accumulates in output dtype (not fp32), so tolerance
-    # scales with the number of K tiles for reduced-precision types.
-    import math
-    k_tiles = math.ceil(K / tile_k)
-    scaled_atol = atol * max(1, k_tiles // 2)
-    scaled_rtol = rtol * max(1, k_tiles // 2)
-    torch.testing.assert_close(c, ref, atol=scaled_atol, rtol=scaled_rtol)
+    # fp32 accumulation across all K blocks — precision is constant
+    # regardless of number of K tiles.
+    torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
 
 
 @requires_gpu
@@ -240,24 +235,14 @@ def _gemm_backward_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,
     _run_gemm_backward(dout, a, b, da=da, db=db,
                        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k)
 
-    # Tolerance scales with K tiles (TMA store_add in output dtype)
-    import math
-
+    # fp32 accumulation — precision is constant regardless of K tiles.
     if da is not None:
-        # dA = dout @ B, contraction over N → k_tiles_da = ceil(N / tile_n)
-        k_tiles_da = math.ceil(N / tile_n)
-        scaled_atol = atol * max(1, k_tiles_da // 2)
-        scaled_rtol = rtol * max(1, k_tiles_da // 2)
         da_ref = (dout.float() @ b.float()).to(dtype)
-        torch.testing.assert_close(da, da_ref, atol=scaled_atol, rtol=scaled_rtol)
+        torch.testing.assert_close(da, da_ref, atol=atol, rtol=rtol)
 
     if db is not None:
-        # dB = dout^T @ A, contraction over M → k_tiles_db = ceil(M / tile_m)
-        k_tiles_db = math.ceil(M / tile_m)
-        scaled_atol = atol * max(1, k_tiles_db // 2)
-        scaled_rtol = rtol * max(1, k_tiles_db // 2)
         db_ref = (dout.float().t() @ a.float()).to(dtype)
-        torch.testing.assert_close(db, db_ref, atol=scaled_atol, rtol=scaled_rtol)
+        torch.testing.assert_close(db, db_ref, atol=atol, rtol=rtol)
 
 
 @requires_gpu
