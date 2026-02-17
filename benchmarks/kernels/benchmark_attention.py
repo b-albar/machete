@@ -6,7 +6,7 @@ Compares GPU kernel execution time of:
   - PyTorch manual attention (bmm + softmax + bmm) [fp32]
   - torch.nn.functional.scaled_dot_product_attention [fp32]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
-  - Megakernel FlashAttentionOp (scalar warp-parallel) [fp32]
+  - Megakernel FlashAttentionOp (tensor core MMA) [fp16]
 
 All implementations use direct CUDA event timing (no CUDA graph capture)
 for consistent measurement.

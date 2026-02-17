@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Machete Authors
-"""Tests for FlashAttentionOp — forward correctness.
+"""Tests for FlashAttentionOp — forward correctness (fp16/bf16 MMA only).
 
 Tests run on GPU (Hopper+) and compare the megakernel FlashAttentionOp
 against a pure PyTorch reference implementation.
@@ -40,24 +40,14 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _tile_size_M(D, elem_bytes=4):
-    """Compute tile_size_M that fits Q/O + mbar + KV row in PAGE_SIZE (16KB)."""
-    # (tile_M + 2) * D * elem_bytes + 8 <= 16384
-    max_tile = (16384 - 8) // (D * elem_bytes) - 2
-    return min(4, max(1, max_tile))
-
-
 def _run_attention_forward(q, k, v, tile_m=None, causal=False):
     """Run FlashAttentionOp forward and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.attention import FlashAttentionOp
 
-    BH, M, D = q.shape
     tile_sizes = {}
     if tile_m is not None:
         tile_sizes["M"] = tile_m
-    elif q.element_size() == 4:  # fp32 scalar path
-        tile_sizes["M"] = _tile_size_M(D, q.element_size())
     # For fp16/bf16, let schedule_forward compute optimal tile_M
     o = torch.zeros_like(q)
     ops = FlashAttentionOp.schedule(
@@ -75,156 +65,6 @@ def _run_attention_forward(q, k, v, tile_m=None, causal=False):
 
 
 # =============================================================================
-# Forward Tests
-# =============================================================================
-
-
-class TestFlashAttentionForward:
-    """Forward pass correctness tests."""
-
-    @requires_gpu
-    @pytest.mark.parametrize("BH,M,N,D", [
-        (1, 4, 4, 64),
-        (1, 4, 4, 128),
-        (1, 8, 8, 64),
-        (4, 4, 4, 64),
-    ])
-    def test_forward_shapes(self, BH, M, N, D):
-        """Flash attention forward for various shapes."""
-        torch.manual_seed(42)
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v)
-        o_ref = flash_attention_pytorch(q, k, v)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_forward_decode(self):
-        """Decode: M=1, N=8 (single query attending to 8 keys)."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 1, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, tile_m=1)
-        o_ref = flash_attention_pytorch(q, k, v)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_forward_multi_tile(self):
-        """Multiple M tiles: M=16, tile_m=4."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 16, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, tile_m=4)
-        o_ref = flash_attention_pytorch(q, k, v)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_forward_non_divisible_m(self):
-        """Non-divisible M: M=10, tile_m=4."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 10, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, tile_m=4)
-        o_ref = flash_attention_pytorch(q, k, v)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_forward_uniform_attention(self):
-        """Uniform keys → each output row equals mean of V."""
-        BH, M, N, D = 1, 4, 4, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        # All K rows identical → uniform attention weights
-        k_row = torch.randn(1, 1, D, dtype=torch.float32, device="cuda")
-        k = k_row.expand(BH, N, D).contiguous()
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v)
-        # With uniform attention, output = mean(V) for each row
-        expected = v.float().mean(dim=1, keepdim=True).expand_as(q)
-        torch.testing.assert_close(o_mk, expected.to(q.dtype), atol=1e-3, rtol=1e-3)
-
-
-# =============================================================================
-# Causal Tests
-# =============================================================================
-
-
-class TestFlashAttentionCausal:
-    """Causal masking tests."""
-
-    @requires_gpu
-    def test_causal_square(self):
-        """Square causal: M=N=8, lower-triangular attention."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 8, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, causal=True)
-        o_ref = flash_attention_pytorch(q, k, v, causal=True)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_causal_decode(self):
-        """Decode causal: M=1, N=8 → attends to all positions."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 1, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, tile_m=1, causal=True)
-        o_ref = flash_attention_pytorch(q, k, v, causal=True)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_causal_asymmetric(self):
-        """Asymmetric causal: M=4, N=16."""
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 4, 16, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, causal=True)
-        o_ref = flash_attention_pytorch(q, k, v, causal=True)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-    @requires_gpu
-    def test_causal_multi_head(self):
-        """Multi-head causal: BH=4."""
-        torch.manual_seed(42)
-        BH, M, N, D = 4, 8, 8, 64
-        q = torch.randn(BH, M, D, dtype=torch.float32, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float32, device="cuda")
-
-        o_mk = _run_attention_forward(q, k, v, causal=True)
-        o_ref = flash_attention_pytorch(q, k, v, causal=True)
-
-        torch.testing.assert_close(o_mk, o_ref, atol=1e-3, rtol=1e-3)
-
-
-# =============================================================================
 # fp16 MMA Tests (tensor core path)
 # =============================================================================
 
@@ -236,8 +76,8 @@ class TestFlashAttentionMMA:
     @pytest.mark.parametrize("BH,M,N,D", [
         (1, 16, 16, 64),     # Exact tile, D=64
         (1, 16, 16, 128),    # Exact tile, D=128
-        (1, 16, 32, 64),     # Multi KV-block
-        (1, 16, 64, 128),    # 4 KV-blocks
+        (1, 16, 32, 64),     # Multi KV-block (if n_block < 32)
+        (1, 16, 64, 128),    # N == n_block for D=128
     ])
     def test_mma_basic_shapes(self, BH, M, N, D):
         """MMA attention for various shapes (exact tile_M=16)."""
@@ -254,7 +94,7 @@ class TestFlashAttentionMMA:
 
     @requires_gpu
     def test_mma_non_divisible_n(self):
-        """N not a multiple of n_block=16."""
+        """N not a multiple of n_block."""
         torch.manual_seed(42)
         BH, M, N, D = 1, 16, 20, 64
         q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
@@ -311,6 +151,21 @@ class TestFlashAttentionMMA:
 
         torch.testing.assert_close(o_mk, expected, atol=5e-2, rtol=5e-2)
 
+    @requires_gpu
+    def test_mma_large_n(self):
+        """Large N requiring multiple KV blocks (N > n_block)."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 16, 256, 128  # n_block=64 for D=128, so 4 blocks
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, tile_m=16)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
 
 # =============================================================================
 # Multi-warp MMA Tests (auto tile_M)
@@ -322,10 +177,10 @@ class TestFlashAttentionMultiWarp:
 
     @requires_gpu
     @pytest.mark.parametrize("BH,M,N,D", [
-        (1, 64, 64, 64),      # D=64: tile_M=112 (7 warps), M < tile_M
-        (1, 112, 64, 64),     # D=64: M=tile_M (exact)
-        (1, 128, 64, 64),     # D=64: M > tile_M, multiple M tiles
-        (1, 64, 64, 128),     # D=128: tile_M=64 (4 warps), exact
+        (1, 64, 64, 64),      # D=64: tile_M=64 (4 warps), n_block=128
+        (1, 96, 64, 64),      # D=64: tile_M=96 (6 warps), n_block=96
+        (1, 128, 64, 64),     # D=64: tile_M=96, multiple M tiles
+        (1, 64, 64, 128),     # D=128: tile_M=64 (4 warps), n_block=64
         (1, 128, 128, 128),   # D=128: 2 M tiles
         (4, 64, 64, 128),     # Multi-head, D=128
     ])
@@ -344,7 +199,7 @@ class TestFlashAttentionMultiWarp:
 
     @requires_gpu
     def test_multi_warp_non_divisible_n(self):
-        """Multi-warp with N not divisible by n_block=16."""
+        """Multi-warp with N not divisible by n_block."""
         torch.manual_seed(42)
         BH, M, N, D = 1, 64, 50, 128
         q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
@@ -384,6 +239,90 @@ class TestFlashAttentionMultiWarp:
         o_mk = _run_attention_forward(q, k, v)
         o_ref = flash_attention_pytorch(
             q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_multi_warp_large_n(self):
+        """Large N exercising multiple KV blocks."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 64, 512, 128  # 512/64 = 8 KV blocks
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float()).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+
+# =============================================================================
+# Causal Tests (fp16 MMA)
+# =============================================================================
+
+
+class TestFlashAttentionCausal:
+    """Causal masking tests (fp16)."""
+
+    @requires_gpu
+    def test_causal_square(self):
+        """Square causal: M=N=32, lower-triangular attention."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 32, 32, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, causal=True)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(), causal=True).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_causal_asymmetric(self):
+        """Asymmetric causal: M=16, N=64 (chunked prefill)."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 16, 64, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, causal=True)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(), causal=True).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_causal_multi_head(self):
+        """Multi-head causal: BH=4."""
+        torch.manual_seed(42)
+        BH, M, N, D = 4, 32, 32, 64
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, causal=True)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(), causal=True).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_causal_d128(self):
+        """Causal with D=128."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 64, 64, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(q, k, v, causal=True)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(), causal=True).half()
 
         torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
 
