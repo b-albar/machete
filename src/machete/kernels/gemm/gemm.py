@@ -112,6 +112,55 @@ class GemmOp(Op):
         # Framework inner iterations: DMA warp calls load() once per K-block
         self.inner_iters = self.num_k_blocks
 
+        # Swizzle parameters for bank-conflict-free LdMatrix reads.
+        # Uses CUTLASS convention: make_swizzle(B, 4, 3) where B selects
+        # the swizzle mode (SW128/SW64/SW32). Pick the largest mode whose
+        # atom size evenly divides tile_K.
+        # SW128: atom_K=64, SW64: atom_K=32, SW32: atom_K=16 (for fp16)
+        if self.tile_K % 64 == 0 and self.tile_K >= 64:
+            self.swz_B_ab = 3   # SW128
+            self.atom_K = 64
+        elif self.tile_K % 32 == 0:
+            self.swz_B_ab = 2   # SW64
+            self.atom_K = 32
+        else:
+            self.swz_B_ab = 1   # SW32
+            self.atom_K = 16
+
+    @classmethod
+    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
+                                tile_sizes, static_dims):
+        """Return swizzled smem layout code for TMA descriptor creation.
+
+        TMA hardware supports swizzle modes (32B/64B/128B). CuTe's
+        make_tiled_tma_atom detects the swizzle from the composed layout
+        and configures the appropriate TMA swizzle mode.
+
+        Uses CUTLASS convention: make_swizzle(B, 4, 3) with fixed M=4, S=3.
+        B selects the mode: 3=SW128, 2=SW64, 1=SW32.
+        K-major atom: (atom_K, 8) stride (1, atom_K) in TMA (K,M/N) convention.
+        """
+        tile_K = static_dims.get("tile_K", 32)
+        if tensor_name not in ("a", "b"):
+            return None  # No swizzle for C
+
+        # Pick largest swizzle whose atom divides tile_K
+        if tile_K % 64 == 0 and tile_K >= 64:
+            B = 3   # SW128
+        elif tile_K % 32 == 0:
+            B = 2   # SW64
+        else:
+            B = 1   # SW32
+
+        dim0, dim1 = tma_tile_shape  # (tile_K, tile_M/N) in TMA convention
+        # Flat composed layout: swizzle over full (K, M/N) col-major base.
+        # make_tiled_tma_atom extracts the swizzle and sets TMA hardware mode.
+        return (
+            f"cute.make_composed_layout("
+            f"cute.make_swizzle({B}, 4, 3), 0, "
+            f"cute.make_layout(({dim0}, {dim1}), stride=(1, {dim0})))"
+        )
+
     # =========================================================================
     # Forward Load: TMA G->S of one K-block of A and B
     # =========================================================================
@@ -126,10 +175,18 @@ class GemmOp(Op):
         inner_iter_idx selects which K-block to load.
 
         TMA transposes gmem: A(M,K) -> smem (K,M), B(N,K) -> smem (K,N).
+        Smem uses swizzled layout for bank-conflict-free LdMatrix reads.
         """
-        sA = cute.make_tensor(
+        # Swizzle on pointer, plain layout: tma_partition requires plain layout
+        # but needs the swizzle on the pointer to match TMA descriptor.
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+        sA_ptr = cute.recast_ptr(
             cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.tile_K, self.tile_size_M)),
+            swz, dtype=self.a_dtype)
+        sA = cute.make_tensor(
+            sA_ptr,
+            cute.make_layout((self.tile_K, self.tile_size_M),
+                             stride=(1, self.tile_K)),
         )
         gA = cute.local_tile(
             a_tma_gmem, (self.tile_K, self.tile_size_M), (None, None),
@@ -140,10 +197,14 @@ class GemmOp(Op):
             cute.group_modes(gA, 0, 2),
         )
 
-        sB = cute.make_tensor(
+        sB_ptr = cute.recast_ptr(
             cute.make_ptr(self.b_dtype, page_ptr + Int32(self.a_tile_bytes),
                           cute.AddressSpace.smem),
-            cute.make_layout((self.tile_K, self.tile_size_N)),
+            swz, dtype=self.b_dtype)
+        sB = cute.make_tensor(
+            sB_ptr,
+            cute.make_layout((self.tile_K, self.tile_size_N),
+                             stride=(1, self.tile_K)),
         )
         gB = cute.local_tile(
             b_tma_gmem, (self.tile_K, self.tile_size_N), (None, None),
@@ -197,16 +258,25 @@ class GemmOp(Op):
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
-        # --- Smem tensors for compute reads (row-major: M/N first, K second) ---
-        sA = cute.make_tensor(
+        # --- Smem tensors for compute reads (swizzled pointer for bank-conflict-free LdMatrix) ---
+        # Swizzle on pointer, plain layout — same pattern as CUTLASS get_tensor(outer, swizzle=inner).
+        # The swizzled pointer XORs the linear address, matching TMA's hardware swizzle.
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+        sA_ptr = cute.recast_ptr(
             cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem,
                           assumed_align=128),
+            swz, dtype=self.a_dtype)
+        sA = cute.make_tensor(
+            sA_ptr,
             cute.make_layout((self.tile_size_M, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
-        sB = cute.make_tensor(
+        sB_ptr = cute.recast_ptr(
             cute.make_ptr(self.b_dtype, page_ptr + Int32(self.a_tile_bytes),
                           cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=self.b_dtype)
+        sB = cute.make_tensor(
+            sB_ptr,
             cute.make_layout((self.tile_size_N, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
@@ -291,9 +361,10 @@ class GemmOp(Op):
         """TMA store of C from shared to global memory.
 
         Regular TMA store (overwrite, not atomic add).
-        Compute writes C as (tile_M, tile_N) row-major stride (tile_N, 1).
-        TMA sees smem as (tile_N, tile_M) col-major — same physical layout.
+        Compute writes C as swizzled (tile_M, tile_N) row-major.
+        TMA sees smem as swizzled (tile_N, tile_M) col-major — same physical layout.
         """
+        # Plain smem layout for TMA partition (TMA descriptor has swizzle)
         sC = cute.make_tensor(
             cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
             cute.make_layout((self.tile_size_N, self.tile_size_M)),
