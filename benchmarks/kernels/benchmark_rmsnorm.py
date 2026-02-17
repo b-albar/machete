@@ -55,11 +55,11 @@ def rmsnorm_bytes(batch, seq_len, hidden_dim):
 
     Reads: x (B*S*D) + weight (D)
     Writes: y (B*S*D)
-    All float32 (4 bytes).
+    All bfloat16 (2 bytes).
     """
     x_elems = batch * seq_len * hidden_dim
     w_elems = hidden_dim
-    return (2 * x_elems + w_elems) * 4
+    return (2 * x_elems + w_elems) * 2
 
 
 def _calculate_threads(hidden_dim):
@@ -96,8 +96,8 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
     torch.manual_seed(42)
     M = batch * seq_len
     D = hidden_dim
-    x = torch.randn(M, D, dtype=torch.float32, device="cuda")
-    weight = torch.randn(D, dtype=torch.float32, device="cuda")
+    x = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(D, dtype=torch.bfloat16, device="cuda")
 
     funcs = {}
 
@@ -126,7 +126,7 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
     # Megakernel (out-of-place, via bench_spec for raw kernel timing)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         y = torch.empty_like(x)
-        tile_m = min(4, max(1, 16384 // (D * 4)))
+        tile_m = min(4, max(1, 16384 // (D * 2)))
         ops = RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m})
 
         # Optimal thread config: 128 threads (4 warps) for warp-parallel rows

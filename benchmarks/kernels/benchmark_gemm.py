@@ -77,7 +77,7 @@ def compute_tile_sizes(M, K, N, elem_bytes=2):
 
 # LLM-scale shapes: (batch*seq, hidden, proj)
 # Typical hidden=4096, FFN=4*hidden=16384, batch*seq=1-8192
-@Benchmark.parametrize("dtype", ["float16", "bfloat16"])
+@Benchmark.parametrize("dtype", ["bfloat16"])
 @Benchmark.parametrize("N", [4096, 8192, 16384])
 @Benchmark.parametrize("K", [4096, 8192])
 @Benchmark.parametrize("M", [128, 512, 2048, 4096])

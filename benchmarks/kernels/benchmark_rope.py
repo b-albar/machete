@@ -45,11 +45,11 @@ def rope_bytes(batch, seq_len, n_heads, head_dim):
 
     Reads: q (B*S*H*D) + cos (S*D/2) + sin (S*D/2)
     Writes: q (B*S*H*D)
-    All float32 (4 bytes).
+    All bfloat16 (2 bytes).
     """
     q_elems = batch * seq_len * n_heads * head_dim
     cs_elems = seq_len * (head_dim // 2)
-    return (2 * q_elems + 2 * cs_elems) * 4
+    return (2 * q_elems + 2 * cs_elems) * 2
 
 
 # =============================================================================
@@ -64,9 +64,9 @@ def rope_bytes(batch, seq_len, n_heads, head_dim):
 def bench_rope(batch, seq_len, n_heads, head_dim):
     """Setup RoPE benchmark functions for each implementation."""
     torch.manual_seed(42)
-    q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.float32, device="cuda")
-    cos = torch.randn(seq_len, head_dim // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(seq_len, head_dim // 2, dtype=torch.float32, device="cuda")
+    q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cos = torch.randn(seq_len, head_dim // 2, dtype=torch.bfloat16, device="cuda")
+    sin = torch.randn(seq_len, head_dim // 2, dtype=torch.bfloat16, device="cuda")
 
     funcs = {}
 
