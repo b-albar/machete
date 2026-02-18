@@ -668,8 +668,14 @@ class Megakernel:
                 else:
                     raise ValueError(f"Unknown TMA direction: {desc.direction}")
                 shape_str = ", ".join(str(s) for s in desc.tile_shape)
+                # Use swizzled smem layout if op provides one (e.g., GEMM),
+                # otherwise plain layout.
+                if desc.smem_layout_src:
+                    smem_layout_code = desc.smem_layout_src
+                else:
+                    smem_layout_code = f"cute.make_layout(({shape_str},))"
                 tma_creation_lines.append(
-                    f"        _smem_layout_{desc.canonical_atom} = cute.make_layout(({shape_str},))\n"
+                    f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
                     f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
                     f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
                     f"            {copy_op},\n"
@@ -935,9 +941,11 @@ class Megakernel:
         - All DMA barrier checks are non-blocking (no spin loops in inline asm)
         - Phase alternates 0/1 with each use; tracked via produce/consume counters
 
-        Two mbarrier arrays:
-        - work_notify[slot]: DMA arrives (1) -> MMA warps wait
-        - compute_done[slot]: MMA warps arrive (num_mma_warps) -> DMA polls
+        Four mbarrier arrays:
+        - work_notify[slot]:  tile-level DMA->MMA (1 arrive per tile)
+        - compute_done[slot]: MMA->DMA (num_mma_warps arrivals)
+        - smem_consumed[slot]: MMA->DMA K-block sync (num_mma_warps arrivals)
+        - kblock_ready[slot]: per-K-block DMA->MMA data signal (1 arrive)
         """
         num_sms = self.config.num_sms
         threads_per_block = self.config.threads_per_block
@@ -953,10 +961,12 @@ class Megakernel:
         pages_start = layout.pages_start
         aligned_page_size = layout.aligned_page_size
 
-        # Mbarrier sub-offsets (work_notify at 0, compute_done at N, smem_consumed at 2N)
+        # Mbarrier sub-offsets (work_notify at 0, compute_done at N,
+        # smem_consumed at 2N, kblock_ready at 3N)
         work_notify_mbar_offset_0 = layout.work_notify_mbar_offset(0)
         compute_done_mbar_offset_0 = layout.compute_done_mbar_offset(0)
         smem_consumed_mbar_offset_0 = layout.smem_consumed_mbar_offset(0)
+        kblock_ready_mbar_offset_0 = layout.kblock_ready_mbar_offset(0)
 
         # Warp specialization constants
         num_mma_warps = (threads_per_block // 32) - 1
@@ -1022,6 +1032,13 @@ class Megakernel:
         def _smem_consumed_mbar(smem_base: Int32, slot: Int32) -> Int32:
             return smem_base + Int32(smem_consumed_mbar_offset_0) + slot * Int32(8)
 
+        # Helper to get kblock_ready mbarrier smem address (per slot)
+        # Per-K-block data readiness: DMA arrives once per K-block,
+        # MMA compute waits inside K-loop.
+        @cute.jit
+        def _kblock_ready_mbar(smem_base: Int32, slot: Int32) -> Int32:
+            return smem_base + Int32(kblock_ready_mbar_offset_0) + slot * Int32(8)
+
         # Tile info size in bytes: INSTRUCTION_WORDS int32s per slot
         tile_info_bytes = INSTRUCTION_WORDS * 4  # 6 * 4 = 24 bytes
 
@@ -1084,6 +1101,10 @@ class Megakernel:
                         mbarrier_init(
                             _smem_consumed_mbar(smem_base, Int32(_ip)),
                             Int32(num_mma_warps),
+                        )
+                        mbarrier_init(
+                            _kblock_ready_mbar(smem_base, Int32(_ip)),
+                            Int32(1),
                         )
                     mbarrier_init_fence()
 
@@ -1190,7 +1211,11 @@ class Megakernel:
                         # STEP 2b: TRY PRODUCE (G2S load) — start new tile.
                         # Runs before store so the async G2S copy starts
                         # earlier and has more time to complete.
-                        if _inner_iter == Int32(0):
+                        # MUST be 'else' (not separate 'if') to prevent
+                        # STEP 2a's dispatch_load_slot_ptr from being
+                        # overwritten when the inner loop completes and
+                        # resets _inner_iter=0 in the same while iteration.
+                        else:
                             _can_produce = Int32(0)
                             if (produce_idx - store_idx) < Int32(num_pages):
                                 if next_instr_idx < num_instructions:
@@ -1248,6 +1273,12 @@ class Megakernel:
                                         st_shared_i32(_p_ti + 20, _ic_4)
                                         # Check inner iterations for this op
                                         _inner_total = get_inner_iters(_ic_op)
+                                        # Re-init kblock_ready for fresh phase
+                                        # tracking on this slot.
+                                        mbarrier_init(
+                                            _kblock_ready_mbar(smem_base, _p_slot),
+                                            Int32(1),
+                                        )
                                         if _inner_total > Int32(1):
                                             # Re-init smem_consumed_mbar for
                                             # clean phase tracking.
@@ -1255,8 +1286,13 @@ class Megakernel:
                                                 _smem_consumed_mbar(smem_base, _p_slot),
                                                 Int32(num_mma_warps),
                                             )
-                                            mbarrier_init_fence()
                                             _smem_consumed_phase = Int32(0)
+                                        mbarrier_init_fence()
+                                        # Arrive work_notify: tile-level signal
+                                        # to MMA (before TMA dispatch).
+                                        mbarrier_arrive(
+                                            _work_notify_mbar(smem_base, _p_slot)
+                                        )
                                         # Signal all DMA warp threads to dispatch load
                                         st_shared_i32(dispatch_load_slot_ptr, _p_slot)
                                         st_shared_i32(inner_iter_idx_ptr, Int32(0))
@@ -1329,7 +1365,7 @@ class Megakernel:
                         _dl_4 = ld_shared_i32(_dl_ti + 20)
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
-                        _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
+                        _dl_mbar = _kblock_ready_mbar(smem_base, _dl_slot)
                         _dl_iter = ld_shared_i32(inner_iter_idx_ptr)
                         # Per-page prev coords: written by thread 0 in produce step.
                         # Contains old tile coords if same op previously used this
@@ -1417,7 +1453,8 @@ class Megakernel:
                 while mma_running == Int32(1):
                     slot = consume_ptr % Int32(num_pages)
 
-                    # Wait for work (phase alternates with each ring buffer pass)
+                    # work_notify phase: 1 arrive per tile, alternates
+                    # each time the slot is reused. Pure register formula.
                     _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
                     if tracing:
                         _tw = trace_start()
@@ -1435,6 +1472,12 @@ class Megakernel:
                         mma_running = Int32(0)
 
                     if op_idx != Int32(TileInstruction.END_MARKER):
+                        # Wait for first K-block data on kblock_ready.
+                        # Phase is always 0: kblock_ready is re-initialized
+                        # per tile so phase resets.
+                        mbarrier_wait(
+                            _kblock_ready_mbar(smem_base, slot), Int32(0)
+                        )
                         if tracing:
                             _mma_lane = end_event_dynamic_raw_1(
                                 _tw, _trace_buf, Int32(trace_row_stride),
@@ -1453,16 +1496,18 @@ class Megakernel:
                         if tracing:
                             _tc = trace_start()
 
-                        # Compute — pass mbar addresses for inner
-                        # iteration sync (ignored by ops without inner loops)
-                        _wn_mbar = _work_notify_mbar(smem_base, slot)
+                        # Compute — pass kblock_ready mbar for inner
+                        # iteration sync (ignored by ops without inner loops).
+                        # Phase starts at 1 (after first K-block arrive on
+                        # fresh kblock_ready).
+                        _kb_mbar = _kblock_ready_mbar(smem_base, slot)
                         _sc_mbar = _smem_consumed_mbar(smem_base, slot)
-                        _next_wn_phase = Int32(1) - _wn_phase
+                        _kb_phase = Int32(1)
                         dispatch_compute(
                             op_idx, page_ptr,
                             tile_0, tile_1, tile_2, tile_3, tile_4,
                             op_config_ptr,
-                            _wn_mbar, _sc_mbar, _next_wn_phase,
+                            _kb_mbar, _sc_mbar, _kb_phase,
                         )
 
                         # Sync MMA warps post-compute
@@ -1495,6 +1540,7 @@ class Megakernel:
                 "_work_notify_mbar": _work_notify_mbar,
                 "_compute_done_mbar": _compute_done_mbar,
                 "_smem_consumed_mbar": _smem_consumed_mbar,
+                "_kblock_ready_mbar": _kblock_ready_mbar,
                 "get_inner_iters": get_inner_iters,
                 "check_barriers": check_barriers,
                 "mbarrier_try_wait": mbarrier_try_wait,

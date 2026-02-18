@@ -893,6 +893,9 @@ class TMADescriptorInfo:
         tile_shape: Tuple of ints, TMA tile shape per tensor dimension
         smem_layout_shape: Tuple of ints, shared memory layout shape
         dtype: CUTLASS dtype for the tensor
+        smem_layout_src: Optional code string for composed smem layout with swizzle.
+            When set, replaces the plain make_layout in TMA descriptor creation
+            so make_tiled_tma_atom can detect the hardware swizzle mode.
     """
 
     canonical_atom: str
@@ -902,6 +905,7 @@ class TMADescriptorInfo:
     tile_shape: Tuple[int, ...]
     smem_layout_shape: Tuple[int, ...]
     dtype: Any
+    smem_layout_src: Optional[str] = None
 
 
 @dataclass
@@ -992,6 +996,13 @@ class TMARegistry:
                     canonical_atom = f"tma{counter}_atom"
                     canonical_gmem = f"tma{counter}_gmem"
 
+                    # Check for custom smem layout (e.g., swizzle for GEMM)
+                    smem_layout_src = None
+                    if hasattr(op_cls, 'get_tma_smem_layout_src'):
+                        smem_layout_src = op_cls.get_tma_smem_layout_src(
+                            tensor_name, tma_tile_shape,
+                            op.tile_sizes, op.static_dims)
+
                     descriptors.append(TMADescriptorInfo(
                         canonical_atom=canonical_atom,
                         canonical_gmem=canonical_gmem,
@@ -1000,6 +1011,7 @@ class TMARegistry:
                         tile_shape=tma_tile_shape,
                         smem_layout_shape=tma_tile_shape,
                         dtype=dtype,
+                        smem_layout_src=smem_layout_src,
                     ))
 
                     # Map op-local names to canonical

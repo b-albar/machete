@@ -145,17 +145,23 @@ class NPageLayout:
         self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
         self.flags_offset = self.instr_offset + self._INSTR_SIZE
 
-        # mbarrier array: 3 * num_pages mbarriers
-        # [work_notify[0..N-1], compute_done[0..N-1], smem_consumed[0..N-1]]
+        # mbarrier array: 4 * num_pages mbarriers
+        # [work_notify, compute_done, smem_consumed, kblock_ready] × N
         # Each mbarrier is 8 bytes and MUST be 8-byte aligned (PTX requirement).
+        #
+        # work_notify:    tile-level DMA→MMA signal (1 arrive per tile)
+        # compute_done:   MMA→DMA signal (num_mma_warps arrivals)
+        # smem_consumed:  MMA→DMA K-block sync (num_mma_warps arrivals)
+        # kblock_ready:   per-K-block DMA→MMA data signal (1 arrive per K-block)
         self.mbarrier_offset = _align_up(
             self.flags_offset + self._FLAGS_SIZE, 8
         )
 
         raw_scratch_size = (
             self.mbarrier_offset
-            + 3 * self.num_pages * self._MBARRIER_SIZE
+            + 4 * self.num_pages * self._MBARRIER_SIZE
         )
+
         self.scratch_size = _align_up(raw_scratch_size, 128)
 
         # Page layout - pages start right after scratch
@@ -189,6 +195,14 @@ class NPageLayout:
         DMA warp polls before issuing the next inner iteration load.
         """
         return self.mbarrier_offset + 2 * self.num_pages * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
+
+    def kblock_ready_mbar_offset(self, slot_idx: int) -> int:
+        """Get offset to the kblock_ready mbarrier for a given slot.
+
+        Per-K-block data readiness signal: DMA arrives once per K-block
+        load, MMA compute waits inside the K-loop.
+        """
+        return self.mbarrier_offset + 3 * self.num_pages * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
 
     @classmethod
     def for_device(
