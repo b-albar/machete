@@ -164,10 +164,13 @@ class Benchmark:
         if isinstance(func_or_spec, KernelBenchSpec):
             torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
+            setup = func_or_spec.setup_fn
 
             with torch.cuda.stream(torch_stream):
                 # Warmup
                 for _ in range(warmup):
+                    if setup is not None:
+                        setup()
                     launch()
                 torch_stream.synchronize()
 
@@ -176,6 +179,8 @@ class Benchmark:
                 end = torch.cuda.Event(enable_timing=True)
                 times = []
                 for _ in range(rep):
+                    if setup is not None:
+                        setup()
                     start.record(torch_stream)
                     launch()
                     end.record(torch_stream)

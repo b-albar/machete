@@ -35,15 +35,19 @@ class KernelBenchSpec:
     Used by Benchmark.run(mode="kernel") to distinguish megakernel launches
     from regular callables. The persistent megakernel requires barrier resets
     between invocations, so CUDA graph replay is NOT used — each iteration
-    calls launch_fn() which resets barriers and launches the kernel.
+    calls launch_fn() which launches the kernel.
 
     Attributes:
-        launch_fn: Callable that resets barriers and launches the kernel.
+        launch_fn: Callable that launches the kernel (timed).
             Must be called on the stream specified in ``stream``.
+        setup_fn: Optional callable for per-iteration setup (barrier resets,
+            output zeroing, etc.). Called BEFORE the timed region so it does
+            not inflate kernel timing.
         stream: A (torch.cuda.Stream, CUstream) pair.
     """
 
     launch_fn: Callable
+    setup_fn: Optional[Callable] = None
     stream: Any = None
     _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
 

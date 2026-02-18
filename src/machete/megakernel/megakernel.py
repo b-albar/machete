@@ -1877,10 +1877,12 @@ class Megakernel:
         cute_tensors = list(self._cute_tensors) if self._cute_tensors else []
         tma_tensor_args = [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else []
 
-        def launch_fn():
+        def _setup():
             if setup_fn is not None:
                 setup_fn()
             barriers_tensor.zero_()
+
+        def _launch():
             compiled_kernel(
                 Int64(instructions_tensor.data_ptr()),
                 Int64(barriers_tensor.data_ptr()),
@@ -1893,7 +1895,8 @@ class Megakernel:
             )
 
         return KernelBenchSpec(
-            launch_fn=launch_fn,
+            launch_fn=_launch,
+            setup_fn=_setup,
             stream=(bench_stream, cu_stream),
             _keep_alive=(self, keep_alive),  # prevent GC from freeing GPU memory
         )
