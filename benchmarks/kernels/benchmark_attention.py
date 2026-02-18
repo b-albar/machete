@@ -195,7 +195,11 @@ def bench_attention(BH, M, N, D):
             ops_mk = FlashAttentionOp.schedule(
                 q=q, k=k, v=v, o=o_mk,
             )
-            kernel_mk = Megakernel(ops_mk, config=MegakernelConfig())
+            actual_tile_m = ops_mk[0].tile_sizes["M"]
+            num_mma_warps = actual_tile_m // 16
+            tpb = (num_mma_warps + 1) * 32
+            kernel_mk = Megakernel(ops_mk, config=MegakernelConfig(
+                threads_per_block=tpb))
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel_mk.run()
             torch.cuda.synchronize()

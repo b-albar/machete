@@ -83,14 +83,14 @@ class TensorMeta:
     validation and stride-based init source generation.
     """
 
-    name: str                       # Op-local name ("x", "weight", "q")
+    name: str  # Op-local name ("x", "weight", "q")
     declared_dims: Tuple[str, ...]  # From reads/writes: ("M", "D") or ("M", "H", "D")
-    ndim: int                       # Expected number of dimensions = len(declared_dims)
-    shape: Tuple[int, ...]          # Actual tensor shape
-    strides: Tuple[int, ...]        # Actual tensor strides (in elements)
-    dtype: Any                      # Resolved CUTLASS dtype
-    is_contiguous: bool             # Whether tensor is contiguous
-    data_ptr: int                   # GPU data pointer
+    ndim: int  # Expected number of dimensions = len(declared_dims)
+    shape: Tuple[int, ...]  # Actual tensor shape
+    strides: Tuple[int, ...]  # Actual tensor strides (in elements)
+    dtype: Any  # Resolved CUTLASS dtype
+    is_contiguous: bool  # Whether tensor is contiguous
+    data_ptr: int  # GPU data pointer
 
 
 def _parse_dims(dims) -> List[str]:
@@ -354,7 +354,7 @@ def _process_op_declarations(cls):
                 continue
             t = tensors[name]
             expected_ndim = len(dims)
-            if hasattr(t, 'ndim') and t.ndim != expected_ndim:
+            if hasattr(t, "ndim") and t.ndim != expected_ndim:
                 raise ValueError(
                     f"{cls.__name__}: tensor '{name}' declared as {expected_ndim}D "
                     f"(dims={dims}) but got {t.ndim}D tensor with shape {tuple(t.shape)}"
@@ -406,7 +406,7 @@ def _process_op_declarations(cls):
         tensor_ptrs = {}
         tensor_refs = {}
         for name in tensors:
-            if hasattr(tensors[name], 'data_ptr'):
+            if hasattr(tensors[name], "data_ptr"):
                 tensor_ptrs[name] = tensors[name].data_ptr()
                 tensor_refs[name] = tensors[name]
 
@@ -456,9 +456,9 @@ def _process_op_declarations(cls):
         subclass. If found, delegates to them. Otherwise wraps a single
         _schedule_single() call in a list.
         """
-        if not backward and hasattr(cls, 'schedule_forward'):
+        if not backward and hasattr(cls, "schedule_forward"):
             return cls.schedule_forward(tile_sizes=tile_sizes, **tensors)
-        if backward and hasattr(cls, 'schedule_backward'):
+        if backward and hasattr(cls, "schedule_backward"):
             return cls.schedule_backward(tile_sizes=tile_sizes, **tensors)
         return [cls._schedule_single(backward=backward, tile_sizes=tile_sizes, **tensors)]
 
@@ -815,14 +815,12 @@ class TensorRegistry:
             mapping: Dict[str, str] = {}
             # Skip ops that don't have tensor declarations (e.g., simple test ops
             # like StampOp/TensorScaleOp that don't use the @op decorator)
-            if not hasattr(op.op_cls, '_UNIQUE_TENSORS'):
+            if not hasattr(op.op_cls, "_UNIQUE_TENSORS"):
                 op_mappings[i] = mapping
                 continue
 
             # Use the op's unique_tensors for consistent ordering
-            unique_tensors = (
-                op.op_cls._BWD_UNIQUE_TENSORS if backward else op.op_cls._UNIQUE_TENSORS
-            )
+            unique_tensors = op.op_cls._BWD_UNIQUE_TENSORS if backward else op.op_cls._UNIQUE_TENSORS
 
             for name, dtype, dims in unique_tensors:
                 if name not in op.tensor_refs:
@@ -869,7 +867,7 @@ class TensorRegistry:
             op_cls: The op class (for accessing _UNIQUE_TENSORS).
             backward: If True, use backward tensor declarations.
         """
-        if not hasattr(op_cls, '_UNIQUE_TENSORS'):
+        if not hasattr(op_cls, "_UNIQUE_TENSORS"):
             return []
         unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
         mapping = self.op_mappings[op_idx]
@@ -942,7 +940,7 @@ class TMARegistry:
 
         for i, op in enumerate(ops):
             op_cls = op.op_cls
-            if not hasattr(op_cls, '_TMA_LOADS'):
+            if not hasattr(op_cls, "_TMA_LOADS"):
                 op_mappings[(i, "load")] = {}
                 op_mappings[(i, "store")] = {}
                 continue
@@ -953,7 +951,7 @@ class TMARegistry:
             for phase, tma_names, direction in [
                 ("load", op_cls._TMA_LOADS, "g2s"),
                 ("store", op_cls._TMA_STORES, "s2g"),
-                ("store", getattr(op_cls, '_TMA_REDUCE_STORES', set()), "s2g_reduce"),
+                ("store", getattr(op_cls, "_TMA_REDUCE_STORES", set()), "s2g_reduce"),
             ]:
                 for tensor_name in tma_names:
                     # Get canonical tensor name from tensor registry
@@ -964,9 +962,12 @@ class TMARegistry:
                     # Compute TMA tile shape from op's dims.
                     # Ops can override via get_tma_tile_shape() for dims
                     # that need custom sub-tiling (e.g., K in GEMM).
-                    if hasattr(op_cls, 'get_tma_tile_shape'):
-                        tile_shape = tuple(op_cls.get_tma_tile_shape(
-                            tensor_name, op.tile_sizes, op.static_dims))
+                    custom_shape = None
+                    if hasattr(op_cls, "get_tma_tile_shape"):
+                        custom_shape = op_cls.get_tma_tile_shape(
+                            tensor_name, op.tile_sizes, op.static_dims)
+                    if custom_shape is not None:
+                        tile_shape = tuple(custom_shape)
                     else:
                         tma_dims = op_cls._TMA_TENSOR_DIMS.get(tensor_name, [])
                         tile_shape = []
@@ -998,21 +999,23 @@ class TMARegistry:
 
                     # Check for custom smem layout (e.g., swizzle for GEMM)
                     smem_layout_src = None
-                    if hasattr(op_cls, 'get_tma_smem_layout_src'):
+                    if hasattr(op_cls, "get_tma_smem_layout_src"):
                         smem_layout_src = op_cls.get_tma_smem_layout_src(
-                            tensor_name, tma_tile_shape,
-                            op.tile_sizes, op.static_dims)
+                            tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
+                        )
 
-                    descriptors.append(TMADescriptorInfo(
-                        canonical_atom=canonical_atom,
-                        canonical_gmem=canonical_gmem,
-                        tensor_canonical=tensor_canonical,
-                        direction=direction,
-                        tile_shape=tma_tile_shape,
-                        smem_layout_shape=tma_tile_shape,
-                        dtype=dtype,
-                        smem_layout_src=smem_layout_src,
-                    ))
+                    descriptors.append(
+                        TMADescriptorInfo(
+                            canonical_atom=canonical_atom,
+                            canonical_gmem=canonical_gmem,
+                            tensor_canonical=tensor_canonical,
+                            direction=direction,
+                            tile_shape=tma_tile_shape,
+                            smem_layout_shape=tma_tile_shape,
+                            dtype=dtype,
+                            smem_layout_src=smem_layout_src,
+                        )
+                    )
 
                     # Map op-local names to canonical
                     op_mappings[(i, phase)][f"{tensor_name}_tma"] = canonical_atom
@@ -1163,7 +1166,6 @@ class BarrierFormula:
     def has_guard(self) -> bool:
         """Whether this formula has an active guard (not NO_GUARD)."""
         return self.guard_max != self.NO_GUARD
-
 
 
 # =============================================================================
@@ -1481,6 +1483,7 @@ class BackwardScheduler(TileScheduler):
 
         # BFS from sinks backward
         from collections import deque
+
         queue = deque()
         for sink_idx in sinks:
             depth[sink_idx] = 0
@@ -1707,7 +1710,7 @@ class InstructionStreamBuilder:
             remainder = linear_idx
             for i in range(ndims):
                 # Stride for axis i = product of counts[i+1:]
-                stride = math.prod(counts[i + 1:]) if i + 1 < ndims else 1
+                stride = math.prod(counts[i + 1 :]) if i + 1 < ndims else 1
                 tile.append(remainder // stride)
                 remainder %= stride
             tiles.append(tuple(tile))
@@ -1825,9 +1828,7 @@ class InstructionStreamBuilder:
             coeffs = _linear_strides(op.tile_counts)
 
             # Signal: own barrier
-            signal_formulas = [
-                BarrierFormula(base=signal_base, coeffs=coeffs)
-            ]
+            signal_formulas = [BarrierFormula(base=signal_base, coeffs=coeffs)]
 
             # Wait: previous op's barrier (if exists)
             wait_formulas: List[BarrierFormula] = []
