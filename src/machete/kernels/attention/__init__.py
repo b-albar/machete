@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Machete Authors
-"""Flash Attention kernel for the megakernel framework."""
+"""Flash Attention kernels for the megakernel framework."""
 
 from .attention import FlashAttentionOp
+from .attention_coop import FlashAttentionCoopOp
 
-__all__ = ["FlashAttentionOp"]
+__all__ = ["FlashAttentionOp", "FlashAttentionCoopOp"]

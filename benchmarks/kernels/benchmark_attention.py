@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.attention import FlashAttentionOp
+from machete.kernels.attention import FlashAttentionOp, FlashAttentionCoopOp
 from machete.kernels.attention.ref import flash_attention_pytorch
 from machete.utils.benchmark import Benchmark
 
@@ -88,25 +88,26 @@ _fa2_cache = {}
 # =============================================================================
 
 CONFIGS = [
-    # (BH, M, N, D) — representative transformer attention shapes
-    # Small prefill (M=16, minimum MMA tile)
-    (32, 16, 128, 128),
-    (32, 16, 512, 128),
-    (32, 16, 1024, 128),
+    # (BH, M, N, D) — realistic LLM attention shapes (D=128 typical)
+    #
+    # Decode (autoregressive, M=16 minimum MMA tile)
     (32, 16, 2048, 128),
-    (32, 16, 128, 64),
-    (32, 16, 1024, 64),
+    (32, 16, 4096, 128),
+    (32, 16, 8192, 128),
+    (32, 16, 16384, 128),
+    (32, 16, 32768, 128),
+    (32, 16, 65536, 128),
+    (32, 16, 131072, 128),
     # Prefill (M=N, processing prompt tokens)
-    (32, 64, 64, 128),
-    (32, 128, 128, 128),
-    (32, 256, 256, 128),
-    (32, 512, 512, 128),
-    (32, 128, 128, 64),
-    (32, 256, 256, 64),
-    # Chunked prefill (M < N)
-    (32, 64, 256, 128),
-    (32, 64, 512, 128),
-    (32, 128, 512, 128),
+    (32, 1024, 1024, 128),
+    (32, 2048, 2048, 128),
+    (32, 4096, 4096, 128),
+    (32, 8192, 8192, 128),
+    # Chunked prefill (M < N, typical chunk sizes)
+    (32, 256, 4096, 128),
+    (32, 256, 16384, 128),
+    (32, 512, 8192, 128),
+    (32, 512, 32768, 128),
 ]
 
 
@@ -125,8 +126,11 @@ def bench_attention(BH, M, N, D):
     # PyTorch manual
     funcs["pytorch"] = lambda: flash_attention_pytorch(q, k, v)
 
-    # torch SDPA
-    funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q, k, v)
+    # torch SDPA (4D input so flash attention backend is used)
+    q4d = q.unsqueeze(0)  # (1, BH, M, D) → (batch, heads, seq, head_dim)
+    k4d = k.unsqueeze(0)
+    v4d = v.unsqueeze(0)
+    funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q4d, k4d, v4d)
 
     # CuTe DSL Flash Attention v2 (fp16, tensor cores)
     if CUTE_FA2_AVAILABLE:
@@ -210,6 +214,29 @@ def bench_attention(BH, M, N, D):
             )
         except Exception as e:
             print(f"  megakernel error: {e}")
+
+    # Megakernel Coop bf16 (cooperative cpasync + MMA)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            o_coop = torch.zeros_like(q)
+            ops_coop = FlashAttentionCoopOp.schedule(
+                q=q, k=k, v=v, o=o_coop,
+            )
+            actual_tile_m = ops_coop[0].tile_sizes["M"]
+            num_mma_warps = actual_tile_m // 16
+            tpb = (num_mma_warps + 1) * 32
+            kernel_coop = Megakernel(ops_coop, config=MegakernelConfig(
+                threads_per_block=tpb))
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel_coop.run()
+            torch.cuda.synchronize()
+
+            funcs["megakernel_coop"] = kernel_coop.bench_spec(
+                setup_fn=lambda: o_coop.zero_(),
+                keep_alive=[q, k, v, o_coop],
+            )
+        except Exception as e:
+            print(f"  megakernel_coop error: {e}")
 
     return funcs
 
