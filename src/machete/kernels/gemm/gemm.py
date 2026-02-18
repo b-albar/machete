@@ -24,8 +24,9 @@ Pipelined phases:
     store:   TMA store S->G of C[tile_M, tile_N]
 
 Page layout (16KB):
-    During K loop: [A: tile_K x tile_M] [B: tile_K x tile_N]
-    Epilogue:      [C: tile_M x tile_N]  (reuses page from offset 0)
+    During K loop (depth=1): [A: tile_K x tile_M] [B: tile_K x tile_N]
+    During K loop (depth=2): [buf0: A+B] [buf1: A+B]  (double buffer)
+    Epilogue:                [C: tile_M x tile_N]  (reuses page from offset 0)
 
 No output pre-zeroing needed — fp32 accumulator handles full K reduction.
 """
@@ -86,19 +87,22 @@ class GemmOp(Op):
         else:
             raise ValueError(f"GemmOp requires fp16 or bf16 input, got {self.a_dtype}")
 
-        # tile_K injected via schedule_forward into static_dims
+        # tile_K and inner_depth injected via schedule_forward into static_dims
         self.tile_K = getattr(self, 'tile_K', 32)
+        self.inner_depth = getattr(self, 'inner_depth', 1)
 
         self.a_tile_bytes = self.tile_size_M * self.tile_K * self.elem_bytes
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
         self.c_tile_bytes = self.tile_size_M * self.tile_size_N * self.elem_bytes
+        self.buf_stride = self.a_tile_bytes + self.b_tile_bytes
 
-        # Smem budget: A+B during K loop, C during epilogue (reuses same space)
-        ab_bytes = self.a_tile_bytes + self.b_tile_bytes
+        # Smem budget: inner_depth copies of A+B during K loop, C during epilogue
+        ab_bytes = self.inner_depth * self.buf_stride
         total_smem = max(ab_bytes, self.c_tile_bytes)
         assert total_smem <= PAGE_SIZE, (
             f"GemmOp: smem {total_smem}B exceeds PAGE_SIZE ({PAGE_SIZE}B). "
-            f"tile_M={self.tile_size_M}, tile_N={self.tile_size_N}, tile_K={self.tile_K}"
+            f"tile_M={self.tile_size_M}, tile_N={self.tile_size_N}, "
+            f"tile_K={self.tile_K}, inner_depth={self.inner_depth}"
         )
 
         assert self.tile_K >= 16 and self.tile_K % 16 == 0, (
@@ -177,11 +181,16 @@ class GemmOp(Op):
         TMA transposes gmem: A(M,K) -> smem (K,M), B(N,K) -> smem (K,N).
         Smem uses swizzled layout for bank-conflict-free LdMatrix reads.
         """
+        # Buffer offset for n-stage pipeline: inner_iter_idx selects K-block,
+        # buf_idx = inner_iter_idx % inner_depth selects which smem buffer.
+        # When inner_depth=1: inner_iter_idx % 1 = 0, so _buf_base = page_ptr.
+        _buf_base = page_ptr + (inner_iter_idx % Int32(self.inner_depth)) * Int32(self.buf_stride)
+
         # Swizzle on pointer, plain layout: tma_partition requires plain layout
         # but needs the swizzle on the pointer to match TMA descriptor.
         swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
         sA_ptr = cute.recast_ptr(
-            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.a_dtype, _buf_base, cute.AddressSpace.smem),
             swz, dtype=self.a_dtype)
         sA = cute.make_tensor(
             sA_ptr,
@@ -198,7 +207,7 @@ class GemmOp(Op):
         )
 
         sB_ptr = cute.recast_ptr(
-            cute.make_ptr(self.b_dtype, page_ptr + Int32(self.a_tile_bytes),
+            cute.make_ptr(self.b_dtype, _buf_base + Int32(self.a_tile_bytes),
                           cute.AddressSpace.smem),
             swz, dtype=self.b_dtype)
         sB = cute.make_tensor(
@@ -239,9 +248,13 @@ class GemmOp(Op):
         work_notify_mbar before calling compute).
 
         For K-blocks 1+:
-            1. Signal smem_consumed (so DMA can load next K-block)
+            1. Signal smem_consumed for previous buffer (so DMA can reuse it)
             2. Wait on work_mbar for next K-block
-            3. LdMatrix + MMA
+            3. LdMatrix + MMA from current buffer
+
+        With inner_depth > 1 (n-stage pipeline), multiple buffers overlap
+        DMA loads with MMA compute. smem_consumed_mbar is the base address
+        of per-buffer mbarriers (spaced 8 bytes apart).
 
         After all K-blocks: epilogue converts fp32 acc to output dtype in smem.
         """
@@ -258,36 +271,9 @@ class GemmOp(Op):
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
-        # --- Smem tensors for compute reads (swizzled pointer for bank-conflict-free LdMatrix) ---
-        # Swizzle on pointer, plain layout — same pattern as CUTLASS get_tensor(outer, swizzle=inner).
-        # The swizzled pointer XORs the linear address, matching TMA's hardware swizzle.
-        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
-        sA_ptr = cute.recast_ptr(
-            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem,
-                          assumed_align=128),
-            swz, dtype=self.a_dtype)
-        sA = cute.make_tensor(
-            sA_ptr,
-            cute.make_layout((self.tile_size_M, self.tile_K),
-                             stride=(self.tile_K, 1)),
-        )
-        sB_ptr = cute.recast_ptr(
-            cute.make_ptr(self.b_dtype, page_ptr + Int32(self.a_tile_bytes),
-                          cute.AddressSpace.smem, assumed_align=128),
-            swz, dtype=self.b_dtype)
-        sB = cute.make_tensor(
-            sB_ptr,
-            cute.make_layout((self.tile_size_N, self.tile_K),
-                             stride=(self.tile_K, 1)),
-        )
-
-        # --- MMA partitions and register fragments ---
-        tCsA = thr_mma.partition_A(sA)
-        tCsB = thr_mma.partition_B(sB)
-        tCrA = tiled_mma.make_fragment_A(tCsA)
-        tCrB = tiled_mma.make_fragment_B(tCsB)
-
         # --- LdMatrix tiled copies (warp-cooperative smem reads) ---
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+
         smem_copy_atom_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
                 transpose=False, num_matrices=4), self.a_dtype)
@@ -302,10 +288,60 @@ class GemmOp(Op):
             smem_copy_atom_B, tiled_mma)
         smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
 
-        tAsA_ld = smem_thr_copy_A.partition_S(sA)
-        tBsB_ld = smem_thr_copy_B.partition_S(sB)
+        # --- Buffer 0 smem tensors, MMA partitions, and fragments ---
+        # Swizzle on pointer, plain layout — same pattern as CUTLASS.
+        sA_ptr = cute.recast_ptr(
+            cute.make_ptr(self.a_dtype, page_ptr,
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=self.a_dtype)
+        sA = cute.make_tensor(
+            sA_ptr,
+            cute.make_layout((self.tile_size_M, self.tile_K),
+                             stride=(self.tile_K, 1)),
+        )
+        sB_ptr = cute.recast_ptr(
+            cute.make_ptr(self.b_dtype,
+                          page_ptr + Int32(self.a_tile_bytes),
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=self.b_dtype)
+        sB = cute.make_tensor(
+            sB_ptr,
+            cute.make_layout((self.tile_size_N, self.tile_K),
+                             stride=(self.tile_K, 1)),
+        )
+
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = tiled_mma.make_fragment_A(tCsA)
+        tCrB = tiled_mma.make_fragment_B(tCsB)
         tCrA_ld = smem_thr_copy_A.retile(tCrA)
         tCrB_ld = smem_thr_copy_B.retile(tCrB)
+
+        # --- Per-buffer LdMatrix smem partitions ---
+        # Buffer 0 is already created above. Build list for K-loop indexing.
+        _buf_tAsA_ld = [smem_thr_copy_A.partition_S(sA)]
+        _buf_tBsB_ld = [smem_thr_copy_B.partition_S(sB)]
+        for _d in cutlass.range_constexpr(self.inner_depth - 1):
+            _buf_off = (_d + 1) * self.buf_stride
+            _sA_d = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.a_dtype, page_ptr + Int32(_buf_off),
+                                  cute.AddressSpace.smem, assumed_align=128),
+                    swz, dtype=self.a_dtype),
+                cute.make_layout((self.tile_size_M, self.tile_K),
+                                 stride=(self.tile_K, 1)),
+            )
+            _sB_d = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.b_dtype,
+                                  page_ptr + Int32(_buf_off + self.a_tile_bytes),
+                                  cute.AddressSpace.smem, assumed_align=128),
+                    swz, dtype=self.b_dtype),
+                cute.make_layout((self.tile_size_N, self.tile_K),
+                                 stride=(self.tile_K, 1)),
+            )
+            _buf_tAsA_ld.append(smem_thr_copy_A.partition_S(_sA_d))
+            _buf_tBsB_ld.append(smem_thr_copy_B.partition_S(_sB_d))
 
         # --- Init fp32 accumulator ---
         acc = cute.make_fragment(
@@ -315,19 +351,32 @@ class GemmOp(Op):
         acc.fill(0.0)
 
         # --- Process all K-blocks ---
-        _phase = work_mbar_phase
+        # Per-buffer kblock_ready phase tracking:
+        # buf 0: framework consumed phase 0, so next wait phase is 1
+        # buf 1+: DMA prefilled (arrived phase 0→1), first wait is phase 0
+        _kb_phases = [work_mbar_phase]
+        for _d in cutlass.range_constexpr(self.inner_depth - 1):
+            _kb_phases.append(Int32(0))
         for k in cutlass.range_constexpr(self.num_k_blocks):
             if k > 0:
-                # Signal smem consumed — all MMA warps done reading smem.
-                # DMA warp polls this before issuing next K-block load.
+                # Signal previous buffer consumed — all MMA warps done reading.
+                # DMA warp polls per-buffer smem_consumed before reusing buffer.
+                prev_buf = (k - 1) % self.inner_depth
                 named_barrier_sync(
                     Int32(2), Int32(self.num_mma_threads))
                 if lane_id == Int32(0):
-                    mbarrier_arrive(smem_consumed_mbar)
+                    mbarrier_arrive(
+                        smem_consumed_mbar + Int32(prev_buf * 8))
 
-                # Wait for DMA to load the next K-block
-                mbarrier_wait(work_mbar, _phase)
-                _phase = Int32(1) - _phase
+                # Wait for DMA to load the next K-block (per-buffer mbar)
+                cur_buf = k % self.inner_depth
+                mbarrier_wait(work_mbar + Int32(cur_buf * 8), _kb_phases[cur_buf])
+                _kb_phases[cur_buf] = Int32(1) - _kb_phases[cur_buf]
+
+            # Select buffer for this K-block
+            cur_buf = k % self.inner_depth
+            tAsA_ld = _buf_tAsA_ld[cur_buf]
+            tBsB_ld = _buf_tBsB_ld[cur_buf]
 
             # LdMatrix + MMA for this K-block
             for k_block in cutlass.range_constexpr(self.tile_K // 16):
@@ -387,20 +436,28 @@ class GemmOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, **tensors):
+    def schedule_forward(cls, tile_sizes=None, inner_depth=1, **tensors):
         """Schedule forward GEMM.
 
         Accepts tile_sizes with M, N, K keys. K is the inner K-block size
         (not a framework tile dimension). Default: M=64, N=32, K=32.
+
+        Args:
+            inner_depth: Pipeline stages for K-block double buffering.
+                1 = single buffer (default), 2 = double buffer.
+                With depth > 1, DMA prefills multiple buffers before compute
+                starts, overlapping loads with MMA. Requires more smem:
+                inner_depth * (A_tile + B_tile) must fit in PAGE_SIZE.
         """
         ts = dict(tile_sizes or {})
         tile_K = ts.pop("K", 32)
         scheduled = cls._schedule_single(tile_sizes=ts, **tensors)
         scheduled.static_dims["tile_K"] = tile_K
+        scheduled.static_dims["inner_depth"] = inner_depth
         return [scheduled]
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, **tensors):
+    def schedule_backward(cls, tile_sizes=None, inner_depth=1, **tensors):
         """Schedule GEMM backward as forward-equivalent ops.
 
         dA[M,K] = dout[M,N] @ B[N,K]  (contracts over N)
@@ -426,6 +483,7 @@ class GemmOp(Op):
             ops.extend(cls.schedule_forward(
                 a=dout, b=b_t, c=da,
                 tile_sizes={"M": tile_m, "N": tile_k, "K": tile_n},
+                inner_depth=inner_depth,
             ))
 
         if db is not None:
@@ -437,6 +495,7 @@ class GemmOp(Op):
             ops.extend(cls.schedule_forward(
                 a=dout_t, b=a_t, c=db,
                 tile_sizes={"M": tile_n, "N": tile_k, "K": tile_m},
+                inner_depth=inner_depth,
             ))
 
         return ops

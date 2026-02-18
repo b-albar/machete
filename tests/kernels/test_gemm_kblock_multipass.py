@@ -48,7 +48,8 @@ def _gemm_reference(a, b_t):
     return (a.float() @ b_t.float().t()).to(a.dtype)
 
 
-def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1):
+def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1,
+              inner_depth=1):
     """Run GemmOp and return output tensor C.
 
     Uses num_sms=1 by default to force multi-pass execution.
@@ -63,6 +64,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1):
     ops = GemmOp.schedule(
         a=a, b=b_t, c=c,
         tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        inner_depth=inner_depth,
     )
     config = MegakernelConfig(threads_per_block=160, num_sms=num_sms)
     kernel = Megakernel(ops, config=config)
@@ -74,7 +76,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1):
 
 
 def _gemm_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,
-               num_sms=1, atol=1e-1, rtol=1e-2):
+               num_sms=1, atol=1e-1, rtol=1e-2, inner_depth=1):
     """Run a single GEMM test case with correctness check."""
     torch.manual_seed(42)
     a = torch.randn(M, K, dtype=dtype, device="cuda")
@@ -82,7 +84,7 @@ def _gemm_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,
     b_t = b.t().contiguous()
 
     c = _run_gemm(a, b_t, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-                  num_sms=num_sms)
+                  num_sms=num_sms, inner_depth=inner_depth)
     ref = _gemm_reference(a, b_t)
     torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
 
@@ -198,3 +200,69 @@ class TestGemmKBlockMultiPass:
     def test_4_tiles_no_inner_iters(self):
         """4 tiles × 1 K-block. Slot reuse without inner_iters."""
         _gemm_case(256, 32, 32, torch.float16)
+
+
+# =============================================================================
+# Double-buffered K-blocks (inner_depth=2)
+# =============================================================================
+
+@requires_gpu
+class TestGemmDoubleBufferSinglePass:
+    """inner_depth=2 with a single (M,N) tile — no multi-pass.
+
+    DMA prefills 2 buffers before MMA starts, then overlaps loads
+    with compute. Smem budget: 2 * (A_tile + B_tile) <= PAGE_SIZE.
+    """
+
+    def test_2_k_blocks_depth2(self):
+        """K=64, tile_K=32 → 2 K-blocks, depth=2. Exactly fills pipeline."""
+        _gemm_case(64, 64, 32, torch.float16, inner_depth=2)
+
+    def test_3_k_blocks_depth2(self):
+        """K=96, tile_K=32 → 3 K-blocks, depth=2. One prefill + one overlap."""
+        _gemm_case(64, 96, 32, torch.float16, inner_depth=2)
+
+    def test_4_k_blocks_depth2(self):
+        """K=128, tile_K=32 → 4 K-blocks, depth=2. Full double-buffer pipeline."""
+        _gemm_case(64, 128, 32, torch.float16, inner_depth=2)
+
+    def test_8_k_blocks_depth2(self):
+        """K=256, tile_K=32 → 8 K-blocks, depth=2. Many overlapped iterations."""
+        _gemm_case(64, 256, 32, torch.float16, inner_depth=2)
+
+    def test_tile_k16_depth2(self):
+        """tile_K=16, K=64 → 4 K-blocks, depth=2. Smallest tile + double buffer."""
+        _gemm_case(64, 64, 32, torch.float16, tile_k=16, inner_depth=2)
+
+
+@requires_gpu
+class TestGemmDoubleBufferMultiPass:
+    """inner_depth=2 with multiple (M,N) tiles on num_sms=1.
+
+    This tests the full DMA pipeline: prefill, overlap, and correct
+    per-buffer smem_consumed phase tracking across tile boundaries.
+    """
+
+    def test_2_tiles_2_kblocks_depth2(self):
+        """2 M-tiles × 2 K-blocks, depth=2."""
+        _gemm_case(128, 64, 32, torch.float16, inner_depth=2)
+
+    def test_2_tiles_4_kblocks_depth2(self):
+        """2 M-tiles × 4 K-blocks, depth=2."""
+        _gemm_case(128, 128, 32, torch.float16, inner_depth=2)
+
+    def test_4_tiles_4_kblocks_depth2(self):
+        """4 M-tiles × 4 K-blocks, depth=2. Heavy multi-pass."""
+        _gemm_case(256, 128, 32, torch.float16, inner_depth=2)
+
+    def test_mn_tiles_4_kblocks_depth2(self):
+        """2×2 tile grid × 4 K-blocks, depth=2."""
+        _gemm_case(128, 128, 64, torch.float16, inner_depth=2)
+
+    def test_8_tiles_4_kblocks_depth2(self):
+        """4×2 tile grid × 4 K-blocks, depth=2. 8 tiles, each slot reused."""
+        _gemm_case(256, 128, 64, torch.float16, inner_depth=2)
+
+    def test_8_tiles_depth2_bf16(self):
+        """8 tiles × 4 K-blocks, depth=2, bf16."""
+        _gemm_case(256, 128, 64, torch.bfloat16, inner_depth=2)
