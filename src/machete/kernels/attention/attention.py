@@ -370,8 +370,11 @@ class FlashAttentionOp(Op):
         """Flash attention forward with multi-warp tensor core MMA.
 
         Uses framework inner_iters for DMA-driven KV loads.
-        k=0 (Q): read from buf 0 to registers, signal smem_consumed.
-        k=1+ (KV blocks): S GEMM + softmax + O GEMM from alternating buffers.
+        Phase 1: read Q from buf 0 to registers.
+        Phase 2: dynamic while loop over KV blocks with:
+          - Register pipeline (prefetch next smem→reg tile)
+          - First-block rescale skip
+          - Boundary-only masking
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
@@ -388,7 +391,7 @@ class FlashAttentionOp(Op):
             )
             thr_mma = tiled_mma.get_slice(tidx)
 
-            # === Q register fragment (filled during k=0) ===
+            # === Q register fragment ===
             sQ = cute.make_tensor(
                 cute.make_ptr(self.q_dtype, page_ptr,
                               cute.AddressSpace.smem, assumed_align=128),
@@ -417,57 +420,55 @@ class FlashAttentionOp(Op):
             smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
             smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
 
-            # Per-buffer K and V^T smem tensors + LdMatrix partitions
-            _buf_tKsK = []
-            _buf_tVsVt = []
-            _buf_tCrK = []
-            _buf_tBrVt = []
-            _buf_tKrK_view = []
-            _buf_tVrVt_view = []
-            for _d in cutlass.range_constexpr(2):
-                buf_base = page_ptr + Int32(_d * self.kv_buf_stride)
+            # === Pre-allocate register fragments (from buf 0 layout)
+            # Shapes are identical for both buffers; only base ptr differs.
+            _buf0_base = page_ptr
+            _sK0_ptr = cute.recast_ptr(
+                cute.make_ptr(self.q_dtype, _buf0_base,
+                              cute.AddressSpace.smem,
+                              assumed_align=128),
+                swz, dtype=self.q_dtype)
+            _sK0 = cute.make_tensor(
+                _sK0_ptr,
+                cute.make_layout((self.n_block, self.D),
+                                 stride=(self.D, 1)))
+            _sVt0_ptr = cute.recast_ptr(
+                cute.make_ptr(self.q_dtype,
+                              _buf0_base + Int32(self.kv_tile_bytes),
+                              cute.AddressSpace.smem,
+                              assumed_align=128),
+                swz, dtype=self.q_dtype)
+            _sVt0 = cute.make_tensor(
+                _sVt0_ptr,
+                cute.make_layout((self.D, self.n_block),
+                                 stride=(1, self.D)))
 
-                # K: (n_block, D) row-major with swizzle
-                sK_ptr = cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, buf_base,
-                                  cute.AddressSpace.smem,
-                                  assumed_align=128),
-                    swz, dtype=self.q_dtype)
-                sK = cute.make_tensor(
-                    sK_ptr,
-                    cute.make_layout((self.n_block, self.D),
-                                     stride=(self.D, 1)))
+            _tCsK0 = thr_mma.partition_B(_sK0)
+            tCrK = tiled_mma.make_fragment_B(_tCsK0)
+            tKrK_view = smem_thr_copy_K.retile(tCrK)
 
-                # V^T: (D, n_block) transposed view with same swizzle
-                sVt_ptr = cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype,
-                                  buf_base + Int32(self.kv_tile_bytes),
-                                  cute.AddressSpace.smem,
-                                  assumed_align=128),
-                    swz, dtype=self.q_dtype)
-                sVt = cute.make_tensor(
-                    sVt_ptr,
-                    cute.make_layout((self.D, self.n_block),
-                                     stride=(1, self.D)))
+            _tBsVt0 = thr_mma.partition_B(_sVt0)
+            tBrVt = tiled_mma.make_fragment_B(_tBsVt0)
+            tVrVt_view = smem_thr_copy_Vt.retile(tBrVt)
 
-                # MMA fragments
-                tCsK = thr_mma.partition_B(sK)
-                tCrK = tiled_mma.make_fragment_B(tCsK)
-                tBsVt = thr_mma.partition_B(sVt)
-                tBrVt = tiled_mma.make_fragment_B(tBsVt)
-
-                # LdMatrix partitions
-                tKsK = smem_thr_copy_K.partition_S(sK)
-                tKrK_view = smem_thr_copy_K.retile(tCrK)
-                tVsVt = smem_thr_copy_Vt.partition_S(sVt)
-                tVrVt_view = smem_thr_copy_Vt.retile(tBrVt)
-
-                _buf_tKsK.append(tKsK)
-                _buf_tVsVt.append(tVsVt)
-                _buf_tCrK.append(tCrK)
-                _buf_tBrVt.append(tBrVt)
-                _buf_tKrK_view.append(tKrK_view)
-                _buf_tVrVt_view.append(tVrVt_view)
+            # P register fragment + MMA view (pre-allocated)
+            acc_S = cute.make_fragment(
+                tiled_mma.partition_shape_C(
+                    (self.tile_size_M, self.n_block)),
+                Float32)
+            rP = cute.make_fragment_like(acc_S, self.q_dtype)
+            rP_ld = cute.logical_divide(
+                rP.layout, (None, None, 2))
+            rP_mma_view = cute.make_layout(
+                ((rP_ld.shape[0], rP_ld.shape[2][0]),
+                 rP_ld.shape[1],
+                 rP_ld.shape[2][1]),
+                stride=(
+                    (rP_ld.stride[0], rP_ld.stride[2][0]),
+                    rP_ld.stride[1],
+                    rP_ld.stride[2][1]),
+            )
+            tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
             # === Accumulators ===
             acc_O = cute.make_fragment(
@@ -475,10 +476,6 @@ class FlashAttentionOp(Op):
                     (self.tile_size_M, self.D)),
                 Float32)
             acc_O.fill(0.0)
-            acc_S = cute.make_fragment(
-                tiled_mma.partition_shape_C(
-                    (self.tile_size_M, self.n_block)),
-                Float32)
 
             # Softmax state
             acc_O_shape = tiled_mma.partition_shape_C(
@@ -492,146 +489,178 @@ class FlashAttentionOp(Op):
                 row_max[r] = Float32(-1e30)
                 row_sum[r] = Float32(0.0)
 
-            # Identity tensor for N-masking in softmax
+            # Identity tensor for masking
             mcS = cute.make_identity_tensor(
                 (self.tile_size_M, self.n_block))
             tScS = thr_mma.partition_C(mcS)
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
-            # === Phase tracking (same as GemmOp pattern) ===
-            _kb_phases = [work_mbar_phase]
-            for _d in cutlass.range_constexpr(self.inner_depth - 1):
-                _kb_phases.append(Int32(0))
+            # =============================================================
+            # Phase 1: Read Q from buf 0 to registers
+            # =============================================================
+            for kb in cutlass.range_constexpr(self.D // 16):
+                cute.autovec_copy(
+                    tCsQ[None, None, kb],
+                    tCrQ[None, None, kb])
 
-            # === Main loop: k=0 is Q, k=1+ are KV blocks ===
-            for k in cutlass.range_constexpr(1 + self.num_kv_blocks):
-                if k > 0:
-                    # Signal previous buffer consumed
-                    prev_buf = (k - 1) % 2
-                    named_barrier_sync(
-                        Int32(2), Int32(self.num_mma_threads))
-                    if lane_id == Int32(0):
-                        mbarrier_arrive(
-                            smem_consumed_mbar + Int32(prev_buf * 8))
+            # =============================================================
+            # Phase 2: KV block loop (DYNAMIC while — single loop body)
+            # =============================================================
+            kv_idx = Int32(0)
+            while kv_idx < Int32(self.num_kv_blocks):
+                # --- Signal previous buffer consumed ---
+                prev_buf = kv_idx % Int32(2)
+                named_barrier_sync(
+                    Int32(2), Int32(self.num_mma_threads))
+                if lane_id == Int32(0):
+                    mbarrier_arrive(
+                        smem_consumed_mbar + prev_buf * Int32(8))
 
-                    # Wait for next buffer from DMA
-                    cur_buf = k % 2
-                    mbarrier_wait(
-                        work_mbar + Int32(cur_buf * 8),
-                        _kb_phases[cur_buf])
-                    _kb_phases[cur_buf] = (
-                        Int32(1) - _kb_phases[cur_buf])
+                # --- Wait for current buffer ---
+                # Phase formula: buf 0 starts at phase 1 (framework
+                # consumed phase 0 for Q), buf 1 starts at phase 0.
+                # Unified: phase = ((kv_idx + 1) // 2) % 2
+                cur_buf = (kv_idx + Int32(1)) % Int32(2)
+                cur_phase = (
+                    (kv_idx + Int32(1)) // Int32(2)) % Int32(2)
+                mbarrier_wait(
+                    work_mbar + cur_buf * Int32(8), cur_phase)
 
-                if k == 0:
-                    # === Read Q from buf 0 to registers ===
-                    for kb in cutlass.range_constexpr(self.D // 16):
-                        cute.autovec_copy(
-                            tCsQ[None, None, kb],
-                            tCrQ[None, None, kb])
-                else:
-                    # === KV block processing ===
-                    cur_buf = k % 2
-                    kv_start = Int32((k - 1) * self.n_block)
+                kv_start = kv_idx * Int32(self.n_block)
 
-                    # --- S GEMM: acc_S = Q(regs) @ K(smem)^T ---
-                    tKsK_cur = _buf_tKsK[cur_buf]
-                    tCrK_cur = _buf_tCrK[cur_buf]
-                    tKrK_view_cur = _buf_tKrK_view[cur_buf]
+                # --- Build smem tensors for current buffer ---
+                buf_base = page_ptr + cur_buf * Int32(
+                    self.kv_buf_stride)
 
-                    acc_S.fill(0.0)
-                    for kb in cutlass.range_constexpr(self.D // 16):
-                        cute.copy(smem_tiled_copy_K,
-                                  tKsK_cur[None, None, kb],
-                                  tKrK_view_cur[None, None, kb])
-                        cute.gemm(tiled_mma, acc_S,
-                                  tCrQ[None, None, kb],
-                                  tCrK_cur[None, None, kb], acc_S)
+                sK = cute.make_tensor(
+                    cute.recast_ptr(
+                        cute.make_ptr(self.q_dtype, buf_base,
+                                      cute.AddressSpace.smem,
+                                      assumed_align=128),
+                        swz, dtype=self.q_dtype),
+                    cute.make_layout((self.n_block, self.D),
+                                     stride=(self.D, 1)))
+                sVt = cute.make_tensor(
+                    cute.recast_ptr(
+                        cute.make_ptr(
+                            self.q_dtype,
+                            buf_base + Int32(self.kv_tile_bytes),
+                            cute.AddressSpace.smem,
+                            assumed_align=128),
+                        swz, dtype=self.q_dtype),
+                    cute.make_layout((self.D, self.n_block),
+                                     stride=(1, self.D)))
 
-                    # --- Mask + online softmax ---
-                    acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
-                    acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+                tKsK = smem_thr_copy_K.partition_S(sK)
+                tVsVt = smem_thr_copy_Vt.partition_S(sVt)
 
+                # --- S GEMM with register pipeline ---
+                acc_S.fill(0.0)
+                # Prefetch first K tile
+                cute.copy(smem_tiled_copy_K,
+                          tKsK[None, None, 0],
+                          tKrK_view[None, None, 0])
+                for kb in cutlass.range_constexpr(self.D // 16):
+                    kb_next = (kb + 1) % (self.D // 16)
+                    # Prefetch next K tile while computing current
+                    cute.copy(smem_tiled_copy_K,
+                              tKsK[None, None, kb_next],
+                              tKrK_view[None, None, kb_next])
+                    cute.gemm(tiled_mma, acc_S,
+                              tCrQ[None, None, kb],
+                              tCrK[None, None, kb], acc_S)
+
+                # --- Masking (boundary blocks only) ---
+                acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
+                acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+
+                # N-boundary mask (only last KV block)
+                if kv_start + Int32(self.n_block) > Int32(self.N):
                     for r in cutlass.range_constexpr(num_rows):
-                        row_idx = tScS_mn[r, 0][0]
                         for c in cutlass.range_constexpr(
                                 cute.size(tScS_mn.shape[1])):
                             col_idx = tScS_mn[0, c][1]
                             global_col = kv_start + Int32(col_idx)
-                            # N-boundary mask
                             if global_col >= Int32(self.N):
                                 acc_S_mn[r, c] = Float32(-1e30)
-                            # Causal mask
-                            if self.causal:
-                                global_row = (
-                                    tile_M * Int32(self.tile_size_M)
-                                    + Int32(row_idx))
+
+                # Causal mask (only blocks near diagonal)
+                if self.causal:
+                    last_blk_col = kv_start + Int32(
+                        self.n_block - 1)
+                    first_row = tile_M * Int32(self.tile_size_M)
+                    if last_blk_col > first_row + Int32(
+                            self.N - self.M):
+                        for r in cutlass.range_constexpr(num_rows):
+                            row_idx = tScS_mn[r, 0][0]
+                            global_row = (
+                                tile_M * Int32(self.tile_size_M)
+                                + Int32(row_idx))
+                            for c in cutlass.range_constexpr(
+                                    cute.size(tScS_mn.shape[1])):
+                                col_idx = tScS_mn[0, c][1]
+                                global_col = (
+                                    kv_start + Int32(col_idx))
                                 if global_col > global_row + Int32(
                                         self.N - self.M):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
-                    for r in cutlass.range_constexpr(num_rows):
-                        acc_S_row = acc_S_mn[r, None].load()
+                # --- Online softmax ---
+                for r in cutlass.range_constexpr(num_rows):
+                    acc_S_row = acc_S_mn[r, None].load()
 
-                        row_max_cur = acc_S_row.reduce(
-                            cute.ReductionOp.MAX, Float32(-1e30), 0)
-                        row_max_cur = self._threadquad_reduce_max(
-                            row_max_cur)
+                    row_max_cur = acc_S_row.reduce(
+                        cute.ReductionOp.MAX, Float32(-1e30), 0)
+                    row_max_cur = self._threadquad_reduce_max(
+                        row_max_cur)
 
-                        m_old = row_max[r]
-                        m_new = cute.arch.fmax(m_old, row_max_cur)
+                    m_old = row_max[r]
+                    m_new = cute.arch.fmax(m_old, row_max_cur)
+
+                    # Skip rescale on first block (acc_O=0,
+                    # row_sum=0 so multiply by correction is no-op)
+                    if kv_idx > Int32(0):
                         correction = cute.math.exp2(
                             (m_old - m_new) * Float32(
                                 self.scale_log2e),
                             fastmath=True,
                         )
-
                         row_sum[r] = row_sum[r] * correction
                         acc_O_mn[r, None] = (
                             acc_O_mn[r, None].load() * correction)
 
-                        acc_S_row_exp = cute.math.exp2(
-                            acc_S_row * Float32(self.scale_log2e)
-                            - m_new * Float32(self.scale_log2e),
-                            fastmath=True,
-                        )
-
-                        acc_S_row_sum = acc_S_row_exp.reduce(
-                            cute.ReductionOp.ADD, Float32(0.0), 0)
-                        row_sum[r] = row_sum[r] + acc_S_row_sum
-
-                        row_max[r] = m_new
-                        acc_S_mn[r, None] = acc_S_row_exp
-
-                    # --- P in registers (rP_mma_view trick) ---
-                    rP = cute.make_fragment_like(acc_S, self.q_dtype)
-                    rP.store(acc_S.load().to(self.q_dtype))
-                    rP_ld = cute.logical_divide(
-                        rP.layout, (None, None, 2))
-                    rP_mma_view = cute.make_layout(
-                        ((rP_ld.shape[0], rP_ld.shape[2][0]),
-                         rP_ld.shape[1],
-                         rP_ld.shape[2][1]),
-                        stride=(
-                            (rP_ld.stride[0], rP_ld.stride[2][0]),
-                            rP_ld.stride[1],
-                            rP_ld.stride[2][1]),
+                    acc_S_row_exp = cute.math.exp2(
+                        acc_S_row * Float32(self.scale_log2e)
+                        - m_new * Float32(self.scale_log2e),
+                        fastmath=True,
                     )
-                    tOrS = cute.make_tensor(
-                        rP.iterator, rP_mma_view)
 
-                    # --- O GEMM: acc_O += P(regs) @ V(smem)^T ---
-                    tVsVt_cur = _buf_tVsVt[cur_buf]
-                    tBrVt_cur = _buf_tBrVt[cur_buf]
-                    tVrVt_view_cur = _buf_tVrVt_view[cur_buf]
+                    acc_S_row_sum = acc_S_row_exp.reduce(
+                        cute.ReductionOp.ADD, Float32(0.0), 0)
+                    row_sum[r] = row_sum[r] + acc_S_row_sum
 
-                    for kb in cutlass.range_constexpr(
-                            self.n_block // 16):
-                        cute.copy(smem_tiled_copy_Vt,
-                                  tVsVt_cur[None, None, kb],
-                                  tVrVt_view_cur[None, None, kb])
-                        cute.gemm(tiled_mma, acc_O,
-                                  tOrS[None, None, kb],
-                                  tBrVt_cur[None, None, kb], acc_O)
+                    row_max[r] = m_new
+                    acc_S_mn[r, None] = acc_S_row_exp
+
+                # --- P conversion + O GEMM with register pipeline
+                rP.store(acc_S.load().to(self.q_dtype))
+
+                # Prefetch first V tile
+                cute.copy(smem_tiled_copy_Vt,
+                          tVsVt[None, None, 0],
+                          tVrVt_view[None, None, 0])
+                for kb in cutlass.range_constexpr(
+                        self.n_block // 16):
+                    kb_next = (kb + 1) % (self.n_block // 16)
+                    # Prefetch next V tile while computing current
+                    cute.copy(smem_tiled_copy_Vt,
+                              tVsVt[None, None, kb_next],
+                              tVrVt_view[None, None, kb_next])
+                    cute.gemm(tiled_mma, acc_O,
+                              tOrS[None, None, kb],
+                              tBrVt[None, None, kb], acc_O)
+
+                kv_idx = kv_idx + Int32(1)
 
             # === Normalize O by row_sum ===
             acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
