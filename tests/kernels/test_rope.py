@@ -67,13 +67,7 @@ def run_rope_megakernel(q_4d, cos, sin, backward=False, num_sms=2):
     cos_f32 = cos.float().contiguous()
     sin_f32 = sin.float().contiguous()
 
-    # Pick largest tile_size_H <= 8 that divides H
-    tile_h = min(h, 8)
-    while h % tile_h != 0:
-        tile_h -= 1
-
-    ops = RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32,
-                          tile_sizes={"M": 2, "H": tile_h})
+    ops = RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)
     mk_config = MegakernelConfig(num_sms=num_sms)
     kernel = Megakernel(ops, config=mk_config, backward=backward)
     kernel.run()

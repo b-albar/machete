@@ -15,7 +15,7 @@ import io
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel
 from machete.kernels.rope import RopeOp
 from machete.kernels.rope.ref import rope_pytorch, HAS_TRITON
 from machete.utils.benchmark import Benchmark
@@ -92,8 +92,9 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
         q_mk = q.clone()
         q_flat = q_mk.view(b * s, h, d)
 
-        ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 2, "H": 8})
-        kernel = Megakernel(ops, config=MegakernelConfig())
+        ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin)
+        config = RopeOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
 
         # Trigger compilation + first run
         with contextlib.redirect_stdout(io.StringIO()):

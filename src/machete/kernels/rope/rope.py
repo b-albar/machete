@@ -118,9 +118,11 @@ class RopeOp(Op):
         D2 = D // 2
         elem_bytes = q.element_size()
         tiles = {}
-        # tile_H: largest <= 8 that divides H
-        tile_H = min(H, 8)
-        while H % tile_H != 0:
+        # tile_H: target ≥2048 bytes per q row for efficient DMA.
+        # For D=128/bf16 this gives tile_H=8, for D=64/bf16 it gives tile_H=16.
+        min_tile_H = max(8, 2048 // (D * elem_bytes))
+        tile_H = min(H, min_tile_H)
+        while tile_H > 1 and H % tile_H != 0:
             tile_H -= 1
         tiles["H"] = tile_H
         # tile_M: q(tile_M * tile_H * D) + cos(tile_M * D2) + sin(tile_M * D2)
