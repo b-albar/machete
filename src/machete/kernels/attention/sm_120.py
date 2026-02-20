@@ -47,7 +47,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.nvgpu import warp
 
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     named_barrier_sync,
 )
@@ -82,10 +82,32 @@ class FlashAttentionSm120Op(Op):
     tma_loads = {"q"}
     tma_stores = {"o"}
 
+    @classmethod
+    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
+        """Swizzled smem layout for O TMA store descriptor."""
+        if tensor_name != "o":
+            return None
+
+        D = static_dims["D"]
+        if D >= 64:
+            B = 3
+        elif D >= 32:
+            B = 2
+        else:
+            B = 1
+
+        dim0, dim1, dim2 = tma_tile_shape
+        return (
+            f"cute.make_composed_layout("
+            f"cute.make_swizzle({B}, 4, 3), 0, "
+            f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
+            f"stride=(1, {dim0}, {dim0 * dim1})))"
+        )
+
     def __init__(self, **config):
         super().__init__(**config)
         self.causal = getattr(self, "causal", 0)
-        self.page_size = getattr(self, "page_size", 16384)
+        self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120Op requires fp16 or bf16, got {self.q_dtype}"
@@ -155,6 +177,10 @@ class FlashAttentionSm120Op(Op):
 
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
+        # Rescale threshold (log2-space): skip O rescale when correction factor
+        # >= 2^(-threshold), i.e. row max changed insignificantly.
+        # 8.0 matches flash_fwd_sm100 for fp16/bf16 (2^-8 = 1/256 worst-case).
+        self.rescale_threshold = 8.0
 
         # Override compute method
         self.compute = self.compute_mma
@@ -164,7 +190,7 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False, page_size=16384, **tensors):
+    def schedule_forward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule cooperative flash attention forward."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("BH", 1)
@@ -196,7 +222,7 @@ class FlashAttentionSm120Op(Op):
         tile_m = ops[0].tile_sizes["M"]
         num_mma_warps = tile_m // 16
         threads_per_block = (num_mma_warps + 1) * 32
-        page_size = ops[0].static_dims.get("page_size", 16384 * 2)
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
             threads_per_block=threads_per_block,
             page_size=page_size,
@@ -337,6 +363,11 @@ class FlashAttentionSm120Op(Op):
             smem_tiled_copy_Vt = cute.make_tiled_copy_B(smem_copy_atom_Vt, tiled_mma)
             smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
             smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
+
+            # === CopyUniversal for O write to swizzled smem ===
+            smem_copy_atom_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.q_dtype)
+            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
+            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
 
             # === K smem tensor + LdMatrix fragments (buf0, swizzled) ===
             _sK = cute.make_tensor(
@@ -504,9 +535,11 @@ class FlashAttentionSm120Op(Op):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---
+                _any_correction = Int32(0)
+                corrections = cute.make_fragment(
+                    cute.make_layout(num_rows), Float32)
                 for r in cutlass.range_constexpr(num_rows):
                     acc_S_row = acc_S_mn[r, None].load()
-
                     row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, Float32(-1e30), 0)
                     row_max_cur = self._threadquad_reduce_max(row_max_cur)
 
@@ -514,23 +547,31 @@ class FlashAttentionSm120Op(Op):
                     m_new = cute.arch.fmax(m_old, row_max_cur)
 
                     if kv_idx > Int32(0):
-                        correction = cute.math.exp2(
-                            (m_old - m_new) * Float32(self.scale_log2e),
-                            fastmath=True,
-                        )
+                        acc_scale_ = (m_old - m_new) * Float32(self.scale_log2e)
+                        correction = cute.math.exp2(acc_scale_, fastmath=True)
+                        if acc_scale_ >= Float32(-self.rescale_threshold):
+                            m_new = m_old
+                            correction = Float32(1.0)
                         row_sum[r] = row_sum[r] * correction
-                        acc_O_mn[r, None] = acc_O_mn[r, None].load() * correction
+                        corrections[r] = correction
+                        if m_new > m_old:
+                            _any_correction = Int32(1)
 
                     acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * Float32(self.scale_log2e) - m_new * Float32(self.scale_log2e),
-                        fastmath=True,
+                        acc_S_row * Float32(self.scale_log2e) - m_new * Float32(self.scale_log2e), fastmath=True
                     )
-
                     acc_S_row_sum = acc_S_row_exp.reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
                     row_sum[r] = row_sum[r] + acc_S_row_sum
-
                     row_max[r] = m_new
                     acc_S_mn[r, None] = acc_S_row_exp
+
+                # Deferred O rescale: skip if max unchanged across all rows/threads
+                if kv_idx > Int32(0):
+                    _skip_rescale = cute.arch.vote_all_sync(
+                        _any_correction == Int32(0))
+                    if not _skip_rescale:
+                        for r in cutlass.range_constexpr(num_rows):
+                            acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
 
                 # --- P conversion + O GEMM with register pipeline ---
                 rP.store(acc_S.load().to(self.q_dtype))
@@ -553,15 +594,23 @@ class FlashAttentionSm120Op(Op):
                 inv_sum = cute.arch.rcp_approx(row_sum[r])
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
 
-            # Write O to smem (at page_ptr, same layout as Q)
+            # Write O to smem (at page_ptr, swizzled layout)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+            _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
             sO = cute.make_tensor(
-                cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.q_dtype
+                ),
                 cute.make_layout((self.tile_size_M, self.D), stride=(self.D, 1)),
             )
-            tCsO = thr_mma.partition_C(sO)
-            for i in cutlass.range(cute.size(acc_O), unroll_full=True):
-                tCsO[i] = acc_O[i].to(self.q_dtype)
+            # Convert acc_O (f32) → q_dtype in registers
+            tCrO_q = cute.make_fragment_like(acc_O, self.q_dtype)
+            for i in cutlass.range_constexpr(cute.size(acc_O)):
+                tCrO_q[i] = acc_O[i].to(self.q_dtype)
+            # Retile register fragment for copy atom, partition smem
+            tOrO = smem_thr_copy_O.retile(tCrO_q)
+            tOsO = smem_thr_copy_O.partition_D(sO)
+            cute.copy(smem_tiled_copy_O, tOrO, tOsO)
 
     # =========================================================================
     # Forward Store (3D TMA S->G for O)
@@ -569,9 +618,10 @@ class FlashAttentionSm120Op(Op):
 
     @cute.jit
     def store(self, page_ptr, tile_BH, tile_M, tile_D, o_tma, o_tma_gmem):
-        """TMA store of O from shared to global memory."""
+        """TMA store of O from shared to global memory (swizzled)."""
+        _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
         sO = cute.make_tensor(
-            cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.recast_ptr(cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.q_dtype),
             cute.make_layout((self.D, self.tile_size_M, 1)),
         )
         gO = cute.local_tile(

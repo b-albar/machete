@@ -20,7 +20,7 @@ import io
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel
 from machete.kernels.rms_norm import RMSNormOp
 from machete.kernels.rms_norm.ref import rmsnorm_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
 from machete.utils.benchmark import Benchmark
@@ -60,27 +60,6 @@ def rmsnorm_bytes(batch, seq_len, hidden_dim):
     x_elems = batch * seq_len * hidden_dim
     w_elems = hidden_dim
     return (2 * x_elems + w_elems) * 2
-
-
-def _calculate_threads(hidden_dim):
-    """Calculate optimal threads per block based on hidden dimension.
-
-    Matches Triton's configuration:
-        block_size = next_power_of_2(hidden_dim), clamped to [32, 65536]
-        num_warps = max(block_size // 256, 1), clamped to [1, 32]
-        threads = num_warps * 32
-    """
-    # Next power of 2, clamped
-    block_size = 1
-    while block_size < hidden_dim:
-        block_size *= 2
-    block_size = max(block_size, 32)
-    block_size = min(block_size, 65536)
-
-    # Warps and threads
-    num_warps = max(block_size // 256, 1)
-    num_warps = min(num_warps, 32)
-    return num_warps * 32
 
 
 # =============================================================================
@@ -126,12 +105,8 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
     # Megakernel (out-of-place, via bench_spec for raw kernel timing)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         y = torch.empty_like(x)
-        tile_m = min(4, max(1, 16384 // (D * 2)))
-        ops = RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m})
-
-        # Optimal thread config: 128 threads (4 warps) for warp-parallel rows
-        # Each warp handles one row independently with warp-level reduction only
-        config = MegakernelConfig(threads_per_block=128)
+        ops = RMSNormOp.schedule(x=x, weight=weight, y=y)
+        config = RMSNormOp.kernel_config(ops)
         kernel = Megakernel(ops, config=config)
 
         # Trigger compilation + first run

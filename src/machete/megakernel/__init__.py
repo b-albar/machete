@@ -16,6 +16,7 @@ Usage:
 """
 
 from .ops import (
+    DEFAULT_PAGE_SIZE,
     Op,
     ScheduledOp,
     TensorMeta,
@@ -66,6 +67,7 @@ __all__ = [
     "TileInstruction",
     "InstructionStreamBuilder",
     # Configuration & Megakernel
+    "DEFAULT_PAGE_SIZE",
     "MegakernelConfig",
     "Megakernel",
     "create_megakernel",

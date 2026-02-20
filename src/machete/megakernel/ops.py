@@ -514,6 +514,9 @@ def _process_op_declarations(cls):
 # Operation Protocol
 # =============================================================================
 
+DEFAULT_PAGE_SIZE: int = 32768
+"""Default page size in bytes (32KB). Single source of truth for all ops."""
+
 
 class Op:
     """Base class for GPU-executable operations with pipelined execution.

@@ -34,7 +34,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
 
@@ -70,7 +70,7 @@ class ActivationOp(Op):
     def __init__(self, **config):
         super().__init__(**config)
         self.activation = getattr(self, 'activation', ACT_RELU)
-        self.page_size = getattr(self, 'page_size', 16384)
+        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
 
         if self.x_dtype == cutlass.Float32:
             self.elem_bytes = 4
@@ -93,12 +93,12 @@ class ActivationOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='relu', page_size=16384, **tensors):
+    def schedule_forward(cls, tile_sizes=None, activation='relu', page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule activation forward.
 
         Args:
             activation: 'relu' or 'silu'
-            page_size: Shared memory page size in bytes. Default 16384 (16KB).
+            page_size: Shared memory page size in bytes.
             **tensors: x required, y optional (defaults to x for in-place)
         """
         tile_sizes = dict(tile_sizes or {})
@@ -120,7 +120,7 @@ class ActivationOp(Op):
     def kernel_config(cls, ops):
         """Return recommended MegakernelConfig for scheduled ActivationOps."""
         from machete.megakernel import MegakernelConfig
-        page_size = ops[0].static_dims.get('page_size', 16384)
+        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
         return MegakernelConfig(page_size=page_size)
 
     # =========================================================================

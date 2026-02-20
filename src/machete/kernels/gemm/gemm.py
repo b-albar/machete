@@ -35,7 +35,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_arrive, mbarrier_arrive_expect_tx, mbarrier_wait,
     named_barrier_sync,
@@ -89,7 +89,7 @@ class GemmOp(Op):
         # tile_K and inner_depth injected via schedule_forward into static_dims
         self.tile_K = getattr(self, 'tile_K', 32)
         self.inner_depth = getattr(self, 'inner_depth', 1)
-        self.page_size = getattr(self, 'page_size', 16384)
+        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
 
         self.a_tile_bytes = self.tile_size_M * self.tile_K * self.elem_bytes
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
@@ -453,7 +453,7 @@ class GemmOp(Op):
         return 32, 32, 16
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, inner_depth=1, page_size=16384, **tensors):
+    def schedule_forward(cls, tile_sizes=None, inner_depth=1, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule forward GEMM.
 
         Accepts tile_sizes with M, N, K keys. K is the inner K-block size
@@ -466,7 +466,7 @@ class GemmOp(Op):
                 With depth > 1, DMA prefills multiple buffers before compute
                 starts, overlapping loads with MMA. Requires more smem:
                 inner_depth * (A_tile + B_tile) must fit in page_size.
-            page_size: Shared memory page size in bytes. Default 16384 (16KB).
+            page_size: Shared memory page size in bytes.
         """
         ts = dict(tile_sizes or {})
         if "M" not in ts or "N" not in ts:
@@ -488,7 +488,7 @@ class GemmOp(Op):
     def kernel_config(cls, ops):
         """Return recommended MegakernelConfig for scheduled GemmOps."""
         from machete.megakernel import MegakernelConfig
-        page_size = ops[0].static_dims.get('page_size', 16384)
+        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
         return MegakernelConfig(page_size=page_size)
 
     @classmethod

@@ -38,7 +38,7 @@ from cutlass.cute.nvgpu.cpasync import (
     group_bulk_copy_modes,
 )
 
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
 
@@ -78,7 +78,7 @@ class RopeOp(Op):
 
     def __init__(self, **config):
         super().__init__(**config)
-        self.page_size = getattr(self, "page_size", 16384)
+        self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
 
         # Element size from dtype (runs at compile time, not in cute.jit)
         if self.q_dtype == cutlass.Float32:
@@ -131,7 +131,7 @@ class RopeOp(Op):
         return tiles
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=16384, **tensors):
+    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule RoPE forward with auto-computed tile sizes."""
         tile_sizes = dict(tile_sizes or {})
         auto = cls._auto_tiles(page_size, **tensors)
@@ -142,7 +142,7 @@ class RopeOp(Op):
         return ops
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, page_size=16384, **tensors):
+    def schedule_backward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule RoPE backward with auto-computed tile sizes."""
         tile_sizes = dict(tile_sizes or {})
         auto = cls._auto_tiles(page_size, **tensors)
@@ -157,7 +157,7 @@ class RopeOp(Op):
         """Return recommended MegakernelConfig for scheduled RopeOps."""
         from machete.megakernel import MegakernelConfig
 
-        page_size = ops[0].static_dims.get("page_size", 16384)
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
