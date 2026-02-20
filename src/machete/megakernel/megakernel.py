@@ -63,6 +63,8 @@ from .paged_memory import (
     NPageLayout,
     st_shared_i32,
     ld_shared_i32,
+    ld_shared_v2_b32,
+    st_shared_v2_b32,
 )
 
 
@@ -1095,7 +1097,10 @@ class Megakernel:
             return smem_base + Int32(kblock_ready_mbar_offset_0) + (slot * Int32(max_inner_depth) + buf_idx) * Int32(8)
 
         # Tile info size in bytes: INSTRUCTION_WORDS int32s per slot
-        tile_info_bytes = INSTRUCTION_WORDS * 4  # 6 * 4 = 24 bytes
+        tile_info_bytes = INSTRUCTION_WORDS * 4  # 2 * 4 = 8 bytes
+
+        # Build decompose_tile JIT function for runtime tile coord recovery
+        decompose_tile = self._builder.build_decompose_tile_fn()
 
         # Ring buffer kernel loop
         def _kernel_loop_ring(
@@ -1141,7 +1146,7 @@ class Megakernel:
                 if lane_id == Int32(0):
                     # Clear done flag and init inner_depth default
                     st_shared_i32(flags_ptr, Int32(0))
-                    st_shared_i32(flags_ptr + 36, Int32(1))  # inner_depth = 1
+                    st_shared_i32(flags_ptr + 20, Int32(1))  # inner_depth = 1
                     for _ip in range(num_pages):
                         # Init per-slot op_idx to -1 (no previous op)
                         _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
@@ -1183,38 +1188,31 @@ class Megakernel:
                 next_instr_idx = block_id
                 done = Int32(0)
                 has_pending_store = Int32(0)
-                # Pending store tile info (op_idx + 5 tile indices)
+                # Pending store tile info (op_idx + linear_tile_idx)
                 _ps_op = Int32(0)
-                _ps_0 = Int32(0)
-                _ps_1 = Int32(0)
-                _ps_2 = Int32(0)
-                _ps_3 = Int32(0)
-                _ps_4 = Int32(0)
+                _ps_linear = Int32(0)
 
                 # Instruction cache: load once from gmem, reuse across
                 # iterations when barriers aren't ready yet.
                 _instr_cached = Int32(0)
                 _ic_op = Int32(0)
-                _ic_0 = Int32(0)
-                _ic_1 = Int32(0)
-                _ic_2 = Int32(0)
-                _ic_3 = Int32(0)
-                _ic_4 = Int32(0)
+                _ic_linear = Int32(0)
 
                 # dispatch_load/store_slot_ptr: smem slots for all-threads dispatch.
                 # Thread 0 writes slot index here; all threads read it.
                 # Value -1 = no dispatch this iteration.
                 dispatch_load_slot_ptr = flags_ptr + 4
                 dispatch_store_slot_ptr = flags_ptr + 8
-                inner_iter_idx_ptr = flags_ptr + 32
-                inner_depth_ptr = flags_ptr + 36
+                prev_linear_ptr = flags_ptr + 12
+                inner_iter_idx_ptr = flags_ptr + 16
+                inner_depth_ptr = flags_ptr + 20
 
                 # Inner iteration state (for ops with inner_iters > 1)
                 _inner_iter = Int32(0)       # Current inner iter (0 = not in inner loop)
                 _inner_total = Int32(1)      # Total inner iters for current tile
                 _inner_depth = Int32(1)      # Pipeline stages for current tile
                 # Per-buffer smem_consumed phases stored in smem (dynamic buf_idx indexing)
-                sc_phases_ptr = flags_ptr + 40
+                sc_phases_ptr = flags_ptr + 24
 
                 while done == Int32(0):
                     if lane_id == Int32(0):
@@ -1228,8 +1226,10 @@ class Megakernel:
                         # then signal barriers and free the page.
                         if has_pending_store == Int32(1):
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            _ps_t0, _ps_t1, _ps_t2, _ps_t3, _ps_t4 = decompose_tile(
+                                _ps_op, _ps_linear)
                             signal_barriers(
-                                _ps_op, _ps_0, _ps_1, _ps_2, _ps_3, _ps_4,
+                                _ps_op, _ps_t0, _ps_t1, _ps_t2, _ps_t3, _ps_t4,
                                 barriers_ptr,
                             )
                             store_idx = store_idx + Int32(1)
@@ -1270,15 +1270,10 @@ class Megakernel:
                                         load_instruction_to_smem(
                                             instructions_ptr, next_instr_idx, scratch_ptr,
                                         )
-                                        _ic_op = ld_shared_i32(scratch_ptr)
+                                        _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
                                         if _ic_op == Int32(TileInstruction.END_MARKER):
                                             next_instr_idx = num_instructions
                                         if _ic_op != Int32(TileInstruction.END_MARKER):
-                                            _ic_0 = ld_shared_i32(scratch_ptr + 4)
-                                            _ic_1 = ld_shared_i32(scratch_ptr + 8)
-                                            _ic_2 = ld_shared_i32(scratch_ptr + 12)
-                                            _ic_3 = ld_shared_i32(scratch_ptr + 16)
-                                            _ic_4 = ld_shared_i32(scratch_ptr + 20)
                                             _instr_cached = Int32(1)
 
                         # STEP 2b: TRY PRODUCE (G2S load) — start new tile.
@@ -1298,17 +1293,14 @@ class Megakernel:
                                 # subsequent iterations while deps aren't ready.
                                 if _instr_cached == Int32(0):
                                     load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
-                                    _ic_op = ld_shared_i32(scratch_ptr)
+                                    _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
                                     if _ic_op == Int32(TileInstruction.END_MARKER):
                                         next_instr_idx = num_instructions
                                     if _ic_op != Int32(TileInstruction.END_MARKER):
-                                        _ic_0 = ld_shared_i32(scratch_ptr + 4)
-                                        _ic_1 = ld_shared_i32(scratch_ptr + 8)
-                                        _ic_2 = ld_shared_i32(scratch_ptr + 12)
-                                        _ic_3 = ld_shared_i32(scratch_ptr + 16)
-                                        _ic_4 = ld_shared_i32(scratch_ptr + 20)
                                         _instr_cached = Int32(1)
                                 if _instr_cached == Int32(1):
+                                    _ic_0, _ic_1, _ic_2, _ic_3, _ic_4 = decompose_tile(
+                                        _ic_op, _ic_linear)
                                     _bar_ok = check_barriers(
                                         _ic_op, _ic_0, _ic_1, _ic_2,
                                         _ic_3, _ic_4, barriers_ptr)
@@ -1318,32 +1310,14 @@ class Megakernel:
                                         # Read old tile info from this page slot
                                         # to detect if same op reuses this page.
                                         _old_op = ld_shared_i32(_p_ti)
-                                        _ep_0 = Int32(-1)
-                                        _ep_1 = Int32(-1)
-                                        _ep_2 = Int32(-1)
-                                        _ep_3 = Int32(-1)
-                                        _ep_4 = Int32(-1)
+                                        _ep_linear = Int32(-1)
                                         if _old_op == _ic_op:
-                                            _ep_0 = ld_shared_i32(_p_ti + 4)
-                                            _ep_1 = ld_shared_i32(_p_ti + 8)
-                                            _ep_2 = ld_shared_i32(_p_ti + 12)
-                                            _ep_3 = ld_shared_i32(_p_ti + 16)
-                                            _ep_4 = ld_shared_i32(_p_ti + 20)
-                                        # Store prev coords in flags area for
+                                            _ep_linear = ld_shared_i32(_p_ti + 4)
+                                        # Store prev linear idx in flags area for
                                         # all DMA warp threads to read at dispatch.
-                                        _prev_base = flags_ptr + 12
-                                        st_shared_i32(_prev_base, _ep_0)
-                                        st_shared_i32(_prev_base + 4, _ep_1)
-                                        st_shared_i32(_prev_base + 8, _ep_2)
-                                        st_shared_i32(_prev_base + 12, _ep_3)
-                                        st_shared_i32(_prev_base + 16, _ep_4)
+                                        st_shared_i32(prev_linear_ptr, _ep_linear)
                                         # Overwrite slot with new tile info
-                                        st_shared_i32(_p_ti, _ic_op)
-                                        st_shared_i32(_p_ti + 4, _ic_0)
-                                        st_shared_i32(_p_ti + 8, _ic_1)
-                                        st_shared_i32(_p_ti + 12, _ic_2)
-                                        st_shared_i32(_p_ti + 16, _ic_3)
-                                        st_shared_i32(_p_ti + 20, _ic_4)
+                                        st_shared_v2_b32(_p_ti, _ic_op, _ic_linear)
                                         # Check inner iterations for this op
                                         _inner_total = get_inner_iters(_ic_op)
                                         # Re-init per-buffer kblock_ready for
@@ -1393,15 +1367,10 @@ class Megakernel:
                                                 load_instruction_to_smem(
                                                     instructions_ptr, next_instr_idx, scratch_ptr,
                                                 )
-                                                _ic_op = ld_shared_i32(scratch_ptr)
+                                                _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
                                                 if _ic_op == Int32(TileInstruction.END_MARKER):
                                                     next_instr_idx = num_instructions
                                                 if _ic_op != Int32(TileInstruction.END_MARKER):
-                                                    _ic_0 = ld_shared_i32(scratch_ptr + 4)
-                                                    _ic_1 = ld_shared_i32(scratch_ptr + 8)
-                                                    _ic_2 = ld_shared_i32(scratch_ptr + 12)
-                                                    _ic_3 = ld_shared_i32(scratch_ptr + 16)
-                                                    _ic_4 = ld_shared_i32(scratch_ptr + 20)
                                                     _instr_cached = Int32(1)
 
                         # STEP 3: TRY ISSUE STORE (S2G copy) — after produce
@@ -1413,12 +1382,7 @@ class Megakernel:
                                 _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
                                 if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
                                     _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
-                                    _ps_op = ld_shared_i32(_s_ti)
-                                    _ps_0 = ld_shared_i32(_s_ti + 4)
-                                    _ps_1 = ld_shared_i32(_s_ti + 8)
-                                    _ps_2 = ld_shared_i32(_s_ti + 12)
-                                    _ps_3 = ld_shared_i32(_s_ti + 16)
-                                    _ps_4 = ld_shared_i32(_s_ti + 20)
+                                    _ps_op, _ps_linear = ld_shared_v2_b32(_s_ti)
                                     # Signal all DMA warp threads to dispatch store
                                     st_shared_i32(dispatch_store_slot_ptr, _s_slot)
                                     has_pending_store = Int32(1)
@@ -1439,27 +1403,27 @@ class Megakernel:
                     _dl_slot = ld_shared_i32(dispatch_load_slot_ptr)
                     if _dl_slot != Int32(-1):
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
-                        _dl_op = ld_shared_i32(_dl_ti)
-                        _dl_0 = ld_shared_i32(_dl_ti + 4)
-                        _dl_1 = ld_shared_i32(_dl_ti + 8)
-                        _dl_2 = ld_shared_i32(_dl_ti + 12)
-                        _dl_3 = ld_shared_i32(_dl_ti + 16)
-                        _dl_4 = ld_shared_i32(_dl_ti + 20)
+                        _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
+                        _dl_0, _dl_1, _dl_2, _dl_3, _dl_4 = decompose_tile(
+                            _dl_op, _dl_lin)
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
                         _dl_iter = ld_shared_i32(inner_iter_idx_ptr)
                         _dl_depth = ld_shared_i32(inner_depth_ptr)
                         _dl_buf = _dl_iter % _dl_depth
                         _dl_mbar = _kblock_ready_mbar(smem_base, _dl_slot, _dl_buf)
-                        # Per-page prev coords: written by thread 0 in produce step.
-                        # Contains old tile coords if same op previously used this
-                        # page slot, -1 otherwise. Lets load skip unchanged data.
-                        _prev_base = flags_ptr + 12
-                        _ep_0 = ld_shared_i32(_prev_base)
-                        _ep_1 = ld_shared_i32(_prev_base + 4)
-                        _ep_2 = ld_shared_i32(_prev_base + 8)
-                        _ep_3 = ld_shared_i32(_prev_base + 12)
-                        _ep_4 = ld_shared_i32(_prev_base + 16)
+                        # Per-page prev linear idx: written by thread 0 in produce step.
+                        # Contains old linear tile idx if same op previously used this
+                        # page slot, -1 otherwise. Decompose to coords for load dispatch.
+                        _ep_lin = ld_shared_i32(prev_linear_ptr)
+                        _ep_0 = Int32(-1)
+                        _ep_1 = Int32(-1)
+                        _ep_2 = Int32(-1)
+                        _ep_3 = Int32(-1)
+                        _ep_4 = Int32(-1)
+                        if _ep_lin != Int32(-1):
+                            _ep_0, _ep_1, _ep_2, _ep_3, _ep_4 = decompose_tile(
+                                _dl_op, _ep_lin)
                         if tracing:
                             _tl = trace_start()
                         dispatch_load(
@@ -1483,12 +1447,9 @@ class Megakernel:
                     _ds_slot = ld_shared_i32(dispatch_store_slot_ptr)
                     if _ds_slot != Int32(-1):
                         _ds_ti = smem_base + Int32(ring_state_offset) + _ds_slot * Int32(tile_info_bytes)
-                        _ds_op = ld_shared_i32(_ds_ti)
-                        _ds_0 = ld_shared_i32(_ds_ti + 4)
-                        _ds_1 = ld_shared_i32(_ds_ti + 8)
-                        _ds_2 = ld_shared_i32(_ds_ti + 12)
-                        _ds_3 = ld_shared_i32(_ds_ti + 16)
-                        _ds_4 = ld_shared_i32(_ds_ti + 20)
+                        _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
+                        _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(
+                            _ds_op, _ds_lin)
                         _ds_pp = _get_page_ptr(smem_base, _ds_slot)
                         _ds_config = ld_global_i64(op_configs_ptr, _ds_op)
                         if tracing:
@@ -1549,7 +1510,7 @@ class Megakernel:
                         smem_base + Int32(ring_state_offset)
                         + slot * Int32(tile_info_bytes)
                     )
-                    op_idx = ld_shared_i32(tile_info_ptr)
+                    op_idx, _mma_lin = ld_shared_v2_b32(tile_info_ptr)
 
                     # Check for sentinel (END_MARKER = exit)
                     if op_idx == Int32(TileInstruction.END_MARKER):
@@ -1568,11 +1529,8 @@ class Megakernel:
                                 _mma_lane, Int32(trace_data_wait_fmt), op_idx,
                             )
 
-                        tile_0 = ld_shared_i32(tile_info_ptr + 4)
-                        tile_1 = ld_shared_i32(tile_info_ptr + 8)
-                        tile_2 = ld_shared_i32(tile_info_ptr + 12)
-                        tile_3 = ld_shared_i32(tile_info_ptr + 16)
-                        tile_4 = ld_shared_i32(tile_info_ptr + 20)
+                        tile_0, tile_1, tile_2, tile_3, tile_4 = decompose_tile(
+                            op_idx, _mma_lin)
 
                         page_ptr = _get_page_ptr(smem_base, slot)
                         op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
@@ -1629,6 +1587,9 @@ class Megakernel:
                 "get_inner_depth": get_inner_depth,
                 "max_inner_depth": max_inner_depth,
                 "check_barriers": check_barriers,
+                "decompose_tile": decompose_tile,
+                "ld_shared_v2_b32": ld_shared_v2_b32,
+                "st_shared_v2_b32": st_shared_v2_b32,
                 "mbarrier_try_wait": mbarrier_try_wait,
                 "num_mma_warps": num_mma_warps,
                 "num_compute_threads": num_compute_threads,

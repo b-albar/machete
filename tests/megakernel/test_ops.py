@@ -224,16 +224,16 @@ class TestTileInstructionPacking:
         instr = TileInstruction(op_idx=1, tiles=(5, 2, 0))
         packed = instr.pack()
         assert len(packed) == INSTRUCTION_WORDS
-        assert INSTRUCTION_WORDS == 6
+        assert INSTRUCTION_WORDS == 2
 
     def test_pack_fields(self):
-        """Fields should pack in the documented order."""
+        """Fields should pack as [op_idx, linear_tile_idx]."""
+        # tiles=(7, 1, 2) with tile_counts needed for strides
         instr = TileInstruction(op_idx=3, tiles=(7, 1, 2))
-        packed = instr.pack()
+        # strides for tile_counts (8, 3, 4) → (12, 4, 1)
+        packed = instr.pack(strides=(12, 4, 1))
         assert packed[0] == 3  # op_idx
-        assert packed[1] == 7  # tiles[0]
-        assert packed[2] == 1  # tiles[1]
-        assert packed[3] == 2  # tiles[2]
+        assert packed[1] == 7 * 12 + 1 * 4 + 2 * 1  # linear = 90
 
     def test_end_marker_packs_correctly(self):
         """End marker should have op_idx == END_MARKER."""
@@ -252,7 +252,7 @@ class TestTileInstructionPacking:
         assert tensor.dtype == torch.int32
 
     def test_build_tensor_roundtrip(self):
-        """Packed tensor values should match the original instruction fields."""
+        """Packed tensor values should encode [op_idx, linear_tile_idx]."""
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         builder.add_op(_NOPOp, tile_counts=(4,))
@@ -261,7 +261,10 @@ class TestTileInstructionPacking:
 
         for i, instr in enumerate(instructions):
             row = tensor[i].tolist()
-            assert row == instr.pack(), f"Instruction {i} mismatch"
+            assert row[0] == instr.op_idx, f"Instruction {i} op_idx mismatch"
+            if instr.op_idx != TileInstruction.END_MARKER:
+                # Linear index should match the tile index for 1D ops
+                assert row[1] == instr.tiles[0], f"Instruction {i} linear mismatch"
 
 
 # =============================================================================

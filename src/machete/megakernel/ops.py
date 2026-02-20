@@ -1172,16 +1172,19 @@ class BarrierFormula:
 # Instruction Stream (Lightweight — barriers baked into handlers)
 # =============================================================================
 
-INSTRUCTION_WORDS = 1 + MAX_TILE_DIMS  # op_idx + up to 5 tile indices = 6
+INSTRUCTION_WORDS = 2  # op_idx + linear_tile_idx (flat encoding)
 
 
 @dataclass
 class TileInstruction:
     """A single tile work instruction for the persistent megakernel.
 
-    Lightweight encoding in global memory (6 x int32):
+    Flat encoding in global memory (2 x int32):
     [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
-    [1..5]  tile indices: Up to 5 tile dimension indices
+    [1]  linear_tile_idx: Row-major linearized tile index
+
+    Tile coordinates are decomposed at runtime from the linear index
+    using compile-time per-op tile_counts (via decompose_tile JIT fn).
 
     Barrier wait/signal logic is baked into op handlers at compile time
     via BarrierFormula, not encoded in the instruction stream.
@@ -1193,10 +1196,17 @@ class TileInstruction:
     # Sentinel for end of stream
     END_MARKER: int = -1
 
-    def pack(self) -> List[int]:
-        """Pack into list of int32 (padded to INSTRUCTION_WORDS)."""
-        padded = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
-        return [self.op_idx] + padded
+    def pack(self, strides: Optional[Tuple[int, ...]] = None) -> List[int]:
+        """Pack into list of int32: [op_idx, linear_tile_idx].
+
+        Args:
+            strides: Row-major strides for linearization. If None (e.g., end
+                marker), linear index is 0.
+        """
+        if self.op_idx == self.END_MARKER or strides is None:
+            return [self.op_idx, 0]
+        linear = sum(t * s for t, s in zip(self.tiles, strides))
+        return [self.op_idx, linear]
 
     @classmethod
     def end_instruction(cls) -> "TileInstruction":
@@ -2161,13 +2171,104 @@ class InstructionStreamBuilder:
         """Build instruction stream as GPU tensor.
 
         Returns:
-            Tensor of shape [num_instructions, INSTRUCTION_WORDS]
+            Tensor of shape [num_instructions, INSTRUCTION_WORDS] where
+            INSTRUCTION_WORDS=2 (op_idx + linear_tile_idx).
         """
         import torch
 
         instructions = self.build()
-        packed = [instr.pack() for instr in instructions]
+        # Precompute row-major strides per op for linearization
+        strides_by_op = {
+            r.op_idx: _linear_strides(r.op.tile_counts)
+            for r in self._op_records
+        }
+        packed = [
+            instr.pack(strides=strides_by_op.get(instr.op_idx))
+            for instr in instructions
+        ]
         return torch.tensor(packed, dtype=torch.int32, device=device)
+
+    def build_decompose_tile_fn(self):
+        """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).
+
+        Uses compile-time baked per-op tile_counts to perform integer
+        div/mod decomposition. Pure ALU — no memory access.
+
+        Returns:
+            A @cute.jit function: decompose_tile(op_idx, linear_idx) → (t0, t1, t2, t3, t4)
+        """
+        import cutlass.cute as cute
+        from cutlass import Int32
+        import linecache
+        import machete.megakernel.compile as compile_mod
+
+        lines = []
+        for rec in self._op_records:
+            idx = rec.op_idx
+            tc = rec.op.tile_counts
+            ndims = len(tc)
+            keyword = "if" if idx == 0 else "elif"
+
+            # Build decomposition: divide linear_idx by strides
+            # For tile_counts = (4, 3, 2): strides = (6, 2, 1)
+            # t0 = linear_idx // 6; rem = linear_idx % 6
+            # t1 = rem // 2; t2 = rem % 2
+            body_lines = []
+            if ndims == 1:
+                body_lines.append("        t0 = _lin")
+            else:
+                remainder = "_lin"
+                for d in range(ndims):
+                    stride = 1
+                    for k in range(d + 1, ndims):
+                        stride *= tc[k]
+                    if d == ndims - 1:
+                        body_lines.append(f"        t{d} = {remainder}")
+                    else:
+                        body_lines.append(
+                            f"        t{d} = {remainder} // Int32({stride})"
+                        )
+                        if d < ndims - 2:
+                            body_lines.append(
+                                f"        {remainder} = {remainder} % Int32({stride})"
+                            )
+                        else:
+                            # Last remainder becomes the final dim
+                            body_lines.append(
+                                f"        t{d+1} = {remainder} % Int32({stride})"
+                            )
+                            break
+
+            lines.append(
+                f"    {keyword} op_idx == Int32({idx}):\n"
+                + "\n".join(body_lines)
+            )
+
+        body = "\n".join(lines) if lines else "    pass"
+        fn_source = (
+            "@cute.jit\n"
+            "def decompose_tile(op_idx, linear_idx):\n"
+            "    t0 = Int32(0)\n"
+            "    t1 = Int32(0)\n"
+            "    t2 = Int32(0)\n"
+            "    t3 = Int32(0)\n"
+            "    t4 = Int32(0)\n"
+            "    _lin = linear_idx\n"
+            f"{body}\n"
+            "    return t0, t1, t2, t3, t4\n"
+        )
+
+        exec_globals = {"cute": cute, "Int32": Int32}
+        compile_mod._compile_counter += 1
+        unique_filename = f"<decompose_tile>_{compile_mod._compile_counter}"
+        linecache.cache[unique_filename] = (
+            len(fn_source), None, fn_source.splitlines(True), unique_filename,
+        )
+        compile_mod._linecache_entries.append(unique_filename)
+
+        code = compile(fn_source, unique_filename, "exec")
+        exec(code, exec_globals)
+        return exec_globals["decompose_tile"]
 
     def get_op_barrier_formulas(self) -> Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]:
         """Get per-op barrier formulas for compile-time baking.

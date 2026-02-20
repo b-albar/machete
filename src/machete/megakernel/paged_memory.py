@@ -14,6 +14,7 @@ With N pages, up to N-1 loads can overlap with compute.
 """
 
 from dataclasses import dataclass
+from typing import Tuple
 
 from cutlass import Int32
 from cutlass.cutlass_dsl import dsl_user_op
@@ -77,6 +78,60 @@ def ld_shared_i32(
     return Int32(result)
 
 
+@dsl_user_op
+def ld_shared_v2_b32(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Int32, Int32]:
+    """Load two consecutive 32-bit integers from shared memory (v2)."""
+    from cutlass._mlir import ir
+
+    i32 = ir.IntegerType.get_signless(32)
+    struct_ty = llvm.StructType.get_literal([i32, i32])
+    result = llvm.inline_asm(
+        struct_ty,
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Int32(llvm.extractvalue(i32, result, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(i32, result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def st_shared_v2_b32(
+    smem_addr: Int32,
+    v0: Int32,
+    v1: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store two consecutive 32-bit integers to shared memory (v2)."""
+    llvm.inline_asm(
+        None,
+        [
+            smem_addr.ir_value(loc=loc, ip=ip),
+            v0.ir_value(loc=loc, ip=ip),
+            v1.ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v2.b32 [$0], {$1, $2};",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 # =============================================================================
 # N-Page Buffer Layout (Generalized Pipelined Execution)
 # =============================================================================
@@ -124,16 +179,16 @@ class NPageLayout:
     max_inner_depth: int = 1  # Max inner pipeline stages across all ops
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 24 bytes [op_idx, tile_0..4] per page
-    # - Current instruction: 24 bytes [op_idx, tile_0..4]
-    # - Flags: 56 bytes [done_flag, dispatch_load_slot, dispatch_store_slot,
-    #                     prev_tile coords (5 int32s), inner_iter_idx,
-    #                     inner_depth, sc_phases (MAX_INNER_DEPTH int32s)]
+    # - Per-page tile info: num_pages * 8 bytes [op_idx, linear_tile_idx] per page
+    # - Current instruction: 8 bytes [op_idx, linear_tile_idx]
+    # - Flags: 40 bytes [done_flag, dispatch_load_slot, dispatch_store_slot,
+    #                     prev_linear_idx, inner_iter_idx, inner_depth,
+    #                     sc_phases (MAX_INNER_DEPTH int32s)]
     # - Mbarriers: (3 + max_inner_depth) * num_pages * 8 bytes
     #              [work_notify + compute_done + smem_consumed × depth + kblock_ready]
-    _TILE_INFO_SIZE: int = 24  # Per-page: op_idx + 5 tile indices (6 int32s)
-    _INSTR_SIZE: int = 24  # Same as tile info: 6 int32s
-    _FLAGS_SIZE: int = 56  # done + dispatch slots + prev_tile coords + inner_iter_idx
+    _TILE_INFO_SIZE: int = 8   # Per-page: op_idx + linear_tile_idx (2 int32s)
+    _INSTR_SIZE: int = 8  # Same as tile info: 2 int32s
+    _FLAGS_SIZE: int = 40  # done + dispatch slots + prev_linear + inner_iter_idx
                            # + inner_depth + sc_phases[MAX_INNER_DEPTH]
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
@@ -309,5 +364,7 @@ __all__ = [
     "MAX_INNER_DEPTH",
     "st_shared_i32",
     "ld_shared_i32",
+    "ld_shared_v2_b32",
+    "st_shared_v2_b32",
     "NPageLayout",
 ]

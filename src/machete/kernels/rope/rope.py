@@ -78,7 +78,7 @@ class RopeOp(Op):
 
     def __init__(self, **config):
         super().__init__(**config)
-        self.page_size = getattr(self, 'page_size', 16384)
+        self.page_size = getattr(self, "page_size", 16384)
 
         # Element size from dtype (runs at compile time, not in cute.jit)
         if self.q_dtype == cutlass.Float32:
@@ -94,12 +94,8 @@ class RopeOp(Op):
         self.cs_tile_bytes = self.tile_size_M * self.D2 * self.elem_bytes
         total_smem = self.q_tile_bytes + 2 * self.cs_tile_bytes
 
-        assert self.D2 >= 32, (
-            f"RopeOp requires D2 >= 32, got D2={self.D2} (D={self.D})"
-        )
-        assert self.H % self.tile_size_H == 0, (
-            f"RopeOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
-        )
+        assert self.D2 >= 32, f"RopeOp requires D2 >= 32, got D2={self.D2} (D={self.D})"
+        assert self.H % self.tile_size_H == 0, f"RopeOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
         assert total_smem <= self.page_size, (
             f"RopeOp: tile smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
             f"Reduce tile_size_M or tile_size_H."
@@ -115,7 +111,7 @@ class RopeOp(Op):
     @classmethod
     def _auto_tiles(cls, page_size, **tensors):
         """Compute tile_sizes M and H that fit in page_size."""
-        q = tensors.get('q')
+        q = tensors.get("q")
         if q is None:
             return {}
         M, H, D = q.shape
@@ -140,7 +136,7 @@ class RopeOp(Op):
         for k, v in auto.items():
             tile_sizes.setdefault(k, v)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
-        ops[0].static_dims['page_size'] = page_size
+        ops[0].static_dims["page_size"] = page_size
         return ops
 
     @classmethod
@@ -151,14 +147,15 @@ class RopeOp(Op):
         for k, v in auto.items():
             tile_sizes.setdefault(k, v)
         ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
-        ops[0].static_dims['page_size'] = page_size
+        ops[0].static_dims["page_size"] = page_size
         return ops
 
     @classmethod
     def kernel_config(cls, ops):
         """Return recommended MegakernelConfig for scheduled RopeOps."""
         from machete.megakernel import MegakernelConfig
-        page_size = ops[0].static_dims.get('page_size', 16384)
+
+        page_size = ops[0].static_dims.get("page_size", 16384)
         return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
@@ -166,8 +163,7 @@ class RopeOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_H, q, cos, sin, work_mbar,
-             prev_tile_M):
+    def load(self, page_ptr, tile_M, tile_H, q, cos, sin, work_mbar, prev_tile_M):
         """Load q/cos/sin tile from global to shared memory.
 
         Having work_mbar in the signature tells the framework this is an
@@ -199,25 +195,23 @@ class RopeOp(Op):
         if _load_cs == Int32(1):
             total_bytes = total_bytes + actual_rows * cs_per_pos_bytes
 
-        mbar_ptr = cute.make_ptr(
-            cutlass.Int64, work_mbar, cute.AddressSpace.smem
-        )
+        mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, total_bytes)
 
         # Copy atoms: q rows (tile_size_H*D) and cos/sin rows (D2)
         g2s_q = cute.make_copy_atom(
-            CopyBulkG2SOp(), self.q_dtype,
+            CopyBulkG2SOp(),
+            self.q_dtype,
             num_bits_per_copy=self.q_nbits_per_row,
         )
         g2s_cs = cute.make_copy_atom(
-            CopyBulkG2SOp(), self.q_dtype,
+            CopyBulkG2SOp(),
+            self.q_dtype,
             num_bits_per_copy=self.cs_nbits_per_row,
         )
 
         cos_smem_start = page_ptr + Int32(self.q_tile_bytes)
-        sin_smem_start = page_ptr + Int32(
-            self.q_tile_bytes + self.cs_tile_bytes
-        )
+        sin_smem_start = page_ptr + Int32(self.q_tile_bytes + self.cs_tile_bytes)
 
         for local_pos in range(self.tile_size_M):
             pos = pos_start + local_pos
@@ -226,17 +220,13 @@ class RopeOp(Op):
 
                 # q: tile_size_H × D contiguous elements per position
                 g_q = cute.make_tensor(
-                    q.iterator
-                    + pos * (self.H * self.D)
-                    + head_start * self.D,
+                    q.iterator + pos * (self.H * self.D) + head_start * self.D,
                     cute.make_layout((self.q_row_elems,)),
                 )
                 s_q = cute.make_tensor(
                     cute.make_ptr(
                         self.q_dtype,
-                        page_ptr + Int32(
-                            local_pos * self.q_row_elems * self.elem_bytes
-                        ),
+                        page_ptr + Int32(local_pos * self.q_row_elems * self.elem_bytes),
                         cute.AddressSpace.smem,
                     ),
                     cute.make_layout((self.q_row_elems,)),
@@ -254,9 +244,7 @@ class RopeOp(Op):
                     s_cos = cute.make_tensor(
                         cute.make_ptr(
                             self.q_dtype,
-                            cos_smem_start + Int32(
-                                local_pos * self.D2 * self.elem_bytes
-                            ),
+                            cos_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
                             cute.AddressSpace.smem,
                         ),
                         cute.make_layout((self.D2,)),
@@ -272,9 +260,7 @@ class RopeOp(Op):
                     s_sin = cute.make_tensor(
                         cute.make_ptr(
                             self.q_dtype,
-                            sin_smem_start + Int32(
-                                local_pos * self.D2 * self.elem_bytes
-                            ),
+                            sin_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
                             cute.AddressSpace.smem,
                         ),
                         cute.make_layout((self.D2,)),
@@ -289,9 +275,7 @@ class RopeOp(Op):
     @cute.jit
     def compute(self, page_ptr, tile_M, tile_H):
         """Apply RoPE rotation for tile_size_M positions × tile_size_H heads."""
-        q_smem = cute.make_ptr(
-            self.q_dtype, page_ptr, cute.AddressSpace.smem
-        )
+        q_smem = cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem)
         cos_smem = cute.make_ptr(
             self.q_dtype,
             page_ptr + Int32(self.q_tile_bytes),
@@ -336,12 +320,8 @@ class RopeOp(Op):
                     cute.make_layout(self.D2),
                 )
 
-                q0_part = cute.local_partition(
-                    q0_row, thr_layout, lane_idx
-                )
-                q1_part = cute.local_partition(
-                    q1_row, thr_layout, lane_idx
-                )
+                q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
+                q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
                 q0_reg = cute.make_fragment_like(q0_part)
                 q1_reg = cute.make_fragment_like(q1_part)
                 cute.autovec_copy(q0_part, q0_reg)
@@ -370,7 +350,8 @@ class RopeOp(Op):
     def store(self, page_ptr, tile_M, tile_H, q, cos, sin):
         """Store modified q from shared to global memory."""
         s2g = cute.make_copy_atom(
-            CopyBulkS2GOp(), self.q_dtype,
+            CopyBulkS2GOp(),
+            self.q_dtype,
             num_bits_per_copy=self.q_nbits_per_row,
         )
         pos_start = tile_M * self.tile_size_M
@@ -382,17 +363,13 @@ class RopeOp(Op):
                 s_tile = cute.make_tensor(
                     cute.make_ptr(
                         self.q_dtype,
-                        page_ptr + Int32(
-                            local_pos * self.q_row_elems * self.elem_bytes
-                        ),
+                        page_ptr + Int32(local_pos * self.q_row_elems * self.elem_bytes),
                         cute.AddressSpace.smem,
                     ),
                     cute.make_layout((self.q_row_elems,)),
                 )
                 g_tile = cute.make_tensor(
-                    q.iterator
-                    + pos * (self.H * self.D)
-                    + head_start * self.D,
+                    q.iterator + pos * (self.H * self.D) + head_start * self.D,
                     cute.make_layout((self.q_row_elems,)),
                 )
                 ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
@@ -407,9 +384,7 @@ class RopeOp(Op):
     @cute.jit
     def backward_compute(self, page_ptr, tile_M, tile_H):
         """Inverse RoPE rotation (transpose of forward rotation matrix)."""
-        q_smem = cute.make_ptr(
-            self.q_dtype, page_ptr, cute.AddressSpace.smem
-        )
+        q_smem = cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem)
         cos_smem = cute.make_ptr(
             self.q_dtype,
             page_ptr + Int32(self.q_tile_bytes),
@@ -454,12 +429,8 @@ class RopeOp(Op):
                     cute.make_layout(self.D2),
                 )
 
-                q0_part = cute.local_partition(
-                    q0_row, thr_layout, lane_idx
-                )
-                q1_part = cute.local_partition(
-                    q1_row, thr_layout, lane_idx
-                )
+                q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
+                q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
                 q0_reg = cute.make_fragment_like(q0_part)
                 q1_reg = cute.make_fragment_like(q1_part)
                 cute.autovec_copy(q0_part, q0_reg)
