@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Machete Authors
-"""Tests for FlashAttentionOp — forward correctness (fp16/bf16 MMA only).
+"""Tests for FlashAttentionSm100Op — forward correctness (fp16/bf16 MMA only).
 
-Tests run on GPU (Hopper+) and compare the megakernel FlashAttentionOp
+Tests run on GPU (Hopper+) and compare the megakernel FlashAttentionSm100Op
 against a pure PyTorch reference implementation.
 """
 
@@ -41,16 +41,16 @@ requires_gpu = pytest.mark.skipif(
 
 
 def _run_attention_forward(q, k, v, tile_m=None, causal=False):
-    """Run FlashAttentionOp forward and return output tensor."""
+    """Run FlashAttentionSm100Op forward and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.attention import FlashAttentionOp
+    from machete.kernels.attention import FlashAttentionSm100Op
 
     tile_sizes = {}
     if tile_m is not None:
         tile_sizes["M"] = tile_m
     # For fp16/bf16, let schedule_forward compute optimal tile_M
     o = torch.zeros_like(q)
-    ops = FlashAttentionOp.schedule(
+    ops = FlashAttentionSm100Op.schedule(
         q=q, k=k, v=v, o=o,
         tile_sizes=tile_sizes,
         causal=causal,

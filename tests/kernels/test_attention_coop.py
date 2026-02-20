@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Machete Authors
-"""Tests for FlashAttentionCoopOp — cooperative forward correctness (fp16/bf16).
+"""Tests for FlashAttentionSm120Op — cooperative forward correctness (fp16/bf16).
 
-Tests run on GPU (Hopper+) and compare the megakernel FlashAttentionCoopOp
+Tests run on GPU (Hopper+) and compare the megakernel FlashAttentionSm120Op
 against a pure PyTorch reference implementation.
 """
 
@@ -41,15 +41,15 @@ requires_gpu = pytest.mark.skipif(
 
 
 def _run_attention_coop_forward(q, k, v, tile_m=None, causal=False):
-    """Run FlashAttentionCoopOp forward and return output tensor."""
+    """Run FlashAttentionSm120Op forward and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.attention import FlashAttentionCoopOp
+    from machete.kernels.attention import FlashAttentionSm120Op
 
     tile_sizes = {}
     if tile_m is not None:
         tile_sizes["M"] = tile_m
     o = torch.zeros_like(q)
-    ops = FlashAttentionCoopOp.schedule(
+    ops = FlashAttentionSm120Op.schedule(
         q=q, k=k, v=v, o=o,
         tile_sizes=tile_sizes,
         causal=causal,

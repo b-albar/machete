@@ -6,7 +6,7 @@ Compares GPU kernel execution time of:
   - PyTorch manual attention (bmm + softmax + bmm) [bf16]
   - torch.nn.functional.scaled_dot_product_attention [bf16]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
-  - Megakernel FlashAttentionOp (tensor core MMA) [bf16]
+  - Megakernel FlashAttentionSm100Op (tensor core MMA) [bf16]
 
 All implementations use direct CUDA event timing (no CUDA graph capture)
 for consistent measurement.
@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.attention import FlashAttentionOp, FlashAttentionCoopOp
+from machete.kernels.attention import FlashAttentionSm100Op, FlashAttentionSm120Op
 from machete.kernels.attention.ref import flash_attention_pytorch
 from machete.utils.benchmark import Benchmark
 
@@ -196,7 +196,7 @@ def bench_attention(BH, M, N, D):
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             o_mk = torch.zeros_like(q)
-            ops_mk = FlashAttentionOp.schedule(
+            ops_mk = FlashAttentionSm100Op.schedule(
                 q=q, k=k, v=v, o=o_mk,
             )
             actual_tile_m = ops_mk[0].tile_sizes["M"]
@@ -219,7 +219,7 @@ def bench_attention(BH, M, N, D):
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             o_coop = torch.zeros_like(q)
-            ops_coop = FlashAttentionCoopOp.schedule(
+            ops_coop = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_coop,
             )
             actual_tile_m = ops_coop[0].tile_sizes["M"]

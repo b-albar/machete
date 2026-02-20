@@ -21,21 +21,21 @@ Smem page layout (16KB, sequential reuse):
         buf0: [n_block × D] for K blocks
         buf1: [n_block × D] for V blocks
 
-Key improvement: tile_M doubles vs FlashAttentionOp (64 vs 32 for D=128)
+Key improvement: tile_M doubles vs FlashAttentionSm100Op (64 vs 32 for D=128)
 because Q gets the full 16KB page (not sharing a buffer with V).
 
 Supports optional causal masking (lower-left aligned):
     Row i in Q can attend to K/V positions 0..(i + N - M).
 
 Usage:
-    from machete.kernels.attention import FlashAttentionCoopOp
+    from machete.kernels.attention import FlashAttentionSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     q = q.view(BH, M, D).contiguous()  # fp16 or bf16
     k = k.view(BH, N, D).contiguous()
     v = v.view(BH, N, D).contiguous()
     o = torch.zeros_like(q)
-    ops = FlashAttentionCoopOp.schedule(q=q, k=k, v=v, o=o)
+    ops = FlashAttentionSm120Op.schedule(q=q, k=k, v=v, o=o)
     tile_m = ops[0].tile_sizes["M"]
     tpb = (tile_m // 16 + 1) * 32
     kernel = Megakernel(ops, config=MegakernelConfig(threads_per_block=tpb))
@@ -54,7 +54,7 @@ from machete.megakernel.interpreter import (
 from machete.megakernel.paged_memory import PAGE_SIZE
 
 
-class FlashAttentionCoopOp(Op):
+class FlashAttentionSm120Op(Op):
     """Cooperative Flash Attention — MMA warps do both cpasync loads and MMA.
 
     Tensors:
@@ -88,7 +88,7 @@ class FlashAttentionCoopOp(Op):
         self.causal = getattr(self, 'causal', 0)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
-            f"FlashAttentionCoopOp requires fp16 or bf16, got {self.q_dtype}")
+            f"FlashAttentionSm120Op requires fp16 or bf16, got {self.q_dtype}")
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D ** 0.5)
@@ -100,20 +100,20 @@ class FlashAttentionCoopOp(Op):
     def _init_mma(self):
         """Init cooperative MMA path with cpasync K/V loading."""
         assert self.tile_size_M % 16 == 0 and self.tile_size_M >= 16, (
-            f"FlashAttentionCoopOp: tile_size_M={self.tile_size_M} must be "
+            f"FlashAttentionSm120Op: tile_size_M={self.tile_size_M} must be "
             f"a positive multiple of 16.")
         self.num_mma_warps = self.tile_size_M // 16
         max_warps = self.threads_per_row // 32
         assert self.num_mma_warps <= max_warps, (
-            f"FlashAttentionCoopOp: tile_size_M={self.tile_size_M} requires "
+            f"FlashAttentionSm120Op: tile_size_M={self.tile_size_M} requires "
             f"{self.num_mma_warps} warps but only {max_warps} available.")
         self.num_mma_threads = self.num_mma_warps * 32
 
         assert self.D >= 16 and self.D % 16 == 0, (
-            f"FlashAttentionCoopOp: D={self.D} must be >= 16 and x16.")
+            f"FlashAttentionSm120Op: D={self.D} must be >= 16 and x16.")
 
         assert self.q_tile_bytes <= PAGE_SIZE, (
-            f"FlashAttentionCoopOp: Q tile ({self.q_tile_bytes}B) > "
+            f"FlashAttentionSm120Op: Q tile ({self.q_tile_bytes}B) > "
             f"PAGE_SIZE ({PAGE_SIZE}B). Reduce tile_size_M.")
 
         # --- n_block: K/V double-buffer must fit in page after Q→regs ---
@@ -127,14 +127,14 @@ class FlashAttentionCoopOp(Op):
         self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
         total_kv_smem = 2 * self.kv_tile_bytes
         assert total_kv_smem <= PAGE_SIZE, (
-            f"FlashAttentionCoopOp: KV double-buffer ({total_kv_smem}B) > "
+            f"FlashAttentionSm120Op: KV double-buffer ({total_kv_smem}B) > "
             f"PAGE_SIZE ({PAGE_SIZE}B).")
 
         # DMA loads Q once, then compute handles everything
         self.inner_iters = 1
         self.inner_depth = 1
 
-        # --- Swizzle parameters (same as FlashAttentionOp) ---
+        # --- Swizzle parameters (same as FlashAttentionSm100Op) ---
         # SW128(B=3)→D≥64, SW64(B=2)→D≥32, SW32(B=1)→D≥16.
         # M=4, S=3 fixed (GemmOp convention): guarantees M≠S for all D.
         if self.D >= 64:
@@ -170,7 +170,7 @@ class FlashAttentionCoopOp(Op):
         q = tensors.get('q')
         if q is not None:
             assert q.element_size() == 2, (
-                f"FlashAttentionCoopOp requires fp16/bf16, "
+                f"FlashAttentionSm120Op requires fp16/bf16, "
                 f"got element_size={q.element_size()}")
             D = q.shape[-1]
             M = q.shape[1]
@@ -665,4 +665,4 @@ class FlashAttentionCoopOp(Op):
             cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_M, tile_BH)])
 
 
-__all__ = ["FlashAttentionCoopOp"]
+__all__ = ["FlashAttentionSm120Op"]

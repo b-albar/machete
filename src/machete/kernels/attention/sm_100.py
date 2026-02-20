@@ -22,14 +22,14 @@ Supports optional causal masking (lower-left aligned):
     Row i in Q can attend to K/V positions 0..(i + N - M).
 
 Usage:
-    from machete.kernels.attention import FlashAttentionOp
+    from machete.kernels.attention import FlashAttentionSm100Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     q = q.view(BH, M, D).contiguous()  # fp16 or bf16
     k = k.view(BH, N, D).contiguous()
     v = v.view(BH, N, D).contiguous()
     o = torch.zeros_like(q)
-    ops = FlashAttentionOp.schedule(q=q, k=k, v=v, o=o)
+    ops = FlashAttentionSm100Op.schedule(q=q, k=k, v=v, o=o)
     kernel = Megakernel(ops, config=MegakernelConfig())
     kernel.run()
 """
@@ -49,7 +49,7 @@ from machete.megakernel.interpreter import (
 from machete.megakernel.paged_memory import PAGE_SIZE
 
 
-class FlashAttentionOp(Op):
+class FlashAttentionSm100Op(Op):
     """Flash Attention operation for the megakernel framework.
 
     Tensors:
@@ -118,7 +118,7 @@ class FlashAttentionOp(Op):
         self.causal = getattr(self, 'causal', 0)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
-            f"FlashAttentionOp requires fp16 or bf16, got {self.q_dtype}")
+            f"FlashAttentionSm100Op requires fp16 or bf16, got {self.q_dtype}")
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D ** 0.5)
@@ -130,20 +130,20 @@ class FlashAttentionOp(Op):
     def _init_mma(self):
         """Init tensor core MMA path with dynamic n_block and swizzle."""
         assert self.tile_size_M % 16 == 0 and self.tile_size_M >= 16, (
-            f"FlashAttentionOp: tile_size_M={self.tile_size_M} must be "
+            f"FlashAttentionSm100Op: tile_size_M={self.tile_size_M} must be "
             f"a positive multiple of 16.")
         self.num_mma_warps = self.tile_size_M // 16
         max_warps = self.threads_per_row // 32
         assert self.num_mma_warps <= max_warps, (
-            f"FlashAttentionOp: tile_size_M={self.tile_size_M} requires "
+            f"FlashAttentionSm100Op: tile_size_M={self.tile_size_M} requires "
             f"{self.num_mma_warps} warps but only {max_warps} available.")
         self.num_mma_threads = self.num_mma_warps * 32
 
         assert self.D >= 16 and self.D % 16 == 0, (
-            f"FlashAttentionOp: D={self.D} must be >= 16 and x16.")
+            f"FlashAttentionSm100Op: D={self.D} must be >= 16 and x16.")
 
         assert self.q_tile_bytes <= PAGE_SIZE, (
-            f"FlashAttentionOp: Q tile ({self.q_tile_bytes}B) > "
+            f"FlashAttentionSm100Op: Q tile ({self.q_tile_bytes}B) > "
             f"PAGE_SIZE ({PAGE_SIZE}B). Reduce tile_size_M.")
 
         # --- Swizzle parameters (must match get_tma_smem_layout_src) ---
@@ -172,12 +172,12 @@ class FlashAttentionOp(Op):
         self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
         total_smem = 2 * self.kv_tile_bytes
         assert total_smem <= PAGE_SIZE, (
-            f"FlashAttentionOp: KV double-buffer ({total_smem}B) > "
+            f"FlashAttentionSm100Op: KV double-buffer ({total_smem}B) > "
             f"PAGE_SIZE ({PAGE_SIZE}B).")
 
         # Q must fit in buf 0 (loaded first, then buf 0 reused for V)
         assert self.q_tile_bytes <= self.kv_tile_bytes, (
-            f"FlashAttentionOp: Q tile ({self.q_tile_bytes}B) > "
+            f"FlashAttentionSm100Op: Q tile ({self.q_tile_bytes}B) > "
             f"kv_tile_bytes ({self.kv_tile_bytes}B). Reduce tile_size_M.")
 
         # Framework inner iterations: Q + (K + V) per KV block
@@ -203,7 +203,7 @@ class FlashAttentionOp(Op):
         n_block = 16  # default
         if q is not None:
             assert q.element_size() == 2, (
-                f"FlashAttentionOp requires fp16/bf16, "
+                f"FlashAttentionSm100Op requires fp16/bf16, "
                 f"got element_size={q.element_size()}")
             D = q.shape[-1]
             M = q.shape[1]
@@ -688,4 +688,4 @@ class FlashAttentionOp(Op):
             cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_M, tile_BH)])
 
 
-__all__ = ["FlashAttentionOp"]
+__all__ = ["FlashAttentionSm100Op"]

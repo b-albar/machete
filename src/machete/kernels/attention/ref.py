@@ -3,7 +3,7 @@
 
 Provides a PyTorch reference implementation of scaled dot-product attention
 with optional causal masking for correctness verification against the
-megakernel FlashAttentionOp.
+megakernel FlashAttentionSm100Op / FlashAttentionSm120Op.
 """
 
 import torch
