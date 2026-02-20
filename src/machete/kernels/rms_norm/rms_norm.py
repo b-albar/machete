@@ -17,7 +17,7 @@ Both forward and backward use the same pipelining pattern:
 
 Configuration:
     - threads_per_row: from MegakernelConfig.threads_per_block (compile-time constant)
-    - tile_size_M: from tile_sizes at schedule time, constrained by PAGE_SIZE
+    - tile_size_M: from tile_sizes at schedule time, constrained by page_size
 
 Forward:
     rstd = 1 / sqrt(mean(x²) + eps)
@@ -41,7 +41,6 @@ from cutlass import Int32, Float32
 
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 
 # =============================================================================
@@ -82,7 +81,7 @@ class RMSNormOp(Op):
 
     Requirements:
         D >= 32 (warp-parallel vectorized access)
-        tile_size_M * D * elem_bytes <= PAGE_SIZE (16KB)
+        tile_size_M * D * elem_bytes <= page_size
     """
 
     # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
@@ -106,6 +105,7 @@ class RMSNormOp(Op):
     def __init__(self, **config):
         super().__init__(**config)
         self.residual = getattr(self, 'residual', 0)
+        self.page_size = getattr(self, 'page_size', 16384)
 
         if self.x_dtype == cutlass.Float32:
             self.elem_bytes = 4
@@ -117,8 +117,8 @@ class RMSNormOp(Op):
         self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
 
         assert self.D >= 32, f"RMSNormOp requires D >= 32, got D={self.D}"
-        assert self.x_tile_bytes <= PAGE_SIZE, (
-            f"RMSNormOp: tile smem ({self.x_tile_bytes}B) exceeds PAGE_SIZE ({PAGE_SIZE}B). "
+        assert self.x_tile_bytes <= self.page_size, (
+            f"RMSNormOp: tile smem ({self.x_tile_bytes}B) exceeds page_size ({self.page_size}B). "
             f"Reduce tile_size_M={self.tile_size_M}."
         )
 
@@ -129,20 +129,49 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, residual=False, **tensors):
+    def _auto_tile_M(cls, page_size, **tensors):
+        """Compute largest tile_size_M that fits in page_size."""
+        x = tensors.get('x')
+        if x is None:
+            return None
+        D = x.shape[1]
+        elem_bytes = x.element_size()
+        return max(1, page_size // (D * elem_bytes))
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, residual=False, page_size=16384, **tensors):
         """Schedule RMSNorm forward, optionally with residual connection."""
+        tile_sizes = dict(tile_sizes or {})
+        if "M" not in tile_sizes:
+            auto_m = cls._auto_tile_M(page_size, **tensors)
+            if auto_m is not None:
+                tile_sizes["M"] = auto_m
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         if residual:
             ops[0].static_dims['residual'] = 1
+        ops[0].static_dims['page_size'] = page_size
         return ops
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, residual=False, **tensors):
+    def schedule_backward(cls, tile_sizes=None, residual=False, page_size=16384, **tensors):
         """Schedule RMSNorm backward, optionally with residual connection."""
+        tile_sizes = dict(tile_sizes or {})
+        if "M" not in tile_sizes:
+            auto_m = cls._auto_tile_M(page_size, **tensors)
+            if auto_m is not None:
+                tile_sizes["M"] = auto_m
         ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
         if residual:
             ops[0].static_dims['residual'] = 1
+        ops[0].static_dims['page_size'] = page_size
         return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for scheduled RMSNormOps."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get('page_size', 16384)
+        return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
     # Forward Load (G->S)

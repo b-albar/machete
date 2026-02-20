@@ -40,7 +40,6 @@ from machete.megakernel.interpreter import (
     mbarrier_arrive, mbarrier_arrive_expect_tx, mbarrier_wait,
     named_barrier_sync,
 )
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 
 class GemmOp(Op):
@@ -90,6 +89,7 @@ class GemmOp(Op):
         # tile_K and inner_depth injected via schedule_forward into static_dims
         self.tile_K = getattr(self, 'tile_K', 32)
         self.inner_depth = getattr(self, 'inner_depth', 1)
+        self.page_size = getattr(self, 'page_size', 16384)
 
         self.a_tile_bytes = self.tile_size_M * self.tile_K * self.elem_bytes
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
@@ -99,8 +99,8 @@ class GemmOp(Op):
         # Smem budget: inner_depth copies of A+B during K loop, C during epilogue
         ab_bytes = self.inner_depth * self.buf_stride
         total_smem = max(ab_bytes, self.c_tile_bytes)
-        assert total_smem <= PAGE_SIZE, (
-            f"GemmOp: smem {total_smem}B exceeds PAGE_SIZE ({PAGE_SIZE}B). "
+        assert total_smem <= self.page_size, (
+            f"GemmOp: smem {total_smem}B exceeds page_size ({self.page_size}B). "
             f"tile_M={self.tile_size_M}, tile_N={self.tile_size_N}, "
             f"tile_K={self.tile_K}, inner_depth={self.inner_depth}"
         )
@@ -436,25 +436,60 @@ class GemmOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, inner_depth=1, **tensors):
+    def _auto_tiles(cls, page_size, inner_depth, elem_bytes=2):
+        """Compute largest (tile_M, tile_N, tile_K) that fit in page_size.
+
+        Constraints:
+          - inner_depth * (tile_M + tile_N) * tile_K * elem <= page_size  (AB)
+          - tile_M * tile_N * elem <= page_size  (C epilogue)
+          - tile_K must be a multiple of 16
+        """
+        tile_K = 32
+        for tile_M, tile_N in [(128, 64), (64, 64), (64, 32), (32, 32)]:
+            ab = inner_depth * (tile_M + tile_N) * tile_K * elem_bytes
+            c = tile_M * tile_N * elem_bytes
+            if ab <= page_size and c <= page_size:
+                return tile_M, tile_N, tile_K
+        return 32, 32, 16
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, inner_depth=1, page_size=16384, **tensors):
         """Schedule forward GEMM.
 
         Accepts tile_sizes with M, N, K keys. K is the inner K-block size
-        (not a framework tile dimension). Default: M=64, N=32, K=32.
+        (not a framework tile dimension). Auto-computed from page_size when
+        not specified.
 
         Args:
             inner_depth: Pipeline stages for K-block double buffering.
                 1 = single buffer (default), 2 = double buffer.
                 With depth > 1, DMA prefills multiple buffers before compute
                 starts, overlapping loads with MMA. Requires more smem:
-                inner_depth * (A_tile + B_tile) must fit in PAGE_SIZE.
+                inner_depth * (A_tile + B_tile) must fit in page_size.
+            page_size: Shared memory page size in bytes. Default 16384 (16KB).
         """
         ts = dict(tile_sizes or {})
+        if "M" not in ts or "N" not in ts:
+            a = tensors.get('a')
+            elem_bytes = a.element_size() if a is not None else 2
+            auto_M, auto_N, auto_K = cls._auto_tiles(
+                page_size, inner_depth, elem_bytes)
+            ts.setdefault("M", auto_M)
+            ts.setdefault("N", auto_N)
+            ts.setdefault("K", auto_K)
         tile_K = ts.pop("K", 32)
         scheduled = cls._schedule_single(tile_sizes=ts, **tensors)
         scheduled.static_dims["tile_K"] = tile_K
         scheduled.static_dims["inner_depth"] = inner_depth
+        scheduled.static_dims["page_size"] = page_size
         return [scheduled]
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for scheduled GemmOps."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get('page_size', 16384)
+        return MegakernelConfig(page_size=page_size)
 
     @classmethod
     def schedule_backward(cls, tile_sizes=None, inner_depth=1, **tensors):

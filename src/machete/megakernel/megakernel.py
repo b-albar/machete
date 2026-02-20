@@ -60,7 +60,6 @@ from .interpreter import (
     get_smem_base_ptr,
 )
 from .paged_memory import (
-    PAGE_SIZE,
     NPageLayout,
     st_shared_i32,
     ld_shared_i32,
@@ -90,7 +89,7 @@ class MegakernelConfig:
 
     threads_per_block: int = 256
     num_sms: Optional[int] = None
-    page_size: int = PAGE_SIZE
+    page_size: int = 16384
     num_pages: Optional[int] = None  # None = auto-detect max for GPU
     tracing: bool = False
     dma_reg_count: int = 40

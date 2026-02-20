@@ -211,7 +211,7 @@ class TestGemmDoubleBufferSinglePass:
     """inner_depth=2 with a single (M,N) tile — no multi-pass.
 
     DMA prefills 2 buffers before MMA starts, then overlaps loads
-    with compute. Smem budget: 2 * (A_tile + B_tile) <= PAGE_SIZE.
+    with compute. Smem budget: 2 * (A_tile + B_tile) <= page_size.
     """
 
     def test_2_k_blocks_depth2(self):

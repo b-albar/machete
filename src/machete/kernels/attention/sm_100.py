@@ -46,7 +46,6 @@ from machete.megakernel.interpreter import (
     mbarrier_wait,
     named_barrier_sync,
 )
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 
 class FlashAttentionSm100Op(Op):
@@ -116,6 +115,7 @@ class FlashAttentionSm100Op(Op):
     def __init__(self, **config):
         super().__init__(**config)
         self.causal = getattr(self, 'causal', 0)
+        self.page_size = getattr(self, 'page_size', 16384)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm100Op requires fp16 or bf16, got {self.q_dtype}")
@@ -142,9 +142,9 @@ class FlashAttentionSm100Op(Op):
         assert self.D >= 16 and self.D % 16 == 0, (
             f"FlashAttentionSm100Op: D={self.D} must be >= 16 and x16.")
 
-        assert self.q_tile_bytes <= PAGE_SIZE, (
+        assert self.q_tile_bytes <= self.page_size, (
             f"FlashAttentionSm100Op: Q tile ({self.q_tile_bytes}B) > "
-            f"PAGE_SIZE ({PAGE_SIZE}B). Reduce tile_size_M.")
+            f"page_size ({self.page_size}B). Reduce tile_size_M.")
 
         # --- Swizzle parameters (must match get_tma_smem_layout_src) ---
         # SW128(B=3)→D≥64, SW64(B=2)→D≥32, SW32(B=1)→D≥16.
@@ -159,8 +159,8 @@ class FlashAttentionSm100Op(Op):
         self.swizzle_S = 3
 
         # --- Dynamic n_block computation (K/V separated double-buffer) ---
-        # 2 buffers x 1 matrix (K or V) = 2 x n_block x D x elem_bytes <= PAGE_SIZE
-        max_n_block = PAGE_SIZE // (2 * self.D * self.elem_bytes)
+        # 2 buffers x 1 matrix (K or V) = 2 x n_block x D x elem_bytes <= page_size
+        max_n_block = self.page_size // (2 * self.D * self.elem_bytes)
         self.n_block = (max_n_block // 16) * 16
         self.n_block = min(self.n_block, self.N)
         # Round down to x16 after clamping to N (TMA zero-fills partial tiles)
@@ -171,9 +171,9 @@ class FlashAttentionSm100Op(Op):
         # K always in buf 1, V always in buf 0 (Q loaded into buf 0 first)
         self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
         total_smem = 2 * self.kv_tile_bytes
-        assert total_smem <= PAGE_SIZE, (
+        assert total_smem <= self.page_size, (
             f"FlashAttentionSm100Op: KV double-buffer ({total_smem}B) > "
-            f"PAGE_SIZE ({PAGE_SIZE}B).")
+            f"page_size ({self.page_size}B).")
 
         # Q must fit in buf 0 (loaded first, then buf 0 reused for V)
         assert self.q_tile_bytes <= self.kv_tile_bytes, (
@@ -195,7 +195,8 @@ class FlashAttentionSm100Op(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False, **tensors):
+    def schedule_forward(cls, tile_sizes=None, causal=False,
+                         page_size=16384, **tensors):
         """Schedule flash attention forward, optionally with causal masking."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("BH", 1)
@@ -210,7 +211,7 @@ class FlashAttentionSm100Op(Op):
             N = tensors['k'].shape[1]
             elem = q.element_size()
             # n_block from K/V separated double-buffer constraint
-            max_n_block = PAGE_SIZE // (2 * D * elem)
+            max_n_block = page_size // (2 * D * elem)
             n_block = (max_n_block // 16) * 16
             n_block = min(n_block, N)
             n_block = max(16, (n_block // 16) * 16)
@@ -221,11 +222,25 @@ class FlashAttentionSm100Op(Op):
                 tile_M = max(16, max_nw * 16)
                 tile_sizes["M"] = tile_M
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims['page_size'] = page_size
         if q is not None:
             ops[0].static_dims['n_block'] = n_block
         if causal:
             ops[0].static_dims['causal'] = 1
         return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for the given scheduled ops."""
+        from machete.megakernel import MegakernelConfig
+        tile_m = ops[0].tile_sizes["M"]
+        num_mma_warps = tile_m // 16
+        threads_per_block = (num_mma_warps + 1) * 32
+        page_size = ops[0].static_dims.get('page_size', 16384)
+        return MegakernelConfig(
+            threads_per_block=threads_per_block,
+            page_size=page_size,
+        )
 
     # =========================================================================
     # Forward Load (DMA warp: Q iter 0, K odd iters, V even iters)

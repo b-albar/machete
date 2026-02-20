@@ -20,9 +20,6 @@ from machete.kernels.rope.ref import rope_pytorch
 from machete.utils.testing import is_hopper_available
 
 
-PAGE_SIZE = 16384  # 16KB
-
-
 def get_tolerances(dtype):
     """Get appropriate rtol/atol for dtype.
 
@@ -34,12 +31,12 @@ def get_tolerances(dtype):
 
 
 def _compute_tile_sizes(n_heads, head_dim, dtype):
-    """Compute tile sizes for both RMSNorm and RoPE that fit in PAGE_SIZE."""
+    """Compute tile sizes for both RMSNorm and RoPE that fit in a 16KB page."""
     elem_bytes = 4 if dtype == torch.float32 else 2
     hidden_dim = n_heads * head_dim
 
-    # RMSNorm: tile_m_rms * hidden_dim * elem_bytes <= PAGE_SIZE
-    tile_m_rms = min(4, max(1, PAGE_SIZE // (hidden_dim * elem_bytes)))
+    # RMSNorm: tile_m_rms * hidden_dim * elem_bytes <= 16384
+    tile_m_rms = min(4, max(1, 16384 // (hidden_dim * elem_bytes)))
 
     # RoPE tile_size_H: largest <= 8 that divides n_heads
     tile_h = min(n_heads, 8)
@@ -48,7 +45,7 @@ def _compute_tile_sizes(n_heads, head_dim, dtype):
 
     # RoPE smem: q (tile_m * tile_h * D) + cos (tile_m * D/2) + sin (tile_m * D/2)
     rope_row_bytes = (tile_h * head_dim + head_dim) * elem_bytes
-    tile_m_rope = min(4, max(1, PAGE_SIZE // rope_row_bytes))
+    tile_m_rope = min(4, max(1, 16384 // rope_row_bytes))
 
     return tile_m_rms, tile_h, tile_m_rope
 

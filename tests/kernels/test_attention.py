@@ -42,7 +42,7 @@ requires_gpu = pytest.mark.skipif(
 
 def _run_attention_forward(q, k, v, tile_m=None, causal=False):
     """Run FlashAttentionSm100Op forward and return output tensor."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm100Op
 
     tile_sizes = {}
@@ -55,13 +55,8 @@ def _run_attention_forward(q, k, v, tile_m=None, causal=False):
         tile_sizes=tile_sizes,
         causal=causal,
     )
-    # threads_per_block must match the op's MMA warp count so the
-    # framework's smem_consumed mbarrier arrival count is consistent.
-    actual_tile_m = ops[0].tile_sizes["M"]
-    num_mma_warps = actual_tile_m // 16
-    threads_per_block = (num_mma_warps + 1) * 32
-    kernel = Megakernel(ops, config=MegakernelConfig(
-        threads_per_block=threads_per_block))
+    config = FlashAttentionSm100Op.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()

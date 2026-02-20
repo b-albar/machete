@@ -6,7 +6,7 @@ Compares GPU kernel execution time of:
   - PyTorch manual attention (bmm + softmax + bmm) [bf16]
   - torch.nn.functional.scaled_dot_product_attention [bf16]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
-  - Megakernel FlashAttentionSm100Op (tensor core MMA) [bf16]
+  - Megakernel FlashAttentionSm120Op (cooperative cpasync + MMA) [bf16]
 
 All implementations use direct CUDA event timing (no CUDA graph capture)
 for consistent measurement.
@@ -22,8 +22,8 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.attention import FlashAttentionSm100Op, FlashAttentionSm120Op
+from machete.megakernel import Megakernel
+from machete.kernels.attention import FlashAttentionSm120Op
 from machete.kernels.attention.ref import flash_attention_pytorch
 from machete.utils.benchmark import Benchmark
 
@@ -192,18 +192,15 @@ def bench_attention(BH, M, N, D):
         except Exception as e:
             print(f"  CuTe FA2 error: {e}")
 
-    # Megakernel bf16 (MMA tensor core path)
+    # Megakernel bf16 (cooperative cpasync + MMA)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             o_mk = torch.zeros_like(q)
-            ops_mk = FlashAttentionSm100Op.schedule(
+            ops_mk = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_mk,
             )
-            actual_tile_m = ops_mk[0].tile_sizes["M"]
-            num_mma_warps = actual_tile_m // 16
-            tpb = (num_mma_warps + 1) * 32
-            kernel_mk = Megakernel(ops_mk, config=MegakernelConfig(
-                threads_per_block=tpb))
+            config_mk = FlashAttentionSm120Op.kernel_config(ops_mk)
+            kernel_mk = Megakernel(ops_mk, config=config_mk)
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel_mk.run()
             torch.cuda.synchronize()
@@ -214,29 +211,6 @@ def bench_attention(BH, M, N, D):
             )
         except Exception as e:
             print(f"  megakernel error: {e}")
-
-    # Megakernel Coop bf16 (cooperative cpasync + MMA)
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        try:
-            o_coop = torch.zeros_like(q)
-            ops_coop = FlashAttentionSm120Op.schedule(
-                q=q, k=k, v=v, o=o_coop,
-            )
-            actual_tile_m = ops_coop[0].tile_sizes["M"]
-            num_mma_warps = actual_tile_m // 16
-            tpb = (num_mma_warps + 1) * 32
-            kernel_coop = Megakernel(ops_coop, config=MegakernelConfig(
-                threads_per_block=tpb))
-            with contextlib.redirect_stdout(io.StringIO()):
-                kernel_coop.run()
-            torch.cuda.synchronize()
-
-            funcs["megakernel_coop"] = kernel_coop.bench_spec(
-                setup_fn=lambda: o_coop.zero_(),
-                keep_alive=[q, k, v, o_coop],
-            )
-        except Exception as e:
-            print(f"  megakernel_coop error: {e}")
 
     return funcs
 

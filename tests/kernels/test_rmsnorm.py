@@ -41,7 +41,7 @@ requires_gpu = pytest.mark.skipif(
 
 
 def _tile_size_M(D, elem_bytes=4):
-    """Compute largest tile_size_M that fits in PAGE_SIZE (16KB)."""
+    """Compute largest tile_size_M that fits in a 16KB page."""
     return min(4, max(1, 16384 // (D * elem_bytes)))
 
 

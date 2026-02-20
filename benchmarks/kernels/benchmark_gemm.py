@@ -18,7 +18,6 @@ import torch
 
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.kernels.gemm import GemmOp
-from machete.megakernel.paged_memory import PAGE_SIZE
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -52,11 +51,11 @@ def gemm_flops(M, K, N, dtype):
 
 
 def compute_tile_sizes(M, K, N, elem_bytes=2, inner_depth=1):
-    """Compute tile sizes that fit in PAGE_SIZE.
+    """Compute tile sizes that fit in a 16KB page.
 
     Constraints:
-      - inner_depth * (tile_M + tile_N) * tile_K * elem_bytes <= PAGE_SIZE
-      - tile_M * tile_N * elem_bytes <= PAGE_SIZE  (C during store)
+      - inner_depth * (tile_M + tile_N) * tile_K * elem_bytes <= page_size
+      - tile_M * tile_N * elem_bytes <= page_size  (C during store)
       - tile_K must be a multiple of 16 (MMA instruction size)
     """
     tile_k = 32
@@ -65,7 +64,7 @@ def compute_tile_sizes(M, K, N, elem_bytes=2, inner_depth=1):
     for tile_m, tile_n in [(128, 64), (64, 64), (64, 32), (32, 32)]:
         ab_bytes = inner_depth * (tile_m + tile_n) * tile_k * elem_bytes
         c_bytes = tile_m * tile_n * elem_bytes
-        if ab_bytes <= PAGE_SIZE and c_bytes <= PAGE_SIZE:
+        if ab_bytes <= 16384 and c_bytes <= 16384:
             return tile_m, tile_n, tile_k
 
     return 32, 32, 16

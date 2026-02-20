@@ -40,7 +40,6 @@ from cutlass.cute.nvgpu.cpasync import (
 
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 
 class RopeOp(Op):
@@ -65,7 +64,7 @@ class RopeOp(Op):
     Requirements:
         D2 >= 32 (warp-parallel vectorized access)
         tile_size_H evenly divides H
-        Tile smem footprint fits in PAGE_SIZE
+        Tile smem footprint fits in page_size
     """
 
     # dtype=None means infer from tensor at schedule time (supports bf16/fp16/fp32)
@@ -79,6 +78,8 @@ class RopeOp(Op):
 
     def __init__(self, **config):
         super().__init__(**config)
+        self.page_size = getattr(self, 'page_size', 16384)
+
         # Element size from dtype (runs at compile time, not in cute.jit)
         if self.q_dtype == cutlass.Float32:
             self.elem_bytes = 4
@@ -99,13 +100,66 @@ class RopeOp(Op):
         assert self.H % self.tile_size_H == 0, (
             f"RopeOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
         )
-        assert total_smem <= PAGE_SIZE, (
-            f"RopeOp: tile smem ({total_smem}B) exceeds PAGE_SIZE ({PAGE_SIZE}B). "
+        assert total_smem <= self.page_size, (
+            f"RopeOp: tile smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
             f"Reduce tile_size_M or tile_size_H."
         )
 
         self.q_nbits_per_row = self.q_row_elems * self.elem_bytes * 8
         self.cs_nbits_per_row = self.D2 * self.elem_bytes * 8
+
+    # =========================================================================
+    # Scheduling
+    # =========================================================================
+
+    @classmethod
+    def _auto_tiles(cls, page_size, **tensors):
+        """Compute tile_sizes M and H that fit in page_size."""
+        q = tensors.get('q')
+        if q is None:
+            return {}
+        M, H, D = q.shape
+        D2 = D // 2
+        elem_bytes = q.element_size()
+        tiles = {}
+        # tile_H: largest <= 8 that divides H
+        tile_H = min(H, 8)
+        while H % tile_H != 0:
+            tile_H -= 1
+        tiles["H"] = tile_H
+        # tile_M: q(tile_M * tile_H * D) + cos(tile_M * D2) + sin(tile_M * D2)
+        row_bytes = (tile_H * D + D) * elem_bytes
+        tiles["M"] = max(1, page_size // row_bytes)
+        return tiles
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, page_size=16384, **tensors):
+        """Schedule RoPE forward with auto-computed tile sizes."""
+        tile_sizes = dict(tile_sizes or {})
+        auto = cls._auto_tiles(page_size, **tensors)
+        for k, v in auto.items():
+            tile_sizes.setdefault(k, v)
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims['page_size'] = page_size
+        return ops
+
+    @classmethod
+    def schedule_backward(cls, tile_sizes=None, page_size=16384, **tensors):
+        """Schedule RoPE backward with auto-computed tile sizes."""
+        tile_sizes = dict(tile_sizes or {})
+        auto = cls._auto_tiles(page_size, **tensors)
+        for k, v in auto.items():
+            tile_sizes.setdefault(k, v)
+        ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims['page_size'] = page_size
+        return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for scheduled RopeOps."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get('page_size', 16384)
+        return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
     # Forward Load (G→S)

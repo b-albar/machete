@@ -36,7 +36,6 @@ from cutlass import Int32, Float32
 
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
-from machete.megakernel.paged_memory import PAGE_SIZE
 
 
 # Activation type constants
@@ -58,7 +57,7 @@ class ActivationOp(Op):
 
     Tiling:
         tile_M indexes row groups. D is full-extent (1 tile).
-        tile_size_M * D * elem_bytes <= PAGE_SIZE.
+        tile_size_M * D * elem_bytes <= page_size.
     """
 
     reads = {"x": (None, ("M", "D"))}
@@ -71,6 +70,7 @@ class ActivationOp(Op):
     def __init__(self, **config):
         super().__init__(**config)
         self.activation = getattr(self, 'activation', ACT_RELU)
+        self.page_size = getattr(self, 'page_size', 16384)
 
         if self.x_dtype == cutlass.Float32:
             self.elem_bytes = 4
@@ -81,8 +81,8 @@ class ActivationOp(Op):
 
         self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
 
-        assert self.x_tile_bytes <= PAGE_SIZE, (
-            f"ActivationOp: tile smem ({self.x_tile_bytes}B) exceeds PAGE_SIZE ({PAGE_SIZE}B). "
+        assert self.x_tile_bytes <= self.page_size, (
+            f"ActivationOp: tile smem ({self.x_tile_bytes}B) exceeds page_size ({self.page_size}B). "
             f"Reduce tile_size_M={self.tile_size_M}."
         )
 
@@ -93,19 +93,35 @@ class ActivationOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='relu', **tensors):
+    def schedule_forward(cls, tile_sizes=None, activation='relu', page_size=16384, **tensors):
         """Schedule activation forward.
 
         Args:
             activation: 'relu' or 'silu'
+            page_size: Shared memory page size in bytes. Default 16384 (16KB).
             **tensors: x required, y optional (defaults to x for in-place)
         """
+        tile_sizes = dict(tile_sizes or {})
+        if "M" not in tile_sizes:
+            x = tensors.get('x')
+            if x is not None:
+                D = x.shape[1]
+                elem_bytes = x.element_size()
+                tile_sizes["M"] = max(1, page_size // (D * elem_bytes))
         if 'y' not in tensors:
             tensors['y'] = tensors['x']
         act_id = ACT_MAP.get(activation, ACT_RELU)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims['activation'] = act_id
+        ops[0].static_dims['page_size'] = page_size
         return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for scheduled ActivationOps."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get('page_size', 16384)
+        return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
     # Forward Load (TMA G->S)

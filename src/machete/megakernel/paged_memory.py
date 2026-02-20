@@ -24,7 +24,6 @@ from cutlass._mlir.dialects import llvm
 # Constants
 # =============================================================================
 
-PAGE_SIZE: int = 16 * 1024  # 16KB per page
 MAX_PAGES: int = 16  # Maximum number of pages
 MAX_INNER_DEPTH: int = 4  # Maximum inner pipeline stages (double/triple/quad buffering)
 
@@ -121,7 +120,7 @@ class NPageLayout:
     """
 
     num_pages: int = 2
-    page_size: int = PAGE_SIZE
+    page_size: int = 16384
     max_inner_depth: int = 1  # Max inner pipeline stages across all ops
 
     # Scratch area layout (ring buffer):
@@ -236,7 +235,7 @@ class NPageLayout:
     @classmethod
     def for_device(
         cls,
-        page_size: int = PAGE_SIZE,
+        page_size: int = 16384,
         max_smem: int | None = None,
         min_pages: int = 2,
         max_inner_depth: int = 1,
@@ -306,7 +305,6 @@ class NPageLayout:
 
 
 __all__ = [
-    "PAGE_SIZE",
     "MAX_PAGES",
     "MAX_INNER_DEPTH",
     "st_shared_i32",
