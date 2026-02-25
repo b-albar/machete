@@ -223,6 +223,7 @@ class FlashAttentionSm100Op(Op):
                 tile_sizes["M"] = tile_M
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims['page_size'] = page_size
+        ops[0].static_dims['inner_depth'] = 2  # Double-buffered K/V
         if q is not None:
             ops[0].static_dims['n_block'] = n_block
         if causal:

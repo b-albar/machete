@@ -58,6 +58,7 @@ from .interpreter import (
     mbarrier_try_wait,
     named_barrier_sync,
     get_smem_base_ptr,
+    nanosleep,
 )
 from .paged_memory import (
     NPageLayout,
@@ -91,7 +92,7 @@ class MegakernelConfig:
 
     threads_per_block: int = 256
     num_sms: Optional[int] = None
-    page_size: int = 16384
+    page_size: int = 32768
     num_pages: Optional[int] = None  # None = auto-detect max for GPU
     tracing: bool = False
     dma_reg_count: int = 40
@@ -631,6 +632,7 @@ class Megakernel:
             "mbarrier_init_fence": mbarrier_init_fence,
             "mbarrier_arrive": mbarrier_arrive,
             "mbarrier_wait": mbarrier_wait,
+            "nanosleep": nanosleep,
             "named_barrier_sync": named_barrier_sync,
             "num_pages": num_pages,
             "scratch_offset": scratch_offset,
@@ -1468,6 +1470,13 @@ class Megakernel:
                                         _ts2, _trace_buf, Int32(trace_row_stride),
                                         _dma_lane, Int32(trace_store_fmts[_i]), _ds_op,
                                     )
+
+                    # Yield when idle: if no load or store was dispatched
+                    # this iteration, sleep to prevent the DMA warp's tight
+                    # polling loop from starving MMA warps (Blackwell SM 12.0).
+                    if _dl_slot == Int32(-1):
+                        if _ds_slot == Int32(-1):
+                            nanosleep(Int32(5000))
 
                     done = ld_shared_i32(flags_ptr)
 
