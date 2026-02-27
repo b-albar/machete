@@ -174,6 +174,10 @@ class FlashAttentionSm120Op(Op):
         self.async_copy_elems = 128 // (self.elem_bytes * 8)  # 8 for fp16
         self.copy_dim1 = self.D // self.async_copy_elems
         self.copy_dim0 = self.num_mma_threads // self.copy_dim1
+        assert self.n_block % self.copy_dim0 == 0, (
+            f"n_block={self.n_block} must be divisible by copy_dim0={self.copy_dim0} "
+            f"(num_mma_warps={self.num_mma_warps}). Use power-of-2 num_mma_warps."
+        )
 
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
@@ -205,8 +209,12 @@ class FlashAttentionSm120Op(Op):
             if "M" not in tile_sizes:
                 # Q gets the full page: tile_M × D × elem ≤ page_size
                 max_tile_M_page = page_size // (D * elem)
-                max_nw = min(7, max_tile_M_page // 16, M // 16)
-                tile_M = max(16, max_nw * 16)
+                max_nw = min(8, max_tile_M_page // 16, M // 16)
+                # Round to power-of-2 warps so cpasync copy_dim0 divides n_block
+                nw = 1
+                while nw * 2 <= max_nw:
+                    nw *= 2
+                tile_M = max(16, nw * 16)
                 tile_sizes["M"] = tile_M
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
