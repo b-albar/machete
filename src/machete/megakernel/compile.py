@@ -139,7 +139,7 @@ def _build_phase_wrapper(
     # page_ptr, tile_*, op_config_ptr, work_mbar, and TMA params)
     if tensor_param_names:
         known_special = {
-            "page_ptr", "op_config_ptr", "work_mbar",
+            "page_ptr", "op_config_ptr", "work_mbar", "inner_iter_idx",
         }
         tma_local_names = set(tma_reverse.keys())
         expects_tensors = any(
@@ -184,6 +184,10 @@ def _build_phase_wrapper(
                 if f"prev_tile_{i}" in method_params:
                     call_args.append(f"prev_{i}")
 
+        # inner_iter_idx: store warp passes iteration index for K-block loading
+        if "inner_iter_idx" in method_params:
+            call_args.append("inner_iter_idx")
+
     call_str = ", ".join(call_args)
 
     # Build wrapper function signature (standard dispatch format)
@@ -192,12 +196,12 @@ def _build_phase_wrapper(
     if extra_params:
         extra_str = ", " + ", ".join(extra_params)
 
-    # For load phases: add prev_0..prev_4 to signature
+    # For load phases: add prev_0..prev_4 and inner_iter_idx to signature
     # Values are -1 when previous tile was a different op (or first tile).
     prev_tile_str = ""
     if is_load_phase:
         prev_params = ", ".join(f"prev_{i}" for i in range(5))
-        prev_tile_str = f", {prev_params}"
+        prev_tile_str = f", {prev_params}, inner_iter_idx"
 
     tensor_str = ""
     if tensor_param_names:

@@ -382,6 +382,7 @@ class Megakernel:
         load_fns = []
         compute_fns = []
         store_fns = []
+        inner_iters_list = []  # Per-op inner iteration count
         op_tensor_args = []  # Per-op list of canonical tensor arg names
         op_tma_args = {"load": [], "compute": [], "store": []}
 
@@ -411,6 +412,7 @@ class Megakernel:
             # Create Op instance with compile-time config, wrap its methods.
             config = build_op_config(op, kernel_config=kernel_config)
             instance = op.op_cls(**config)
+            inner_iters_list.append(getattr(instance, 'inner_iters', 1))
 
             if use_backward:
                 load_fns.append(compile_backward_load(
@@ -451,7 +453,7 @@ class Megakernel:
         dispatch_compute = _build_dispatch(compute_fns, "compute")
         dispatch_store = _build_dispatch(store_fns, "store")
 
-        return dispatch_load, dispatch_compute, dispatch_store
+        return dispatch_load, dispatch_compute, dispatch_store, inner_iters_list
 
     def _build_exec_dispatch_fn(self, phase_fns, phase_name, op_tensor_args,
                                 all_canonical, op_tma_args=None,
@@ -502,7 +504,7 @@ class Megakernel:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
-                    f"{prev_tile_params}{args_str})"
+                    f"{prev_tile_params}, inner_iter_idx{args_str})"
                 )
             elif is_compute:
                 lines.append(
@@ -521,7 +523,7 @@ class Megakernel:
         tma_sig = f", {tma_params}" if tma_params else ""
         extra_sig = ""
         if is_load:
-            extra_sig = f", work_mbar, {prev_tile_params}"
+            extra_sig = f", work_mbar, {prev_tile_params}, inner_iter_idx"
         elif is_compute:
             extra_sig = ""
         fn_source = (
@@ -960,7 +962,7 @@ class Megakernel:
                 setmaxregister_decrease = _setmaxregister_noop
 
         # Build pipelined dispatch functions (with barrier replacement for compute)
-        dispatch_load, dispatch_compute, dispatch_store = (
+        dispatch_load, dispatch_compute, dispatch_store, inner_iters_list = (
             self._build_pipelined_dispatch_fns()
         )
 
@@ -994,6 +996,35 @@ class Megakernel:
 
         # Build decompose_tile JIT function for runtime tile coord recovery
         decompose_tile = self._builder.build_decompose_tile_fn()
+
+        # Build _get_inner_iters JIT function: op_idx → inner iteration count.
+        # Store warp calls dispatch_load for iterations 1..inner_iters-1.
+        # Ops without inner_iters return 1 (loop body never executes).
+        _iters_lines = []
+        for idx, n_iters in enumerate(inner_iters_list):
+            kw = "if" if idx == 0 else "elif"
+            _iters_lines.append(
+                f"    {kw} op_idx == Int32({idx}):\n"
+                f"        _r = Int32({n_iters})")
+        _iters_body = "\n".join(_iters_lines) if _iters_lines else "    _r = Int32(1)"
+        _iters_src = (
+            "@cute.jit\n"
+            "def _get_inner_iters(op_idx) -> Int32:\n"
+            "    _r = Int32(1)\n"
+            f"{_iters_body}\n"
+            "    return _r\n"
+        )
+        import linecache
+        import machete.megakernel.compile as _compile_mod
+        _iters_globals = {"cute": cute, "Int32": Int32}
+        _compile_mod._compile_counter += 1
+        _iters_filename = f"<_get_inner_iters>_{_compile_mod._compile_counter}"
+        linecache.cache[_iters_filename] = (
+            len(_iters_src), None, _iters_src.splitlines(True), _iters_filename,
+        )
+        _compile_mod._linecache_entries.append(_iters_filename)
+        exec(compile(_iters_src, _iters_filename, "exec"), _iters_globals)
+        _get_inner_iters = _iters_globals["_get_inner_iters"]
 
         # Ring buffer kernel loop
         def _kernel_loop_ring(
@@ -1193,6 +1224,7 @@ class Megakernel:
                         if _ep_lin != Int32(-1):
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4 = decompose_tile(
                                 _dl_op, _ep_lin)
+                        _dl_iter = Int32(0)
                         if tracing:
                             _tl = trace_start()
                         dispatch_load(
@@ -1200,6 +1232,7 @@ class Megakernel:
                             _dl_0, _dl_1, _dl_2, _dl_3, _dl_4,
                             _dl_config, _dl_mbar,
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4,
+                            _dl_iter,
                         )
                         if tracing:
                             for _i in range_constexpr(num_ops):
@@ -1219,8 +1252,8 @@ class Megakernel:
                     finish_lane_dynamic_raw(_trace_buf, _dma_lane)
 
             # ========== STORE WARP LOOP ==========
-            # Waits for compute_done, dispatches TMA stores, signals barriers.
-            # Only blocks when compute is not done (mbarrier_wait).
+            # For each tile: optionally issue K-block TMA loads (iterations
+            # 1..inner_iters-1), then wait for compute_done, then TMA store.
             if is_store_warp:
                 _sw_done = Int32(0)
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
@@ -1235,17 +1268,41 @@ class Megakernel:
                         _s_slot = _s_idx % Int32(num_pages)
                         _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
 
-                        # ALL 32 store warp threads block on compute_done.
-                        # Removes warp from scheduler when compute is slow.
-                        mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
-
-                        # ALL 32 threads dispatch store (TMA warp convergence)
+                        # Read tile info early (valid once load warp incremented
+                        # produce_idx). ALL 32 threads read for TMA convergence.
                         _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                         _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
                         _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(
                             _ds_op, _ds_lin)
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
                         _ds_config = ld_global_i64(op_configs_ptr, _ds_op)
+                        _ds_mbar = _work_notify_mbar(smem_base, _s_slot)
+
+                        # K-block iteration: store warp issues remaining TMA
+                        # loads (iter 1..N-1) while compute processes K-blocks.
+                        # Ops without inner_iters get _n_iters=1, loop is skipped.
+                        # Must wait for work_notify first so load(iter=0) has
+                        # initialized op-managed mbarriers before iter 1+ uses them.
+                        _n_iters = _get_inner_iters(_ds_op)
+                        if _n_iters > Int32(1):
+                            mbarrier_wait(_ds_mbar, _s_phase)
+                        _no_prev = Int32(-1)
+                        _iter_idx = Int32(1)
+                        while _iter_idx < _n_iters:
+                            dispatch_load(
+                                _ds_op, _ds_pp,
+                                _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
+                                _ds_config, _ds_mbar,
+                                _no_prev, _no_prev, _no_prev,
+                                _no_prev, _no_prev,
+                                _iter_idx,
+                            )
+                            _iter_idx = _iter_idx + Int32(1)
+
+                        # Wait for full compute completion
+                        mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
+
+                        # ALL 32 threads dispatch store (TMA warp convergence)
                         dispatch_store(
                             _ds_op, _ds_pp,
                             _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
@@ -1371,6 +1428,7 @@ class Megakernel:
                 "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
                 "FLAG_STORE_IDX": FLAG_STORE_IDX,
                 "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
+                "_get_inner_iters": _get_inner_iters,
                 **trace_exec_globals,
             },
         )
