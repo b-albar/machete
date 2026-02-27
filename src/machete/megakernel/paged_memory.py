@@ -26,7 +26,15 @@ from cutlass._mlir.dialects import llvm
 # =============================================================================
 
 MAX_PAGES: int = 16  # Maximum number of pages
-MAX_INNER_DEPTH: int = 4  # Maximum inner pipeline stages (double/triple/quad buffering)
+IQ_DEPTH: int = 8  # Instruction queue depth for out-of-order loading
+
+# Flag offsets within the flags region (each int32 = 4 bytes).
+# Used by load warp, store warp, and all load-warp threads for communication.
+FLAG_DISPATCH_LOAD: int = 4    # Load warp thread 0 → all load threads: page slot to dispatch
+FLAG_PREV_LINEAR: int = 12     # Previous tile's linear index (same-op page reuse detection)
+FLAG_PRODUCE_IDX: int = 16     # Load warp's produce counter (written by load, read by store)
+FLAG_STORE_IDX: int = 20       # Store warp's store counter (written by store, read by load)
+FLAG_LOAD_DONE: int = 24       # Load warp signals completion (read by store warp + load warp)
 
 
 # =============================================================================
@@ -172,24 +180,23 @@ class NPageLayout:
         pages_start: Offset to first page (for arithmetic computation)
         aligned_page_size: Page size aligned to 128 bytes
         total_size: Total shared memory required
+
+    Layout:
+        [Scratch: tile_info + flags + IQ + mbarriers] [Page 0..N-1]
     """
 
     num_pages: int = 2
     page_size: int = 16384
-    max_inner_depth: int = 1  # Max inner pipeline stages across all ops
 
     # Scratch area layout (ring buffer):
     # - Per-page tile info: num_pages * 8 bytes [op_idx, linear_tile_idx] per page
-    # - Current instruction: 8 bytes [op_idx, linear_tile_idx]
-    # - Flags: 40 bytes [done_flag, dispatch_load_slot, dispatch_store_slot,
-    #                     prev_linear_idx, inner_iter_idx, inner_depth,
-    #                     sc_phases (MAX_INNER_DEPTH int32s)]
-    # - Mbarriers: (3 + max_inner_depth) * num_pages * 8 bytes
-    #              [work_notify + compute_done + smem_consumed × depth + kblock_ready]
+    # - Flags: 28 bytes (see FLAG_* constants for active offsets;
+    #          offsets 0 and 8 are reserved/unused)
+    # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
+    # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
     _TILE_INFO_SIZE: int = 8   # Per-page: op_idx + linear_tile_idx (2 int32s)
-    _INSTR_SIZE: int = 8  # Same as tile info: 2 int32s
-    _FLAGS_SIZE: int = 40  # done + dispatch slots + prev_linear + inner_iter_idx
-                           # + inner_depth + sc_phases[MAX_INNER_DEPTH]
+    _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
+    _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
@@ -198,32 +205,21 @@ class NPageLayout:
             raise ValueError(f"num_pages must be >= 2, got {self.num_pages}")
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
-        if self.max_inner_depth < 1:
-            raise ValueError(f"max_inner_depth must be >= 1, got {self.max_inner_depth}")
-        if self.max_inner_depth > MAX_INNER_DEPTH:
-            raise ValueError(f"max_inner_depth must be <= {MAX_INNER_DEPTH}, got {self.max_inner_depth}")
 
-        # Scratch region layout: [tile_info][instr][flags][mbarriers]
+        # Scratch region layout: [tile_info][flags][iq][mbarriers]
         self.ring_state_offset = 0
-        self.instr_offset = self.num_pages * self._TILE_INFO_SIZE
-        self.flags_offset = self.instr_offset + self._INSTR_SIZE
+        self.flags_offset = self.num_pages * self._TILE_INFO_SIZE
+        self.iq_offset = _align_up(self.flags_offset + self._FLAGS_SIZE, 8)
 
         # mbarrier array layout:
-        #   work_notify:    N entries (tile-level DMA→MMA, 1 arrive per tile)
+        #   work_notify:    N entries (tile-level DMA→MMA data ready, 1 arrive per tile)
         #   compute_done:   N entries (MMA→DMA, num_mma_warps arrivals)
-        #   smem_consumed:  N × max_inner_depth entries (per-buffer MMA→DMA sync)
-        #   kblock_ready:   N × max_inner_depth entries (per-buffer DMA→MMA data signal)
         # Each mbarrier is 8 bytes and MUST be 8-byte aligned (PTX requirement).
         self.mbarrier_offset = _align_up(
-            self.flags_offset + self._FLAGS_SIZE, 8
+            self.iq_offset + IQ_DEPTH * self._IQ_ENTRY_SIZE, 8
         )
 
-        num_mbarriers = (
-            self.num_pages                                  # work_notify
-            + self.num_pages                                # compute_done
-            + self.num_pages * self.max_inner_depth         # smem_consumed (per-buffer)
-            + self.num_pages * self.max_inner_depth         # kblock_ready (per-buffer)
-        )
+        num_mbarriers = 2 * self.num_pages  # work_notify + compute_done
         raw_scratch_size = (
             self.mbarrier_offset
             + num_mbarriers * self._MBARRIER_SIZE
@@ -255,45 +251,12 @@ class NPageLayout:
         """Get offset to the compute_done mbarrier for a given page."""
         return self.mbarrier_offset + self.num_pages * self._MBARRIER_SIZE + page_idx * self._MBARRIER_SIZE
 
-    def smem_consumed_mbar_offset(self, slot_idx: int, buf_idx: int = 0) -> int:
-        """Get offset to the smem_consumed mbarrier for a given slot and buffer.
-
-        With n-stage inner pipelining, each page slot has max_inner_depth
-        smem_consumed mbarriers (one per buffer). MMA signals the buffer it
-        finished reading; DMA polls the buffer it wants to overwrite.
-
-        Args:
-            slot_idx: Page slot index (0..num_pages-1)
-            buf_idx: Buffer index within the slot (0..max_inner_depth-1)
-        """
-        base = self.mbarrier_offset + 2 * self.num_pages * self._MBARRIER_SIZE
-        return base + (slot_idx * self.max_inner_depth + buf_idx) * self._MBARRIER_SIZE
-
-    def kblock_ready_mbar_offset(self, slot_idx: int, buf_idx: int = 0) -> int:
-        """Get offset to the kblock_ready mbarrier for a given slot and buffer.
-
-        Per-buffer data readiness signal: DMA arrives on kblock_ready[buf]
-        when a K-block's TMA completes into that buffer. MMA compute waits
-        on the buffer it needs to read next.
-
-        With n-stage inner pipelining, each page slot has max_inner_depth
-        kblock_ready mbarriers (one per buffer). This prevents phase aliasing
-        when DMA prefills multiple buffers before MMA starts consuming.
-
-        Args:
-            slot_idx: Page slot index (0..num_pages-1)
-            buf_idx: Buffer index within the slot (0..max_inner_depth-1)
-        """
-        base = self.mbarrier_offset + (2 * self.num_pages + self.num_pages * self.max_inner_depth) * self._MBARRIER_SIZE
-        return base + (slot_idx * self.max_inner_depth + buf_idx) * self._MBARRIER_SIZE
-
     @classmethod
     def for_device(
         cls,
         page_size: int = 16384,
         max_smem: int | None = None,
         min_pages: int = 2,
-        max_inner_depth: int = 1,
     ) -> "NPageLayout":
         """Create layout with maximum pages that fit in device shared memory.
 
@@ -301,7 +264,6 @@ class NPageLayout:
             page_size: Size of each page in bytes
             max_smem: Maximum shared memory (None = auto-detect from GPU)
             min_pages: Minimum number of pages required
-            max_inner_depth: Maximum inner pipeline stages across all ops
 
         Returns:
             NPageLayout configured for maximum pages
@@ -333,24 +295,18 @@ class NPageLayout:
 
         # Try from max down to find largest that actually fits
         for n in range(max_possible, min_pages - 1, -1):
-            layout = cls(num_pages=n, page_size=page_size,
-                         max_inner_depth=max_inner_depth)
+            layout = cls(num_pages=n, page_size=page_size)
             if layout.total_size <= max_smem:
                 return layout
 
         # Fallback to minimum
-        return cls(num_pages=min_pages, page_size=page_size,
-                   max_inner_depth=max_inner_depth)
+        return cls(num_pages=min_pages, page_size=page_size)
 
     def __repr__(self) -> str:
-        depth_str = ""
-        if self.max_inner_depth > 1:
-            depth_str = f"  max_inner_depth={self.max_inner_depth},\n"
         return (
             f"NPageLayout(\n"
             f"  num_pages={self.num_pages},\n"
             f"  page_size={self.page_size // 1024}KB,\n"
-            f"{depth_str}"
             f"  total_size={self.total_size // 1024}KB,\n"
             f"  scratch_size={self.scratch_size}B,\n"
             f"  pages_start={self.pages_start},\n"
@@ -361,7 +317,12 @@ class NPageLayout:
 
 __all__ = [
     "MAX_PAGES",
-    "MAX_INNER_DEPTH",
+    "IQ_DEPTH",
+    "FLAG_DISPATCH_LOAD",
+    "FLAG_PREV_LINEAR",
+    "FLAG_PRODUCE_IDX",
+    "FLAG_STORE_IDX",
+    "FLAG_LOAD_DONE",
     "st_shared_i32",
     "ld_shared_i32",
     "ld_shared_v2_b32",

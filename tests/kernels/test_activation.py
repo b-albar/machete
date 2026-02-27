@@ -67,7 +67,7 @@ def _run_activation(x_2d, activation='relu'):
 
 def _run_gemm_activation(a, b_t, activation='relu', tile_m=64, tile_n=32, tile_k=32):
     """Run fused GEMM + Activation and return output tensor C."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
     from machete.kernels.activation import ActivationOp
 
@@ -86,7 +86,7 @@ def _run_gemm_activation(a, b_t, activation='relu', tile_m=64, tile_n=32, tile_k
         x=c, activation=activation, tile_sizes={"M": act_tile_m},
     )
 
-    config = MegakernelConfig(threads_per_block=160)
+    config = GemmOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):

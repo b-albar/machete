@@ -50,7 +50,7 @@ def _gemm_reference(a, b_t):
 
 def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
     """Run GemmOp and return output tensor C."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
     M, K = a.shape
@@ -61,8 +61,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
         a=a, b=b_t, c=c,
         tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
     )
-    # 5 warps: 4 MMA + 1 DMA = 160 threads
-    config = MegakernelConfig(threads_per_block=160)
+    config = GemmOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -191,6 +190,13 @@ class TestGemmForward:
         """Minimum tile_K=16 (many K tiles, tests atomic add convergence)."""
         _gemm_case(64, 64, 32, dtype, tile_k=16)
 
+    # ----- Large shapes -----
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_large_gemm(self, dtype):
+        """Large GEMM with many tiles along all dimensions."""
+        _gemm_case(128, 4096, 16384, dtype)
+
 
 # =============================================================================
 # Backward Tests
@@ -205,15 +211,15 @@ def _run_gemm_backward(dout, a, b, da=None, db=None,
     buffer 'c' but with different data_ptr, so the framework treats
     them as independent.
     """
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
-    config = MegakernelConfig(threads_per_block=160)
     ts = {"M": tile_m, "N": tile_n, "K": tile_k}
 
     ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
                           tile_sizes=ts)
     if ops:
+        config = GemmOp.kernel_config(ops)
         with contextlib.redirect_stdout(io.StringIO()):
             Megakernel(ops, config=config).run()
 

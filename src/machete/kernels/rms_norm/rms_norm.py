@@ -196,8 +196,9 @@ class RMSNormOp(Op):
             if D % ct == 0:
                 compute_threads = ct
                 break
+        from machete.megakernel.megakernel import NUM_DMA_WARPS
         return MegakernelConfig(
-            threads_per_block=compute_threads + 32,
+            threads_per_block=compute_threads + NUM_DMA_WARPS * 32,
             page_size=page_size,
         )
 

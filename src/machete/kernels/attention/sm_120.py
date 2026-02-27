@@ -37,7 +37,7 @@ Usage:
     o = torch.zeros_like(q)
     ops = FlashAttentionSm120Op.schedule(q=q, k=k, v=v, o=o)
     tile_m = ops[0].tile_sizes["M"]
-    tpb = (tile_m // 16 + 1) * 32
+    tpb = (tile_m // 16 + 2) * 32  # +2 for load warp + store warp
     kernel = Megakernel(ops, config=MegakernelConfig(threads_per_block=tpb))
     kernel.run()
 """
@@ -220,8 +220,9 @@ class FlashAttentionSm120Op(Op):
         from machete.megakernel import MegakernelConfig
 
         tile_m = ops[0].tile_sizes["M"]
+        from machete.megakernel.megakernel import NUM_DMA_WARPS
         num_mma_warps = tile_m // 16
-        threads_per_block = (num_mma_warps + 1) * 32
+        threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
             threads_per_block=threads_per_block,
@@ -233,7 +234,7 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_BH, tile_M, tile_D, q_tma, q_tma_gmem, work_mbar, inner_iter_idx):
+    def load(self, page_ptr, tile_BH, tile_M, tile_D, q_tma, q_tma_gmem, work_mbar):
         """TMA Q load into page (single shot)."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
@@ -300,7 +301,7 @@ class FlashAttentionSm120Op(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, work_mbar, smem_consumed_mbar, work_mbar_phase
+        self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o
     ):
         """Cooperative flash attention: MMA warps do both cpasync loads and MMA.
 
@@ -315,7 +316,6 @@ class FlashAttentionSm120Op(Op):
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
-        lane_id = tidx % Int32(32)
 
         if warp_idx < Int32(self.num_mma_warps):
             # === MMA setup (multi-warp) ===
@@ -341,14 +341,8 @@ class FlashAttentionSm120Op(Op):
             for kb in cutlass.range_constexpr(self.D // 16):
                 cute.autovec_copy(tCsQ[None, None, kb], tCrQ[None, None, kb])
 
-            # =============================================================
-            # Phase 2: Signal smem consumed (page now free for KV)
-            # =============================================================
+            # Sync MMA warps before reusing page memory for KV
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-            if lane_id == Int32(0):
-                from machete.megakernel.interpreter import mbarrier_arrive
-
-                mbarrier_arrive(smem_consumed_mbar)
 
             # === Swizzle + LdMatrix setup for KV ===
             swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)

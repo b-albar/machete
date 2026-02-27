@@ -16,7 +16,7 @@ import io
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel
 from machete.kernels.gemm import GemmOp
 from machete.utils.benchmark import Benchmark
 
@@ -107,8 +107,7 @@ def bench_gemm(M, K, N, dtype):
             tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
             inner_depth=inner_depth,
         )
-        # 5 warps: 4 MMA + 1 DMA = 160 threads
-        config = MegakernelConfig(threads_per_block=160)
+        config = GemmOp.kernel_config(ops)
         kernel = Megakernel(ops, config=config)
 
         # Trigger compilation + first run

@@ -945,10 +945,12 @@ class TMARegistry:
             op_cls = op.op_cls
             if not hasattr(op_cls, "_TMA_LOADS"):
                 op_mappings[(i, "load")] = {}
+                op_mappings[(i, "compute")] = {}
                 op_mappings[(i, "store")] = {}
                 continue
 
             op_mappings[(i, "load")] = {}
+            op_mappings[(i, "compute")] = {}
             op_mappings[(i, "store")] = {}
 
             for phase, tma_names, direction in [
@@ -1024,6 +1026,9 @@ class TMARegistry:
                     op_mappings[(i, phase)][f"{tensor_name}_tma"] = canonical_atom
                     op_mappings[(i, phase)][f"{tensor_name}_tma_gmem"] = canonical_gmem
                     counter += 1
+
+            # Compute phase can use the same TMA load descriptors
+            op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
 
         return cls(descriptors=descriptors, op_mappings=op_mappings)
 

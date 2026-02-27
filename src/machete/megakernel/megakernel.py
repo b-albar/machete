@@ -55,23 +55,31 @@ from .interpreter import (
     mbarrier_init_fence,
     mbarrier_arrive,
     mbarrier_wait,
-    mbarrier_try_wait,
     named_barrier_sync,
     get_smem_base_ptr,
     nanosleep,
 )
 from .paged_memory import (
     NPageLayout,
+    IQ_DEPTH,
     st_shared_i32,
     ld_shared_i32,
     ld_shared_v2_b32,
     st_shared_v2_b32,
+    FLAG_DISPATCH_LOAD,
+    FLAG_PREV_LINEAR,
+    FLAG_PRODUCE_IDX,
+    FLAG_STORE_IDX,
+    FLAG_LOAD_DONE,
 )
 
 
 # =============================================================================
 # Megakernel Configuration
 # =============================================================================
+
+# Two DMA warps: one for loading (G→S), one for storing (S→G).
+NUM_DMA_WARPS = 2
 
 
 @dataclass
@@ -169,27 +177,18 @@ class Megakernel:
             props = torch.cuda.get_device_properties(device)
             self.config.num_sms = props.multi_processor_count
 
-        # Compute max inner depth across all ops (for smem_consumed mbarrier allocation)
-        max_inner_depth = 1
-        for op in ops:
-            depth = (op.static_dims or {}).get('inner_depth', 1)
-            if depth > max_inner_depth:
-                max_inner_depth = depth
-
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
                 page_size=self.config.page_size,
-                max_inner_depth=max_inner_depth,
             )
         else:
             # Auto-detect maximum pages that fit in shared memory
             self._layout = NPageLayout.for_device(
                 page_size=self.config.page_size,
                 min_pages=2,
-                max_inner_depth=max_inner_depth,
             )
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
@@ -386,9 +385,9 @@ class Megakernel:
         op_tensor_args = []  # Per-op list of canonical tensor arg names
         op_tma_args = {"load": [], "compute": [], "store": []}
 
-        # Warp-specialized mode: DMA warp is last warp, compute threads = rest
+        # Warp-specialized mode: DMA warps are last warps, compute threads = rest
         threads_per_block = self.config.threads_per_block
-        num_compute_threads = threads_per_block - 32  # Exclude DMA warp
+        num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32  # Exclude load + store warps
 
         for i, op in enumerate(ops):
             # Get canonical names in declaration order for this op
@@ -397,12 +396,14 @@ class Megakernel:
 
             # Get TMA canonical names and local mappings per phase
             load_tma_args = tma_registry.get_op_tma_args(i, "load")
+            compute_tma_args = tma_registry.get_op_tma_args(i, "compute")
             store_tma_args = tma_registry.get_op_tma_args(i, "store")
             load_tma_mapping = tma_registry.op_mappings.get((i, "load"), {})
+            compute_tma_mapping = tma_registry.op_mappings.get((i, "compute"), {})
             store_tma_mapping = tma_registry.op_mappings.get((i, "store"), {})
 
             op_tma_args["load"].append(load_tma_args)
-            op_tma_args["compute"].append([])
+            op_tma_args["compute"].append(compute_tma_args)
             op_tma_args["store"].append(store_tma_args)
 
             kernel_config = {"threads_per_row": num_compute_threads}
@@ -411,19 +412,15 @@ class Megakernel:
             config = build_op_config(op, kernel_config=kernel_config)
             instance = op.op_cls(**config)
 
-            # Collect inner_iters and inner_depth per op (for GEMM K-loop etc.)
-            op_tma_args["_inner_iters"] = op_tma_args.get("_inner_iters", [])
-            op_tma_args["_inner_iters"].append(getattr(instance, 'inner_iters', 1))
-            op_tma_args["_inner_depths"] = op_tma_args.get("_inner_depths", [])
-            op_tma_args["_inner_depths"].append(getattr(instance, 'inner_depth', 1))
-
             if use_backward:
                 load_fns.append(compile_backward_load(
                     instance, tensor_param_names=tensor_args,
                     tma_param_names=load_tma_args,
                     tma_local_mapping=load_tma_mapping))
                 compute_fns.append(compile_backward_compute(
-                    instance, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args,
+                    tma_param_names=compute_tma_args,
+                    tma_local_mapping=compute_tma_mapping))
                 store_fns.append(compile_backward_store(
                     instance, tensor_param_names=tensor_args,
                     tma_param_names=store_tma_args,
@@ -434,7 +431,9 @@ class Megakernel:
                     tma_param_names=load_tma_args,
                     tma_local_mapping=load_tma_mapping))
                 compute_fns.append(compile_compute(
-                    instance, tensor_param_names=tensor_args))
+                    instance, tensor_param_names=tensor_args,
+                    tma_param_names=compute_tma_args,
+                    tma_local_mapping=compute_tma_mapping))
                 store_fns.append(compile_store(
                     instance, tensor_param_names=tensor_args,
                     tma_param_names=store_tma_args,
@@ -452,10 +451,7 @@ class Megakernel:
         dispatch_compute = _build_dispatch(compute_fns, "compute")
         dispatch_store = _build_dispatch(store_fns, "store")
 
-        inner_iters_per_op = tuple(op_tma_args.get("_inner_iters", [1] * len(ops)))
-        inner_depths_per_op = tuple(op_tma_args.get("_inner_depths", [1] * len(ops)))
-
-        return dispatch_load, dispatch_compute, dispatch_store, inner_iters_per_op, inner_depths_per_op
+        return dispatch_load, dispatch_compute, dispatch_store
 
     def _build_exec_dispatch_fn(self, phase_fns, phase_name, op_tensor_args,
                                 all_canonical, op_tma_args=None,
@@ -506,13 +502,12 @@ class Megakernel:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
-                    f"inner_iter_idx, {prev_tile_params}{args_str})"
+                    f"{prev_tile_params}{args_str})"
                 )
             elif is_compute:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, "
-                    f"work_mbar, smem_consumed_mbar, work_mbar_phase{args_str})"
+                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr{args_str})"
                 )
             else:
                 lines.append(
@@ -526,9 +521,9 @@ class Megakernel:
         tma_sig = f", {tma_params}" if tma_params else ""
         extra_sig = ""
         if is_load:
-            extra_sig = f", work_mbar, inner_iter_idx, {prev_tile_params}"
+            extra_sig = f", work_mbar, {prev_tile_params}"
         elif is_compute:
-            extra_sig = ", work_mbar, smem_consumed_mbar, work_mbar_phase"
+            extra_sig = ""
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, {tile_params}, "
@@ -558,7 +553,7 @@ class Megakernel:
         dispatch_load, dispatch_compute, dispatch_store,
         signal_barriers, get_page_ptr_fn,
         num_sms, threads_per_block, smem_size,
-        num_pages, scratch_offset, flags_offset, ring_state_offset,
+        num_pages, iq_offset, flags_offset, ring_state_offset,
         extra_exec_globals=None,
     ):
         """Build the PersistentKernel via source transformation.
@@ -618,6 +613,7 @@ class Megakernel:
         # Exec globals: all references used in the kernel loop body
         exec_globals = {
             "cute": cute, "Int32": Int32, "Int64": Int64,
+            "range_constexpr": __import__('cutlass').range_constexpr,
             "TileInstruction": TileInstruction,
             "dispatch_load": dispatch_load,
             "dispatch_compute": dispatch_compute,
@@ -635,7 +631,7 @@ class Megakernel:
             "nanosleep": nanosleep,
             "named_barrier_sync": named_barrier_sync,
             "num_pages": num_pages,
-            "scratch_offset": scratch_offset,
+            "iq_offset": iq_offset,
             "flags_offset": flags_offset,
             "ring_state_offset": ring_state_offset,
         }
@@ -906,82 +902,6 @@ class Megakernel:
         exec(code, exec_globals)
         return exec_globals[fn_name]
 
-    def _build_get_inner_iters(self, inner_iters_per_op):
-        """Build a @cute.jit dispatch function returning inner_iters for an op.
-
-        Generated as an if/elif chain mapping op_idx to its inner_iters count.
-        Ops without inner iterations return 1.
-        """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
-        lines = ["    result = Int32(1)"]
-        for i, iters in enumerate(inner_iters_per_op):
-            keyword = "if" if i == 0 else "elif"
-            lines.append(
-                f"    {keyword} op_idx == Int32({i}):\n"
-                f"        result = Int32({iters})"
-            )
-        lines.append("    return result")
-        body = "\n".join(lines)
-
-        fn_source = (
-            "@cute.jit\n"
-            "def _get_inner_iters(op_idx: Int32) -> Int32:\n"
-            f"{body}\n"
-        )
-
-        exec_globals = {"cute": cute, "Int32": Int32}
-
-        compile_mod._compile_counter += 1
-        unique_filename = f"<_get_inner_iters>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source), None, fn_source.splitlines(True), unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
-        return exec_globals["_get_inner_iters"]
-
-    def _build_get_inner_depth(self, inner_depths_per_op):
-        """Build a @cute.jit dispatch function returning inner_depth for an op.
-
-        Generated as an if/elif chain mapping op_idx to its inner_depth count.
-        Ops without inner_depth return 1 (single buffer).
-        """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
-        lines = ["    result = Int32(1)"]
-        for i, depth in enumerate(inner_depths_per_op):
-            keyword = "if" if i == 0 else "elif"
-            lines.append(
-                f"    {keyword} op_idx == Int32({i}):\n"
-                f"        result = Int32({depth})"
-            )
-        lines.append("    return result")
-        body = "\n".join(lines)
-
-        fn_source = (
-            "@cute.jit\n"
-            "def _get_inner_depth(op_idx: Int32) -> Int32:\n"
-            f"{body}\n"
-        )
-
-        exec_globals = {"cute": cute, "Int32": Int32}
-
-        compile_mod._compile_counter += 1
-        unique_filename = f"<_get_inner_depth>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source), None, fn_source.splitlines(True), unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
-        return exec_globals["_get_inner_depth"]
-
     def _create_kernel(self):
         """Create the persistent warp-specialized kernel with ring buffer pages.
 
@@ -994,11 +914,9 @@ class Megakernel:
         - All DMA barrier checks are non-blocking (no spin loops in inline asm)
         - Phase alternates 0/1 with each use; tracked via produce/consume counters
 
-        Four mbarrier arrays:
-        - work_notify[slot]:  tile-level DMA->MMA (1 arrive per tile)
+        Two mbarrier arrays:
+        - work_notify[slot]:  DMA->MMA data ready (1 arrive per tile via TMA)
         - compute_done[slot]: MMA->DMA (num_mma_warps arrivals)
-        - smem_consumed[slot]: MMA->DMA K-block sync (num_mma_warps arrivals)
-        - kblock_ready[slot]: per-K-block DMA->MMA data signal (1 arrive)
         """
         num_sms = self.config.num_sms
         threads_per_block = self.config.threads_per_block
@@ -1008,21 +926,18 @@ class Megakernel:
         num_pages = layout.num_pages
 
         # Capture layout offsets as compile-time constants
-        scratch_offset = layout.instr_offset
+        iq_offset = layout.iq_offset
         flags_offset = layout.flags_offset
         ring_state_offset = layout.ring_state_offset
         pages_start = layout.pages_start
         aligned_page_size = layout.aligned_page_size
 
-        # Mbarrier sub-offsets (work_notify at 0, compute_done at N,
-        # smem_consumed at 2N with N*max_inner_depth entries, kblock_ready after)
+        # Mbarrier sub-offsets (work_notify at 0, compute_done at N)
         work_notify_mbar_offset_0 = layout.work_notify_mbar_offset(0)
         compute_done_mbar_offset_0 = layout.compute_done_mbar_offset(0)
-        smem_consumed_mbar_offset_0 = layout.smem_consumed_mbar_offset(0)
-        kblock_ready_mbar_offset_0 = layout.kblock_ready_mbar_offset(0)
 
-        # Warp specialization constants
-        num_mma_warps = (threads_per_block // 32) - 1
+        # Warp specialization constants: load warp + store warp = NUM_DMA_WARPS
+        num_mma_warps = (threads_per_block // 32) - NUM_DMA_WARPS
         num_compute_threads = num_mma_warps * 32
         dma_reg_count = self.config.dma_reg_count
         mma_reg_count = self.config.mma_reg_count
@@ -1045,19 +960,13 @@ class Megakernel:
                 setmaxregister_decrease = _setmaxregister_noop
 
         # Build pipelined dispatch functions (with barrier replacement for compute)
-        dispatch_load, dispatch_compute, dispatch_store, inner_iters_per_op, inner_depths_per_op = (
+        dispatch_load, dispatch_compute, dispatch_store = (
             self._build_pipelined_dispatch_fns()
         )
-        has_inner_iters = any(n > 1 for n in inner_iters_per_op)
-        max_inner_depth = max(inner_depths_per_op) if inner_depths_per_op else 1
 
         # Build barrier functions
         check_barriers = self._build_check_barriers()
         signal_barriers = self._build_signal_barriers()
-
-        # Build inner_iters and inner_depth dispatch functions
-        get_inner_iters = self._build_get_inner_iters(inner_iters_per_op)
-        get_inner_depth = self._build_get_inner_depth(inner_depths_per_op)
 
         # Trace exec globals: device-side functions and format_ids.
         # `if tracing:` blocks are resolved at source level in _build_kernel,
@@ -1080,24 +989,6 @@ class Megakernel:
         def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
             return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(8)
 
-        # Helper to get smem_consumed mbarrier smem address (per slot, per buffer)
-        # Used for inner iterations: MMA signals after consuming a buffer,
-        # DMA polls before overwriting that buffer with the next inner load.
-        # With n-stage pipeline, each slot has max_inner_depth mbarriers.
-        @cute.jit
-        def _smem_consumed_mbar(smem_base: Int32, slot: Int32, buf_idx: Int32) -> Int32:
-            return smem_base + Int32(smem_consumed_mbar_offset_0) + (slot * Int32(max_inner_depth) + buf_idx) * Int32(8)
-
-        # Helper to get kblock_ready mbarrier smem address (per slot, per buffer)
-        # Per-buffer data readiness: DMA arrives on kblock_ready[buf] when a
-        # K-block's TMA completes into that buffer. MMA compute waits on the
-        # buffer it needs to read next. With n-stage pipeline, each slot has
-        # max_inner_depth kblock_ready mbarriers to prevent phase aliasing
-        # when DMA prefills multiple buffers.
-        @cute.jit
-        def _kblock_ready_mbar(smem_base: Int32, slot: Int32, buf_idx: Int32) -> Int32:
-            return smem_base + Int32(kblock_ready_mbar_offset_0) + (slot * Int32(max_inner_depth) + buf_idx) * Int32(8)
-
         # Tile info size in bytes: INSTRUCTION_WORDS int32s per slot
         tile_info_bytes = INSTRUCTION_WORDS * 4  # 2 * 4 = 8 bytes
 
@@ -1118,22 +1009,24 @@ class Megakernel:
         ) -> None:
             """Warp-specialized ring buffer loop.
 
-            DMA warp (last warp): in-order fetch, blocking dep wait, load/store.
-            MMA warps: compute from ring buffer slots (page == slot).
+            Load warp (warp N-2): fetches instructions, checks deps, dispatches TMA loads.
+            Store warp (warp N-1): waits for compute_done, dispatches TMA stores.
+            MMA warps (0..N-3): compute from ring buffer slots (page == slot).
             Mbarrier phases alternate 0/1 with each use (hardware auto-reset).
             """
             warp_id = tidx // Int32(32)
             lane_id = tidx % Int32(32)
-            is_dma_warp = warp_id == Int32(num_mma_warps)
+            is_load_warp = warp_id == Int32(num_mma_warps)
+            is_store_warp = warp_id == Int32(num_mma_warps + 1)
 
-            # Register reallocation: DMA warp frees registers, MMA warps gain
-            if is_dma_warp:
+            # Register reallocation: both DMA warps free registers, MMA warps gain
+            if warp_id >= Int32(num_mma_warps):
                 setmaxregister_decrease(dma_reg_count)
             if warp_id < Int32(num_mma_warps):
                 setmaxregister_increase(mma_reg_count)
 
-            # Scratch pointer for instruction decode
-            scratch_ptr = smem_base + Int32(scratch_offset)
+            # Instruction queue base pointer (out-of-order lookahead)
+            iq_base = smem_base + Int32(iq_offset)
             flags_ptr = smem_base + Int32(flags_offset)
 
             # ========== TRACE INIT ==========
@@ -1143,12 +1036,12 @@ class Megakernel:
                     cute.make_layout(1 << 24),
                 )
 
-            # ========== INIT (DMA warp thread 0) ==========
-            if is_dma_warp:
+            # ========== INIT (load warp thread 0) ==========
+            if is_load_warp:
                 if lane_id == Int32(0):
-                    # Clear done flag and init inner_depth default
-                    st_shared_i32(flags_ptr, Int32(0))
-                    st_shared_i32(flags_ptr + 20, Int32(1))  # inner_depth = 1
+                    st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
+                    st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
+                    st_shared_i32(flags_ptr + FLAG_LOAD_DONE, Int32(0))
                     for _ip in range(num_pages):
                         # Init per-slot op_idx to -1 (no previous op)
                         _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
@@ -1161,23 +1054,15 @@ class Megakernel:
                             _compute_done_mbar(smem_base, Int32(_ip)),
                             Int32(num_mma_warps),
                         )
-                        for _id in range(max_inner_depth):
-                            mbarrier_init(
-                                _smem_consumed_mbar(smem_base, Int32(_ip), Int32(_id)),
-                                Int32(num_mma_warps),
-                            )
-                        for _id2 in range(max_inner_depth):
-                            mbarrier_init(
-                                _kblock_ready_mbar(smem_base, Int32(_ip), Int32(_id2)),
-                                Int32(1),
-                            )
                     mbarrier_init_fence()
 
             # Sync all threads after init (named barrier 0 = full block)
             named_barrier_sync(Int32(0), Int32(threads_per_block))
 
-            # ========== DMA WARP LOOP (non-blocking polling) ==========
-            if is_dma_warp:
+            # ========== LOAD WARP LOOP ==========
+            # Fetches instructions, checks dependencies, dispatches TMA loads.
+            # Only blocks when no page is available (all pages in use).
+            if is_load_warp:
                 if tracing:
                     _dma_lane = begin_lane_dynamic_raw(
                         Int32(2), Int32(trace_row_stride),
@@ -1186,222 +1071,110 @@ class Megakernel:
                     )
 
                 produce_idx = Int32(0)
-                store_idx = Int32(0)
-                next_instr_idx = block_id
+                _iq_fetch_idx = block_id
                 done = Int32(0)
-                has_pending_store = Int32(0)
-                # Pending store tile info (op_idx + linear_tile_idx)
-                _ps_op = Int32(0)
-                _ps_linear = Int32(0)
 
-                # Instruction cache: load once from gmem, reuse across
-                # iterations when barriers aren't ready yet.
-                _instr_cached = Int32(0)
-                _ic_op = Int32(0)
-                _ic_linear = Int32(0)
+                # Smem pointers for inter-thread/warp communication
+                dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
+                prev_linear_ptr = flags_ptr + FLAG_PREV_LINEAR
+                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
+                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
+                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
 
-                # dispatch_load/store_slot_ptr: smem slots for all-threads dispatch.
-                # Thread 0 writes slot index here; all threads read it.
-                # Value -1 = no dispatch this iteration.
-                dispatch_load_slot_ptr = flags_ptr + 4
-                dispatch_store_slot_ptr = flags_ptr + 8
-                prev_linear_ptr = flags_ptr + 12
-                inner_iter_idx_ptr = flags_ptr + 16
-                inner_depth_ptr = flags_ptr + 20
-
-                # Inner iteration state (for ops with inner_iters > 1)
-                _inner_iter = Int32(0)       # Current inner iter (0 = not in inner loop)
-                _inner_total = Int32(1)      # Total inner iters for current tile
-                _inner_depth = Int32(1)      # Pipeline stages for current tile
-                # Per-buffer smem_consumed phases stored in smem (dynamic buf_idx indexing)
-                sc_phases_ptr = flags_ptr + 24
+                # Pre-fill instruction queue from global memory.
+                # IQ enables out-of-order loading: when instruction N is
+                # blocked on deps, the load warp can skip to N+1, N+2, etc.
+                # op_idx markers: >= 0 = valid, -1 = END_MARKER, -2 = empty
+                if lane_id == Int32(0):
+                    for _pf in range_constexpr(IQ_DEPTH):
+                        _pf_slot = iq_base + Int32(_pf * 8)
+                        _pf_loaded = Int32(0)
+                        if _iq_fetch_idx < num_instructions:
+                            load_instruction_to_smem(instructions_ptr, _iq_fetch_idx, _pf_slot)
+                            _pf_op = ld_shared_i32(_pf_slot)
+                            if _pf_op == Int32(TileInstruction.END_MARKER):
+                                _iq_fetch_idx = num_instructions
+                            if _pf_op != Int32(TileInstruction.END_MARKER):
+                                _iq_fetch_idx = _iq_fetch_idx + num_blocks
+                                _pf_loaded = Int32(1)
+                        if _pf_loaded == Int32(0):
+                            st_shared_v2_b32(_pf_slot, Int32(-2), Int32(0))
 
                 while done == Int32(0):
                     if lane_id == Int32(0):
-                        iter_done = Int32(0)
-                        # Reset dispatch flags (no dispatch by default)
+                        # Reset dispatch flag (no dispatch by default)
                         st_shared_i32(dispatch_load_slot_ptr, Int32(-1))
-                        st_shared_i32(dispatch_store_slot_ptr, Int32(-1))
 
-                        # STEP 1: COMPLETE PREVIOUS STORE
-                        # Wait for S2G copy issued last iteration to finish,
-                        # then signal barriers and free the page.
-                        if has_pending_store == Int32(1):
-                            cute.arch.cp_async_bulk_wait_group(0, read=True)
-                            _ps_t0, _ps_t1, _ps_t2, _ps_t3, _ps_t4 = decompose_tile(
-                                _ps_op, _ps_linear)
-                            signal_barriers(
-                                _ps_op, _ps_t0, _ps_t1, _ps_t2, _ps_t3, _ps_t4,
-                                barriers_ptr,
-                            )
-                            store_idx = store_idx + Int32(1)
-                            has_pending_store = Int32(0)
+                        # STEP 1: SCAN IQ FOR READY INSTRUCTION
+                        # Out-of-order: scan IQ for first instruction with
+                        # satisfied deps. Skips blocked instructions to load
+                        # ready ones, maximizing load/compute overlap.
+                        _store_idx_shared = ld_shared_i32(store_idx_ptr)
+                        _found = Int32(-1)
+                        _found_op = Int32(-1)
+                        _found_lin = Int32(0)
+                        if (produce_idx - _store_idx_shared) < Int32(num_pages):
+                            for _iq in range_constexpr(IQ_DEPTH):
+                                if _found == Int32(-1):
+                                    _iq_op_k, _iq_lin_k = ld_shared_v2_b32(iq_base + Int32(_iq * 8))
+                                    if _iq_op_k >= Int32(0):
+                                        _d0, _d1, _d2, _d3, _d4 = decompose_tile(_iq_op_k, _iq_lin_k)
+                                        _bar_ok = check_barriers(
+                                            _iq_op_k, _d0, _d1, _d2,
+                                            _d3, _d4, barriers_ptr)
+                                        if _bar_ok == Int32(1):
+                                            _found = Int32(_iq)
+                                            _found_op = _iq_op_k
+                                            _found_lin = _iq_lin_k
+                        if _found != Int32(-1):
+                            # Mark IQ slot empty + refill from gmem
+                            _rf_ptr = iq_base + _found * Int32(8)
+                            st_shared_i32(_rf_ptr, Int32(-2))
+                            if _iq_fetch_idx < num_instructions:
+                                load_instruction_to_smem(instructions_ptr, _iq_fetch_idx, _rf_ptr)
+                                _rf_op = ld_shared_i32(_rf_ptr)
+                                if _rf_op == Int32(TileInstruction.END_MARKER):
+                                    _iq_fetch_idx = num_instructions
+                                    st_shared_i32(_rf_ptr, Int32(-2))
+                                if _rf_op != Int32(TileInstruction.END_MARKER):
+                                    _iq_fetch_idx = _iq_fetch_idx + num_blocks
 
-                        # STEP 2a: INNER LOOP CONTINUATION
-                        # If we're in the middle of an inner loop (e.g., GEMM
-                        # K-blocks), check if we can load the next block.
-                        # With n-stage pipeline: first inner_depth loads skip
-                        # smem_consumed wait (prefill — buffers are fresh).
-                        # Subsequent loads poll per-buffer smem_consumed mbar.
-                        if _inner_iter > Int32(0):
-                            _p_slot_inner = produce_idx % Int32(num_pages)
-                            _buf_idx = _inner_iter % _inner_depth
-                            _sc_mbar = _smem_consumed_mbar(smem_base, _p_slot_inner, _buf_idx)
-                            # Prefill: skip wait for first inner_depth loads
-                            _sc_ready = Int32(0)
-                            if _inner_iter < _inner_depth:
-                                _sc_ready = Int32(1)
-                            if _inner_iter >= _inner_depth:
-                                _sc_phase = ld_shared_i32(sc_phases_ptr + _buf_idx * Int32(4))
-                                if mbarrier_try_wait(_sc_mbar, _sc_phase) == Int32(1):
-                                    st_shared_i32(sc_phases_ptr + _buf_idx * Int32(4), Int32(1) - _sc_phase)
-                                    _sc_ready = Int32(1)
-                            if _sc_ready == Int32(1):
-                                st_shared_i32(dispatch_load_slot_ptr, _p_slot_inner)
-                                st_shared_i32(inner_iter_idx_ptr, _inner_iter)
-                                _inner_iter = _inner_iter + Int32(1)
-                                if _inner_iter >= _inner_total:
-                                    _inner_iter = Int32(0)
-                                    _inner_total = Int32(1)
-                                    _inner_depth = Int32(1)
-                                    produce_idx = produce_idx + Int32(1)
-                                    next_instr_idx = next_instr_idx + num_blocks
-                                    # Prefetch next instruction
-                                    _instr_cached = Int32(0)
-                                    if next_instr_idx < num_instructions:
-                                        load_instruction_to_smem(
-                                            instructions_ptr, next_instr_idx, scratch_ptr,
-                                        )
-                                        _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
-                                        if _ic_op == Int32(TileInstruction.END_MARKER):
-                                            next_instr_idx = num_instructions
-                                        if _ic_op != Int32(TileInstruction.END_MARKER):
-                                            _instr_cached = Int32(1)
+                            # Dispatch into ring buffer
+                            _p_slot = produce_idx % Int32(num_pages)
+                            _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
+                            # Read old tile info to detect same-op page reuse
+                            _old_op = ld_shared_i32(_p_ti)
+                            _ep_linear = Int32(-1)
+                            if _old_op == _found_op:
+                                _ep_linear = ld_shared_i32(_p_ti + 4)
+                            st_shared_i32(prev_linear_ptr, _ep_linear)
+                            # Overwrite slot with new tile info
+                            st_shared_v2_b32(_p_ti, _found_op, _found_lin)
+                            # Signal all load warp threads to dispatch
+                            st_shared_i32(dispatch_load_slot_ptr, _p_slot)
+                            produce_idx = produce_idx + Int32(1)
+                            st_shared_i32(produce_idx_ptr, produce_idx)
 
-                        # STEP 2b: TRY PRODUCE (G2S load) — start new tile.
-                        # Runs before store so the async G2S copy starts
-                        # earlier and has more time to complete.
-                        # MUST be 'else' (not separate 'if') to prevent
-                        # STEP 2a's dispatch_load_slot_ptr from being
-                        # overwritten when the inner loop completes and
-                        # resets _inner_iter=0 in the same while iteration.
-                        else:
-                            _can_produce = Int32(0)
-                            if (produce_idx - store_idx) < Int32(num_pages):
-                                if next_instr_idx < num_instructions:
-                                    _can_produce = Int32(1)
-                            if _can_produce == Int32(1):
-                                # Load instruction once; reuse cached copy on
-                                # subsequent iterations while deps aren't ready.
-                                if _instr_cached == Int32(0):
-                                    load_instruction_to_smem(instructions_ptr, next_instr_idx, scratch_ptr)
-                                    _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
-                                    if _ic_op == Int32(TileInstruction.END_MARKER):
-                                        next_instr_idx = num_instructions
-                                    if _ic_op != Int32(TileInstruction.END_MARKER):
-                                        _instr_cached = Int32(1)
-                                if _instr_cached == Int32(1):
-                                    _ic_0, _ic_1, _ic_2, _ic_3, _ic_4 = decompose_tile(
-                                        _ic_op, _ic_linear)
-                                    _bar_ok = check_barriers(
-                                        _ic_op, _ic_0, _ic_1, _ic_2,
-                                        _ic_3, _ic_4, barriers_ptr)
-                                    if _bar_ok == Int32(1):
-                                        _p_slot = produce_idx % Int32(num_pages)
-                                        _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
-                                        # Read old tile info from this page slot
-                                        # to detect if same op reuses this page.
-                                        _old_op = ld_shared_i32(_p_ti)
-                                        _ep_linear = Int32(-1)
-                                        if _old_op == _ic_op:
-                                            _ep_linear = ld_shared_i32(_p_ti + 4)
-                                        # Store prev linear idx in flags area for
-                                        # all DMA warp threads to read at dispatch.
-                                        st_shared_i32(prev_linear_ptr, _ep_linear)
-                                        # Overwrite slot with new tile info
-                                        st_shared_v2_b32(_p_ti, _ic_op, _ic_linear)
-                                        # Check inner iterations for this op
-                                        _inner_total = get_inner_iters(_ic_op)
-                                        # Re-init per-buffer kblock_ready for
-                                        # fresh phase tracking on this slot.
-                                        for _d in range(max_inner_depth):
-                                            mbarrier_init(
-                                                _kblock_ready_mbar(smem_base, _p_slot, Int32(_d)),
-                                                Int32(1),
-                                            )
-                                        if _inner_total > Int32(1):
-                                            # Re-init per-buffer smem_consumed
-                                            # mbarriers for clean phase tracking.
-                                            _inner_depth = get_inner_depth(_ic_op)
-                                            # Store inner_depth in smem for all
-                                            # DMA threads to compute buf_idx.
-                                            st_shared_i32(inner_depth_ptr, _inner_depth)
-                                            for _d in range(max_inner_depth):
-                                                mbarrier_init(
-                                                    _smem_consumed_mbar(smem_base, _p_slot, Int32(_d)),
-                                                    Int32(num_mma_warps),
-                                                )
-                                            for _d in range(max_inner_depth):
-                                                st_shared_i32(sc_phases_ptr + Int32(_d * 4), Int32(0))
-                                        if _inner_total == Int32(1):
-                                            st_shared_i32(inner_depth_ptr, Int32(1))
-                                        mbarrier_init_fence()
-                                        # Arrive work_notify: tile-level signal
-                                        # to MMA (before TMA dispatch).
-                                        mbarrier_arrive(
-                                            _work_notify_mbar(smem_base, _p_slot)
-                                        )
-                                        # Signal all DMA warp threads to dispatch load
-                                        st_shared_i32(dispatch_load_slot_ptr, _p_slot)
-                                        st_shared_i32(inner_iter_idx_ptr, Int32(0))
-                                        if _inner_total > Int32(1):
-                                            # Start inner loop — don't advance
-                                            # produce_idx until all iters done.
-                                            _inner_iter = Int32(1)
-                                        if _inner_total == Int32(1):
-                                            produce_idx = produce_idx + Int32(1)
-                                            next_instr_idx = next_instr_idx + num_blocks
+                        # STEP 2: DONE + SENTINEL — IQ drained and no more
+                        # instructions. Write END_MARKER so MMA warps exit.
+                        _iq_empty = Int32(1)
+                        for _ec in range_constexpr(IQ_DEPTH):
+                            if ld_shared_i32(iq_base + Int32(_ec * 8)) >= Int32(0):
+                                _iq_empty = Int32(0)
+                        if _iq_empty == Int32(1):
+                            if _iq_fetch_idx >= num_instructions:
+                                _store_idx_done = ld_shared_i32(store_idx_ptr)
+                                if (produce_idx - _store_idx_done) < Int32(num_pages):
+                                    _sent = produce_idx % Int32(num_pages)
+                                    st_shared_i32(
+                                        smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
+                                        Int32(TileInstruction.END_MARKER),
+                                    )
+                                    mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
+                                    st_shared_i32(load_done_ptr, Int32(1))
 
-                                            # Prefetch next instruction while G2S
-                                            # copy is in flight.
-                                            _instr_cached = Int32(0)
-                                            if next_instr_idx < num_instructions:
-                                                load_instruction_to_smem(
-                                                    instructions_ptr, next_instr_idx, scratch_ptr,
-                                                )
-                                                _ic_op, _ic_linear = ld_shared_v2_b32(scratch_ptr)
-                                                if _ic_op == Int32(TileInstruction.END_MARKER):
-                                                    next_instr_idx = num_instructions
-                                                if _ic_op != Int32(TileInstruction.END_MARKER):
-                                                    _instr_cached = Int32(1)
-
-                        # STEP 3: TRY ISSUE STORE (S2G copy) — after produce
-                        # so the G2S from step 2 starts before the S2G here.
-                        # Thread 0 signals slot; all threads dispatch below.
-                        if has_pending_store == Int32(0):
-                            if store_idx < produce_idx:
-                                _s_slot = store_idx % Int32(num_pages)
-                                _s_phase = (store_idx // Int32(num_pages)) % Int32(2)
-                                if mbarrier_try_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase) == Int32(1):
-                                    _s_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
-                                    _ps_op, _ps_linear = ld_shared_v2_b32(_s_ti)
-                                    # Signal all DMA warp threads to dispatch store
-                                    st_shared_i32(dispatch_store_slot_ptr, _s_slot)
-                                    has_pending_store = Int32(1)
-
-                        # STEP 4: DONE — all fetched, all stored, nothing pending,
-                        # and not in an inner loop.
-                        if _inner_iter == Int32(0):
-                            if next_instr_idx >= num_instructions:
-                                if store_idx >= produce_idx:
-                                    if has_pending_store == Int32(0):
-                                        iter_done = Int32(1)
-                        st_shared_i32(flags_ptr, iter_done)
-
-                    # ALL DMA WARP THREADS: dispatch load if thread 0
-                    # flagged a slot. Required for TMA warp convergence
-                    # (cute.copy for TMA must be called by all warp threads).
-                    # Non-TMA ops are wrapped in elect_one() by compile_load.
+                    # ALL LOAD WARP THREADS: dispatch load if thread 0
+                    # flagged a slot. Required for TMA warp convergence.
                     _dl_slot = ld_shared_i32(dispatch_load_slot_ptr)
                     if _dl_slot != Int32(-1):
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
@@ -1410,13 +1183,7 @@ class Megakernel:
                             _dl_op, _dl_lin)
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
-                        _dl_iter = ld_shared_i32(inner_iter_idx_ptr)
-                        _dl_depth = ld_shared_i32(inner_depth_ptr)
-                        _dl_buf = _dl_iter % _dl_depth
-                        _dl_mbar = _kblock_ready_mbar(smem_base, _dl_slot, _dl_buf)
-                        # Per-page prev linear idx: written by thread 0 in produce step.
-                        # Contains old linear tile idx if same op previously used this
-                        # page slot, -1 otherwise. Decompose to coords for load dispatch.
+                        _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
                         _ep_lin = ld_shared_i32(prev_linear_ptr)
                         _ep_0 = Int32(-1)
                         _ep_1 = Int32(-1)
@@ -1431,7 +1198,7 @@ class Megakernel:
                         dispatch_load(
                             _dl_op, _dl_pp,
                             _dl_0, _dl_1, _dl_2, _dl_3, _dl_4,
-                            _dl_config, _dl_mbar, _dl_iter,
+                            _dl_config, _dl_mbar,
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4,
                         )
                         if tracing:
@@ -1442,55 +1209,65 @@ class Megakernel:
                                         _dma_lane, Int32(trace_load_fmts[_i]), _dl_op,
                                     )
 
-                    # ALL DMA WARP THREADS: dispatch store if thread 0
-                    # flagged a slot. Same pattern as dispatch_load —
-                    # needed for TMA S2G warp convergence.
-                    # Non-TMA ops are wrapped in elect_one() by compile_store.
-                    _ds_slot = ld_shared_i32(dispatch_store_slot_ptr)
-                    if _ds_slot != Int32(-1):
-                        _ds_ti = smem_base + Int32(ring_state_offset) + _ds_slot * Int32(tile_info_bytes)
+                    # Yield when idle: no load dispatched this iteration.
+                    if _dl_slot == Int32(-1):
+                        nanosleep(Int32(5000))
+
+                    done = ld_shared_i32(load_done_ptr)
+
+                if tracing:
+                    finish_lane_dynamic_raw(_trace_buf, _dma_lane)
+
+            # ========== STORE WARP LOOP ==========
+            # Waits for compute_done, dispatches TMA stores, signals barriers.
+            # Only blocks when compute is not done (mbarrier_wait).
+            if is_store_warp:
+                _sw_done = Int32(0)
+                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
+                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
+                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+
+                while _sw_done == Int32(0):
+                    _s_idx = ld_shared_i32(store_idx_ptr)
+                    _p_idx = ld_shared_i32(produce_idx_ptr)
+
+                    if _s_idx < _p_idx:
+                        _s_slot = _s_idx % Int32(num_pages)
+                        _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+
+                        # ALL 32 store warp threads block on compute_done.
+                        # Removes warp from scheduler when compute is slow.
+                        mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
+
+                        # ALL 32 threads dispatch store (TMA warp convergence)
+                        _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                         _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
                         _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(
                             _ds_op, _ds_lin)
-                        _ds_pp = _get_page_ptr(smem_base, _ds_slot)
+                        _ds_pp = _get_page_ptr(smem_base, _s_slot)
                         _ds_config = ld_global_i64(op_configs_ptr, _ds_op)
-                        if tracing:
-                            _ts2 = trace_start()
                         dispatch_store(
                             _ds_op, _ds_pp,
                             _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
                             _ds_config,
                         )
                         cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0)
-                        if tracing:
-                            for _i in range_constexpr(num_ops):
-                                if _ds_op == Int32(_i):
-                                    _dma_lane = end_event_dynamic_raw_1(
-                                        _ts2, _trace_buf, Int32(trace_row_stride),
-                                        _dma_lane, Int32(trace_store_fmts[_i]), _ds_op,
-                                    )
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
 
-                    # Yield when idle: if no load or store was dispatched
-                    # this iteration, sleep to prevent the DMA warp's tight
-                    # polling loop from starving MMA warps (Blackwell SM 12.0).
-                    if _dl_slot == Int32(-1):
-                        if _ds_slot == Int32(-1):
+                        # Thread 0: signal barriers + update store_idx
+                        if lane_id == Int32(0):
+                            signal_barriers(
+                                _ds_op, _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
+                                barriers_ptr,
+                            )
+                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))
+
+                    if _s_idx >= _p_idx:
+                        # No tiles to store — check if load warp is done
+                        if ld_shared_i32(load_done_ptr) == Int32(1):
+                            _sw_done = Int32(1)
+                        if ld_shared_i32(load_done_ptr) != Int32(1):
                             nanosleep(Int32(5000))
-
-                    done = ld_shared_i32(flags_ptr)
-
-                # SENTINEL: wake MMA warps to exit
-                if lane_id == Int32(0):
-                    _sent = produce_idx % Int32(num_pages)
-                    st_shared_i32(
-                        smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
-                        Int32(TileInstruction.END_MARKER),
-                    )
-                    mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
-
-                if tracing:
-                    finish_lane_dynamic_raw(_trace_buf, _dma_lane)
 
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
@@ -1526,12 +1303,6 @@ class Megakernel:
                         mma_running = Int32(0)
 
                     if op_idx != Int32(TileInstruction.END_MARKER):
-                        # Wait for first K-block data on kblock_ready[buf=0].
-                        # Phase is always 0: kblock_ready is re-initialized
-                        # per tile so phase resets.
-                        mbarrier_wait(
-                            _kblock_ready_mbar(smem_base, slot, Int32(0)), Int32(0)
-                        )
                         if tracing:
                             _mma_lane = end_event_dynamic_raw_1(
                                 _tw, _trace_buf, Int32(trace_row_stride),
@@ -1547,18 +1318,10 @@ class Megakernel:
                         if tracing:
                             _tc = trace_start()
 
-                        # Compute — pass kblock_ready[buf=0] base for inner
-                        # iteration sync (ignored by ops without inner loops).
-                        # Phase for buf 0 starts at 1 (framework consumed
-                        # phase 0). Other bufs start at phase 0.
-                        _kb_mbar = _kblock_ready_mbar(smem_base, slot, Int32(0))
-                        _sc_mbar = _smem_consumed_mbar(smem_base, slot, Int32(0))
-                        _kb_phase = Int32(1)
                         dispatch_compute(
                             op_idx, page_ptr,
                             tile_0, tile_1, tile_2, tile_3, tile_4,
                             op_config_ptr,
-                            _kb_mbar, _sc_mbar, _kb_phase,
                         )
 
                         # Sync MMA warps post-compute
@@ -1586,20 +1349,14 @@ class Megakernel:
             dispatch_load, dispatch_compute, dispatch_store,
             signal_barriers, _get_page_ptr,
             num_sms, threads_per_block, smem_size,
-            num_pages, scratch_offset, flags_offset, ring_state_offset,
+            num_pages, iq_offset, flags_offset, ring_state_offset,
             extra_exec_globals={
                 "_work_notify_mbar": _work_notify_mbar,
                 "_compute_done_mbar": _compute_done_mbar,
-                "_smem_consumed_mbar": _smem_consumed_mbar,
-                "_kblock_ready_mbar": _kblock_ready_mbar,
-                "get_inner_iters": get_inner_iters,
-                "get_inner_depth": get_inner_depth,
-                "max_inner_depth": max_inner_depth,
                 "check_barriers": check_barriers,
                 "decompose_tile": decompose_tile,
                 "ld_shared_v2_b32": ld_shared_v2_b32,
                 "st_shared_v2_b32": st_shared_v2_b32,
-                "mbarrier_try_wait": mbarrier_try_wait,
                 "num_mma_warps": num_mma_warps,
                 "num_compute_threads": num_compute_threads,
                 "threads_per_block": threads_per_block,
@@ -1608,7 +1365,12 @@ class Megakernel:
                 "dma_reg_count": dma_reg_count,
                 "mma_reg_count": mma_reg_count,
                 "tile_info_bytes": tile_info_bytes,
-                "has_inner_iters": has_inner_iters,
+                "IQ_DEPTH": IQ_DEPTH,
+                "FLAG_DISPATCH_LOAD": FLAG_DISPATCH_LOAD,
+                "FLAG_PREV_LINEAR": FLAG_PREV_LINEAR,
+                "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
+                "FLAG_STORE_IDX": FLAG_STORE_IDX,
+                "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
                 **trace_exec_globals,
             },
         )

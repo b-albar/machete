@@ -235,8 +235,9 @@ class FlashAttentionSm100Op(Op):
         """Return recommended MegakernelConfig for the given scheduled ops."""
         from machete.megakernel import MegakernelConfig
         tile_m = ops[0].tile_sizes["M"]
+        from machete.megakernel.megakernel import NUM_DMA_WARPS
         num_mma_warps = tile_m // 16
-        threads_per_block = (num_mma_warps + 1) * 32
+        threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
             threads_per_block=threads_per_block,
