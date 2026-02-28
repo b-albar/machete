@@ -17,9 +17,9 @@ Barrier Mapping:
     - expected = 1 (single signal per barrier)
 
 Test Strategy:
-    Producer: writes value (tile_m + 1) to output[tile_m]
-    Consumer: reads input[tile_m], writes input[tile_m] * 2 to output[tile_m]
-    Verify: output == (tile_m + 1) * 2 for all tiles
+    Producer: writes value (tile_0 + 1) to output[tile_0]
+    Consumer: reads input[tile_0], writes input[tile_0] * 2 to output[tile_0]
+    Verify: output == (tile_0 + 1) * 2 for all tiles
 """
 
 import pytest
@@ -32,13 +32,7 @@ from cutlass import Int32, Int64
 from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import st_global_i32, ld_global_i32
-
-
-def is_hopper_available():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+from machete.utils.testing import is_hopper_available
 
 
 # =============================================================================
@@ -56,52 +50,40 @@ _consumer_result_ptr = 0
 
 class ProducerOp(Op):
     """
-    Writes (tile_m + 1) to producer_result[tile_m].
+    Writes (tile_0 + 1) to producer_result[tile_0].
 
     This simple operation allows verifying that the producer ran
     and wrote the expected value before the consumer reads it.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = ["data"]
 
-    @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
-            # Write (tile_m + 1) to producer result
-            value = tile_m + Int32(1)
-            st_global_i32(Int64(_producer_result_ptr), tile_m, value)
+            # Write (tile_0 + 1) to producer result
+            value = tile_0 + Int32(1)
+            st_global_i32(Int64(_producer_result_ptr), tile_0, value)
 
 
 class ConsumerOp(Op):
     """
-    Reads producer_result[tile_m], writes producer_result[tile_m] * 2 to consumer_result[tile_m].
+    Reads producer_result[tile_0], writes producer_result[tile_0] * 2 to consumer_result[tile_0].
 
     If barrier synchronization works correctly, the consumer will read
-    the value written by the producer (tile_m + 1) and write (tile_m + 1) * 2.
+    the value written by the producer (tile_0 + 1) and write (tile_0 + 1) * 2.
     """
-    NUM_INPUT_PAGES: ClassVar[int] = 0
-    NUM_OUTPUT_PAGES: ClassVar[int] = 0
     INPUTS: ClassVar[List[str]] = ["data"]
     OUTPUTS: ClassVar[List[str]] = []
 
-    @staticmethod
-    def forward(
-        smem_base: Int32, config_ptr: Int32, page_ids: tuple,
-        tile_m: Int32, tile_n: Int32, tile_l: Int32,
-        op_config_ptr: Int64,
-    ) -> None:
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
         if tidx == Int32(0):
             # Read from producer, multiply by 2, write to consumer result
-            val = ld_global_i32(Int64(_producer_result_ptr), tile_m)
-            st_global_i32(Int64(_consumer_result_ptr), tile_m, val * Int32(2))
+            val = ld_global_i32(Int64(_producer_result_ptr), tile_0)
+            st_global_i32(Int64(_consumer_result_ptr), tile_0, val * Int32(2))
 
 
 # =============================================================================
@@ -123,9 +105,9 @@ class TestOneToOneSameSizeGPU:
                           ▼   ▼   ▼   ▼
         Consumer tiles:  [0] [1] [2] [3]
 
-    Each producer writes (tile_m + 1).
+    Each producer writes (tile_0 + 1).
     Each consumer reads that value and multiplies by 2.
-    Expected output: (tile_m + 1) * 2 = [2, 4, 6, 8]
+    Expected output: (tile_0 + 1) * 2 = [2, 4, 6, 8]
     """
 
     def test_simple_chain(self):
@@ -145,21 +127,21 @@ class TestOneToOneSameSizeGPU:
         _consumer_result_ptr = consumer_results.data_ptr()
 
         ops = [
-            ScheduledOp(ProducerOp, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(ConsumerOp, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(ProducerOp, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(ConsumerOp, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
-        # Verify producer: tile_m + 1
+        # Verify producer: tile_0 + 1
         expected_producer = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda")
         assert torch.equal(producer_results, expected_producer), (
             f"Producer mismatch: expected {expected_producer.tolist()}, got {producer_results.tolist()}"
         )
 
-        # Verify consumer: (tile_m + 1) * 2
+        # Verify consumer: (tile_0 + 1) * 2
         expected_consumer = torch.tensor([2, 4, 6, 8], dtype=torch.int32, device="cuda")
         assert torch.equal(consumer_results, expected_consumer), (
             f"Consumer mismatch: expected {expected_consumer.tolist()}, got {consumer_results.tolist()}"
@@ -181,8 +163,8 @@ class TestOneToOneSameSizeGPU:
         _consumer_result_ptr = consumer_results.data_ptr()
 
         ops = [
-            ScheduledOp(ProducerOp, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(ConsumerOp, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(ProducerOp, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(ConsumerOp, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)
@@ -210,11 +192,11 @@ class TestOneToOneSameSizeGPU:
         Three-op chain: A -> B -> C
 
         Diagram:
-            Op A writes: tile_m + 1
+            Op A writes: tile_0 + 1
             Op B reads, multiplies by 2, writes
             Op C reads, multiplies by 3, writes
 
-            Expected: (tile_m + 1) * 2 * 3 = (tile_m + 1) * 6
+            Expected: (tile_0 + 1) * 2 * 3 = (tile_0 + 1) * 6
         """
         global _opa_result_ptr, _opb_result_ptr, _opc_result_ptr
         num_tiles = 8
@@ -225,42 +207,36 @@ class TestOneToOneSameSizeGPU:
         _opc_result_ptr = 0
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    st_global_i32(Int64(_opa_result_ptr), tile_m, tile_m + Int32(1))
+                    st_global_i32(Int64(_opa_result_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["buf2"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_opa_result_ptr), tile_m)
-                    st_global_i32(Int64(_opb_result_ptr), tile_m, val * Int32(2))
+                    val = ld_global_i32(Int64(_opa_result_ptr), tile_0)
+                    st_global_i32(Int64(_opb_result_ptr), tile_0, val * Int32(2))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["buf2"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_opb_result_ptr), tile_m)
-                    st_global_i32(Int64(_opc_result_ptr), tile_m, val * Int32(3))
+                    val = ld_global_i32(Int64(_opb_result_ptr), tile_0)
+                    st_global_i32(Int64(_opc_result_ptr), tile_0, val * Int32(3))
 
         buf1 = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
         buf2 = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
@@ -271,9 +247,9 @@ class TestOneToOneSameSizeGPU:
         _opc_result_ptr = buf3.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=num_tiles, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=num_tiles, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(num_tiles,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(num_tiles,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)

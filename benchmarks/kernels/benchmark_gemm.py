@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 # Copyright (c) 2025, Machete Authors
-"""Benchmark GEMM: Megakernel vs PyTorch vs cuBLAS.
+"""Benchmark GEMM: Megakernel vs PyTorch.
 
-Compares GPU kernel execution time and compute throughput of GEMM
-implementations across various matrix sizes.
-
-Implementations:
-- PyTorch: torch.mm (backed by cuBLAS)
-- Megakernel: Machete megakernel framework GemmOp
+Compares GPU kernel execution time of the megakernel GemmOp (tensor core MMA
+with TMA store_add K-reduction) against PyTorch's torch.matmul across
+LLM-scale matrix shapes. Both implementations are measured using CUDA event
+timing for fair comparison.
 
 Usage:
     python benchmarks/kernels/benchmark_gemm.py
@@ -18,113 +16,109 @@ import io
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel
 from machete.kernels.gemm import GemmOp
 from machete.utils.benchmark import Benchmark
-from machete.utils.testing import is_hopper_available
 
 try:
     import cutlass  # noqa: F401
+
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
 
 
-def gemm_flops(m, n, k):
-    """Compute FLOPs for GEMM: 2 * M * N * K (multiply-add)."""
-    return 2 * m * n * k
+def is_sm90_or_newer():
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor >= 90
 
 
-def gemm_bytes(m, n, k, dtype_bytes=2):
+def gemm_bytes(M, K, N, dtype):
     """Total bytes read + written for GEMM.
 
     Reads: A (M*K) + B (N*K)
     Writes: C (M*N)
     """
-    return (m * k + n * k + m * n) * dtype_bytes
+    elem_bytes = 2 if dtype in ("float16", "bfloat16") else 4
+    return (M * K + N * K + M * N) * elem_bytes
+
+
+def gemm_flops(M, K, N, dtype):
+    """FLOPs for GEMM: 2*M*N*K (multiply-add)."""
+    return 2 * M * N * K
+
+
+def compute_tile_sizes(M, K, N, elem_bytes=2, inner_depth=1):
+    """Compute tile sizes that fit in a 16KB page.
+
+    Constraints:
+      - inner_depth * (tile_M + tile_N) * tile_K * elem_bytes <= page_size
+      - tile_M * tile_N * elem_bytes <= page_size  (C during store)
+      - tile_K must be a multiple of 16 (MMA instruction size)
+    """
+    tile_k = 32
+
+    # Start with large tile_M, tile_N and shrink if needed
+    for tile_m, tile_n in [(128, 64), (64, 64), (64, 32), (32, 32)]:
+        ab_bytes = inner_depth * (tile_m + tile_n) * tile_k * elem_bytes
+        c_bytes = tile_m * tile_n * elem_bytes
+        if ab_bytes <= 16384 and c_bytes <= 16384:
+            return tile_m, tile_n, tile_k
+
+    return 32, 32, 16
 
 
 # =============================================================================
 # Benchmark Setup
 # =============================================================================
 
-
-@Benchmark.parametrize("m", [512, 1024, 2048, 4096])
-@Benchmark.parametrize("n", [512, 1024, 2048, 4096])
-@Benchmark.parametrize("k", [512, 1024, 2048])
-def bench_gemm(m, n, k):
+# LLM-scale shapes: (batch*seq, hidden, proj)
+# Typical hidden=4096, FFN=4*hidden=16384, batch*seq=1-8192
+@Benchmark.parametrize("dtype", ["bfloat16"])
+@Benchmark.parametrize("N", [4096, 8192, 16384])
+@Benchmark.parametrize("K", [4096, 8192])
+@Benchmark.parametrize("M", [128, 512, 2048, 4096])
+def bench_gemm(M, K, N, dtype):
     """Setup GEMM benchmark functions for each implementation."""
-    torch.manual_seed(42)
-    dtype = torch.float16
+    torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
+    elem_bytes = 2
 
-    a = torch.randn(m, k, dtype=dtype, device="cuda")
-    b = torch.randn(n, k, dtype=dtype, device="cuda")
+    torch.manual_seed(42)
+    a = torch.randn(M, K, dtype=torch_dtype, device="cuda")
+    b = torch.randn(K, N, dtype=torch_dtype, device="cuda")
+    b_t = b.t().contiguous()  # (N, K) layout for GemmOp
 
     funcs = {}
 
     # PyTorch (cuBLAS)
-    def pytorch_gemm():
-        return torch.mm(a, b.t())
+    funcs["pytorch"] = lambda: torch.matmul(a, b)
 
-    funcs["pytorch"] = pytorch_gemm
+    # Megakernel GemmOp (double-buffered K-pipeline)
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        inner_depth = 2
+        tile_m, tile_n, tile_k = compute_tile_sizes(
+            M, K, N, elem_bytes, inner_depth=inner_depth)
+        c = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
 
-    # Megakernel (requires Hopper+)
-    if is_hopper_available() and CUTLASS_AVAILABLE:
-        c = torch.empty(m, n, dtype=dtype, device="cuda")
+        ops = GemmOp.schedule(
+            a=a, b=b_t, c=c,
+            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+            inner_depth=inner_depth,
+        )
+        config = GemmOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
 
-        # Schedule GEMM operation
-        scheduled_op = GemmOp.schedule(a=a, b=b, c=c)
+        # Trigger compilation + first run
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel.run()
+        torch.cuda.synchronize()
 
-        ops = [scheduled_op]
-        config = MegakernelConfig(threads_per_block=256)
-
-        try:
-            kernel = Megakernel(ops, config=config)
-
-            # Trigger compilation + first run
-            with contextlib.redirect_stdout(io.StringIO()):
-                kernel.run()
-            torch.cuda.synchronize()
-
-            funcs["megakernel"] = kernel.bench_spec(keep_alive=[a, b, c])
-        except Exception as e:
-            print(f"Megakernel compilation failed for M={m}, N={n}, K={k}: {e}")
-
-    return funcs
-
-
-@Benchmark.parametrize("size", [512, 1024, 2048, 4096])
-def bench_gemm_square(size):
-    """Benchmark square matrices (M=N=K)."""
-    torch.manual_seed(42)
-    dtype = torch.float16
-    m = n = k = size
-
-    a = torch.randn(m, k, dtype=dtype, device="cuda")
-    b = torch.randn(n, k, dtype=dtype, device="cuda")
-
-    funcs = {}
-
-    # PyTorch (cuBLAS)
-    funcs["pytorch"] = lambda: torch.mm(a, b.t())
-
-    # Megakernel
-    if is_hopper_available() and CUTLASS_AVAILABLE:
-        c = torch.empty(m, n, dtype=dtype, device="cuda")
-        scheduled_op = GemmOp.schedule(a=a, b=b, c=c)
-
-        ops = [scheduled_op]
-        config = MegakernelConfig(threads_per_block=256)
-
-        try:
-            kernel = Megakernel(ops, config=config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                kernel.run()
-            torch.cuda.synchronize()
-
-            funcs["megakernel"] = kernel.bench_spec(keep_alive=[a, b, c])
-        except Exception as e:
-            print(f"Megakernel compilation failed for size={size}: {e}")
+        funcs["megakernel"] = kernel.bench_spec(
+            setup_fn=lambda: c.zero_(),
+            keep_alive=[a, b_t, c],
+        )
 
     return funcs
 
@@ -136,40 +130,20 @@ def bench_gemm_square(size):
 
 if __name__ == "__main__":
     print("=" * 100)
-    print("GEMM Benchmark: Megakernel vs PyTorch (cuBLAS)")
+    print("GEMM Benchmark: Megakernel vs PyTorch")
     print("=" * 100)
 
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {props.name} ({props.multi_processor_count} SMs)")
-        print(f"Hopper+: {is_hopper_available()}")
-    print(f"CUTLASS (megakernel): {CUTLASS_AVAILABLE}")
+        print(f"SM_90+: {is_sm90_or_newer()}")
+    print(f"CUTLASS: {CUTLASS_AVAILABLE}")
     print()
-
-    print("-" * 100)
-    print("Square Matrix Benchmark (M=N=K)")
-    print("-" * 100)
-
-    bench_gemm_square._benchmark.run(
-        mode="kernel",
-        bytes_fn=lambda size: gemm_bytes(size, size, size),
-        warmup=10,
-        rep=50,
-    )
-
-    print()
-    print("-" * 100)
-    print("General Matrix Benchmark")
-    print("-" * 100)
-
-    # Run only a subset to keep benchmark time reasonable
-    bench_gemm._benchmark.parameters["m"] = [1024, 2048]
-    bench_gemm._benchmark.parameters["n"] = [1024, 2048]
-    bench_gemm._benchmark.parameters["k"] = [1024]
 
     bench_gemm._benchmark.run(
         mode="kernel",
-        bytes_fn=lambda m, n, k: gemm_bytes(m, n, k),
-        warmup=10,
-        rep=50,
+        flops=gemm_flops,
+        bytes_fn=gemm_bytes,
+        warmup=25,
+        rep=100,
     )

@@ -24,6 +24,8 @@ class Benchmark:
     def __init__(self):
         self.parameters = {}
         self.func = {}
+        self._configs = None
+        self._config_names = None
 
     @classmethod
     def parametrize(cls, param_name: str, values: List[Any]):
@@ -34,6 +36,35 @@ class Benchmark:
             func._benchmark.func = func
             return func
 
+        return decorator
+
+    @classmethod
+    def configs(cls, param_names: List[str], config_list: List[tuple]):
+        """Parametrize with explicit configs (no cartesian product).
+
+        Unlike ``parametrize`` which generates all combinations, this accepts
+        a list of specific parameter tuples to benchmark.
+
+        Args:
+            param_names: Parameter names, e.g. ["BH", "M", "N", "D"].
+            config_list: List of tuples, each matching param_names order.
+
+        Example::
+
+            @Benchmark.configs(["BH", "M", "N", "D"], [
+                (32, 16, 128, 128),
+                (32, 64, 256, 128),
+            ])
+            def bench_fn(BH, M, N, D):
+                ...
+        """
+        def decorator(func):
+            if not hasattr(func, "_benchmark"):
+                func._benchmark = cls()
+            func._benchmark._config_names = param_names
+            func._benchmark._configs = config_list
+            func._benchmark.func = func
+            return func
         return decorator
 
     def _plot_graphics(self, results, path_graphics, key_split, memory=False, is_flops=False):
@@ -115,11 +146,15 @@ class Benchmark:
                 plt.close()
 
     def _bench_kernel_func(self, func_or_spec, warmup, rep):
-        """Benchmark a single function or KernelBenchSpec using CUDA graphs.
+        """Benchmark a single function or KernelBenchSpec.
+
+        For KernelBenchSpec: per-iteration CUDA event timing with barrier
+        resets (persistent megakernel is incompatible with CUDA graph replay).
+        For callables: CUDA graph capture + replay.
 
         Args:
             func_or_spec: A callable (benchmarked with torch CUDA graphs)
-                or a KernelBenchSpec (benchmarked with cute.testing.benchmark).
+                or a KernelBenchSpec (benchmarked with per-iteration events).
             warmup: Number of warmup iterations.
             rep: Number of timed iterations.
 
@@ -127,20 +162,51 @@ class Benchmark:
             Execution time in milliseconds.
         """
         if isinstance(func_or_spec, KernelBenchSpec):
-            torch_stream, cu_stream = func_or_spec.stream
+            torch_stream, _ = func_or_spec.stream
+            launch = func_or_spec.launch_fn
+            setup = func_or_spec.setup_fn
+
             with torch.cuda.stream(torch_stream):
-                time_us = benchmark_jit_kernel(
-                    func_or_spec.compiled_kernel,
-                    workspace_generator=func_or_spec.workspace_generator,
-                    warmup_iterations=warmup,
-                    iterations=rep,
-                    workspace_count=func_or_spec.workspace_count,
-                    stream=cu_stream,
-                    use_cuda_graphs=True,
-                )
-            return time_us / 1000.0
+                # Warmup
+                for _ in range(warmup):
+                    if setup is not None:
+                        setup()
+                    launch()
+                torch_stream.synchronize()
+
+                # Timed iterations with CUDA events
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                times = []
+                for _ in range(rep):
+                    if setup is not None:
+                        setup()
+                    start.record(torch_stream)
+                    launch()
+                    end.record(torch_stream)
+                    torch_stream.synchronize()
+                    times.append(start.elapsed_time(end))
+
+            return sum(times) / len(times)
         else:
-            return benchmark_cuda_graph(func_or_spec, warmup=warmup, rep=rep)
+            try:
+                return benchmark_cuda_graph(func_or_spec, warmup=warmup, rep=rep)
+            except Exception:
+                # Fallback to per-iteration CUDA event timing (e.g. for
+                # CuTe DSL compiled kernels that don't support graph capture).
+                for _ in range(warmup):
+                    func_or_spec()
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                times = []
+                for _ in range(rep):
+                    start.record()
+                    func_or_spec()
+                    end.record()
+                    torch.cuda.synchronize()
+                    times.append(start.elapsed_time(end))
+                return sum(times) / len(times)
 
     def _print_kernel_summary(self, results, names, bytes_fn):
         """Print a formatted summary table for kernel benchmark results."""
@@ -203,6 +269,61 @@ class Benchmark:
 
         print("=" * 120)
 
+    def _print_kernel_header(self, names, bytes_fn):
+        """Print table header for line-by-line kernel benchmark output."""
+        has_gbps = bytes_fn is not None
+        baseline_name = names[0] if names else None
+
+        header = f"{'Config':<40}"
+        for name in names:
+            if has_gbps:
+                header += f" {name:>16}"
+            else:
+                header += f" {name + ' (ms)':>14}"
+            if name != baseline_name:
+                header += f" {'speedup':>8}"
+        print(header)
+
+        if has_gbps:
+            sub = f"{'':<40}"
+            for name in names:
+                sub += f" {'ms':>8} {'GB/s':>7}"
+                if name != baseline_name:
+                    sub += f" {'':<8}"
+            print(sub)
+
+        print("-" * len(header))
+
+    def _print_kernel_row(self, params, func_results, names, bytes_fn):
+        """Print a single result row for kernel benchmark."""
+        has_gbps = bytes_fn is not None
+        baseline_name = names[0] if names else None
+
+        label = ", ".join(f"{k}={v}" for k, v in params.items())
+        if len(label) > 39:
+            label = label[:36] + "..."
+        line = f"{label:<40}"
+
+        baseline_ms = None
+        for name in names:
+            data = func_results.get(name, {})
+            time_ms = data.get("time_ms", float("nan"))
+
+            if baseline_ms is None:
+                baseline_ms = time_ms
+
+            if has_gbps:
+                gbps = data.get("gbps", float("nan"))
+                line += f" {time_ms:>8.3f} {gbps:>7.1f}"
+            else:
+                line += f" {time_ms:>14.3f}"
+
+            if name != baseline_name and baseline_ms and baseline_ms > 0:
+                speedup = baseline_ms / time_ms if time_ms > 0 else float("inf")
+                line += f" {speedup:>7.2f}x"
+
+        print(line, flush=True)
+
     def run(
         self,
         flops: Optional[Callable] = None,
@@ -217,16 +338,21 @@ class Benchmark:
         rep: int = 100,
         print_summary: bool = True,
     ):
-        param_names = list(self.parameters.keys())
-        param_values = list(self.parameters.values())
+        if self._configs is not None:
+            param_names = self._config_names
+            all_combinations = self._configs
+        else:
+            param_names = list(self.parameters.keys())
+            param_values = list(self.parameters.values())
+            all_combinations = list(itertools.product(*param_values))
 
         results = {}
 
         names_seen = set()
         names_ordered = []
+        _header_printed = False
 
-        for combination in itertools.product(*param_values):
-            # get functions list
+        for combination in all_combinations:
             params = dict(zip(param_names, combination))
 
             try:
@@ -323,12 +449,16 @@ class Benchmark:
                         results[str(params)][func_name]["bwd"] = 0.0
                         results[str(params)][func_name]["memory"] = 0.0
 
-            # Cleanup between parameter combinations
+            # Line-by-line printing for kernel mode
             if mode == "kernel":
+                if not _header_printed and names_ordered:
+                    self._print_kernel_header(names_ordered, bytes_fn)
+                    _header_printed = True
+                if str(params) in results:
+                    self._print_kernel_row(
+                        params, results[str(params)], names_ordered, bytes_fn,
+                    )
                 torch.cuda.empty_cache()
-
-        if mode == "kernel" and print_summary:
-            self._print_kernel_summary(results, names_ordered, bytes_fn)
 
         if export_graphics and mode != "kernel":
             self._plot_graphics(results, path_graphics, key_split=key_split, memory=memory, is_flops=flops is not None)

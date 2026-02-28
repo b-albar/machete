@@ -7,29 +7,28 @@ instruction stream and fine-grained tile-level barriers for maximum
 pipeline overlap between operations.
 
 Usage:
-    from machete.megakernel import ScheduledOp, Megakernel, NOPOp
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormOp
 
-    ops = [
-        ScheduledOp(NOPOp, tiles_m=32),
-        ScheduledOp(NOPOp, tiles_m=32),  # Overlaps with first op!
-    ]
-
+    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """
 
 from .ops import (
+    DEFAULT_PAGE_SIZE,
     Op,
-    NOPOp,
     ScheduledOp,
+    TensorMeta,
     BarrierFormula,
     INSTRUCTION_WORDS,
     TileInstruction,
     InstructionStreamBuilder,
+    validate_op_compatibility,
+    build_op_config,
 )
 
 from .compile import (
-    compile_op,
     cleanup_linecache,
 )
 
@@ -37,7 +36,6 @@ from .megakernel import (
     MegakernelConfig,
     Megakernel,
     create_megakernel,
-    get_smem_base_ptr,
 )
 
 from .interpreter import (
@@ -45,6 +43,7 @@ from .interpreter import (
     global_barrier_signal,
     load_instruction_to_smem,
     st_global_i32,
+    get_smem_base_ptr,
 )
 
 from .autograd_op import AutogradOp, TensorSpec
@@ -55,18 +54,20 @@ from .functional import megakernel_apply, MegakernelModule
 __all__ = [
     # Operation Protocol
     "Op",
-    "NOPOp",
     "ScheduledOp",
+    "TensorMeta",
+    "validate_op_compatibility",
+    "build_op_config",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
-    "compile_op",
     "cleanup_linecache",
     # Instruction Stream
     "INSTRUCTION_WORDS",
     "TileInstruction",
     "InstructionStreamBuilder",
     # Configuration & Megakernel
+    "DEFAULT_PAGE_SIZE",
     "MegakernelConfig",
     "Megakernel",
     "create_megakernel",

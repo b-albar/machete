@@ -12,7 +12,7 @@ Tests combinations of 1D and 2D ops in a chain.
        16 tiles       4 tiles       16 tiles
 
 Test Strategy:
-    A: writes tile_m * 1000 + tile_n to matrix[m * N + n]
+    A: writes tile_0 * 1000 + tile_1 to matrix[m * N + n]
     B: reads matrix, writes m * 100 + 1 to buf[m]
     C: reads buf[m], writes buf[m] * (n + 1) to output[m * N + n]
     Verify: output[m * N + n] = (m * 100 + 1) * (n + 1)
@@ -28,13 +28,7 @@ from cutlass import Int32, Int64
 from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import st_global_i32, ld_global_i32
-
-
-def is_hopper_available():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+from machete.utils.testing import is_hopper_available
 
 
 # =============================================================================
@@ -74,45 +68,39 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    idx = tile_m * Int32(_num_cols) + tile_n
-                    st_global_i32(Int64(_matrix_ptr), idx, tile_m * Int32(1000) + tile_n)
+                    idx = tile_0 * Int32(_num_cols) + tile_1
+                    st_global_i32(Int64(_matrix_ptr), idx, tile_0 * Int32(1000) + tile_1)
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["matrix"]
             OUTPUTS: ClassVar[List[str]] = ["buf"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    # Read last value for this M to verify all producers completed
-                    _ = ld_global_i32(Int64(_matrix_ptr), tile_m * Int32(_num_cols) + Int32(_num_cols - 1))
-                    st_global_i32(Int64(_buf_ptr), tile_m, tile_m * Int32(100) + Int32(1))
+                    # Read last value for this dim 0 to verify all producers completed
+                    _ = ld_global_i32(Int64(_matrix_ptr), tile_0 * Int32(_num_cols) + Int32(_num_cols - 1))
+                    st_global_i32(Int64(_buf_ptr), tile_0, tile_0 * Int32(100) + Int32(1))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["buf"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_buf_ptr), tile_m)
-                    out_idx = tile_m * Int32(_num_cols) + tile_n
-                    st_global_i32(Int64(_output_ptr), out_idx, val * (tile_n + Int32(1)))
+                    val = ld_global_i32(Int64(_buf_ptr), tile_0)
+                    out_idx = tile_0 * Int32(_num_cols) + tile_1
+                    st_global_i32(Int64(_output_ptr), out_idx, val * (tile_1 + Int32(1)))
 
         matrix = torch.zeros(tiles_m * tiles_n, dtype=torch.int32, device="cuda")
         buf = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
@@ -123,9 +111,9 @@ class TestChainMixedDimsGPU:
         _output_ptr = output.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
-            ScheduledOp(OpB, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpC, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
+            ScheduledOp(OpA, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
+            ScheduledOp(OpB, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpC, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
         ]
 
         config = MegakernelConfig(num_sms=2)
@@ -157,44 +145,38 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["buf1"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    st_global_i32(Int64(_buf1_ptr), tile_m, tile_m * Int32(10) + Int32(1))
+                    st_global_i32(Int64(_buf1_ptr), tile_0, tile_0 * Int32(10) + Int32(1))
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["buf1"]
             OUTPUTS: ClassVar[List[str]] = ["matrix"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_buf1_ptr), tile_m)
-                    out_idx = tile_m * Int32(_num_cols) + tile_n
-                    st_global_i32(Int64(_matrix_ptr), out_idx, val * (tile_n + Int32(1)))
+                    val = ld_global_i32(Int64(_buf1_ptr), tile_0)
+                    out_idx = tile_0 * Int32(_num_cols) + tile_1
+                    st_global_i32(Int64(_matrix_ptr), out_idx, val * (tile_1 + Int32(1)))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["matrix"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    # Read last value for this M
-                    val = ld_global_i32(Int64(_matrix_ptr), tile_m * Int32(_num_cols) + Int32(_num_cols - 1))
-                    st_global_i32(Int64(_output_ptr), tile_m, val * Int32(2))
+                    # Read last value for this dim 0
+                    val = ld_global_i32(Int64(_matrix_ptr), tile_0 * Int32(_num_cols) + Int32(_num_cols - 1))
+                    st_global_i32(Int64(_output_ptr), tile_0, val * Int32(2))
 
         buf1 = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
         matrix = torch.zeros(tiles_m * tiles_n, dtype=torch.int32, device="cuda")
@@ -205,9 +187,9 @@ class TestChainMixedDimsGPU:
         _output_ptr = output.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
-            ScheduledOp(OpC, tiles_m=tiles_m, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
+            ScheduledOp(OpC, tile_counts=(tiles_m,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)
@@ -241,58 +223,50 @@ class TestChainMixedDimsGPU:
         _num_cols = tiles_n
 
         class OpA(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = []
             OUTPUTS: ClassVar[List[str]] = ["a"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    st_global_i32(Int64(_a_ptr), tile_m, tile_m + Int32(1))
+                    st_global_i32(Int64(_a_ptr), tile_0, tile_0 + Int32(1))
 
         class OpB(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["a"]
             OUTPUTS: ClassVar[List[str]] = ["b"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    val = ld_global_i32(Int64(_a_ptr), tile_m)
-                    out_idx = tile_m * Int32(_num_cols) + tile_n
+                    val = ld_global_i32(Int64(_a_ptr), tile_0)
+                    out_idx = tile_0 * Int32(_num_cols) + tile_1
                     st_global_i32(Int64(_b_ptr), out_idx, val * Int32(10))
 
         class OpC(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["b"]
             OUTPUTS: ClassVar[List[str]] = ["c"]
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0, tile_1):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    in_idx = tile_m * Int32(_num_cols) + tile_n
+                    in_idx = tile_0 * Int32(_num_cols) + tile_1
                     val = ld_global_i32(Int64(_b_ptr), in_idx)
-                    st_global_i32(Int64(_c_ptr), in_idx, val + tile_n)
+                    st_global_i32(Int64(_c_ptr), in_idx, val + tile_1)
 
         class OpD(Op):
-            NUM_INPUT_PAGES: ClassVar[int] = 0
-            NUM_OUTPUT_PAGES: ClassVar[int] = 0
             INPUTS: ClassVar[List[str]] = ["c"]
             OUTPUTS: ClassVar[List[str]] = []
 
-            @staticmethod
-            def forward(smem_base, config_ptr, page_ids, tile_m, tile_n, tile_l, op_config_ptr):
+            @cute.jit
+            def compute(self, page_ptr, tile_0):
                 tidx = cute.arch.thread_idx()[0]
                 if tidx == Int32(0):
-                    # Read last value for this M
-                    val = ld_global_i32(Int64(_c_ptr), tile_m * Int32(_num_cols) + Int32(_num_cols - 1))
-                    st_global_i32(Int64(_d_ptr), tile_m, val)
+                    # Read last value for this dim 0
+                    val = ld_global_i32(Int64(_c_ptr), tile_0 * Int32(_num_cols) + Int32(_num_cols - 1))
+                    st_global_i32(Int64(_d_ptr), tile_0, val)
 
         a = torch.zeros(tiles_m, dtype=torch.int32, device="cuda")
         b = torch.zeros(tiles_m * tiles_n, dtype=torch.int32, device="cuda")
@@ -305,10 +279,10 @@ class TestChainMixedDimsGPU:
         _d_ptr = d.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tiles_m=tiles_m, dim_names={"batch": "m"}),
-            ScheduledOp(OpB, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
-            ScheduledOp(OpC, tiles_m=tiles_m, tiles_n=tiles_n, dim_names={"batch": "m", "seq": "n"}),
-            ScheduledOp(OpD, tiles_m=tiles_m, dim_names={"batch": "m"}),
+            ScheduledOp(OpA, tile_counts=(tiles_m,), dim_names={"batch": 0}),
+            ScheduledOp(OpB, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
+            ScheduledOp(OpC, tile_counts=(tiles_m, tiles_n), dim_names={"batch": 0, "seq": 1}),
+            ScheduledOp(OpD, tile_counts=(tiles_m,), dim_names={"batch": 0}),
         ]
 
         config = MegakernelConfig(num_sms=2)

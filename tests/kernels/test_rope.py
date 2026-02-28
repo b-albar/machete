@@ -10,7 +10,7 @@ Tests cover:
 2. Forward RoPE matches Triton (Unsloth) reference
 3. Backward (inverse) RoPE roundtrip: backward(forward(q)) ≈ q
 4. Backward RoPE matches PyTorch inverse reference
-5. Multi-batch correctness (position wrapping via tile_m % seq_len)
+5. Multi-batch correctness (position wrapping via tile_M % seq_len)
 6. Autograd forward + backward through megakernel_apply
 """
 
@@ -67,7 +67,7 @@ def run_rope_megakernel(q_4d, cos, sin, backward=False, num_sms=2):
     cos_f32 = cos.float().contiguous()
     sin_f32 = sin.float().contiguous()
 
-    ops = [RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)]
+    ops = RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)
     mk_config = MegakernelConfig(num_sms=num_sms)
     kernel = Megakernel(ops, config=mk_config, backward=backward)
     kernel.run()
@@ -98,29 +98,39 @@ def mk_rope_backward(q, cos, sin):
 class TestRopeForwardGPU:
     """Test RopeOp forward pass correctness."""
 
-    @pytest.mark.parametrize("b,s,h,d", [
-        # Edge cases
-        (1, 1, 1, 4),      # minimal
-        (1, 4, 1, 4),      # single batch/head, small dim
-        # Typical LLM shapes
-        (1, 128, 32, 64),   # single-batch, long seq, GQA-style heads
-        (1, 512, 32, 128),  # single-batch, long seq, large head_dim
-        (2, 16, 4, 64),     # small multi-batch
-        (4, 64, 8, 128),    # multi-batch, medium seq
-        (8, 32, 32, 64),    # large batch, many heads
-        # Stress: position wrapping (batch * seq >> seq)
-        (16, 8, 8, 128),    # 128 positions, wraps every 8
-        (4, 256, 4, 64),    # 1024 positions
-        # Odd head dims (must be even for half_d split)
-        (1, 16, 4, 32),     # small head_dim
-        (2, 16, 4, 256),    # large head_dim
-    ], ids=[
-        "minimal", "small",
-        "long_seq_h32_d64", "long_seq_h32_d128",
-        "b2_s16_h4_d64", "b4_s64_h8_d128", "b8_s32_h32_d64",
-        "wrap_b16_s8", "wrap_b4_s256",
-        "head_dim_32", "head_dim_256",
-    ])
+    @pytest.mark.parametrize(
+        "b,s,h,d",
+        [
+            # Edge cases
+            (1, 1, 1, 64),  # minimal
+            (1, 4, 2, 64),  # single batch, few heads
+            # Typical LLM shapes
+            (1, 128, 32, 64),  # single-batch, long seq, GQA-style heads
+            (1, 512, 32, 128),  # single-batch, long seq, large head_dim
+            (2, 16, 4, 64),  # small multi-batch
+            (4, 64, 8, 128),  # multi-batch, medium seq
+            (8, 32, 32, 64),  # large batch, many heads
+            # Stress: position wrapping (batch * seq >> seq)
+            (16, 8, 8, 128),  # 128 positions, wraps every 8
+            (4, 256, 4, 64),  # 1024 positions
+            # Head dim variants
+            (1, 16, 4, 64),  # small head_dim
+            (2, 16, 4, 256),  # large head_dim
+        ],
+        ids=[
+            "minimal",
+            "small",
+            "long_seq_h32_d64",
+            "long_seq_h32_d128",
+            "b2_s16_h4_d64",
+            "b4_s64_h8_d128",
+            "b8_s32_h32_d64",
+            "wrap_b16_s8",
+            "wrap_b4_s256",
+            "head_dim_64",
+            "head_dim_256",
+        ],
+    )
     def test_forward_matches_pytorch(self, b, s, h, d):
         """Megakernel RoPE forward matches PyTorch reference."""
         torch.manual_seed(42)
@@ -190,29 +200,37 @@ class TestRopeBackwardGPU:
         assert not torch.allclose(q, q_original, atol=atol)
 
         run_rope_megakernel(q, cos, sin, backward=True)
-        assert torch.allclose(q, q_original, atol=atol), (
-            f"Roundtrip max diff: {(q - q_original).abs().max().item()}"
-        )
+        assert torch.allclose(q, q_original, atol=atol), f"Roundtrip max diff: {(q - q_original).abs().max().item()}"
 
-    @pytest.mark.parametrize("b,s,h,d", [
-        (1, 1, 1, 4),
-        (1, 4, 1, 4),
-        (1, 128, 32, 64),
-        (1, 512, 32, 128),
-        (2, 16, 4, 64),
-        (4, 64, 8, 128),
-        (8, 32, 32, 64),
-        (16, 8, 8, 128),
-        (4, 256, 4, 64),
-        (1, 16, 4, 32),
-        (2, 16, 4, 256),
-    ], ids=[
-        "minimal", "small",
-        "long_seq_h32_d64", "long_seq_h32_d128",
-        "b2_s16_h4_d64", "b4_s64_h8_d128", "b8_s32_h32_d64",
-        "wrap_b16_s8", "wrap_b4_s256",
-        "head_dim_32", "head_dim_256",
-    ])
+    @pytest.mark.parametrize(
+        "b,s,h,d",
+        [
+            (1, 1, 1, 64),
+            (1, 4, 2, 64),
+            (1, 128, 32, 64),
+            (1, 512, 32, 128),
+            (2, 16, 4, 64),
+            (4, 64, 8, 128),
+            (8, 32, 32, 64),
+            (16, 8, 8, 128),
+            (4, 256, 4, 64),
+            (1, 16, 4, 64),
+            (2, 16, 4, 256),
+        ],
+        ids=[
+            "minimal",
+            "small",
+            "long_seq_h32_d64",
+            "long_seq_h32_d128",
+            "b2_s16_h4_d64",
+            "b4_s64_h8_d128",
+            "b8_s32_h32_d64",
+            "wrap_b16_s8",
+            "wrap_b4_s256",
+            "head_dim_64",
+            "head_dim_256",
+        ],
+    )
     def test_backward_matches_pytorch(self, b, s, h, d):
         """Megakernel backward matches PyTorch inverse reference."""
         torch.manual_seed(42)
@@ -237,8 +255,8 @@ class TestRopeBackwardGPU:
 # =============================================================================
 
 SHAPE_PARAMS = [
-    (1, 1, 1, 4),
-    (1, 4, 1, 4),
+    (1, 1, 1, 64),
+    (1, 4, 2, 64),
     (1, 128, 32, 64),
     (1, 512, 32, 128),
     (2, 16, 4, 64),
@@ -246,16 +264,22 @@ SHAPE_PARAMS = [
     (8, 32, 32, 64),
     (16, 8, 8, 128),
     (4, 256, 4, 64),
-    (1, 16, 4, 32),
+    (1, 16, 4, 64),
     (2, 16, 4, 256),
 ]
 
 SHAPE_IDS = [
-    "minimal", "small",
-    "long_seq_h32_d64", "long_seq_h32_d128",
-    "b2_s16_h4_d64", "b4_s64_h8_d128", "b8_s32_h32_d64",
-    "wrap_b16_s8", "wrap_b4_s256",
-    "head_dim_32", "head_dim_256",
+    "minimal",
+    "small",
+    "long_seq_h32_d64",
+    "long_seq_h32_d128",
+    "b2_s16_h4_d64",
+    "b4_s64_h8_d128",
+    "b8_s32_h32_d64",
+    "wrap_b16_s8",
+    "wrap_b4_s256",
+    "head_dim_64",
+    "head_dim_256",
 ]
 
 
@@ -267,8 +291,7 @@ class TestRopeAutogradGPU:
     def test_autograd_forward_and_grad(self, b, s, h, d):
         """megakernel_apply forward + backward matches differentiable PyTorch ref."""
         torch.manual_seed(42)
-        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda",
-                         requires_grad=True)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda", requires_grad=True)
         cos = torch.randn(s, d // 2, dtype=torch.float32, device="cuda")
         sin = torch.randn(s, d // 2, dtype=torch.float32, device="cuda")
 

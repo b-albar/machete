@@ -137,6 +137,8 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from machete.megakernel.interpreter import named_barrier_sync
+
 
 # =============================================================================
 # Inline PTX Operations for Cluster Communication
@@ -305,6 +307,51 @@ def block_reduce(
 
     # All lanes participate in reading and reducing
     # Only lanes < warps_per_row have valid data
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return cute.arch.warp_reduction(block_reduce_val, op)
+
+
+# =============================================================================
+# Block-Level Reduction (Named Barrier Variant)
+# =============================================================================
+
+
+@cute.jit
+def block_reduce_named_barrier(
+    val: Float32,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    init_val: Float32,
+    barrier_thread_count: Int32,
+) -> Float32:
+    """
+    Reduce values across warps using a named barrier instead of __syncthreads.
+
+    Identical to block_reduce but uses named_barrier_sync for synchronization,
+    making it safe for warp-specialized kernels where the DMA warp doesn't
+    participate in compute. Uses barrier ID 1 with the specified thread count.
+
+    Args:
+        val: The warp-reduced value (only lane 0's value is used)
+        op: Binary reduction operator, e.g., `operator.add`
+        reduction_buffer: Shared memory tensor with shape (rows_per_block, warps_per_row)
+        init_val: Identity element for the reduction
+        barrier_thread_count: Number of compute threads (MMA warps * 32)
+    """
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx = warp_idx // warps_per_row
+    col_idx = warp_idx % warps_per_row
+
+    # Lane 0 of each warp writes its value to shared memory
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    named_barrier_sync(Int32(1), barrier_thread_count)
+
+    # All lanes participate in reading and reducing
     block_reduce_val = init_val
     if lane_idx < warps_per_row:
         block_reduce_val = reduction_buffer[row_idx, lane_idx]

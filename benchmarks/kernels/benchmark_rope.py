@@ -15,7 +15,7 @@ import io
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel
 from machete.kernels.rope import RopeOp
 from machete.kernels.rope.ref import rope_pytorch, HAS_TRITON
 from machete.utils.benchmark import Benchmark
@@ -45,11 +45,11 @@ def rope_bytes(batch, seq_len, n_heads, head_dim):
 
     Reads: q (B*S*H*D) + cos (S*D/2) + sin (S*D/2)
     Writes: q (B*S*H*D)
-    All float32 (4 bytes).
+    All bfloat16 (2 bytes).
     """
     q_elems = batch * seq_len * n_heads * head_dim
     cs_elems = seq_len * (head_dim // 2)
-    return (2 * q_elems + 2 * cs_elems) * 4
+    return (2 * q_elems + 2 * cs_elems) * 2
 
 
 # =============================================================================
@@ -64,9 +64,9 @@ def rope_bytes(batch, seq_len, n_heads, head_dim):
 def bench_rope(batch, seq_len, n_heads, head_dim):
     """Setup RoPE benchmark functions for each implementation."""
     torch.manual_seed(42)
-    q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.float32, device="cuda")
-    cos = torch.randn(seq_len, head_dim // 2, dtype=torch.float32, device="cuda")
-    sin = torch.randn(seq_len, head_dim // 2, dtype=torch.float32, device="cuda")
+    q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cos = torch.randn(seq_len, head_dim // 2, dtype=torch.bfloat16, device="cuda")
+    sin = torch.randn(seq_len, head_dim // 2, dtype=torch.bfloat16, device="cuda")
 
     funcs = {}
 
@@ -92,8 +92,9 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
         q_mk = q.clone()
         q_flat = q_mk.view(b * s, h, d)
 
-        ops = [RopeOp.schedule(q=q_flat, cos=cos, sin=sin)]
-        kernel = Megakernel(ops, config=MegakernelConfig())
+        ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin)
+        config = RopeOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
 
         # Trigger compilation + first run
         with contextlib.redirect_stdout(io.StringIO()):
