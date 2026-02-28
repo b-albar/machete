@@ -11,7 +11,7 @@ import io
 import pytest
 import torch
 
-from machete.kernels.attention.ref import flash_attention_pytorch
+from machete.kernels.attention.ref import flash_attention_pytorch, flash_attention_backward_pytorch
 
 
 def is_hopper_or_newer():
@@ -323,3 +323,167 @@ class TestFlashAttentionCoopCausal:
             q.float(), k.float(), v.float(), causal=True).half()
 
         torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+
+# =============================================================================
+# Backward Helpers
+# =============================================================================
+
+
+def _run_attention_coop_forward_with_lse(q, k, v, causal=False):
+    """Run forward and return (o, lse) tensors."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.attention import FlashAttentionSm120Op
+
+    o = torch.zeros_like(q)
+    lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+    ops = FlashAttentionSm120Op.schedule_forward(
+        q=q, k=k, v=v, o=o, lse=lse, causal=causal,
+    )
+    config = FlashAttentionSm120Op.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+
+    torch.cuda.synchronize()
+    return o, lse
+
+
+def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False):
+    """Run FlashAttentionSm120BwdOp and return (dq, dk, dv)."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.attention import FlashAttentionSm120BwdOp
+
+    dpsum = (dout.float() * o.float()).sum(dim=-1).contiguous()
+    dq_accum = torch.zeros(q.shape[0], q.shape[1], q.shape[2],
+                           dtype=torch.float32, device=q.device)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+
+    ops = FlashAttentionSm120BwdOp.schedule_backward(
+        k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
+        dq_accum=dq_accum, dk=dk, dv=dv, causal=causal,
+    )
+    config = FlashAttentionSm120BwdOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+
+    torch.cuda.synchronize()
+    dq = dq_accum.to(q.dtype)
+    return dq, dk, dv
+
+
+# =============================================================================
+# Backward Tests (fp16 MMA)
+# =============================================================================
+
+
+class TestFlashAttentionCoopBwd:
+    """Backward pass correctness tests (cooperative, SM120)."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH,M,N,D", [
+        (1, 32, 32, 64),
+        (1, 32, 32, 128),
+    ])
+    def test_bwd_basic(self, BH, M, N, D):
+        """Basic backward: square shapes."""
+        torch.manual_seed(42)
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(q, k, v)
+        dq, dk, dv = _run_attention_coop_backward(q, k, v, o, dout, lse)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_bwd_multi_head(self):
+        """Multi-head backward."""
+        torch.manual_seed(42)
+        BH, M, N, D = 4, 32, 32, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(q, k, v)
+        dq, dk, dv = _run_attention_coop_backward(q, k, v, o, dout, lse)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_bwd_multi_m_blocks(self):
+        """Multiple M-blocks in backward (M > tile_N)."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 64, 32, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(q, k, v)
+        dq, dk, dv = _run_attention_coop_backward(q, k, v, o, dout, lse)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_bwd_multi_n_tiles(self):
+        """Multiple N-tiles in backward (N > tile_N)."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 32, 64, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(q, k, v)
+        dq, dk, dv = _run_attention_coop_backward(q, k, v, o, dout, lse)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_bwd_causal(self):
+        """Causal backward."""
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 32, 32, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(q, k, v, causal=True)
+        dq, dk, dv = _run_attention_coop_backward(
+            q, k, v, o, dout, lse, causal=True)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout, causal=True)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)

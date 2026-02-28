@@ -3,6 +3,7 @@
 
 from .sm_100 import FlashAttentionSm100Op
 from .sm_120 import FlashAttentionSm120Op
+from .sm_120_bwd import FlashAttentionSm120BwdOp
 
 import torch
 
@@ -23,4 +24,4 @@ def _get_flash_attention_op():
 
 FlashAttentionOp = _get_flash_attention_op()
 
-__all__ = ["FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op"]
+__all__ = ["FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120BwdOp"]
