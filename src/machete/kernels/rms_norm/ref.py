@@ -14,35 +14,40 @@ import torch
 # =============================================================================
 
 
-def rmsnorm_pytorch(x, weight, eps=1e-6, residual=False):
+def rmsnorm_pytorch(x, weight, eps=1e-6, residual=False, gemma=False):
     """Pure PyTorch RMSNorm forward reference.
 
     Args:
         x: (..., D) float32
-        weight: (D,) float32
+        weight: (D,) or (M, D) float32 — per-row weight supported via broadcasting
         eps: float
         residual: if True, compute y = rmsnorm(x) + x
+        gemma: if True, use w_eff = 1 + weight (Gemma-style)
 
     Returns:
         (..., D) float32
     """
     variance = x.float().pow(2).mean(-1, keepdim=True)
     x_normed = x.float() * torch.rsqrt(variance + eps)
-    y = x_normed * weight.float()
+    w = weight.float()
+    if gemma:
+        w = 1.0 + w
+    y = x_normed * w
     if residual:
         y = y + x.float()
     return y.to(x.dtype)
 
 
-def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=False):
+def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=False, gemma=False):
     """Pure PyTorch RMSNorm backward reference.
 
     Args:
         dout: (..., D) float32 — grad_output
         x: (..., D) float32 — saved input
-        weight: (D,) float32
+        weight: (D,) or (M, D) float32 — per-row weight supported via broadcasting
         eps: float
         residual: if True, dx includes identity gradient (dx += dout)
+        gemma: if True, use w_eff = 1 + weight (Gemma-style)
 
     Returns:
         dx: (..., D) float32 — grad_input
@@ -50,6 +55,8 @@ def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=False):
     x_f = x.float()
     dout_f = dout.float()
     w_f = weight.float()
+    if gemma:
+        w_f = 1.0 + w_f
 
     variance = x_f.pow(2).mean(-1, keepdim=True)
     rstd = torch.rsqrt(variance + eps)
@@ -63,6 +70,84 @@ def rmsnorm_backward_pytorch(dout, x, weight, eps=1e-6, residual=False):
         dx = dx + dout_f
 
     return dx.to(x.dtype)
+
+
+# =============================================================================
+# Fused Add + RMSNorm Reference
+# =============================================================================
+
+
+def fused_add_rmsnorm_pytorch(x, residual_in, weight, eps=1e-6, gemma=False):
+    """Fused add + RMSNorm forward: residual_out = x + residual, y = rmsnorm(residual_out).
+
+    Returns:
+        (y, residual_out)
+    """
+    residual_out = (x.float() + residual_in.float()).to(x.dtype)
+    y = rmsnorm_pytorch(residual_out, weight, eps=eps, gemma=gemma)
+    return y, residual_out
+
+
+def fused_add_rmsnorm_backward_pytorch(dout, residual_out, weight, eps=1e-6, gemma=False):
+    """Fused add + RMSNorm backward.
+
+    Returns:
+        (dx, d_residual) — both equal to d_rmsnorm(dout, residual_out, weight)
+    """
+    dx = rmsnorm_backward_pytorch(dout, residual_out, weight, eps=eps, gemma=gemma)
+    d_residual = dx.clone()
+    return dx, d_residual
+
+
+# =============================================================================
+# Gated RMSNorm Reference
+# =============================================================================
+
+
+def rmsnorm_gated_pytorch(x, gate, weight, eps=1e-6, gemma=False):
+    """Gated RMSNorm forward: y = rmsnorm(x, weight) * silu(gate).
+
+    Returns:
+        y: (..., D)
+    """
+    normed = rmsnorm_pytorch(x, weight, eps=eps, gemma=gemma)
+    silu_gate = gate.float() * torch.sigmoid(gate.float())
+    y = normed.float() * silu_gate
+    return y.to(x.dtype)
+
+
+def rmsnorm_gated_backward_pytorch(dout, x, gate, weight, eps=1e-6, gemma=False):
+    """Gated RMSNorm backward.
+
+    Returns:
+        (dx, dgate)
+    """
+    x_f = x.float()
+    gate_f = gate.float()
+    dout_f = dout.float()
+    w_f = weight.float()
+    if gemma:
+        w_f = 1.0 + w_f
+
+    variance = x_f.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + eps)
+    normed = x_f * rstd * w_f  # rmsnorm(x, w)
+
+    sig = torch.sigmoid(gate_f)
+    silu_gate = gate_f * sig
+    silu_grad = sig * (1.0 + gate_f * (1.0 - sig))
+
+    # dgate = dout * normed * silu'(gate)
+    dgate = (dout_f * normed * silu_grad).to(x.dtype)
+
+    # dy_norm = dout * silu(gate), then standard rmsnorm backward
+    dy_norm = dout_f * silu_gate
+    x_hat = x_f * rstd
+    dout_w = dy_norm * w_f
+    grad_sum = (dout_w * x_hat).mean(-1, keepdim=True)
+    dx = ((dout_w - x_hat * grad_sum) * rstd).to(x.dtype)
+
+    return dx, dgate
 
 
 # =============================================================================
@@ -220,6 +305,10 @@ except ImportError:
 __all__ = [
     "rmsnorm_pytorch",
     "rmsnorm_backward_pytorch",
+    "fused_add_rmsnorm_pytorch",
+    "fused_add_rmsnorm_backward_pytorch",
+    "rmsnorm_gated_pytorch",
+    "rmsnorm_gated_backward_pytorch",
     "HAS_TRITON",
     "HAS_CUTLASS_RMSNORM",
 ]

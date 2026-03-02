@@ -597,10 +597,8 @@ class Megakernel:
                 body,
             )
 
-        # Resolve `if tracing:` blocks at source level. CuTe DSL has no
-        # constexpr-if, so we strip blocks when disabled / inline when enabled.
-        from .tracing import resolve_tracing_blocks
-        body = resolve_tracing_blocks(body, self.config.tracing)
+        # `if const_expr(tracing):` in the kernel body is resolved by CuTe DSL's
+        # AST preprocessor — only the taken branch is compiled (zero overhead).
 
         # Build kernel loop with tensor + TMA params in signature
         fn_source = (
@@ -616,6 +614,8 @@ class Megakernel:
         exec_globals = {
             "cute": cute, "Int32": Int32, "Int64": Int64,
             "range_constexpr": __import__('cutlass').range_constexpr,
+            "const_expr": __import__('cutlass').const_expr,
+            "tracing": bool(self.config.tracing),
             "TileInstruction": TileInstruction,
             "dispatch_load": dispatch_load,
             "dispatch_compute": dispatch_compute,
@@ -971,8 +971,8 @@ class Megakernel:
         signal_barriers = self._build_signal_barriers()
 
         # Trace exec globals: device-side functions and format_ids.
-        # `if tracing:` blocks are resolved at source level in _build_kernel,
-        # so these globals are only referenced when tracing is enabled.
+        # `if const_expr(tracing):` blocks are resolved by CuTe DSL's AST
+        # preprocessor, so these globals are only referenced when tracing is enabled.
         from .tracing import get_trace_exec_globals
         trace_exec_globals = get_trace_exec_globals(self._tracing_state)
 
@@ -1061,7 +1061,7 @@ class Megakernel:
             flags_ptr = smem_base + Int32(flags_offset)
 
             # ========== TRACE INIT ==========
-            if tracing:
+            if const_expr(tracing):
                 _trace_buf = cute.make_tensor(
                     cute.make_ptr(cute.Uint8, trace_buffer_ptr),
                     cute.make_layout(1 << 24),
@@ -1094,7 +1094,7 @@ class Megakernel:
             # Fetches instructions, checks dependencies, dispatches TMA loads.
             # Only blocks when no page is available (all pages in use).
             if is_load_warp:
-                if tracing:
+                if const_expr(tracing):
                     _dma_lane = begin_lane_dynamic_raw(
                         Int32(2), Int32(trace_row_stride),
                         block_id, Int32(0),
@@ -1225,7 +1225,7 @@ class Megakernel:
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4 = decompose_tile(
                                 _dl_op, _ep_lin)
                         _dl_iter = Int32(0)
-                        if tracing:
+                        if const_expr(tracing):
                             _tl = trace_start()
                         dispatch_load(
                             _dl_op, _dl_pp,
@@ -1234,7 +1234,7 @@ class Megakernel:
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4,
                             _dl_iter,
                         )
-                        if tracing:
+                        if const_expr(tracing):
                             for _i in range_constexpr(num_ops):
                                 if _dl_op == Int32(_i):
                                     _dma_lane = end_event_dynamic_raw_1(
@@ -1248,7 +1248,7 @@ class Megakernel:
 
                     done = ld_shared_i32(load_done_ptr)
 
-                if tracing:
+                if const_expr(tracing):
                     finish_lane_dynamic_raw(_trace_buf, _dma_lane)
 
             # ========== STORE WARP LOOP ==========
@@ -1328,7 +1328,7 @@ class Megakernel:
 
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
-                if tracing:
+                if const_expr(tracing):
                     _mma_lane = begin_lane_dynamic_raw(
                         Int32(2), Int32(trace_row_stride),
                         block_id, Int32(1),
@@ -1344,7 +1344,7 @@ class Megakernel:
                     # work_notify phase: 1 arrive per tile, alternates
                     # each time the slot is reused. Pure register formula.
                     _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
-                    if tracing:
+                    if const_expr(tracing):
                         _tw = trace_start()
                     mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
 
@@ -1360,7 +1360,7 @@ class Megakernel:
                         mma_running = Int32(0)
 
                     if op_idx != Int32(TileInstruction.END_MARKER):
-                        if tracing:
+                        if const_expr(tracing):
                             _mma_lane = end_event_dynamic_raw_1(
                                 _tw, _trace_buf, Int32(trace_row_stride),
                                 _mma_lane, Int32(trace_data_wait_fmt), op_idx,
@@ -1372,7 +1372,7 @@ class Megakernel:
                         page_ptr = _get_page_ptr(smem_base, slot)
                         op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
 
-                        if tracing:
+                        if const_expr(tracing):
                             _tc = trace_start()
 
                         dispatch_compute(
@@ -1384,7 +1384,7 @@ class Megakernel:
                         # Sync MMA warps post-compute
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
-                        if tracing:
+                        if const_expr(tracing):
                             for _i in range_constexpr(num_ops):
                                 if op_idx == Int32(_i):
                                     _mma_lane = end_event_dynamic_raw_1(
@@ -1398,7 +1398,7 @@ class Megakernel:
 
                         consume_ptr = consume_ptr + Int32(1)
 
-                if tracing:
+                if const_expr(tracing):
                     finish_lane_dynamic_raw(_trace_buf, _mma_lane)
 
         return self._build_kernel(
