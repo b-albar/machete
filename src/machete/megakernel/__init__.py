@@ -24,6 +24,8 @@ from .ops import (
     INSTRUCTION_WORDS,
     TileInstruction,
     InstructionStreamBuilder,
+    PeerBufferRegistry,
+    PeerTMARegistry,
     validate_op_compatibility,
     build_op_config,
 )
@@ -56,6 +58,8 @@ __all__ = [
     "Op",
     "ScheduledOp",
     "TensorMeta",
+    "PeerBufferRegistry",
+    "PeerTMARegistry",
     "validate_op_compatibility",
     "build_op_config",
     # Barrier Formulas

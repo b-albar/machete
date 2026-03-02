@@ -304,6 +304,14 @@ def _process_op_declarations(cls):
     cls._TMA_STORES = tma_stores
     cls._TMA_REDUCE_STORES = tma_reduce_stores
 
+    # --- Process peer store declarations ---
+    # peer_stores: set of tensor names to send to peer GPUs via TMA S2G
+    peer_stores = set(getattr(cls, "peer_stores", set()))
+    for name in peer_stores:
+        if name not in all_write_names:
+            raise ValueError(f"peer_stores tensor '{name}' not found in writes or backward_writes")
+    cls._PEER_STORES = peer_stores
+
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
@@ -314,7 +322,7 @@ def _process_op_declarations(cls):
     for name, _, dims in cls._BWD_UNIQUE_TENSORS:
         if name not in tensor_dims_map:
             tensor_dims_map[name] = dims
-    for name in tma_loads | tma_stores | tma_reduce_stores:
+    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
     cls._TMA_TENSOR_DIMS = tma_tensor_dims
@@ -626,6 +634,24 @@ class Op:
         pass
 
     # =========================================================================
+    # Multi-GPU Communication Interface
+    # =========================================================================
+
+    def communicate(self, page_ptr) -> None:
+        """Send results to peer GPU buffers after local store.
+
+        Called by store warp after store() completes. For TMA-based peer
+        communication, issue cute.copy(peer_tma_atom, ...) here (S2G to
+        peer memory via NVLink).
+
+        Receives peer TMA descriptors as keyword arguments when peer_stores
+        is declared on the op class.
+
+        Default: no-op (for ops that don't need multi-GPU communication).
+        """
+        pass
+
+    # =========================================================================
     # Backward Pass Interface
     # =========================================================================
 
@@ -878,6 +904,122 @@ class TensorRegistry:
 
 
 # =============================================================================
+# Peer Buffer Registry (Multi-GPU Communication)
+# =============================================================================
+
+
+@dataclass
+class PeerBufferInfo:
+    """Metadata for a single peer buffer entry.
+
+    Attributes:
+        canonical_name: Canonical tensor name from TensorRegistry (e.g., "t0")
+        peer_tensors: List of tensors on peer GPUs (one per peer device)
+    """
+
+    canonical_name: str
+    peer_tensors: List[Any]  # List[torch.Tensor]
+
+
+@dataclass
+class PeerBufferRegistry:
+    """Tracks identically-shaped pre-allocated buffers on peer GPUs.
+
+    Maps canonical tensor names to lists of peer GPU tensors for TMA
+    peer-to-peer stores. Users pre-allocate buffers on each peer device
+    and pass them via MegakernelConfig.peer_buffers.
+
+    Usage:
+        registry = PeerBufferRegistry.from_config(
+            peer_map={"y": [gpu1_y, gpu2_y]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
+    """
+
+    buffers: List[PeerBufferInfo]
+    num_peers: int
+
+    @classmethod
+    def from_config(
+        cls,
+        peer_map: Dict[str, List[Any]],
+        tensor_registry: "TensorRegistry",
+        ops: List[ScheduledOp],
+    ) -> "PeerBufferRegistry":
+        """Build from user-provided peer tensor mapping.
+
+        Args:
+            peer_map: {tensor_name: [peer0_tensor, peer1_tensor, ...]}
+                Maps op-local tensor names to pre-allocated peer buffers.
+            tensor_registry: Local TensorRegistry for canonical name resolution.
+            ops: Scheduled ops list for resolving tensor names to canonical names.
+        """
+        if not peer_map:
+            return cls(buffers=[], num_peers=0)
+
+        # Validate all peer lists have the same length
+        num_peers = None
+        for name, peers in peer_map.items():
+            if num_peers is None:
+                num_peers = len(peers)
+            elif len(peers) != num_peers:
+                raise ValueError(
+                    f"Peer buffer '{name}' has {len(peers)} peers, "
+                    f"expected {num_peers} (must be consistent)"
+                )
+
+        if num_peers is None or num_peers == 0:
+            return cls(buffers=[], num_peers=0)
+
+        # Resolve tensor names to canonical names via op mappings
+        buffers: List[PeerBufferInfo] = []
+        seen_canonical: Set[str] = set()
+
+        for name, peers in peer_map.items():
+            # Find canonical name by searching op mappings
+            canonical = None
+            for op_idx, mapping in tensor_registry.op_mappings.items():
+                if name in mapping:
+                    canonical = mapping[name]
+                    break
+
+            if canonical is None:
+                raise ValueError(
+                    f"Peer buffer tensor '{name}' not found in any op's "
+                    f"tensor declarations"
+                )
+
+            if canonical in seen_canonical:
+                continue
+            seen_canonical.add(canonical)
+
+            buffers.append(PeerBufferInfo(
+                canonical_name=canonical,
+                peer_tensors=list(peers),
+            ))
+
+        return cls(buffers=buffers, num_peers=num_peers)
+
+    @property
+    def has_peers(self) -> bool:
+        """Whether any peer buffers are registered."""
+        return len(self.buffers) > 0
+
+    @property
+    def canonical_names(self) -> List[str]:
+        """Canonical tensor names that have peer buffers."""
+        return [b.canonical_name for b in self.buffers]
+
+    def get_peer_tensors(self, canonical_name: str) -> Optional[List[Any]]:
+        """Get peer tensors for a canonical tensor name."""
+        for b in self.buffers:
+            if b.canonical_name == canonical_name:
+                return b.peer_tensors
+        return None
+
+
+# =============================================================================
 # TMA Registry (Descriptor Management for TMA Parameter Mode)
 # =============================================================================
 
@@ -1058,6 +1200,182 @@ class TMARegistry:
         """
         mapping = self.op_mappings.get((op_idx, phase), {})
         # Return in consistent order: for each TMA tensor, atom then gmem
+        result = []
+        for local_name, canonical in sorted(mapping.items()):
+            result.append(canonical)
+        return result
+
+
+# =============================================================================
+# Peer TMA Registry (Multi-GPU TMA Descriptors)
+# =============================================================================
+
+
+@dataclass
+class PeerTMADescriptorInfo:
+    """Metadata for a TMA descriptor targeting a peer GPU buffer.
+
+    Similar to TMADescriptorInfo but tracks which peer device the
+    descriptor targets. Created per (tensor, peer) pair.
+
+    Attributes:
+        canonical_atom: e.g., "ptma0_p0_atom" (peer 0), "ptma0_p1_atom" (peer 1)
+        canonical_gmem: e.g., "ptma0_p0_gmem"
+        tensor_canonical: Canonical tensor name from TensorRegistry (e.g., "t0")
+        peer_idx: Index of the peer device
+        tile_shape: TMA tile shape (transposed for row-major)
+        smem_layout_shape: Shared memory layout shape
+        dtype: CUTLASS dtype
+        smem_layout_src: Optional swizzle layout code string
+    """
+
+    canonical_atom: str
+    canonical_gmem: str
+    tensor_canonical: str
+    peer_idx: int
+    tile_shape: Tuple[int, ...]
+    smem_layout_shape: Tuple[int, ...]
+    dtype: Any
+    smem_layout_src: Optional[str] = None
+
+
+@dataclass
+class PeerTMARegistry:
+    """Manages TMA descriptors for peer GPU stores.
+
+    For each op with peer_stores, creates one set of TMA S2G descriptors
+    per peer device. Descriptors are created at runtime since peer GPU
+    addresses are runtime values.
+
+    Usage:
+        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
+        # registry.descriptors → [PeerTMADescriptorInfo(...), ...]
+        # registry.get_op_peer_tma_args(0, "communicate") → ['ptma0_p0_atom', ...]
+    """
+
+    descriptors: List[PeerTMADescriptorInfo]
+    # Per-op mappings: {(op_idx, "communicate"): {local_name: canonical_name}}
+    op_mappings: Dict[Tuple[int, str], Dict[str, str]]
+    num_peers: int
+
+    @classmethod
+    def from_ops(
+        cls,
+        ops: List[ScheduledOp],
+        tensor_registry: "TensorRegistry",
+        peer_buffer_registry: "PeerBufferRegistry",
+    ) -> "PeerTMARegistry":
+        """Build PeerTMARegistry from ops that declare peer_stores.
+
+        For each op's peer_stores tensor, for each peer device, creates
+        a TMA S2G descriptor targeting the peer's buffer.
+        """
+        descriptors: List[PeerTMADescriptorInfo] = []
+        op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
+        counter = 0
+        num_peers = peer_buffer_registry.num_peers
+
+        for i, op in enumerate(ops):
+            op_cls = op.op_cls
+            peer_stores = getattr(op_cls, "_PEER_STORES", set())
+            op_mappings[(i, "communicate")] = {}
+
+            if not peer_stores:
+                continue
+
+            for tensor_name in peer_stores:
+                # Get canonical tensor name
+                tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
+                if tensor_canonical is None:
+                    continue
+
+                # Compute TMA tile shape (same logic as TMARegistry)
+                custom_shape = None
+                if hasattr(op_cls, "get_tma_tile_shape"):
+                    custom_shape = op_cls.get_tma_tile_shape(
+                        tensor_name, op.tile_sizes, op.static_dims)
+
+                if custom_shape is not None:
+                    tile_shape = tuple(custom_shape)
+                else:
+                    tma_dims = getattr(op_cls, "_TMA_TENSOR_DIMS", {}).get(tensor_name, [])
+                    tile_shape = []
+                    for dim_name in tma_dims:
+                        if dim_name in op.tile_sizes:
+                            tile_shape.append(op.tile_sizes[dim_name])
+                        elif dim_name in op.static_dims:
+                            tile_shape.append(op.static_dims[dim_name])
+                        else:
+                            raise ValueError(
+                                f"Peer store tensor '{tensor_name}' dim '{dim_name}' "
+                                f"not found in tile_sizes or static_dims"
+                            )
+                    tile_shape = tuple(tile_shape)
+
+                tma_tile_shape = tuple(reversed(tile_shape))
+
+                # Resolve dtype
+                meta = op.tensor_metas.get(tensor_name)
+                dtype = meta.dtype if meta else None
+
+                # Smem layout (use same swizzle as local store if available)
+                smem_layout_src = None
+                if hasattr(op_cls, "get_tma_smem_layout_src"):
+                    smem_layout_src = op_cls.get_tma_smem_layout_src(
+                        tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
+                    )
+
+                # Create one descriptor per peer
+                for peer_idx in range(num_peers):
+                    canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
+                    canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
+
+                    descriptors.append(
+                        PeerTMADescriptorInfo(
+                            canonical_atom=canonical_atom,
+                            canonical_gmem=canonical_gmem,
+                            tensor_canonical=tensor_canonical,
+                            peer_idx=peer_idx,
+                            tile_shape=tma_tile_shape,
+                            smem_layout_shape=tma_tile_shape,
+                            dtype=dtype,
+                            smem_layout_src=smem_layout_src,
+                        )
+                    )
+
+                    # Map local names to canonical for communicate phase
+                    op_mappings[(i, "communicate")][
+                        f"{tensor_name}_p{peer_idx}_tma"
+                    ] = canonical_atom
+                    op_mappings[(i, "communicate")][
+                        f"{tensor_name}_p{peer_idx}_tma_gmem"
+                    ] = canonical_gmem
+
+                counter += 1
+
+        return cls(
+            descriptors=descriptors,
+            op_mappings=op_mappings,
+            num_peers=num_peers,
+        )
+
+    @property
+    def has_peer_tma(self) -> bool:
+        """Whether any ops use peer TMA stores."""
+        return len(self.descriptors) > 0
+
+    @property
+    def all_canonical_names(self) -> List[str]:
+        """All canonical peer TMA parameter names in order."""
+        names = []
+        for d in self.descriptors:
+            names.append(d.canonical_atom)
+            names.append(d.canonical_gmem)
+        return names
+
+    def get_op_peer_tma_args(self, op_idx: int, phase: str = "communicate") -> List[str]:
+        """Get canonical peer TMA param names for an op's communicate phase."""
+        mapping = self.op_mappings.get((op_idx, phase), {})
         result = []
         for local_name, canonical in sorted(mapping.items()):
             result.append(canonical)
