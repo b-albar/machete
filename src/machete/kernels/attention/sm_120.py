@@ -75,7 +75,7 @@ class FlashAttentionSm120Op(Op):
         "k": (None, ("BH", "N", "D")),
         "v": (None, ("BH", "N", "D")),
     }
-    writes = {"o": (None, ("BH", "M", "D"))}
+    writes = {"o": (None, ("BH", "M", "D")), "lse": (cutlass.Float32, ("BH", "M"))}
     tile = ("BH", "M", "D")
 
     # Only Q via TMA (DMA warp), K/V loaded by cpasync in compute
@@ -216,6 +216,10 @@ class FlashAttentionSm120Op(Op):
                     nw *= 2
                 tile_M = max(16, nw * 16)
                 tile_sizes["M"] = tile_M
+        # Auto-allocate lse output if not provided
+        if "lse" not in tensors and q is not None:
+            import torch
+            tensors["lse"] = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         if causal:
@@ -309,7 +313,7 @@ class FlashAttentionSm120Op(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o
+        self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, lse
     ):
         """Cooperative flash attention: MMA warps do both cpasync loads and MMA.
 
@@ -593,6 +597,37 @@ class FlashAttentionSm120Op(Op):
             acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
             for r in cutlass.range_constexpr(num_rows):
                 row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
+
+            # Write LSE = row_max / log2e + log(row_sum) = row_max * scale_val / (scale_val * log2e) + log(row_sum)
+            # Since row_max is in raw score space (pre-scale), LSE = row_max + log(row_sum)
+            # Actually: softmax used S * scale_log2e, so row_max is in log2-scaled space.
+            # P = exp2(S * scale_log2e - row_max * scale_log2e)
+            # = exp(S * scale - row_max * scale)  [since exp2(x * log2e) = exp(x)]
+            # Wait — row_max stores raw S values (not scaled). Let's trace:
+            #   acc_S_row values are raw Q@K^T scores
+            #   row_max_cur = max(acc_S_row)  → raw score space
+            #   m_new = fmax(m_old, row_max_cur)  → raw score space
+            #   exp2(acc_S_row * scale_log2e - m_new * scale_log2e) = exp((acc_S_row - m_new) * scale)
+            # So P_ij = exp((S_ij - row_max_i) * scale)
+            # True softmax: P_ij = exp(S_ij * scale) / sum_j exp(S_ij * scale)
+            #             = exp((S_ij - row_max_i) * scale) / sum_j exp((S_ij - row_max_i) * scale)
+            # row_sum = sum_j exp((S_ij - row_max_i) * scale)
+            # LSE_i = log(sum_j exp(S_ij * scale)) = row_max_i * scale + log(row_sum_i)
+            # Write LSE to global via CuTe tensor. Each thread in the MMA partition owns
+            # specific rows identified by the identity tensor tScS_mn[r, 0][0].
+            # Only one thread per quad writes (threads 0,1,2,3 in a quad share the same row).
+            lse_head_ptr = lse.iterator + tile_BH * Int32(self.M)
+            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
+            lane_in_quad = tidx % Int32(4)
+            for r in cutlass.range_constexpr(num_rows):
+                if lane_in_quad == Int32(0):
+                    row_idx = tScS_mn[r, 0][0]
+                    global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
+                    if global_row < Int32(self.M):
+                        lse_val = row_max[r] * Float32(self.scale_val) + cute.math.log(row_sum[r])
+                        g_lse[global_row] = lse_val
+
+            for r in cutlass.range_constexpr(num_rows):
                 inv_sum = cute.arch.rcp_approx(row_sum[r])
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
 

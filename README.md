@@ -1,19 +1,18 @@
 # Machete
 
-High-performance GPU kernel library for deep learning, built on NVIDIA CuteDSL.
+High-performance GPU kernel library for deep learning, built on NVIDIA CuTe DSL.
 
 ## Features
 
-- **Megakernel** - Persistent kernel architecture for fusing multiple operations
-  - Instruction stream execution with automatic tile scheduling
-  - Dependency resolution via named buffers
-  - Multiple scheduling strategies (level-batched, backward)
-  - Per-SM tracing for performance analysis
+- **Megakernel framework** -- Persistent kernel that fuses multiple operations into a single launch
+  - Pipelined load/compute/store with paged shared memory
+  - Automatic tile scheduling, dependency resolution, and SM work distribution
+  - Dedicated DMA warps (TMA load + store) and MMA compute warps
+  - Per-SM tracing (Perfetto / nanotrace export)
 
-- **Optimized Kernels** - High-performance implementations of common operations
+- **Built-in kernels** -- Flash Attention (SM100 Hopper + SM120 Blackwell), GEMM, RoPE, RMSNorm, Activation
 
-- **Model Patching** - Optional drop-in optimization for transformer models
-  - Works with Transformers, TRL, PEFT/LoRA
+- **Model patching** -- Drop-in optimization for HuggingFace Transformers models
 
 ## Installation
 
@@ -21,34 +20,45 @@ High-performance GPU kernel library for deep learning, built on NVIDIA CuteDSL.
 pip install machete
 ```
 
-### Dependencies
-
-- NVIDIA CUTLASS
-- [flash-attn-cute](https://github.com/b-albar/flash-attention/tree/main/flash_attn/cute)
-- [quack](https://github.com/b-albar/quack)
-- [nvidia-cutlass-dsl](https://github.com/NVIDIA/cutlass)
+Requires [nvidia-cutlass-dsl](https://github.com/NVIDIA/cutlass) and a Hopper (SM90+) or Blackwell (SM120+) GPU.
 
 ## Quick Start
 
-### Megakernel
+### Using built-in kernels
 
 ```python
-from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.rope import RopeOp
+import torch
+from machete.megakernel import Megakernel
+from machete.kernels.attention import FlashAttentionOp
 
-# Schedule operations
-ops = [RopeOp.schedule(q=q_tensor, cos=cos, sin=sin)]
+q = torch.randn(1, 128, 64, dtype=torch.float16, device="cuda")  # (BH, M, D)
+k = torch.randn(1, 128, 64, dtype=torch.float16, device="cuda")  # (BH, N, D)
+v = torch.randn(1, 128, 64, dtype=torch.float16, device="cuda")  # (BH, N, D)
+o = torch.zeros_like(q)
 
-# Create and run kernel
-config = MegakernelConfig(tracing=True)
+ops = FlashAttentionOp.schedule_forward(q=q, k=k, v=v, o=o)
+config = FlashAttentionOp.kernel_config(ops)
 kernel = Megakernel(ops, config=config)
 kernel.run()
-
-# Export trace for performance analysis
-kernel.write_trace("trace.nanotrace")  # or .perfetto
 ```
 
-### Model Patching
+### Fusing operations
+
+```python
+from machete.kernels.gemm import GemmOp
+from machete.kernels.activation import ActivationOp
+
+c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
+ops  = GemmOp.schedule_forward(a=a, b=b, c=c)
+ops += ActivationOp.schedule_forward(x=c, activation='silu')
+
+kernel = Megakernel(ops)
+kernel.run()
+# GEMM and activation run fused -- the framework auto-detects the
+# dependency on tensor c and pipelines them in a single kernel launch.
+```
+
+### Model patching
 
 ```python
 from transformers import AutoModelForCausalLM
@@ -58,72 +68,186 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 machete.patch(model)
 ```
 
-## Megakernel Architecture
+## Architecture
 
-The megakernel system fuses multiple operations into a single persistent kernel:
+The megakernel compiles all scheduled ops into a single persistent CUDA kernel. Each SM fetches work tiles from a shared instruction stream:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Megakernel                        │
-│  ┌─────────┐   ┌─────────┐   ┌─────────┐          │
-│  │  Op A   │──▶│  Op B   │──▶│  Op C   │          │
-│  └─────────┘   └─────────┘   └─────────┘          │
-│       │             │             │                │
-│       ▼             ▼             ▼                │
-│  [Instruction Stream: A0,A1,B0,A2,B1,C0,...]      │
-│                                                    │
-│  SM0: fetches A0, B0, C0, ...  (strided)          │
-│  SM1: fetches A1, B1, C1, ...                     │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    Megakernel                         │
+│                                                      │
+│  Instruction stream: [A0, A1, B0, A2, B1, C0, ...]  │
+│                                                      │
+│  SM 0 ──▶ A0 ──▶ B0 ──▶ C0 ──▶ ...  (strided)      │
+│  SM 1 ──▶ A1 ──▶ B1 ──▶ C1 ──▶ ...                  │
+│  SM 2 ──▶ A2 ──▶ B2 ──▶ C2 ──▶ ...                  │
+│                                                      │
+│  Per SM:                                             │
+│    Load warp  ── TMA G→S ──┐                         │
+│                             ├── paged shared memory  │
+│    MMA warps  ── compute ──┤                         │
+│                             │                        │
+│    Store warp ── TMA S→G ──┘                         │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Tile Schedulers
+Each SM has a circular buffer of shared memory **pages**. The load warp fills pages via TMA, compute warps process them, and the store warp drains results back to global memory -- all pipelined with mbarrier synchronization.
 
-- **LevelBatchedScheduler** (default): Emits all source tiles first for better SM load balancing
-- **BackwardScheduler**: Depth-based priority for latency optimization
+### Configuration
 
 ```python
-from machete.megakernel.ops import BackwardScheduler, set_default_scheduler
+from machete.megakernel import Megakernel, MegakernelConfig
 
-set_default_scheduler(BackwardScheduler())
+config = MegakernelConfig(
+    threads_per_block=192,  # (4 MMA + 2 DMA) warps * 32
+    page_size=32768,        # 32KB shared memory per page
+    tracing=True,           # enable per-SM trace recording
+)
+kernel = Megakernel(ops, config=config)
+kernel.run()
+
+# Most ops provide a kernel_config() classmethod that returns a
+# recommended config based on tile sizes and tensor shapes:
+config = MyOp.kernel_config(ops)
 ```
 
 ### Tracing
-
-Export execution traces for performance analysis:
 
 ```python
 config = MegakernelConfig(tracing=True)
 kernel = Megakernel(ops, config=config)
 kernel.run()
 
-# Export formats
-kernel.write_trace("trace.nanotrace")  # Native format
-kernel.write_trace("trace.perfetto")   # Open at https://ui.perfetto.dev/
+kernel.write_trace("trace.nanotrace")
+kernel.write_trace("trace.perfetto")   # open at https://ui.perfetto.dev/
+```
+
+### Tile schedulers
+
+- **LevelBatchedScheduler** (default) -- emits all source tiles first for better SM load balancing
+- **BackwardScheduler** -- depth-based priority for latency optimization
+
+```python
+from machete.megakernel.ops import BackwardScheduler, set_default_scheduler
+set_default_scheduler(BackwardScheduler())
 ```
 
 ## Defining Custom Operations
 
+An op declares its tensor interface, tiling strategy, and implements three phases: `load`, `compute`, `store`.
+
 ```python
-from machete.megakernel.ops import Op
-from cutlass import Float32
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Float32
 
-class MyOp(Op):
-    reads  = {"x": (Float32, "M, D")}
-    writes = {"y": (Float32, "M, D")}
-    tile   = ("M",)
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
+from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
-    INPUTS = ["x"]
-    OUTPUTS = ["y"]
 
-    @staticmethod
-    def forward(smem_base, config_ptr, page_ids,
-                tile_m, tile_n, tile_l, op_config_ptr):
-        # M is dynamic (tile dim), D is static (compile-time constant)
-        ...
+class ScaleOp(Op):
+    """Multiply every element by a scalar. Demonstrates the op interface."""
 
-ops = [MyOp.schedule(x=input_tensor, y=output_tensor)]
+    # Tensor declarations: {name: (dtype, dim_names)}
+    # dtype=None infers from the tensor passed at schedule time.
+    reads  = {"x": (None, ("M", "D"))}
+    writes = {"y": (None, ("M", "D"))}
+
+    # Dimensions to tile over -- these define the grid of work tiles.
+    # Non-tiled dimensions (here D) are processed in full within each tile.
+    tile = ("M",)
+
+    # Tensors transferred via TMA (async bulk copy).
+    tma_loads  = {"x"}
+    tma_stores = {"y"}
+
+    def __init__(self, **config):
+        # The framework injects: M, D, tile_size_M, threads_per_row,
+        # x_dtype, y_dtype, and any static_dims set during scheduling.
+        super().__init__(**config)
+        self.scale = getattr(self, 'scale', 1.0)
+        self.elem_bytes = 2 if self.x_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
+        self.tile_bytes = self.tile_size_M * self.D * self.elem_bytes
+
+    @classmethod
+    def schedule_forward(cls, scale=1.0, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        x = tensors["x"]
+        D = x.shape[1]
+        tile_M = max(1, page_size // (D * x.element_size()))
+        if "y" not in tensors:
+            tensors["y"] = tensors["x"]  # in-place
+
+        ops = [cls._schedule_single(tile_sizes={"M": tile_M}, **tensors)]
+        ops[0].static_dims["scale"] = scale
+        ops[0].static_dims["page_size"] = page_size
+        return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+        return MegakernelConfig(page_size=page_size)
+
+    # ----- DMA warp: load x tile from global → shared memory -----
+    @cute.jit
+    def load(self, page_ptr, tile_M, x_tma, x_tma_gmem, work_mbar):
+        nbytes = Int32(self.tile_bytes)
+        mbar_ptr = cute.get_mbarrier_ptr(work_mbar)
+        sX = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M, self.D)),
+        )
+        gX = cute.local_tile(x_tma_gmem, (self.tile_size_M, self.D), (0, 0))
+        tXsX, tXgX = cute.tma_partition(x_tma, mbar_ptr, sX, gX)
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        cute.copy(x_tma, tXgX[0], tXsX, tma_bar_ptr=mbar_ptr)
+
+    # ----- MMA warps: compute in shared memory -----
+    @cute.jit
+    def compute(self, page_ptr, tile_M):
+        tidx = cute.arch.thread_idx()
+        n_elems = Int32(self.tile_size_M * self.D)
+        smem_ptr = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
+        for i in range(tidx, n_elems, Int32(self.threads_per_row)):
+            val = Float32(smem_ptr[i])
+            smem_ptr[i] = val * Float32(self.scale)
+
+    # ----- DMA warp: store result from shared → global memory -----
+    @cute.jit
+    def store(self, page_ptr, tile_M, y_tma, y_tma_gmem):
+        sY = cute.make_tensor(
+            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_M, self.D)),
+        )
+        gY = cute.local_tile(y_tma_gmem, (self.tile_size_M, self.D), (0, 0))
+        tYsY, tYgY = cute.tma_partition(y_tma, None, sY, gY)
+        cute.copy(y_tma, tYsY, tYgY[0])
 ```
+
+### Key concepts
+
+**Tensor declarations** -- `reads` and `writes` map tensor names to `(dtype, dim_names)` tuples. `dtype=None` infers from the tensor at schedule time. Dimension names are tuples of strings like `("M", "D")` or `("BH", "M", "D")`.
+
+**Tiling** -- The `tile` attribute lists which dimensions to tile over. The framework creates one work tile per tile-count along those dimensions. Non-tiled dimensions are processed in full within each tile.
+
+**TMA** -- Tensors listed in `tma_loads` / `tma_stores` are transferred via TMA (Tensor Memory Accelerator). The framework generates TMA descriptors and passes them to `load()` / `store()` as `{name}_tma` and `{name}_tma_gmem` parameters.
+
+**Pipelined phases** -- Each tile passes through `load → compute → store`, pipelined across pages with mbarrier synchronization. The `work_mbar` parameter in `load()` signals the framework that loading is asynchronous.
+
+**Scheduling** -- `schedule_forward()` computes tile sizes, sets compile-time constants via `static_dims`, and returns a list of `ScheduledOp`. The framework resolves dependencies between ops by matching tensor pointers.
+
+**Backward pass** -- Declare `backward_reads` / `backward_writes` and implement `backward_load`, `backward_compute`, `backward_store`. Schedule with `schedule_backward()`, run with `Megakernel(ops, backward=True)`.
+
+## Built-in Kernels
+
+| Kernel | Op Class | Description |
+|--------|----------|-------------|
+| Flash Attention | `FlashAttentionOp` | Auto-selects SM100 (Hopper) or SM120 (Blackwell) |
+| GEMM | `GemmOp` | Tiled matrix multiply with TMA and smem swizzle |
+| RoPE | `RopeOp` | Rotary position embedding (forward + backward) |
+| RMSNorm | `RMSNormOp` | Root mean square normalization (forward + backward) |
+| Activation | `ActivationOp` | Element-wise ReLU / SiLU (fuses with GEMM) |
 
 ## License
 

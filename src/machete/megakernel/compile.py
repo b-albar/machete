@@ -355,6 +355,21 @@ def compile_backward_store(instance, tensor_param_names=None,
     )
 
 
+def compile_communicate(instance, tensor_param_names=None,
+                         tma_param_names=None, tma_local_mapping=None):
+    """Compile Op's communicate method for peer GPU stores.
+
+    Same pattern as compile_store — called by store warp after local store.
+    TMA params here are peer TMA descriptors (S2G to peer memory).
+    """
+    return _build_phase_wrapper(
+        instance, "communicate", tensor_param_names,
+        filename="<compile_communicate>",
+        tma_param_names=tma_param_names,
+        tma_local_mapping=tma_local_mapping,
+    )
+
+
 # =============================================================================
 # Cleanup
 # =============================================================================
@@ -378,6 +393,7 @@ __all__ = [
     "compile_load",
     "compile_compute",
     "compile_store",
+    "compile_communicate",
     "compile_backward_load",
     "compile_backward_compute",
     "compile_backward_store",

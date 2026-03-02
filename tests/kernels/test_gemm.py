@@ -300,3 +300,181 @@ class TestGemmBackward:
     def test_backward_large_k(self, dtype):
         """Large K with many K tiles."""
         _gemm_backward_case(64, 256, 32, dtype)
+
+
+# =============================================================================
+# Fused GEMM + Activation
+# =============================================================================
+
+
+def _run_gemm_fused_act(a, b_t, activation, tile_m=64, tile_n=32, tile_k=32):
+    """Run GemmOp with fused activation and return output tensor C."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.gemm import GemmOp
+
+    M, K = a.shape
+    N = b_t.shape[0]
+    c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
+
+    ops = GemmOp.schedule_forward(
+        a=a, b=b_t, c=c, activation=activation,
+        tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+    )
+    config = GemmOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+
+    return c
+
+
+@requires_gpu
+class TestGemmFusedActivation:
+    """GEMM with fused epilogue activation."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_relu(self, dtype):
+        """Fused GEMM + ReLU matches torch reference."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+
+        c = _run_gemm_fused_act(a, b_t, activation='relu')
+        ref = torch.relu((a.float() @ b_t.float().t())).to(dtype)
+        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_silu(self, dtype):
+        """Fused GEMM + SiLU matches torch reference."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+
+        c = _run_gemm_fused_act(a, b_t, activation='silu')
+        ref = torch.nn.functional.silu((a.float() @ b_t.float().t())).to(dtype)
+        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+
+
+# =============================================================================
+# Fused GEMM + Activation Backward
+# =============================================================================
+
+
+def _run_gemm_fused_act_backward(dout, a, b, activation, c=None, pre_act=None,
+                                  da=None, db=None,
+                                  tile_m=64, tile_n=32, tile_k=32):
+    """Run GemmOp backward with fused activation and return (da, db)."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.gemm import GemmOp
+
+    ts = {"M": tile_m, "N": tile_n, "K": tile_k}
+    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
+                          activation=activation, c=c, pre_act=pre_act,
+                          tile_sizes=ts)
+    if ops:
+        config = GemmOp.kernel_config(ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            Megakernel(ops, config=config).run()
+
+    return da, db
+
+
+@requires_gpu
+class TestGemmFusedActivationBackward:
+    """GEMM backward with fused activation gradient via A-operand scaling."""
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_relu_backward_da(self, dtype):
+        """dA with fused ReLU backward: dA = (dout * relu'(pre_act)) @ B."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+        dout = torch.randn(M, N, dtype=dtype, device="cuda")
+
+        # Forward to get c = relu(A @ B^T)
+        pre_act_f32 = a.float() @ b_t.float().t()
+        c = torch.relu(pre_act_f32).to(dtype)
+
+        da = torch.zeros(M, K, dtype=dtype, device="cuda")
+        _run_gemm_fused_act_backward(dout, a, b_t, activation='relu',
+                                      c=c, da=da)
+
+        # Reference: dA = (dout * (c > 0)) @ B
+        act_grad = (c > 0).float()
+        da_ref = ((dout.float() * act_grad) @ b_t.float()).to(dtype)
+        torch.testing.assert_close(da, da_ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_relu_backward_both(self, dtype):
+        """Both dA and dB with fused ReLU backward."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+        dout = torch.randn(M, N, dtype=dtype, device="cuda")
+
+        pre_act_f32 = a.float() @ b_t.float().t()
+        c = torch.relu(pre_act_f32).to(dtype)
+
+        da = torch.zeros(M, K, dtype=dtype, device="cuda")
+        db = torch.zeros(N, K, dtype=dtype, device="cuda")
+        _run_gemm_fused_act_backward(dout, a, b_t, activation='relu',
+                                      c=c, da=da, db=db)
+
+        act_grad = (c > 0).float()
+        dout_adj = dout.float() * act_grad
+        da_ref = (dout_adj @ b_t.float()).to(dtype)
+        db_ref = (dout_adj.t() @ a.float()).to(dtype)
+        torch.testing.assert_close(da, da_ref, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(db, db_ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_silu_backward_da(self, dtype):
+        """dA with fused SiLU backward: dA = (dout * silu'(pre_act)) @ B."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+        dout = torch.randn(M, N, dtype=dtype, device="cuda")
+
+        pre_act_f32 = a.float() @ b_t.float().t()
+        pre_act = pre_act_f32.to(dtype)
+
+        da = torch.zeros(M, K, dtype=dtype, device="cuda")
+        _run_gemm_fused_act_backward(dout, a, b_t, activation='silu',
+                                      pre_act=pre_act, da=da)
+
+        # Reference: silu'(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        sig = torch.sigmoid(pre_act_f32)
+        act_grad = sig * (1.0 + pre_act_f32 * (1.0 - sig))
+        da_ref = ((dout.float() * act_grad) @ b_t.float()).to(dtype)
+        torch.testing.assert_close(da, da_ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_fused_silu_backward_both(self, dtype):
+        """Both dA and dB with fused SiLU backward."""
+        torch.manual_seed(42)
+        M, K, N = 128, 128, 64
+        a = torch.randn(M, K, dtype=dtype, device="cuda")
+        b_t = torch.randn(N, K, dtype=dtype, device="cuda")
+        dout = torch.randn(M, N, dtype=dtype, device="cuda")
+
+        pre_act_f32 = a.float() @ b_t.float().t()
+        pre_act = pre_act_f32.to(dtype)
+
+        da = torch.zeros(M, K, dtype=dtype, device="cuda")
+        db = torch.zeros(N, K, dtype=dtype, device="cuda")
+        _run_gemm_fused_act_backward(dout, a, b_t, activation='silu',
+                                      pre_act=pre_act, da=da, db=db)
+
+        sig = torch.sigmoid(pre_act_f32)
+        act_grad = sig * (1.0 + pre_act_f32 * (1.0 - sig))
+        dout_adj = dout.float() * act_grad
+        da_ref = (dout_adj @ b_t.float()).to(dtype)
+        db_ref = (dout_adj.t() @ a.float()).to(dtype)
+        torch.testing.assert_close(da, da_ref, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(db, db_ref, atol=1e-1, rtol=1e-2)
