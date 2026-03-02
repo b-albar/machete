@@ -41,6 +41,8 @@ from cutlass.cute.nvgpu import warp
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
+    mbarrier_init,
+    mbarrier_init_fence,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -158,21 +160,31 @@ class FlashAttentionSm100Op(Op):
         self.swizzle_M = 4
         self.swizzle_S = 3
 
+        # Op-managed mbarrier overhead (always 32B: 4 × 8B)
+        self.mbar_bytes = 32
+
         # --- Dynamic n_block computation (K/V separated double-buffer) ---
-        # 2 buffers x 1 matrix (K or V) = 2 x n_block x D x elem_bytes <= page_size
-        max_n_block = self.page_size // (2 * self.D * self.elem_bytes)
+        # 2 buffers x 1 matrix (K or V) + mbarriers <= page_size
+        max_n_block = (self.page_size - self.mbar_bytes) // (2 * self.D * self.elem_bytes)
         self.n_block = (max_n_block // 16) * 16
         self.n_block = min(self.n_block, self.N)
         # Round down to x16 after clamping to N (TMA zero-fills partial tiles)
         self.n_block = max(16, (self.n_block // 16) * 16)
         self.num_kv_blocks = (self.N + self.n_block - 1) // self.n_block
 
-        # Smem layout: buf0=[single matrix], buf1=[single matrix]
+        # Smem layout: buf0=[single matrix], buf1=[single matrix], mbarriers
         # K always in buf 1, V always in buf 0 (Q loaded into buf 0 first)
         self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
-        total_smem = 2 * self.kv_tile_bytes
+
+        # 4 op-managed mbarriers after double-buffer data (32 bytes):
+        #   smem_consumed[0,1]: compute → store warp (buffer read done)
+        #   kblock_ready[0,1]:  TMA hw → compute (new K/V data arrived)
+        self.mbar_offset = 2 * self.kv_tile_bytes
+        self.mbar_bytes = 32  # 4 × 8B
+
+        total_smem = 2 * self.kv_tile_bytes + self.mbar_bytes
         assert total_smem <= self.page_size, (
-            f"FlashAttentionSm100Op: KV double-buffer ({total_smem}B) > "
+            f"FlashAttentionSm100Op: KV double-buffer + mbarriers ({total_smem}B) > "
             f"page_size ({self.page_size}B).")
 
         # Q must fit in buf 0 (loaded first, then buf 0 reused for V)
@@ -210,8 +222,9 @@ class FlashAttentionSm100Op(Op):
             M = q.shape[1]
             N = tensors['k'].shape[1]
             elem = q.element_size()
-            # n_block from K/V separated double-buffer constraint
-            max_n_block = page_size // (2 * D * elem)
+            # n_block from K/V separated double-buffer + mbarrier constraint
+            mbar_bytes = 32  # 4 op-managed mbarriers × 8B
+            max_n_block = (page_size - mbar_bytes) // (2 * D * elem)
             n_block = (max_n_block // 16) * 16
             n_block = min(n_block, N)
             n_block = max(16, (n_block // 16) * 16)
@@ -254,18 +267,36 @@ class FlashAttentionSm100Op(Op):
              work_mbar, inner_iter_idx):
         """TMA load dispatched by inner_iter_idx.
 
-        iter 0:        TMA Q tile into buf 0 (plain smem, no swizzle)
-        odd iters 1+:  TMA K block into buf 1 (swizzled smem)
-        even iters 2+: TMA V block into buf 0 (swizzled smem)
+        iter 0:        Init op-managed mbarriers, TMA Q into buf 0
+                       (uses framework work_mbar for Q).
+        odd iters 1+:  Wait smem_consumed[1], TMA K → buf 1 (kblock_ready[1])
+        even iters 2+: Wait smem_consumed[0], TMA V → buf 0 (kblock_ready[0])
         """
         _buf_base = page_ptr + (
             inner_iter_idx % Int32(self.inner_depth)
         ) * Int32(self.kv_tile_bytes)
-        mbar_ptr = cute.make_ptr(
-            cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+
+        # Op-managed mbarrier addresses
+        _sc_0 = page_ptr + Int32(self.mbar_offset)       # smem_consumed[0]
+        _sc_1 = page_ptr + Int32(self.mbar_offset + 8)   # smem_consumed[1]
+        _kr_0 = page_ptr + Int32(self.mbar_offset + 16)  # kblock_ready[0]
+        _kr_1 = page_ptr + Int32(self.mbar_offset + 24)  # kblock_ready[1]
 
         # --- Q load (iter 0) -> buf 0 ---
         if inner_iter_idx == Int32(0):
+            # Init op-managed mbarriers
+            with cute.arch.elect_one():
+                mbarrier_init(_sc_0, Int32(1))
+                mbarrier_init(_sc_1, Int32(1))
+                mbarrier_init(_kr_0, Int32(1))
+                mbarrier_init(_kr_1, Int32(1))
+            mbarrier_init_fence()
+            # Pre-arrive smem_consumed[1]: buf 1 starts empty
+            with cute.arch.elect_one():
+                mbarrier_arrive(_sc_1)
+
+            mbar_ptr = cute.make_ptr(
+                cutlass.Int64, work_mbar, cute.AddressSpace.smem)
             sQ = cute.make_tensor(
                 cute.make_ptr(self.q_dtype, _buf_base,
                               cute.AddressSpace.smem),
@@ -289,6 +320,11 @@ class FlashAttentionSm100Op(Op):
         # --- K load (odd iters: 1, 3, 5, ...) -> buf 1 ---
         if inner_iter_idx % Int32(2) == Int32(1):
             kv_block_idx = (inner_iter_idx - Int32(1)) // Int32(2)
+
+            # Wait for compute to free buf 1
+            _sc_phase = kv_block_idx % Int32(2)
+            mbarrier_wait(_sc_1, _sc_phase)
+
             swz = cute.make_swizzle(
                 self.swizzle_B, self.swizzle_M, self.swizzle_S)
             sK = cute.make_tensor(
@@ -309,17 +345,24 @@ class FlashAttentionSm100Op(Op):
                 cute.group_modes(sK, 0, 3),
                 cute.group_modes(gK, 0, 3),
             )
+            _kr_1_ptr = cute.make_ptr(
+                cutlass.Int64, _kr_1, cute.AddressSpace.smem)
             nbytes = Int32(self.kv_tile_bytes)
             with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                mbarrier_arrive_expect_tx(_kr_1, nbytes)
             cute.copy(k_tma,
                       tKgK[(None, Int32(0), kv_block_idx, tile_BH)],
-                      tKsK, tma_bar_ptr=mbar_ptr)
+                      tKsK, tma_bar_ptr=_kr_1_ptr)
 
         # --- V load (even iters >= 2: 2, 4, 6, ...) -> buf 0 ---
         if inner_iter_idx > Int32(0):
             if inner_iter_idx % Int32(2) == Int32(0):
                 kv_block_idx = (inner_iter_idx - Int32(2)) // Int32(2)
+
+                # Wait for compute to free buf 0
+                _sc_phase = kv_block_idx % Int32(2)
+                mbarrier_wait(_sc_0, _sc_phase)
+
                 swz = cute.make_swizzle(
                     self.swizzle_B, self.swizzle_M, self.swizzle_S)
                 sV = cute.make_tensor(
@@ -340,12 +383,14 @@ class FlashAttentionSm100Op(Op):
                     cute.group_modes(sV, 0, 3),
                     cute.group_modes(gV, 0, 3),
                 )
+                _kr_0_ptr = cute.make_ptr(
+                    cutlass.Int64, _kr_0, cute.AddressSpace.smem)
                 nbytes = Int32(self.kv_tile_bytes)
                 with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                    mbarrier_arrive_expect_tx(_kr_0, nbytes)
                 cute.copy(v_tma,
                           tVgV[(None, Int32(0), kv_block_idx, tile_BH)],
-                          tVsV, tma_bar_ptr=mbar_ptr)
+                          tVsV, tma_bar_ptr=_kr_0_ptr)
 
     # =========================================================================
     # MMA Helpers
@@ -389,20 +434,18 @@ class FlashAttentionSm100Op(Op):
     # =========================================================================
 
     @cute.jit
-    def compute_mma(self, page_ptr, tile_BH, tile_M, tile_D,
-                    work_mbar, smem_consumed_mbar, work_mbar_phase):
+    def compute_mma(self, page_ptr, tile_BH, tile_M, tile_D):
         """Flash attention forward with multi-warp tensor core MMA.
 
         K/V separated: K always in buf 1, V always in buf 0.
+        Op-managed mbarriers derived from page_ptr (GemmOp pattern).
         Phase 1: read Q from buf 0 to registers.
         Phase 2: dynamic while loop over KV blocks with:
-          - Wait K (buf 1) -> S GEMM -> signal buf 1 consumed
-          - Wait V (buf 0) -> softmax + O GEMM
-          - Register pipeline, first-block rescale skip, boundary masking
+          - Signal smem_consumed[0], wait kblock_ready[1] -> S GEMM
+          - Signal smem_consumed[1], wait kblock_ready[0] -> softmax + O GEMM
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
-        lane_id = tidx % Int32(32)
 
         if warp_idx < Int32(self.num_mma_warps):
             # === MMA setup (multi-warp) ===
@@ -534,20 +577,26 @@ class FlashAttentionSm100Op(Op):
 
             # =============================================================
             # Phase 2: KV block loop (K/V separated)
-            #   K wait phase on buf 1: kv_idx % 2
-            #   V wait phase on buf 0: (kv_idx + 1) % 2
+            #   Op-managed mbarriers (GemmOp pattern):
+            #   smem_consumed[0,1] signaled by compute after reading
+            #   kblock_ready[0,1] signaled by TMA on arrival
             # =============================================================
+            _sc_0 = page_ptr + Int32(self.mbar_offset)
+            _sc_1 = page_ptr + Int32(self.mbar_offset + 8)
+            _kr_0 = page_ptr + Int32(self.mbar_offset + 16)
+            _kr_1 = page_ptr + Int32(self.mbar_offset + 24)
+
             kv_idx = Int32(0)
             while kv_idx < Int32(self.num_kv_blocks):
                 # --- Signal buf 0 consumed (Q on first, prev V after) ---
                 named_barrier_sync(
                     Int32(2), Int32(self.num_mma_threads))
-                if lane_id == Int32(0):
-                    mbarrier_arrive(smem_consumed_mbar)
+                if tidx == Int32(0):
+                    mbarrier_arrive(_sc_0)
 
                 # --- Wait for K on buf 1 ---
                 k_phase = kv_idx % Int32(2)
-                mbarrier_wait(work_mbar + Int32(8), k_phase)
+                mbarrier_wait(_kr_1, k_phase)
 
                 kv_start = kv_idx * Int32(self.n_block)
 
@@ -568,13 +617,12 @@ class FlashAttentionSm100Op(Op):
                 # --- Signal buf 1 consumed (K done) ---
                 named_barrier_sync(
                     Int32(2), Int32(self.num_mma_threads))
-                if lane_id == Int32(0):
-                    mbarrier_arrive(
-                        smem_consumed_mbar + Int32(8))
+                if tidx == Int32(0):
+                    mbarrier_arrive(_sc_1)
 
                 # --- Wait for V on buf 0 ---
-                v_phase = (kv_idx + Int32(1)) % Int32(2)
-                mbarrier_wait(work_mbar, v_phase)
+                v_phase = kv_idx % Int32(2)
+                mbarrier_wait(_kr_0, v_phase)
 
                 # --- Masking (boundary blocks only) ---
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
