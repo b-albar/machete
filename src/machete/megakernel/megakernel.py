@@ -47,7 +47,8 @@ from .scheduling import (
 from .compile import compile_phase
 from .interpreter import (
     global_barrier_signal,
-    check_barrier_ready,
+    global_barrier_signal_gpu,
+    check_barrier_ready_gpu,
     load_instruction_to_smem,
     ld_global_i64,
     mbarrier_init,
@@ -1009,10 +1010,12 @@ class Megakernel:
             f"{epilogue}"
         )
 
+        # Use GPU-scoped barrier ops for local (intra-GPU) barriers.
+        # Peer barriers use .sys scope (see _build_signal_peer_barriers).
         exec_globals = {
             "cute": cute, "Int32": Int32, "Int64": Int64,
-            "global_barrier_signal": global_barrier_signal,
-            "check_barrier_ready": check_barrier_ready,
+            "global_barrier_signal": global_barrier_signal_gpu,
+            "check_barrier_ready": check_barrier_ready_gpu,
         }
 
         compile_mod._compile_counter += 1
@@ -1295,6 +1298,9 @@ class Megakernel:
                 produce_idx = Int32(0)
                 _iq_fetch_idx = block_id
                 done = Int32(0)
+                # Cache op_config_ptr per op_idx (avoid repeated global loads)
+                _dl_cached_op_idx = Int32(-1)
+                _dl_cached_config = Int64(0)
 
                 # Smem pointers for inter-thread/warp communication
                 dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
@@ -1404,7 +1410,9 @@ class Megakernel:
                         _dl_0, _dl_1, _dl_2, _dl_3, _dl_4 = decompose_tile(
                             _dl_op, _dl_lin)
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
-                        _dl_config = ld_global_i64(op_configs_ptr, _dl_op)
+                        if _dl_op != _dl_cached_op_idx:
+                            _dl_cached_config = ld_global_i64(op_configs_ptr, _dl_op)
+                            _dl_cached_op_idx = _dl_op
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
                         _ep_lin = ld_shared_i32(prev_linear_ptr)
                         _ep_0 = Int32(-1)
@@ -1421,7 +1429,7 @@ class Megakernel:
                         dispatch_load(
                             _dl_op, _dl_pp,
                             _dl_0, _dl_1, _dl_2, _dl_3, _dl_4,
-                            _dl_config, _dl_mbar,
+                            _dl_cached_config, _dl_mbar,
                             _ep_0, _ep_1, _ep_2, _ep_3, _ep_4,
                             _dl_iter,
                         )
@@ -1450,6 +1458,9 @@ class Megakernel:
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+                # Cache op_config_ptr per op_idx (avoid repeated global loads)
+                _ds_cached_op_idx = Int32(-1)
+                _ds_cached_config = Int64(0)
 
                 while _sw_done == Int32(0):
                     _s_idx = ld_shared_i32(store_idx_ptr)
@@ -1466,7 +1477,9 @@ class Megakernel:
                         _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(
                             _ds_op, _ds_lin)
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
-                        _ds_config = ld_global_i64(op_configs_ptr, _ds_op)
+                        if _ds_op != _ds_cached_op_idx:
+                            _ds_cached_config = ld_global_i64(op_configs_ptr, _ds_op)
+                            _ds_cached_op_idx = _ds_op
                         _ds_mbar = _work_notify_mbar(smem_base, _s_slot)
 
                         # K-block iteration: store warp issues remaining TMA
@@ -1483,7 +1496,7 @@ class Megakernel:
                             dispatch_load(
                                 _ds_op, _ds_pp,
                                 _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
-                                _ds_config, _ds_mbar,
+                                _ds_cached_config, _ds_mbar,
                                 _no_prev, _no_prev, _no_prev,
                                 _no_prev, _no_prev,
                                 _iter_idx,
@@ -1497,7 +1510,7 @@ class Megakernel:
                         dispatch_store(
                             _ds_op, _ds_pp,
                             _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
-                            _ds_config,
+                            _ds_cached_config,
                         )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -1508,7 +1521,7 @@ class Megakernel:
                             dispatch_communicate(
                                 _ds_op, _ds_pp,
                                 _ds_0, _ds_1, _ds_2, _ds_3, _ds_4,
-                                _ds_config,
+                                _ds_cached_config,
                             )
                             cute.arch.cp_async_bulk_commit_group()
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -1544,6 +1557,9 @@ class Megakernel:
 
                 consume_ptr = Int32(0)
                 mma_running = Int32(1)
+                # Cache op_config_ptr: only reload from global when op_idx changes
+                _cached_op_idx = Int32(-1)
+                _cached_op_config = Int64(0)
 
                 while mma_running == Int32(1):
                     slot = consume_ptr % Int32(num_pages)
@@ -1577,7 +1593,10 @@ class Megakernel:
                             op_idx, _mma_lin)
 
                         page_ptr = _get_page_ptr(smem_base, slot)
-                        op_config_ptr = ld_global_i64(op_configs_ptr, op_idx)
+                        # Cache op_config_ptr: avoid global load when op unchanged
+                        if op_idx != _cached_op_idx:
+                            _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
+                            _cached_op_idx = op_idx
 
                         if const_expr(tracing):
                             _tc = trace_start()
@@ -1585,7 +1604,7 @@ class Megakernel:
                         dispatch_compute(
                             op_idx, page_ptr,
                             tile_0, tile_1, tile_2, tile_3, tile_4,
-                            op_config_ptr,
+                            _cached_op_config,
                         )
 
                         # Sync MMA warps post-compute

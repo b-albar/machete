@@ -26,7 +26,7 @@ from cutlass._mlir.dialects import llvm
 # =============================================================================
 
 MAX_PAGES: int = 16  # Maximum number of pages
-IQ_DEPTH: int = 8  # Instruction queue depth for out-of-order loading
+IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by load warp, store warp, and all load-warp threads for communication.

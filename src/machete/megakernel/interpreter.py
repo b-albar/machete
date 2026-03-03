@@ -58,7 +58,7 @@ def global_barrier_wait(
         ".reg .u64 %addr; "
         "mad.wide.u32 %addr, $1, 4, $0; "
         "{loop}: "
-        "ld.acquire.sys.global.b32 %val, [%addr]; "
+        "ld.acquire.gpu.global.b32 %val, [%addr]; "
         "setp.ge.u32 %p, %val, $2; "
         "@%p bra {done}; "
         "nanosleep.u32 8; "
@@ -110,7 +110,7 @@ def check_barrier_ready(
             .reg .u32 %val;
             .reg .u64 %addr;
             mad.wide.u32 %addr, $2, 4, $1;
-            ld.acquire.sys.global.b32 %val, [%addr];
+            ld.acquire.gpu.global.b32 %val, [%addr];
             setp.ge.u32 %p, %val, $3;
             selp.u32 $0, 1, 0, %p;
         }
@@ -149,6 +149,80 @@ def global_barrier_signal(
             .reg .u64 %addr;
             mad.wide.u32 %addr, $1, 4, $0;
             atom.add.release.sys.global.u32 _, [%addr], 1;
+        }
+        """,
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def check_barrier_ready_gpu(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    expected: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Non-blocking barrier check with GPU scope (cheaper than sys scope).
+
+    Same as check_barrier_ready but uses .gpu scope instead of .sys.
+    Sufficient for intra-GPU barriers (not cross-GPU NVLink).
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [
+            barrier_ptr.ir_value(loc=loc, ip=ip),
+            barrier_idx.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred %p;
+            .reg .u32 %val;
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $2, 4, $1;
+            ld.acquire.gpu.global.b32 %val, [%addr];
+            setp.ge.u32 %p, %val, $3;
+            selp.u32 $0, 1, 0, %p;
+        }
+        """,
+        "=r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def global_barrier_signal_gpu(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Signal (increment) a global barrier with GPU scope (cheaper than sys scope).
+
+    Same as global_barrier_signal but uses .gpu scope instead of .sys.
+    Sufficient for intra-GPU barriers (not cross-GPU NVLink).
+    """
+    llvm.inline_asm(
+        None,
+        [barrier_ptr.ir_value(loc=loc, ip=ip), barrier_idx.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $1, 4, $0;
+            atom.add.release.gpu.global.u32 _, [%addr], 1;
         }
         """,
         "l,r",
@@ -632,7 +706,9 @@ def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
+    "global_barrier_signal_gpu",
     "check_barrier_ready",
+    "check_barrier_ready_gpu",
     "load_instruction_to_smem",
     "ld_global_i32",
     "ld_global_i64",
