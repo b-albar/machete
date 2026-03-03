@@ -6,7 +6,7 @@ Tests the following components:
 1. PeerBufferRegistry: peer buffer tracking and canonical name resolution
 2. PeerTMARegistry: peer TMA descriptor generation
 3. Op.peer_stores validation in _process_op_declarations
-4. compile_communicate: compiles Op.communicate into @cute.jit wrapper
+4. compile_phase: compiles Op.communicate into @cute.jit wrapper
 5. has_communicate flag and num_peer_barriers property
 6. Single-GPU smoke test: peer_stores op with no actual peers (no-op communicate)
 7. Multi-GPU integration test: actual peer buffer TMA communication
@@ -18,9 +18,8 @@ import io
 import pytest
 import torch
 
-from machete.megakernel.ops import (
-    Op,
-    ScheduledOp,
+from machete.megakernel.ops import Op, ScheduledOp
+from machete.megakernel.registries import (
     TensorRegistry,
     PeerBufferInfo,
     PeerBufferRegistry,
@@ -28,7 +27,7 @@ from machete.megakernel.ops import (
     PeerTMADescriptorInfo,
 )
 from machete.megakernel.megakernel import Megakernel, MegakernelConfig
-from machete.megakernel.compile import compile_communicate
+from machete.megakernel.compile import compile_phase
 from machete.utils.testing import is_hopper_available
 
 requires_hopper = pytest.mark.skipif(
@@ -452,7 +451,7 @@ class TestPeerStoresValidation:
 
 
 # =============================================================================
-# compile_communicate Tests
+# compile_phase Tests
 # =============================================================================
 
 
@@ -473,13 +472,13 @@ class TestCompileCommunicate:
         config = build_op_config(ops[0], kernel_config={"threads_per_row": 128})
         instance = PeerStoreOp(**config)
 
-        fn = compile_communicate(instance, tensor_param_names=tensor_args)
+        fn = compile_phase(instance, "communicate", tensor_param_names=tensor_args)
         assert fn is not None
         assert callable(fn)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_communicate_with_peer_tma_mapping(self):
-        """compile_communicate with TMA mapping produces valid function."""
+        """compile_phase with TMA mapping produces valid function."""
         from machete.megakernel.ops import build_op_config
 
         x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
@@ -504,8 +503,8 @@ class TestCompileCommunicate:
         config = build_op_config(ops[0], kernel_config={"threads_per_row": 128})
         instance = PeerStoreOp(**config)
 
-        fn = compile_communicate(
-            instance, tensor_param_names=tensor_args,
+        fn = compile_phase(
+            instance, "communicate", tensor_param_names=tensor_args,
             tma_param_names=comm_tma_args,
             tma_local_mapping=comm_tma_mapping,
         )

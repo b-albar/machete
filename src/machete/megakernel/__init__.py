@@ -20,14 +20,20 @@ from .ops import (
     Op,
     ScheduledOp,
     TensorMeta,
+    build_op_config,
+)
+
+from .registries import (
+    PeerBufferRegistry,
+    PeerTMARegistry,
+    validate_op_compatibility,
+)
+
+from .scheduling import (
     BarrierFormula,
     INSTRUCTION_WORDS,
     TileInstruction,
     InstructionStreamBuilder,
-    PeerBufferRegistry,
-    PeerTMARegistry,
-    validate_op_compatibility,
-    build_op_config,
 )
 
 from .compile import (

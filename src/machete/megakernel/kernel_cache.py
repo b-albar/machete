@@ -20,9 +20,9 @@ Usage:
 """
 
 import threading
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple
 
-from .ops import ScheduledOp, Op
+from .ops import ScheduledOp
 from .megakernel import MegakernelConfig
 
 

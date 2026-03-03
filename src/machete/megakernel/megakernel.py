@@ -30,25 +30,21 @@ from cutlass import Int32, Int64
 from .ops import (
     MAX_TILE_DIMS,
     ScheduledOp,
+    build_op_config,
+)
+from .registries import (
     TensorRegistry,
     TMARegistry,
     PeerBufferRegistry,
     PeerTMARegistry,
+    validate_op_compatibility,
+)
+from .scheduling import (
     InstructionStreamBuilder,
     TileInstruction,
     INSTRUCTION_WORDS,
-    validate_op_compatibility,
-    build_op_config,
 )
-from .compile import (
-    compile_load,
-    compile_compute,
-    compile_store,
-    compile_communicate,
-    compile_backward_load,
-    compile_backward_compute,
-    compile_backward_store,
-)
+from .compile import compile_phase
 from .interpreter import (
     global_barrier_signal,
     check_barrier_ready,
@@ -312,7 +308,19 @@ class Megakernel:
             # via from_dlpack + mark_layout_dynamic, preserving shape for TMA.
             # Ops that need flat 1D access get a flat alias in init source.
             t = tensor.detach().contiguous()
-            self._cute_tensors.append(t)
+            # Fix ambiguous strides: CuTe's mark_layout_dynamic() can't deduce
+            # the leading dim when multiple dims have stride 1 (happens with
+            # size-1 dims since from_dlpack normalizes their strides to 1).
+            # Convert these tensors to CuTe manually with explicit leading_dim.
+            strides = t.stride()
+            unit_dims = [i for i in range(t.ndim) if strides[i] == 1]
+            if len(unit_dims) > 1:
+                from cutlass.cute.runtime import from_dlpack
+                cute_t = from_dlpack(t, assumed_align=16).mark_layout_dynamic(
+                    leading_dim=t.ndim - 1)
+                self._cute_tensors.append(cute_t)
+            else:
+                self._cute_tensors.append(t)
 
     def _prepare_tma_tensors(self) -> None:
         """Prepare CuTe tensors with static layout for TMA descriptor creation.
@@ -483,36 +491,27 @@ class Megakernel:
             instance = op.op_cls(**config)
             inner_iters_list.append(getattr(instance, 'inner_iters', 1))
 
-            if use_backward:
-                load_fns.append(compile_backward_load(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=load_tma_args,
-                    tma_local_mapping=load_tma_mapping))
-                compute_fns.append(compile_backward_compute(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=compute_tma_args,
-                    tma_local_mapping=compute_tma_mapping))
-                store_fns.append(compile_backward_store(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=store_tma_args,
-                    tma_local_mapping=store_tma_mapping))
-            else:
-                load_fns.append(compile_load(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=load_tma_args,
-                    tma_local_mapping=load_tma_mapping))
-                compute_fns.append(compile_compute(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=compute_tma_args,
-                    tma_local_mapping=compute_tma_mapping))
-                store_fns.append(compile_store(
-                    instance, tensor_param_names=tensor_args,
-                    tma_param_names=store_tma_args,
-                    tma_local_mapping=store_tma_mapping))
+            prefix = "backward_" if use_backward else ""
+            load_fns.append(compile_phase(
+                instance, f"{prefix}load",
+                tensor_param_names=tensor_args,
+                tma_param_names=load_tma_args,
+                tma_local_mapping=load_tma_mapping))
+            compute_fns.append(compile_phase(
+                instance, f"{prefix}compute",
+                tensor_param_names=tensor_args,
+                tma_param_names=compute_tma_args,
+                tma_local_mapping=compute_tma_mapping))
+            store_fns.append(compile_phase(
+                instance, f"{prefix}store",
+                tensor_param_names=tensor_args,
+                tma_param_names=store_tma_args,
+                tma_local_mapping=store_tma_mapping))
 
             # Communicate: same for forward and backward (always sends to peers)
-            communicate_fns.append(compile_communicate(
-                instance, tensor_param_names=tensor_args,
+            communicate_fns.append(compile_phase(
+                instance, "communicate",
+                tensor_param_names=tensor_args,
                 tma_param_names=comm_tma_args,
                 tma_local_mapping=comm_tma_mapping))
 
@@ -555,7 +554,6 @@ class Megakernel:
         import machete.megakernel.compile as compile_mod
 
         is_load = phase_name == "load"
-        is_compute = phase_name == "compute"
         tensor_params = ", ".join(all_canonical)
 
         tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
@@ -585,11 +583,6 @@ class Megakernel:
                     f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
                     f"{prev_tile_params}, inner_iter_idx{args_str})"
                 )
-            elif is_compute:
-                lines.append(
-                    f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr{args_str})"
-                )
             else:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
@@ -603,8 +596,6 @@ class Megakernel:
         extra_sig = ""
         if is_load:
             extra_sig = f", work_mbar, {prev_tile_params}, inner_iter_idx"
-        elif is_compute:
-            extra_sig = ""
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, {tile_params}, "

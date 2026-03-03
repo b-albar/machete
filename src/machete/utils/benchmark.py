@@ -11,7 +11,6 @@ from .benchmark_utils import (
     benchmark_backward,
     benchmark_memory,
     benchmark_fwd_bwd,
-    benchmark_cuda_graph,
     benchmark_jit_kernel,
     KernelBenchSpec,
     efficiency,
@@ -148,13 +147,14 @@ class Benchmark:
     def _bench_kernel_func(self, func_or_spec, warmup, rep):
         """Benchmark a single function or KernelBenchSpec.
 
-        For KernelBenchSpec: per-iteration CUDA event timing with barrier
-        resets (persistent megakernel is incompatible with CUDA graph replay).
-        For callables: CUDA graph capture + replay.
+        Uses per-iteration CUDA event timing for all callables. CUDA graph
+        capture is avoided because failed captures (e.g. from functions that
+        allocate intermediates) corrupt CUDA runtime state, causing all
+        subsequent GPU allocations to fail.
 
         Args:
-            func_or_spec: A callable (benchmarked with torch CUDA graphs)
-                or a KernelBenchSpec (benchmarked with per-iteration events).
+            func_or_spec: A callable or a KernelBenchSpec (with optional
+                per-iteration setup and dedicated stream).
             warmup: Number of warmup iterations.
             rep: Number of timed iterations.
 
@@ -189,24 +189,20 @@ class Benchmark:
 
             return sum(times) / len(times)
         else:
-            try:
-                return benchmark_cuda_graph(func_or_spec, warmup=warmup, rep=rep)
-            except Exception:
-                # Fallback to per-iteration CUDA event timing (e.g. for
-                # CuTe DSL compiled kernels that don't support graph capture).
-                for _ in range(warmup):
-                    func_or_spec()
+            # Per-iteration CUDA event timing (no graph capture).
+            for _ in range(warmup):
+                func_or_spec()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            times = []
+            for _ in range(rep):
+                start.record()
+                func_or_spec()
+                end.record()
                 torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                times = []
-                for _ in range(rep):
-                    start.record()
-                    func_or_spec()
-                    end.record()
-                    torch.cuda.synchronize()
-                    times.append(start.elapsed_time(end))
-                return sum(times) / len(times)
+                times.append(start.elapsed_time(end))
+            return sum(times) / len(times)
 
     def _print_kernel_summary(self, results, names, bytes_fn):
         """Print a formatted summary table for kernel benchmark results."""

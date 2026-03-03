@@ -8,8 +8,8 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.ops import (
-    Op,
+from machete.megakernel.ops import Op
+from machete.megakernel.scheduling import (
     BarrierFormula,
     TileInstruction,
     InstructionStreamBuilder,
@@ -507,14 +507,14 @@ class TestLinecacheCleanup:
 
     def test_cleanup_removes_entries(self):
         from machete.megakernel.compile import (
-            compile_compute,
+            compile_phase,
             cleanup_linecache,
             _linecache_entries,
         )
         import linecache
 
         before = len(_linecache_entries)
-        compile_compute(_NOPOp())
+        compile_phase(_NOPOp(), "compute")
         assert len(_linecache_entries) > before
 
         # Verify entries exist in linecache
@@ -710,10 +710,12 @@ class TestSchedulerAPI:
 
 from machete.megakernel.ops import (
     TensorMeta,
-    TensorRegistry,
     _build_tensor_and_dim_lists,
-    validate_op_compatibility,
     ScheduledOp,
+)
+from machete.megakernel.registries import (
+    TensorRegistry,
+    validate_op_compatibility,
 )
 
 
