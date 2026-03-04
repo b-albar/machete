@@ -52,7 +52,7 @@ class TensorRegistry:
     name_to_idx: Dict[str, int]
 
     @classmethod
-    def from_ops(cls, ops: List[ScheduledOp], backward: bool = False) -> "TensorRegistry":
+    def from_ops(cls, ops: List[ScheduledOp]) -> "TensorRegistry":
         """Build a TensorRegistry from a list of ScheduledOps.
 
         Iterates through each op's tensor_refs in declaration order,
@@ -61,7 +61,6 @@ class TensorRegistry:
 
         Args:
             ops: List of scheduled operations with tensor_refs populated.
-            backward: If True, use backward tensor declarations for ordering.
         """
         ptr_to_canonical: Dict[int, str] = {}
         tensors: List[Tuple[str, Any, Any]] = []
@@ -77,7 +76,7 @@ class TensorRegistry:
                 continue
 
             # Use the op's unique_tensors for consistent ordering
-            unique_tensors = op.op_cls._BWD_UNIQUE_TENSORS if backward else op.op_cls._UNIQUE_TENSORS
+            unique_tensors = op.op_cls._UNIQUE_TENSORS
 
             for name, dtype, dims in unique_tensors:
                 if name not in op.tensor_refs:
@@ -112,7 +111,7 @@ class TensorRegistry:
         """Number of unique tensors."""
         return len(self.tensors)
 
-    def get_op_tensor_args(self, op_idx: int, op_cls, backward: bool = False) -> List[str]:
+    def get_op_tensor_args(self, op_idx: int, op_cls) -> List[str]:
         """Get ordered canonical tensor names for an op's function call.
 
         Returns canonical names in the same order as the op's tensor
@@ -122,13 +121,11 @@ class TensorRegistry:
         Args:
             op_idx: Index of the op in the ops list.
             op_cls: The op class (for accessing _UNIQUE_TENSORS).
-            backward: If True, use backward tensor declarations.
         """
         if not hasattr(op_cls, "_UNIQUE_TENSORS"):
             return []
-        unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
         mapping = self.op_mappings[op_idx]
-        return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
+        return [mapping[name] for name, _, _ in op_cls._UNIQUE_TENSORS if name in mapping]
 
 
 # =============================================================================
@@ -423,8 +420,15 @@ class TMARegistry:
                     op_mappings[(i, phase)][f"{tensor_name}_tma_gmem"] = canonical_gmem
                     counter += 1
 
-            # Compute phase can use the same TMA load descriptors
+            # Compute phase can use TMA load descriptors + reduce store descriptors
             op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
+            for key, val in op_mappings[(i, "store")].items():
+                if any(
+                    d.direction == "s2g_reduce"
+                    and (d.canonical_atom == val or d.canonical_gmem == val)
+                    for d in descriptors
+                ):
+                    op_mappings[(i, "compute")][key] = val
 
         return cls(descriptors=descriptors, op_mappings=op_mappings)
 

@@ -672,7 +672,7 @@ class GemmOp(Op):
         """
         a_factor = 2 if has_a_scale else 1
         tile_K = 32
-        for tile_M, tile_N in [(128, 64), (64, 64), (64, 32), (32, 32)]:
+        for tile_M, tile_N in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
             ab = 2 * (a_factor * tile_M + tile_N) * tile_K * elem_bytes
             c = tile_M * tile_N * elem_bytes
             if ab <= page_size and c <= page_size:

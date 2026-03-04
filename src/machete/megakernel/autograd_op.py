@@ -69,6 +69,7 @@ class AutogradOp(ABC):
     """
 
     op_cls: ClassVar[Type[Op]]
+    bwd_op_cls: ClassVar[Optional[Type[Op]]] = None  # Separate backward Op class
 
     @abstractmethod
     def tensor_specs(self) -> List[TensorSpec]:

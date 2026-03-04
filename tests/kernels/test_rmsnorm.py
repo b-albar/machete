@@ -82,19 +82,19 @@ def _run_rmsnorm_forward(x_2d, weight, eps=1e-6, residual=False, gemma=False,
 
 def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6, residual=False,
                           gemma=False, per_row_weight=False):
-    """Run RMSNormOp backward and return dx tensor."""
+    """Run RMSNormBwdOp backward and return dx tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
     D = x_2d.shape[1]
     tile_m = _tile_size_M(D)
     dx = torch.zeros_like(x_2d)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=x_2d, weight=weight, dx=dx,
+    ops = RMSNormBwdOp.schedule(
+        dout=dout_2d, x=x_2d, weight=weight, dx=dx,
         tile_sizes={"M": tile_m},
         residual=residual, gemma=gemma, per_row_weight=per_row_weight,
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
@@ -127,21 +127,21 @@ def _run_fused_add_rmsnorm_forward(x_2d, residual_in, weight):
 
 
 def _run_fused_add_rmsnorm_backward(dout_2d, residual_out_2d, weight):
-    """Run RMSNormOp backward with fused add (d_residual output)."""
+    """Run RMSNormBwdOp backward with fused add (d_residual output)."""
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
     D = dout_2d.shape[1]
     tile_m = _tile_size_M(D)
     dx = torch.zeros_like(dout_2d)
     d_residual = torch.zeros_like(dout_2d)
     # For fused-add backward, pass residual_out as x (it's what gets TMA loaded)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=residual_out_2d, weight=weight,
+    ops = RMSNormBwdOp.schedule(
+        dout=dout_2d, x=residual_out_2d, weight=weight,
         dx=dx, d_residual=d_residual,
         tile_sizes={"M": tile_m},
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
@@ -172,20 +172,20 @@ def _run_rmsnorm_gated_forward(x_2d, gate, weight):
 
 
 def _run_rmsnorm_gated_backward(dout_2d, x_2d, gate, weight):
-    """Run RMSNormOp backward with gating."""
+    """Run RMSNormBwdOp backward with gating."""
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
     D = x_2d.shape[1]
     tile_m = _tile_size_M(D)
     dx = torch.zeros_like(x_2d)
     dgate = torch.zeros_like(gate)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=x_2d, weight=weight,
+    ops = RMSNormBwdOp.schedule(
+        dout=dout_2d, x=x_2d, weight=weight,
         dx=dx, gate=gate, dgate=dgate,
         tile_sizes={"M": tile_m},
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    kernel = Megakernel(ops, config=MegakernelConfig())
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()

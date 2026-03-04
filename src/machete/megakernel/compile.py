@@ -171,7 +171,7 @@ def _build_phase_wrapper(
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
 
-    is_load_phase = phase_name in ("load", "backward_load")
+    is_load_phase = phase_name == "load"
 
     # Map prev_tile params for load phases: prev_tile_M, prev_tile_D, etc.
     # Framework passes -1 when the previous tile was a different op.
@@ -270,7 +270,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
                   tma_param_names=None, tma_local_mapping=None):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
-    For load phases (load, backward_load), detects async vs sync from method
+    For load phases, detects async vs sync from method
     signature. Async loads manage their own mbarrier; sync loads get an
     automatic mbarrier_arrive appended. All load wrappers include work_mbar
     in their signature.
@@ -278,7 +278,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
     All other phases (compute, store, communicate, backward_*) are compiled
     directly with no extra parameters.
     """
-    is_load = phase_name in ("load", "backward_load")
+    is_load = phase_name == "load"
 
     if is_load:
         method = getattr(instance, phase_name)

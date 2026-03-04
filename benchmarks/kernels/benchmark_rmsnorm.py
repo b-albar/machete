@@ -21,7 +21,7 @@ import io
 import torch
 
 from machete.megakernel import Megakernel
-from machete.kernels.rms_norm import RMSNormOp
+from machete.kernels.rms_norm import RMSNormOp, RMSNormBwdOp
 from machete.kernels.rms_norm.ref import rmsnorm_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
 from machete.utils.benchmark import Benchmark
 
@@ -115,6 +115,20 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
         torch.cuda.synchronize()
 
         funcs["megakernel"] = kernel.bench_spec(keep_alive=[x, weight, y])
+
+    # Megakernel backward
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        dout = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
+        dx = torch.empty_like(x)
+        bwd_ops = RMSNormBwdOp.schedule(dout=dout, x=x, weight=weight, dx=dx)
+        bwd_config = RMSNormBwdOp.kernel_config(bwd_ops)
+        bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            bwd_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["megakernel_bwd"] = bwd_kernel.bench_spec(keep_alive=[dout, x, weight, dx])
 
     return funcs
 

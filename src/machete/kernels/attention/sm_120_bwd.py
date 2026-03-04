@@ -59,9 +59,9 @@ class FlashAttentionSm120BwdOp(Op):
         dout: (BH, M, D) -- gradient of loss w.r.t. O
         lse: (BH, M)    -- logsumexp from forward (f32)
         dpsum: (BH, M)  -- rowsum(dO * O), precomputed (f32)
-        dq_accum: (BH, M, D) -- atomicAdd target (f32)
         dk: (BH, N, D) -- output gradient w.r.t. K
         dv: (BH, N, D) -- output gradient w.r.t. V
+        dq: (BH, M, D) -- output gradient w.r.t. Q (TMA reduce-add)
 
     Tiling: tile_BH=1, tile_N from schedule, tile_D=D (full).
     """
@@ -73,20 +73,36 @@ class FlashAttentionSm120BwdOp(Op):
         "dout": (None, ("BH", "M", "D")),
         "lse": (cutlass.Float32, ("BH", "M")),
         "dpsum": (cutlass.Float32, ("BH", "M")),
-        "dq_accum": (cutlass.Float32, ("BH", "M", "D")),
     }
     writes = {
         "dk": (None, ("BH", "N", "D")),
         "dv": (None, ("BH", "N", "D")),
+        "dq": (None, ("BH", "M", "D")),
     }
     tile = ("BH", "N", "D")
 
     tma_loads = {"k", "v"}
     tma_stores = {"dk", "dv"}
+    tma_reduce_stores = {"dq"}
+
+    @classmethod
+    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
+        """Custom TMA tile shape for dq (M-block sized, not N-tiled)."""
+        if tensor_name == "dq":
+            m_block = tile_sizes["N"]  # m_block = tile_N
+            D = static_dims["D"]
+            return (1, m_block, D)
+        return None
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
-        """Swizzled smem layout for K/V TMA load and dK/dV TMA store."""
+        """Swizzled smem layout for K/V/dK/dV TMA, plain for dq."""
+        if tensor_name == "dq":
+            dim0, dim1, dim2 = tma_tile_shape
+            return (
+                f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
+                f"stride=(1, {dim0}, {dim0 * dim1}))"
+            )
         if tensor_name not in ("k", "v", "dk", "dv"):
             return None
 
@@ -184,33 +200,55 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        """Schedule backward pass."""
+    def _smem_per_page(cls, tile_N, D, elem_bytes):
+        """Total smem bytes per page for a given tile_N (m_block = tile_N).
+
+        Layout: K + V + Q_buf + dO_buf + P_buf + dS_buf
+        = (4*tile_N*D + 2*tile_N^2) * elem_bytes
+        """
+        return (4 * tile_N * D + 2 * tile_N * tile_N) * elem_bytes
+
+    @classmethod
+    def schedule_backward(cls, tile_sizes=None, causal=False, page_size=None, **tensors):
+        """Schedule backward pass.
+
+        If page_size is None, auto-detects optimal page_size from GPU shared
+        memory to maximize tile_N (and thus MMA warp count).
+        """
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("BH", 1)
         k = tensors.get("k")
         if k is not None:
             assert k.element_size() == 2
             D = k.shape[-1]
+            eb = k.element_size()
+
             if "N" not in tile_sizes:
-                # Total smem = 2*tile_N*D*2 + 2*tile_N*D*2 + 2*tile_N*tile_N*2
-                # = 4*tile_N*D*2 + 2*tile_N^2*2 = tile_N*(8*D + 4*tile_N) bytes
-                # For simplicity, start with tile_N from K+V constraint, check total
-                max_tile_N = page_size // (2 * D * k.element_size())
-                max_nw = min(8, max_tile_N // 16, k.shape[1] // 16)
-                # Power-of-2 warps for cpasync divisibility
+                if page_size is not None:
+                    max_page = page_size
+                else:
+                    # Auto-detect from GPU: 2 pages + scratch must fit in max smem
+                    import torch
+                    max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+                    max_page = (max_smem - 1024) // 2  # conservative scratch estimate
+
+                # Find largest power-of-2-warps tile_N that fits
                 nw = 1
-                while nw * 2 <= max_nw:
+                while nw * 2 <= 8 and (nw * 2) * 16 <= k.shape[1]:
+                    tn = (nw * 2) * 16
+                    if cls._smem_per_page(tn, D, eb) > max_page:
+                        break
                     nw *= 2
+
                 tile_N = max(16, nw * 16)
-                # Verify total smem fits
-                eb = k.element_size()
-                total = 2 * tile_N * D * eb + 2 * tile_N * D * eb + 2 * tile_N * tile_N * eb
-                while total > page_size and nw > 1:
-                    nw = nw // 2
-                    tile_N = nw * 16
-                    total = 2 * tile_N * D * eb + 2 * tile_N * D * eb + 2 * tile_N * tile_N * eb
                 tile_sizes["N"] = tile_N
+
+                if page_size is None:
+                    page_size = cls._smem_per_page(tile_N, D, eb)
+
+        if page_size is None:
+            page_size = DEFAULT_PAGE_SIZE
+
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         if causal:
@@ -586,18 +624,21 @@ class FlashAttentionSm120BwdOp(Op):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # P = exp2(S * scale_log2e - LSE * log2e)
+                # Rows beyond M are zeroed (m_block may exceed M)
                 for r in cutlass.range_constexpr(num_rows_S):
                     row_idx = tScS_mn[r, 0][0]
                     global_row = m_start + Int32(row_idx)
-                    lse_val = Float32(0.0)
                     if global_row < Int32(self.M):
                         lse_val = g_lse[global_row]
-                    lse_log2e = lse_val * Float32(1.4426950408889634074)
-                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
-                        acc_S_mn[r, c] = cute.math.exp2(
-                            acc_S_mn[r, c] * Float32(self.scale_log2e) - lse_log2e,
-                            fastmath=True,
-                        )
+                        lse_log2e = lse_val * Float32(1.4426950408889634074)
+                        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                            acc_S_mn[r, c] = cute.math.exp2(
+                                acc_S_mn[r, c] * Float32(self.scale_log2e) - lse_log2e,
+                                fastmath=True,
+                            )
+                    else:
+                        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                            acc_S_mn[r, c] = Float32(0.0)
 
                 # --- GEMM 2: dP = dO @ V^T (m_block × tile_N), K-dim=D ---
                 for kb in cutlass.range_constexpr(self.D // 16):

@@ -1,15 +1,9 @@
 # Copyright (c) 2025, Machete Authors
 """
-RoPE (Rotary Position Embedding) Op for the Megakernel.
+RoPE (Rotary Position Embedding) Ops for the Megakernel.
 
 Applies rotary position embedding in-place to a query tensor using
-pipelined load/compute/store with shared memory staging. Both forward
-and backward passes are implemented.
-
-Data flows through shared memory:
-    load:    async cp.async.bulk G->S (q, cos, sin tiles)
-    compute: rotate in shared memory (warp-parallel vectorized)
-    store:   cp.async.bulk S->G (modified q tile)
+pipelined load/compute/store with shared memory staging.
 
 Forward rotation:
     out[..., :half_d] = q[..., :half_d] * cos - q[..., half_d:] * sin
@@ -20,13 +14,12 @@ Backward (inverse rotation — transpose of the rotation matrix):
     out[..., half_d:] = q[..., half_d:] * cos - q[..., :half_d] * sin
 
 Usage:
-    from machete.kernels.rope import RopeOp
+    from machete.kernels.rope import RopeOp, RopeBwdOp
     from machete.megakernel import Megakernel
 
     q_flat = q.view(b * s, h, d).contiguous()
-    ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin, tile_sizes={"M": 2, "H": 8})
-    kernel = Megakernel(ops)
-    kernel.run()
+    fwd_ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin)
+    bwd_ops = RopeBwdOp.schedule(q=dq_flat, cos=cos, sin=sin)
 """
 
 import cutlass
@@ -43,7 +36,7 @@ from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
 
 class RopeOp(Op):
-    """RoPE operation for the megakernel framework.
+    """RoPE forward operation for the megakernel framework.
 
     Applies rotary position embedding in-place to a query tensor.
     Pipelined: uses load/compute/store with shared memory staging.
@@ -142,17 +135,6 @@ class RopeOp(Op):
         return ops
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        """Schedule RoPE backward with auto-computed tile sizes."""
-        tile_sizes = dict(tile_sizes or {})
-        auto = cls._auto_tiles(page_size, **tensors)
-        for k, v in auto.items():
-            tile_sizes.setdefault(k, v)
-        ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
-        ops[0].static_dims["page_size"] = page_size
-        return ops
-
-    @classmethod
     def kernel_config(cls, ops):
         """Return recommended MegakernelConfig for scheduled RopeOps."""
         from machete.megakernel import MegakernelConfig
@@ -161,7 +143,7 @@ class RopeOp(Op):
         return MegakernelConfig(page_size=page_size)
 
     # =========================================================================
-    # Forward Load (G→S)
+    # Load (G→S)
     # =========================================================================
 
     @cute.jit
@@ -345,7 +327,7 @@ class RopeOp(Op):
                 cute.autovec_copy(out1_reg, q1_part)
 
     # =========================================================================
-    # Forward Store (S→G)
+    # Store (S→G)
     # =========================================================================
 
     @cute.jit
@@ -377,14 +359,67 @@ class RopeOp(Op):
                 ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
                 cute.copy(s2g, ssrc, gdst)
 
-    # =========================================================================
-    # Backward (identical load/store, inverse rotation in compute)
-    # =========================================================================
 
-    backward_load = load
+class RopeBwdOp(Op):
+    """RoPE backward (inverse rotation) operation.
+
+    Applies inverse rotary embedding: transpose of the forward rotation matrix.
+    Reuses RopeOp's load and store — only the compute sign differs.
+    """
+
+    reads = {
+        "q": (None, ("M", "H", "D")),
+        "cos": (None, ("S", "D2")),
+        "sin": (None, ("S", "D2")),
+    }
+    writes = {"q": (None, ("M", "H", "D"))}
+    tile = ("M", "H")
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
+
+        if self.q_dtype == cutlass.Float32:
+            self.elem_bytes = 4
+        elif self.q_dtype in (cutlass.Float16, cutlass.BFloat16):
+            self.elem_bytes = 2
+        else:
+            self.elem_bytes = 4
+
+        self.q_row_elems = self.tile_size_H * self.D
+        self.q_tile_bytes = self.tile_size_M * self.q_row_elems * self.elem_bytes
+        self.cs_tile_bytes = self.tile_size_M * self.D2 * self.elem_bytes
+        total_smem = self.q_tile_bytes + 2 * self.cs_tile_bytes
+
+        assert self.D2 >= 32, f"RopeBwdOp requires D2 >= 32, got D2={self.D2} (D={self.D})"
+        assert self.H % self.tile_size_H == 0, f"RopeBwdOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
+        assert total_smem <= self.page_size, (
+            f"RopeBwdOp: tile smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
+            f"Reduce tile_size_M or tile_size_H."
+        )
+
+        self.q_nbits_per_row = self.q_row_elems * self.elem_bytes * 8
+        self.cs_nbits_per_row = self.D2 * self.elem_bytes * 8
+
+    # Reuse RopeOp's load and store — zero duplication
+    load = RopeOp.load
+    store = RopeOp.store
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        """Schedule RoPE backward with auto-computed tile sizes."""
+        tile_sizes = dict(tile_sizes or {})
+        auto = RopeOp._auto_tiles(page_size, **tensors)
+        for k, v in auto.items():
+            tile_sizes.setdefault(k, v)
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims["page_size"] = page_size
+        return ops
+
+    kernel_config = RopeOp.kernel_config
 
     @cute.jit
-    def backward_compute(self, page_ptr, tile_M, tile_H):
+    def compute(self, page_ptr, tile_M, tile_H):
         """Inverse RoPE rotation (transpose of forward rotation matrix)."""
         q_smem = cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem)
         cos_smem = cute.make_ptr(
@@ -438,7 +473,7 @@ class RopeOp(Op):
                 cute.autovec_copy(q0_part, q0_reg)
                 cute.autovec_copy(q1_part, q1_reg)
 
-                # Compute inverse rotation in fp32
+                # Compute inverse rotation in fp32 (signs flipped vs forward)
                 out0_reg = cute.make_fragment_like(q0_reg)
                 out1_reg = cute.make_fragment_like(q1_reg)
                 for i in range(cute.size(q0_reg)):
@@ -452,7 +487,5 @@ class RopeOp(Op):
                 cute.autovec_copy(out0_reg, q0_part)
                 cute.autovec_copy(out1_reg, q1_part)
 
-    backward_store = store
 
-
-__all__ = ["RopeOp"]
+__all__ = ["RopeOp", "RopeBwdOp"]

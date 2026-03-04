@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 import torch
 
 from machete.megakernel.autograd_op import AutogradOp, TensorSpec
-from .rope import RopeOp
+from .rope import RopeOp, RopeBwdOp
 
 
 class RopeAutogradOp(AutogradOp):
@@ -34,6 +34,7 @@ class RopeAutogradOp(AutogradOp):
     """
 
     op_cls = RopeOp
+    bwd_op_cls = RopeBwdOp
 
     def tensor_specs(self) -> List[TensorSpec]:
         return [

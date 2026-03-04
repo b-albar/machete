@@ -124,6 +124,62 @@ def bench_gemm(M, K, N, dtype):
 
 
 # =============================================================================
+# Backward Benchmark
+# =============================================================================
+
+@Benchmark.parametrize("dtype", ["bfloat16"])
+@Benchmark.parametrize("N", [4096, 8192])
+@Benchmark.parametrize("K", [4096, 8192])
+@Benchmark.parametrize("M", [128, 512, 2048, 4096])
+def bench_gemm_bwd(M, K, N, dtype):
+    """Setup GEMM backward benchmark (dA and dB gradients)."""
+    torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
+
+    torch.manual_seed(42)
+    a = torch.randn(M, K, dtype=torch_dtype, device="cuda")
+    b = torch.randn(K, N, dtype=torch_dtype, device="cuda")
+    b_t = b.t().contiguous()  # (N, K) layout for GemmOp
+    dout = torch.randn(M, N, dtype=torch_dtype, device="cuda")
+
+    funcs = {}
+
+    # PyTorch backward: dA = dout @ B, dB = A^T @ dout
+    def pytorch_bwd():
+        da = torch.matmul(dout, b)
+        db = torch.matmul(a.t(), dout)
+        return da, db
+
+    funcs["pytorch"] = pytorch_bwd
+
+    # Megakernel backward (GemmOp.schedule_backward)
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        da = torch.zeros(M, K, dtype=torch_dtype, device="cuda")
+        db = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
+
+        ops = GemmOp.schedule_backward(
+            dout=dout, a=a, b=b_t, da=da, db=db,
+        )
+        if ops:
+            config = GemmOp.kernel_config(ops)
+            kernel = Megakernel(ops, config=config)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
+
+            def reset_bwd():
+                da.zero_()
+                db.zero_()
+
+            funcs["megakernel"] = kernel.bench_spec(
+                setup_fn=reset_bwd,
+                keep_alive=[a, b_t, dout, da, db],
+            )
+
+    return funcs
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -144,6 +200,18 @@ if __name__ == "__main__":
         mode="kernel",
         flops=gemm_flops,
         bytes_fn=gemm_bytes,
+        warmup=25,
+        rep=100,
+    )
+
+    print()
+    print("=" * 100)
+    print("GEMM Backward Benchmark: Megakernel vs PyTorch")
+    print("=" * 100)
+    print()
+
+    bench_gemm_bwd._benchmark.run(
+        mode="kernel",
         warmup=25,
         rep=100,
     )

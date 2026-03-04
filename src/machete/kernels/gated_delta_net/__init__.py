@@ -37,7 +37,7 @@ from machete.kernels.gated_delta_net.grad import (
 # Megakernel Ops (fusable with other Ops)
 try:
     from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
-    from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
+    from machete.kernels.gated_delta_net.fused_op import GDNFusedOp, GDNFusedBwdOp
     HAS_MEGAKERNEL_OPS = True
 except ImportError:
     HAS_MEGAKERNEL_OPS = False
@@ -105,6 +105,35 @@ def _run_fused_megakernel(q, k, v, g, beta, scale):
     Megakernel(all_ops, config=config).run()
 
     return o, g_cumsum, None, w, u
+
+
+def _run_fused_bwd_megakernel(q, k, w, g_cumsum, do, scale):
+    """Run backward stages 1+2 as a single fused megakernel: GDNFusedBwdOp.
+
+    Fuses dv_local (Stage 1) + backward state recurrence (Stage 2).
+    Returns dv2 (accumulated value gradient).
+    """
+    from machete.megakernel import Megakernel
+
+    B, T, H, K = q.shape
+    V = do.shape[-1]
+    dtype = q.dtype
+
+    q = q.contiguous()
+    k = k.contiguous()
+    w = w.contiguous()
+    g_cumsum = g_cumsum.contiguous()
+    do = do.contiguous()
+
+    dv = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+
+    ops = GDNFusedBwdOp.schedule_forward(
+        q=q, k=k, w=w, g_cumsum=g_cumsum, do=do, dv=dv, scale=scale,
+    )
+    config = GDNFusedBwdOp.kernel_config(ops)
+    Megakernel(ops, config=config).run()
+
+    return dv
 
 
 def _forward(q, k, v, g, beta, scale, initial_state, output_final_state):
@@ -228,4 +257,5 @@ __all__ = [
     "chunk_gated_delta_rule",
     "HAS_MEGAKERNEL_OPS",
     "_run_fused_megakernel",
+    "_run_fused_bwd_megakernel",
 ]

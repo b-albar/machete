@@ -92,3 +92,74 @@ def moe_full_ref(
             output[t] += weight * token_out
 
     return output
+
+
+def moe_gemm_bwd_dx_ref(
+    dc: torch.Tensor,
+    w: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Reference backward dx: dx[i] = dc[i] @ w[expert_ids[i]].
+
+    Args:
+        dc: [total_padded, N] — gradient w.r.t. output c (fp16/bf16)
+        w: [num_experts, N, K] — expert weights (same as forward)
+        expert_ids: [total_padded] — expert ID per sorted position (int32)
+        sorted_token_ids: [total_padded] — original token indices.
+
+    Returns:
+        dx: [total_padded, K] — gradient w.r.t. sorted_x (same dtype as dc)
+    """
+    total_padded, N = dc.shape
+    num_experts, _, K = w.shape
+    dtype = dc.dtype
+    device = dc.device
+
+    dx = torch.zeros(total_padded, K, dtype=dtype, device=device)
+
+    for e in range(num_experts):
+        mask = expert_ids == e
+        if not mask.any():
+            continue
+        dc_e = dc[mask].float()
+        w_e = w[e].float()  # [N, K]
+        # dx = dc @ w (no transpose): [tokens, N] @ [N, K] = [tokens, K]
+        dx[mask] = (dc_e @ w_e).to(dtype)
+
+    return dx
+
+
+def moe_gemm_bwd_dw_ref(
+    dc: torch.Tensor,
+    sorted_x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Reference backward dw: dw[e] = dc_e^T @ sorted_x_e.
+
+    Args:
+        dc: [total_padded, N] — gradient w.r.t. output c (fp16/bf16)
+        sorted_x: [total_padded, K] — input tokens in sorted order (fp16/bf16)
+        expert_ids: [total_padded] — expert ID per sorted position (int32)
+        num_experts: Total number of experts
+
+    Returns:
+        dw: [num_experts, N, K] — gradient w.r.t. weights (float32)
+    """
+    _, N = dc.shape
+    _, K = sorted_x.shape
+    device = dc.device
+
+    dw = torch.zeros(num_experts, N, K, dtype=torch.float32, device=device)
+
+    for e in range(num_experts):
+        mask = expert_ids == e
+        if not mask.any():
+            continue
+        dc_e = dc[mask].float()    # [tokens_e, N]
+        x_e = sorted_x[mask].float()  # [tokens_e, K]
+        # dw[e] = dc_e^T @ x_e: [N, tokens_e] @ [tokens_e, K] = [N, K]
+        dw[e] = dc_e.t() @ x_e
+
+    return dw

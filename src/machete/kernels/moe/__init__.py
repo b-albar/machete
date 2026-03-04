@@ -24,6 +24,7 @@ Usage:
 """
 
 from machete.kernels.moe.moe_gemm import MoeGemmOp
+from machete.kernels.moe.moe_gemm_bwd import MoeGemmBwdOp
 from machete.kernels.moe.align_sort import moe_align_sort
 
-__all__ = ["MoeGemmOp", "moe_align_sort"]
+__all__ = ["MoeGemmOp", "MoeGemmBwdOp", "moe_align_sort"]

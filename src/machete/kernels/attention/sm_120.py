@@ -15,7 +15,7 @@ Pipelined KV loop (inside compute, all MMA warps):
                wait V → cpasync K[next] → softmax → O GEMM (overlap K load)
     epilogue:  write O to smem for TMA store
 
-Smem page layout (64KB, persistent Q + KV double-buffer):
+Smem page layout (48KB default, persistent Q + KV double-buffer):
     [Q: tile_M × D × 2 bytes]  (persistent, swizzled for LdMatrix reads)
     [buf0: n_block × D × 2 bytes]  for K blocks
     [buf1: n_block × D × 2 bytes]  for V blocks

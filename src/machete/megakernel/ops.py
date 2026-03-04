@@ -156,58 +156,42 @@ def _build_tensor_and_dim_lists(reads, writes):
 
 
 def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=None):
-    """Generate and attach pack_config / pack_backward_config staticmethods.
+    """Generate and attach pack_config staticmethod.
 
     Only packs pointers and dynamic dims into the config tensor. Static dims
     are baked into the compiled kernel as compile-time constants.
     """
-
-    def _make_pack_fn(tensors_decl, dims_list, dyn_names):
-        """Create a pack_config function for a given tensor/dim specification."""
-        num_unique = len(tensors_decl)
-        # Only pack dynamic dims
-        dynamic_dims = [(d, t, a) for d, t, a in dims_list if d in dyn_names]
-        num_dynamic = len(dynamic_dims)
-        config_size = 2 * num_unique + num_dynamic
-
-        def pack_config(**tensors):
-            config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
-            # Pack pointers
-            for i, (name, dtype, dims) in enumerate(tensors_decl):
-                t = tensors[name]
-                assert t.is_contiguous(), f"{name} must be contiguous"
-                lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
-                config[2 * i] = lo
-                config[2 * i + 1] = hi
-            # Pack dynamic dims only
-            offset = 2 * num_unique
-            for j, (dim_name, tensor_name, axis_idx) in enumerate(dynamic_dims):
-                config[offset + j] = tensors[tensor_name].shape[axis_idx]
-            return config
-
-        return staticmethod(pack_config)
-
-    # All dims are dynamic if no classification provided
+    num_unique = len(unique_tensors)
+    # Only pack dynamic dims
     if dynamic_dim_names is None:
         dynamic_dim_names = {d for d, _, _ in unique_dims}
+    dynamic_dims = [(d, t, a) for d, t, a in unique_dims if d in dynamic_dim_names]
+    num_dynamic = len(dynamic_dims)
+    config_size = 2 * num_unique + num_dynamic
 
-    cls.pack_config = _make_pack_fn(unique_tensors, unique_dims, dynamic_dim_names)
+    def pack_config(**tensors):
+        config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
+        # Pack pointers
+        for i, (name, dtype, dims) in enumerate(unique_tensors):
+            t = tensors[name]
+            assert t.is_contiguous(), f"{name} must be contiguous"
+            lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
+            config[2 * i] = lo
+            config[2 * i + 1] = hi
+        # Pack dynamic dims only
+        offset = 2 * num_unique
+        for j, (dim_name, tensor_name, axis_idx) in enumerate(dynamic_dims):
+            config[offset + j] = tensors[tensor_name].shape[axis_idx]
+        return config
 
-    # Backward config: use backward_reads/backward_writes if defined
-    bwd_reads = getattr(cls, "backward_reads", None) or reads
-    bwd_writes = getattr(cls, "backward_writes", None) or writes
-    if bwd_reads is reads and bwd_writes is writes:
-        cls.pack_backward_config = cls.pack_config
-    else:
-        bwd_tensors, bwd_dims = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims, dynamic_dim_names)
+    cls.pack_config = staticmethod(pack_config)
 
 
 def _process_op_declarations(cls):
     """Process reads/writes/tile declarations on an Op subclass.
 
     Auto-generates: INPUTS, OUTPUTS,
-    DIM_NAMES, pack_config, pack_backward_config, load/store stubs,
+    DIM_NAMES, pack_config, load/store stubs,
     and schedule() classmethod.
 
     Stores tensor/dim metadata on the class for deferred init generation
@@ -252,15 +236,6 @@ def _process_op_declarations(cls):
     cls._STATIC_DIM_NAMES = static_dim_names
     cls._TILE_DIM_NAMES_ORDERED = tile  # ordered tuple of tile dim names
 
-    # Backward tensor/dim metadata (may differ from forward)
-    bwd_reads = getattr(cls, "backward_reads", None) or reads
-    bwd_writes = getattr(cls, "backward_writes", None) or writes
-    if bwd_reads is reads and bwd_writes is writes:
-        cls._BWD_UNIQUE_TENSORS = unique_tensors
-        cls._BWD_UNIQUE_DIMS = unique_dims
-    else:
-        cls._BWD_UNIQUE_TENSORS, cls._BWD_UNIQUE_DIMS = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-
     # Set INPUTS / OUTPUTS
     cls.INPUTS = list(reads.keys())
     cls.OUTPUTS = list(writes.keys())
@@ -282,22 +257,18 @@ def _process_op_declarations(cls):
     tma_stores = set(getattr(cls, "tma_stores", set()))
     tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
 
-    # Validate TMA tensors exist in reads/writes (including backward declarations).
-    # TMA names may appear in forward-only or backward-only tensors — the framework
-    # skips non-existent tensors at schedule time (TMARegistry.from_ops).
-    bwd_reads = getattr(cls, "backward_reads", None) or {}
-    bwd_writes = getattr(cls, "backward_writes", None) or {}
-    all_read_names = set(reads.keys()) | set(bwd_reads.keys())
-    all_write_names = set(writes.keys()) | set(bwd_writes.keys())
+    # Validate TMA tensors exist in reads/writes.
+    all_read_names = set(reads.keys())
+    all_write_names = set(writes.keys())
     for name in tma_loads:
         if name not in all_read_names:
-            raise ValueError(f"tma_loads tensor '{name}' not found in reads or backward_reads")
+            raise ValueError(f"tma_loads tensor '{name}' not found in reads")
     for name in tma_stores:
         if name not in all_write_names:
-            raise ValueError(f"tma_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"tma_stores tensor '{name}' not found in writes")
     for name in tma_reduce_stores:
         if name not in all_write_names:
-            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes")
 
     cls._TMA_LOADS = tma_loads
     cls._TMA_STORES = tma_stores
@@ -308,35 +279,28 @@ def _process_op_declarations(cls):
     peer_stores = set(getattr(cls, "peer_stores", set()))
     for name in peer_stores:
         if name not in all_write_names:
-            raise ValueError(f"peer_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"peer_stores tensor '{name}' not found in writes")
     cls._PEER_STORES = peer_stores
 
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
-    # Include both forward and backward tensor dims so that TMA tensors
-    # declared in backward_writes (e.g., "dx") get correct tile shapes.
     tma_tensor_dims = {}  # {tensor_name: list of dim_names}
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    for name, _, dims in cls._BWD_UNIQUE_TENSORS:
-        if name not in tensor_dims_map:
-            tensor_dims_map[name] = dims
     for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
     cls._TMA_TENSOR_DIMS = tma_tensor_dims
 
-    # Generate pack_config / pack_backward_config (only packs dynamic dims)
+    # Generate pack_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
     # Add _schedule_single() classmethod (internal — returns one ScheduledOp)
     @classmethod
-    def _schedule_single(cls, backward=False, tile_sizes=None, **tensors):
+    def _schedule_single(cls, tile_sizes=None, **tensors):
         """Create a single ScheduledOp from tensor kwargs (internal).
 
         Args:
-            backward: If True, use backward_reads/backward_writes tensor
-                      declarations for packing and dim extraction.
             tile_sizes: Dict mapping tile dim names to tile sizes.
                 E.g., {"M": 4}. Unspecified dims default to full extent
                 (1 tile covering entire dimension).
@@ -345,15 +309,9 @@ def _process_op_declarations(cls):
         if tile_sizes is None:
             tile_sizes = {}
 
-        # Select forward or backward dim/tensor declarations
-        if backward and hasattr(cls, "_BWD_UNIQUE_DIMS"):
-            unique_dims = cls._BWD_UNIQUE_DIMS
-            unique_tensors = cls._BWD_UNIQUE_TENSORS
-            pack_fn = cls.pack_backward_config
-        else:
-            unique_dims = cls._UNIQUE_DIMS
-            unique_tensors = cls._UNIQUE_TENSORS
-            pack_fn = cls.pack_config
+        unique_dims = cls._UNIQUE_DIMS
+        unique_tensors = cls._UNIQUE_TENSORS
+        pack_fn = cls.pack_config
 
         # --- Validate tensor ndim matches declaration ---
         for name, dtype, dims in unique_tensors:
@@ -456,34 +414,28 @@ def _process_op_declarations(cls):
 
     # Add schedule() classmethod (public dispatcher — returns list of ScheduledOps)
     @classmethod
-    def schedule(cls, backward=False, tile_sizes=None, **tensors):
+    def schedule(cls, tile_sizes=None, **tensors):
         """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
 
-        Checks for schedule_forward / schedule_backward overrides on the
-        subclass. If found, delegates to them. Otherwise wraps a single
-        _schedule_single() call in a list.
+        Checks for schedule_forward override on the subclass. If found,
+        delegates to it. Otherwise wraps a single _schedule_single() call
+        in a list.
         """
-        if not backward and hasattr(cls, "schedule_forward"):
+        if hasattr(cls, "schedule_forward"):
             return cls.schedule_forward(tile_sizes=tile_sizes, **tensors)
-        if backward and hasattr(cls, "schedule_backward"):
-            return cls.schedule_backward(tile_sizes=tile_sizes, **tensors)
-        return [cls._schedule_single(backward=backward, tile_sizes=tile_sizes, **tensors)]
+        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
 
     cls.schedule = schedule
 
     # Add gen_tensor_param_names classmethod
     @classmethod
-    def gen_tensor_param_names(cls, backward=False):
+    def gen_tensor_param_names(cls):
         """Get the tensor parameter names for function signature in tensor mode.
 
         Returns the list of tensor names declared in reads/writes (deduplicated,
         in declaration order). Used to build the phase function signature.
-
-        Args:
-            backward: If True, use backward tensor declarations.
         """
-        tensors = cls._BWD_UNIQUE_TENSORS if backward else cls._UNIQUE_TENSORS
-        return [name for name, _, _ in tensors]
+        return [name for name, _, _ in cls._UNIQUE_TENSORS]
 
     cls.gen_tensor_param_names = gen_tensor_param_names
 
@@ -650,30 +602,6 @@ class Op:
         """
         pass
 
-    # =========================================================================
-    # Backward Pass Interface
-    # =========================================================================
-
-    def backward_load(self, page_ptr) -> None:
-        """Load data for backward pass.
-
-        Default: no-op (for ops that don't use shared memory staging).
-        """
-        pass
-
-    def backward_compute(self, page_ptr) -> None:
-        """Backward computation for one tile.
-
-        Default: no-op.
-        """
-        pass
-
-    def backward_store(self, page_ptr) -> None:
-        """Store backward results from shared memory to global memory.
-
-        Default: no-op.
-        """
-        pass
 
 
 def build_op_config(
@@ -706,25 +634,20 @@ def build_op_config(
         config.update(op.static_dims)
 
     # Tensor dtypes (x_dtype, weight_dtype, dout_dtype, ...)
-    # Include both forward and backward tensor declarations since the same
-    # instance is used for all phases.
-    for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
-        if hasattr(op.op_cls, attr):
-            for name, dtype, dims in getattr(op.op_cls, attr):
-                key = f"{name}_dtype"
-                if key not in config:
-                    resolved = op.tensor_dtypes.get(name, dtype) if op.tensor_dtypes else dtype
-                    if resolved is not None:
-                        config[key] = resolved
+    if hasattr(op.op_cls, "_UNIQUE_TENSORS"):
+        for name, dtype, dims in op.op_cls._UNIQUE_TENSORS:
+            key = f"{name}_dtype"
+            if key not in config:
+                resolved = op.tensor_dtypes.get(name, dtype) if op.tensor_dtypes else dtype
+                if resolved is not None:
+                    config[key] = resolved
 
     # Tensor strides (x_stride_M, x_stride_D, ...)
-    if op.tensor_strides:
-        for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
-            if hasattr(op.op_cls, attr):
-                for name, dtype, dims in getattr(op.op_cls, attr):
-                    if name in op.tensor_strides:
-                        for i, dim_name in enumerate(dims):
-                            config[f"{name}_stride_{dim_name}"] = op.tensor_strides[name][i]
+    if op.tensor_strides and hasattr(op.op_cls, "_UNIQUE_TENSORS"):
+        for name, dtype, dims in op.op_cls._UNIQUE_TENSORS:
+            if name in op.tensor_strides:
+                for i, dim_name in enumerate(dims):
+                    config[f"{name}_stride_{dim_name}"] = op.tensor_strides[name][i]
 
     return config
 

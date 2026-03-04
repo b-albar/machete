@@ -216,7 +216,7 @@ def _run_gemm_backward(dout, a, b, da=None, db=None,
 
     ts = {"M": tile_m, "N": tile_n, "K": tile_k}
 
-    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
+    ops = GemmOp.schedule_backward( dout=dout, a=a, b=b, da=da, db=db,
                           tile_sizes=ts)
     if ops:
         config = GemmOp.kernel_config(ops)
@@ -371,7 +371,7 @@ def _run_gemm_fused_act_backward(dout, a, b, activation, c=None, pre_act=None,
     from machete.kernels.gemm import GemmOp
 
     ts = {"M": tile_m, "N": tile_n, "K": tile_k}
-    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
+    ops = GemmOp.schedule_backward( dout=dout, a=a, b=b, da=da, db=db,
                           activation=activation, c=c, pre_act=pre_act,
                           tile_sizes=ts)
     if ops:

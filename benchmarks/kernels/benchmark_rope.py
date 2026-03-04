@@ -16,7 +16,7 @@ import io
 import torch
 
 from machete.megakernel import Megakernel
-from machete.kernels.rope import RopeOp
+from machete.kernels.rope import RopeOp, RopeBwdOp
 from machete.kernels.rope.ref import rope_pytorch, HAS_TRITON
 from machete.utils.benchmark import Benchmark
 
@@ -104,6 +104,24 @@ def bench_rope(batch, seq_len, n_heads, head_dim):
         funcs["megakernel"] = kernel.bench_spec(
             setup_fn=lambda: q_mk.copy_(q),
             keep_alive=[q_flat, cos, sin],
+        )
+
+    # Megakernel backward (inverse rotation)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        q_bwd = q.clone()
+        q_bwd_flat = q_bwd.view(b * s, h, d)
+
+        bwd_ops = RopeBwdOp.schedule(q=q_bwd_flat, cos=cos, sin=sin)
+        bwd_config = RopeBwdOp.kernel_config(bwd_ops)
+        bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            bwd_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["megakernel_bwd"] = bwd_kernel.bench_spec(
+            setup_fn=lambda: q_bwd.copy_(q),
+            keep_alive=[q_bwd_flat, cos, sin],
         )
 
     return funcs

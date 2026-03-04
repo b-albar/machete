@@ -129,7 +129,7 @@ class Megakernel:
     Caching:
         Compiled kernels are cached at the class level to avoid recompilation
         when creating multiple Megakernel instances with the same configuration.
-        The cache key is based on: (op_classes, static_dims, config_params, backward).
+        The cache key is based on: (op_classes, static_dims, config_params).
 
     Architecture:
     - All SMs launched as persistent blocks
@@ -143,10 +143,6 @@ class Megakernel:
         Block 0: instr 0 -> instr num_sms -> instr 2*num_sms -> ...
         Block 1: instr 1 -> instr num_sms+1 -> instr 2*num_sms+1 -> ...
 
-    When backward=True, the kernel dispatches to each op's backward() method
-    instead of forward(). This enables using the same op definitions and
-    scheduling infrastructure for gradient computation.
-
     Example:
         ops = [
             ScheduledOp(RMSNormOp, tile_counts=(32,)),
@@ -154,14 +150,10 @@ class Megakernel:
         ]
         kernel = Megakernel(ops)
         kernel.run()
-
-        # Backward pass with same ops
-        bwd_kernel = Megakernel(ops, backward=True)
-        bwd_kernel.run()
     """
 
     # Class-level cache for compiled kernels to avoid recompilation
-    # Key: (op_classes_tuple, static_dims_tuple, config_key, backward)
+    # Key: (op_classes_tuple, static_dims_tuple, config_key)
     _compiled_kernel_cache: Dict[Tuple, Any] = {}
 
     def __init__(
@@ -169,12 +161,10 @@ class Megakernel:
         ops: List[ScheduledOp],
         config: Optional[MegakernelConfig] = None,
         device: str = "cuda",
-        backward: bool = False,
     ):
         self.ops = ops
         self.config = config or MegakernelConfig()
         self.device = device
-        self.backward = backward
 
         # Detect SM count if not specified
         if self.config.num_sms is None:
@@ -212,7 +202,7 @@ class Megakernel:
         self._compiled_kernel = None
 
         # Tensor parameter mode: build registry, validate compatibility, prepare tensors
-        self._tensor_registry = TensorRegistry.from_ops(ops, backward=backward)
+        self._tensor_registry = TensorRegistry.from_ops(ops)
         validate_op_compatibility(ops, self._tensor_registry)
         self._cute_tensors: Optional[List] = None  # torch.Tensor objects for kernel params
 
@@ -443,7 +433,6 @@ class Megakernel:
             (dispatch_load, dispatch_compute, dispatch_store)
         """
         ops = self.ops
-        use_backward = self.backward
         registry = self._tensor_registry
         tma_registry = self._tma_registry
         peer_tma_registry = self._peer_tma_registry
@@ -466,7 +455,7 @@ class Megakernel:
 
         for i, op in enumerate(ops):
             # Get canonical names in declaration order for this op
-            tensor_args = registry.get_op_tensor_args(i, op.op_cls, backward=use_backward)
+            tensor_args = registry.get_op_tensor_args(i, op.op_cls)
             op_tensor_args.append(tensor_args)
 
             # Get TMA canonical names and local mappings per phase
@@ -493,11 +482,10 @@ class Megakernel:
             instance = op.op_cls(**config)
             inner_iters_list.append(getattr(instance, "inner_iters", 1))
 
-            prefix = "backward_" if use_backward else ""
             load_fns.append(
                 compile_phase(
                     instance,
-                    f"{prefix}load",
+                    "load",
                     tensor_param_names=tensor_args,
                     tma_param_names=load_tma_args,
                     tma_local_mapping=load_tma_mapping,
@@ -506,7 +494,7 @@ class Megakernel:
             compute_fns.append(
                 compile_phase(
                     instance,
-                    f"{prefix}compute",
+                    "compute",
                     tensor_param_names=tensor_args,
                     tma_param_names=compute_tma_args,
                     tma_local_mapping=compute_tma_mapping,
@@ -515,14 +503,14 @@ class Megakernel:
             store_fns.append(
                 compile_phase(
                     instance,
-                    f"{prefix}store",
+                    "store",
                     tensor_param_names=tensor_args,
                     tma_param_names=store_tma_args,
                     tma_local_mapping=store_tma_mapping,
                 )
             )
 
-            # Communicate: same for forward and backward (always sends to peers)
+            # Communicate: sends results to peer GPUs
             communicate_fns.append(
                 compile_phase(
                     instance,
@@ -1851,7 +1839,7 @@ class Megakernel:
         # Tensors are runtime parameters (not compile-time constants), so
         # the cache key does NOT include tensor addresses. Same shapes/dtypes
         # (captured in static_dims and tensor_dtypes above) share compiled kernels.
-        return (tuple(op_keys), config_key, self.backward)
+        return (tuple(op_keys), config_key)
 
     def compile(self) -> None:
         """Compile the kernel without running it.
@@ -1880,12 +1868,11 @@ class Megakernel:
 
             set_tracing_enabled(self.config.tracing)
 
-            mode = "backward" if self.backward else "forward"
             tracing_str = " [traced]" if self.config.tracing else ""
             tma_str = " [TMA]" if self._tma_registry.has_tma else ""
             peer_str = " [peer]" if self._peer_tma_registry.has_peer_tma else ""
             print(
-                f"Compiling persistent kernel ({mode}{tracing_str}{tma_str}{peer_str}) for "
+                f"Compiling persistent kernel ({tracing_str}{tma_str}{peer_str}) for "
                 f"{len(self.ops)} ops, "
                 f"{self.total_tiles} tiles, {self.num_sms} SMs, "
                 f"{self.smem_size // 1024}KB smem..."
@@ -2076,10 +2063,8 @@ class Megakernel:
 
     def __repr__(self) -> str:
         op_names = ", ".join(f"{op.op_cls.__name__}({op.total_tiles})" for op in self.ops)
-        mode = "backward" if self.backward else "forward"
         return (
             f"Megakernel(\n"
-            f"  mode={mode},\n"
             f"  ops=[{op_names}],\n"
             f"  total_tiles={self.total_tiles},\n"
             f"  num_sms={self.num_sms},\n"
@@ -2097,7 +2082,6 @@ class Megakernel:
 def create_megakernel(
     ops: List[ScheduledOp],
     num_sms: Optional[int] = None,
-    backward: bool = False,
     **kwargs,
 ) -> Megakernel:
     """Create a megakernel for the given operations.
@@ -2105,14 +2089,13 @@ def create_megakernel(
     Args:
         ops: List of scheduled operations
         num_sms: Number of SMs (default: all available)
-        backward: If True, use backward methods instead of forward
         **kwargs: Additional arguments passed to MegakernelConfig
 
     Returns:
         Configured Megakernel instance
     """
     config = MegakernelConfig(num_sms=num_sms, **kwargs)
-    return Megakernel(ops, config=config, backward=backward)
+    return Megakernel(ops, config=config)
 
 
 __all__ = [

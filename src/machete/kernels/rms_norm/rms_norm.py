@@ -1,33 +1,24 @@
 # Copyright (c) 2025, Machete Authors
 """
-Unified RMSNorm Op for the Megakernel.
+RMSNorm Ops for the Megakernel.
 
 Supports all RMSNorm variants via flags:
     - Standard:    y = rmsnorm(x, weight)
-    - Residual:    y = rmsnorm(x, weight) + x
-    - Gemma:       y = rmsnorm(x, (1+weight))
-    - Fused add:   residual_out = x + residual_in; y = rmsnorm(residual_out, weight)
-    - Gated:       y = rmsnorm(x, weight) * silu(gate)
+    - Residual:    y = rmsnorm(x, w) + x
+    - Gemma:       y = rmsnorm(x, (1+w))
+    - Fused add:   residual_out = x + residual_in; y = rmsnorm(residual_out, w)
+    - Gated:       y = rmsnorm(x, w) * silu(gate)
     - Per-row weight: weight is (M, D) instead of shared (D,)
 
 Pipelined load/compute/store with shared memory staging:
     load:    TMA async G->S (x tile)
-    compute: read x from smem, other tensors from global, write y to smem
+    compute: read x from smem, other tensors from global, write result to smem
     store:   TMA S->G (y forward / dx backward)
 
 All compute warps cooperate on each row via cross-warp reduction:
     - warp_reduction → scratch smem → named_barrier_sync → sum scratch → sync
     - Forward: 2 barriers per row (1 reduction for sum_sq)
     - Backward: 4 barriers per row (2 reductions for sum_sq + sum_grad)
-
-Weight is loaded from global memory to registers in compute.
-For shared weight (D,), auto-expanded to (M, D) at schedule time but loaded
-ONCE before the row loop (single L1 cache line). Per-row weight (M, D) is
-loaded per-row inside the loop only when per_row_weight=True.
-
-Optional tensors (residual_in, gate, residual_out, d_residual, dgate) use
-dummy tensors (aliased to existing tensors) when not needed. Flags in
-static_dims control which code paths execute at runtime.
 """
 
 import operator
@@ -49,25 +40,90 @@ SCRATCH_BYTES = 128  # Cross-warp reduction scratch (up to 32 warps × 4B Float3
 
 
 # =============================================================================
-# Unified RMSNorm Op
+# Shared helpers
+# =============================================================================
+
+def _rmsnorm_init(self, **config):
+    """Common __init__ logic for RMSNormOp and RMSNormBwdOp."""
+    self.residual = getattr(self, 'residual', 0)
+    self.gemma = getattr(self, 'gemma', 0)
+    self.has_residual = getattr(self, 'has_residual', 0)
+    self.has_gate = getattr(self, 'has_gate', 0)
+    self.per_row_weight = getattr(self, 'per_row_weight', 0)
+    self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
+
+    if self.x_dtype == cutlass.Float32:
+        self.elem_bytes = 4
+    elif self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
+        self.elem_bytes = 2
+    else:
+        self.elem_bytes = 4
+
+    self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
+    self.scratch_offset = self.x_tile_bytes
+
+    assert self.D >= 32 and self.D % 32 == 0, (
+        f"RMSNorm requires D >= 32 and D % 32 == 0, got D={self.D}"
+    )
+    assert self.x_tile_bytes + SCRATCH_BYTES <= self.page_size, (
+        f"RMSNorm: tile smem ({self.x_tile_bytes}B) + scratch ({SCRATCH_BYTES}B) "
+        f"exceeds page_size ({self.page_size}B). Reduce tile_size_M={self.tile_size_M}."
+    )
+
+    max_et = min(self.D, self.threads_per_row)
+    self.effective_threads = 32
+    for t in range(32, max_et + 1, 32):
+        if self.D % t == 0:
+            self.effective_threads = t
+    self.effective_warps = self.effective_threads // 32
+
+
+def _auto_tile_M(page_size, **tensors):
+    """Compute largest tile_size_M that fits in page_size minus scratch."""
+    x = tensors.get('x')
+    if x is None:
+        return None
+    D = x.shape[1]
+    elem_bytes = x.element_size()
+    usable = page_size - SCRATCH_BYTES
+    return max(1, usable // (D * elem_bytes))
+
+
+def _expand_weight(tensors):
+    """Auto-expand 1D weight (D,) to 2D (M, D) for uniform handling."""
+    w = tensors.get('weight')
+    if w is not None and w.ndim == 1:
+        M = tensors['x'].shape[0]
+        tensors['weight'] = w.unsqueeze(0).expand(M, -1).contiguous()
+
+
+def _kernel_config(ops):
+    """Return recommended MegakernelConfig for RMSNorm ops."""
+    from machete.megakernel import MegakernelConfig
+    page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
+    D = ops[0].static_dims.get('D', 4096)
+    compute_threads = 128
+    for ct in [256, 128, 64]:
+        if D % ct == 0:
+            compute_threads = ct
+            break
+    from machete.megakernel.megakernel import NUM_DMA_WARPS
+    return MegakernelConfig(
+        threads_per_block=compute_threads + NUM_DMA_WARPS * 32,
+        page_size=page_size,
+    )
+
+
+# =============================================================================
+# RMSNormOp (Forward)
 # =============================================================================
 
 
 class RMSNormOp(Op):
-    """Unified RMSNorm operation for the megakernel framework.
+    """RMSNorm forward operation.
 
-    All RMSNorm variants are handled by a single op with flags:
-        - residual=1:     y = rmsnorm(x, w) + x
-        - gemma=1:        w_eff = 1 + w
-        - has_residual=1: residual_out = x + residual_in, y = rmsnorm(residual_out, w)
-        - has_gate=1:     y = rmsnorm(x, w) * silu(gate)
-
-    All compute warps cooperate on each row via cross-warp reduction.
-    Weight is always (M, D) — for shared weight, auto-expanded from (D,) at
-    schedule time. Per-row weight is supported natively.
-
-    Optional tensors (residual_in, gate, residual_out, d_residual, dgate)
-    are filled with dummy aliases at schedule time when not provided.
+    All variants handled via flags: residual, gemma, has_residual, has_gate,
+    per_row_weight. See module docstring for details.
     """
 
     reads = {
@@ -83,83 +139,19 @@ class RMSNormOp(Op):
     tile = ("M", "D")
 
     tma_loads = {"x"}
-    tma_stores = {"y", "dx"}
-
-    backward_reads = {
-        "dout": (None, ("M", "D")),
-        "x": (None, ("M", "D")),
-        "weight": (None, ("M", "D")),
-        "gate": (None, ("M", "D")),
-    }
-    backward_writes = {
-        "dx": (None, ("M", "D")),
-        "d_residual": (None, ("M", "D")),
-        "dgate": (None, ("M", "D")),
-    }
+    tma_stores = {"y"}
 
     def __init__(self, **config):
         super().__init__(**config)
-        self.residual = getattr(self, 'residual', 0)
-        self.gemma = getattr(self, 'gemma', 0)
-        self.has_residual = getattr(self, 'has_residual', 0)
-        self.has_gate = getattr(self, 'has_gate', 0)
-        self.per_row_weight = getattr(self, 'per_row_weight', 0)
-        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
-
-        if self.x_dtype == cutlass.Float32:
-            self.elem_bytes = 4
-        elif self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
-            self.elem_bytes = 2
-        else:
-            self.elem_bytes = 4
-
-        self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
-        self.scratch_offset = self.x_tile_bytes  # Cross-warp reduction scratch
-
-        assert self.D >= 32 and self.D % 32 == 0, (
-            f"RMSNormOp requires D >= 32 and D % 32 == 0, got D={self.D}"
-        )
-        assert self.x_tile_bytes + SCRATCH_BYTES <= self.page_size, (
-            f"RMSNormOp: tile smem ({self.x_tile_bytes}B) + scratch ({SCRATCH_BYTES}B) "
-            f"exceeds page_size ({self.page_size}B). Reduce tile_size_M={self.tile_size_M}."
-        )
-
-        # Effective threads must DIVIDE D (else local_partition's strided access
-        # reads beyond row boundary). Find largest multiple of 32 that divides D
-        # and fits within threads_per_row. Threads >= effective_threads skip compute.
-        max_et = min(self.D, self.threads_per_row)
-        self.effective_threads = 32  # At least 1 warp
-        for t in range(32, max_et + 1, 32):
-            if self.D % t == 0:
-                self.effective_threads = t
-        self.effective_warps = self.effective_threads // 32
+        _rmsnorm_init(self, **config)
 
     # =========================================================================
-    # Scheduling helpers
+    # Scheduling
     # =========================================================================
 
     @classmethod
-    def _auto_tile_M(cls, page_size, **tensors):
-        """Compute largest tile_size_M that fits in page_size minus scratch."""
-        x = tensors.get('x')
-        if x is None:
-            return None
-        D = x.shape[1]
-        elem_bytes = x.element_size()
-        usable = page_size - SCRATCH_BYTES
-        return max(1, usable // (D * elem_bytes))
-
-    @classmethod
-    def _expand_weight(cls, tensors):
-        """Auto-expand 1D weight (D,) to 2D (M, D) for uniform handling."""
-        w = tensors.get('weight')
-        if w is not None and w.ndim == 1:
-            M = tensors['x'].shape[0]
-            tensors['weight'] = w.unsqueeze(0).expand(M, -1).contiguous()
-
-    @classmethod
-    def _fill_dummies_forward(cls, tensors):
-        """Fill dummy tensors for optional forward inputs. Returns (has_residual, has_gate)."""
+    def _fill_dummies(cls, tensors):
+        """Fill dummy tensors for optional forward inputs."""
         x, y = tensors['x'], tensors['y']
         has_residual = 'residual_in' in tensors
         has_gate = 'gate' in tensors
@@ -172,34 +164,16 @@ class RMSNormOp(Op):
         return has_residual, has_gate
 
     @classmethod
-    def _fill_dummies_backward(cls, tensors):
-        """Fill dummy tensors for optional backward inputs. Returns (has_residual, has_gate)."""
-        x, dx = tensors['x'], tensors['dx']
-        has_residual = 'd_residual' in tensors
-        has_gate = 'gate' in tensors
-        if not has_gate:
-            tensors['gate'] = x
-        if not has_residual:
-            tensors['d_residual'] = dx
-        if 'dgate' not in tensors:
-            tensors['dgate'] = dx
-        return has_residual, has_gate
-
-    # =========================================================================
-    # Schedule
-    # =========================================================================
-
-    @classmethod
     def schedule_forward(cls, tile_sizes=None, residual=False, gemma=False,
-                         per_row_weight=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
+                 per_row_weight=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule RMSNorm forward with optional fused-add and/or gating."""
         tensors = dict(tensors)
-        cls._expand_weight(tensors)
-        has_residual, has_gate = cls._fill_dummies_forward(tensors)
+        _expand_weight(tensors)
+        has_residual, has_gate = cls._fill_dummies(tensors)
 
         tile_sizes = dict(tile_sizes or {})
         if "M" not in tile_sizes:
-            auto_m = cls._auto_tile_M(page_size, **tensors)
+            auto_m = _auto_tile_M(page_size, **tensors)
             if auto_m is not None:
                 tile_sizes["M"] = auto_m
 
@@ -217,53 +191,10 @@ class RMSNormOp(Op):
         ops[0].static_dims['page_size'] = page_size
         return ops
 
-    @classmethod
-    def schedule_backward(cls, tile_sizes=None, residual=False, gemma=False,
-                          per_row_weight=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        """Schedule RMSNorm backward with optional fused-add and/or gating."""
-        tensors = dict(tensors)
-        cls._expand_weight(tensors)
-        has_residual, has_gate = cls._fill_dummies_backward(tensors)
-
-        tile_sizes = dict(tile_sizes or {})
-        if "M" not in tile_sizes:
-            auto_m = cls._auto_tile_M(page_size, **tensors)
-            if auto_m is not None:
-                tile_sizes["M"] = auto_m
-
-        ops = [cls._schedule_single(backward=True, tile_sizes=tile_sizes, **tensors)]
-        if residual:
-            ops[0].static_dims['residual'] = 1
-        if gemma:
-            ops[0].static_dims['gemma'] = 1
-        if has_residual:
-            ops[0].static_dims['has_residual'] = 1
-        if has_gate:
-            ops[0].static_dims['has_gate'] = 1
-        if per_row_weight:
-            ops[0].static_dims['per_row_weight'] = 1
-        ops[0].static_dims['page_size'] = page_size
-        return ops
-
-    @classmethod
-    def kernel_config(cls, ops):
-        """Return recommended MegakernelConfig for scheduled RMSNormOps."""
-        from machete.megakernel import MegakernelConfig
-        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
-        D = ops[0].static_dims.get('D', 4096)
-        compute_threads = 128
-        for ct in [256, 128, 64]:
-            if D % ct == 0:
-                compute_threads = ct
-                break
-        from machete.megakernel.megakernel import NUM_DMA_WARPS
-        return MegakernelConfig(
-            threads_per_block=compute_threads + NUM_DMA_WARPS * 32,
-            page_size=page_size,
-        )
+    kernel_config = staticmethod(_kernel_config)
 
     # =========================================================================
-    # Forward Load (G->S)
+    # Load (G->S)
     # =========================================================================
 
     @cute.jit
@@ -298,12 +229,7 @@ class RMSNormOp(Op):
     @cute.jit
     def compute(self, page_ptr, tile_M, tile_D,
                 x, weight, residual_in, gate, y, residual_out):
-        """RMSNorm forward: read x from smem, write y to same smem region.
-
-        All effective warps cooperate on each row via cross-warp reduction.
-        Weight is loaded from global memory to registers. Residual_in, gate
-        from global. y written to smem for TMA store. residual_out to global.
-        """
+        """RMSNorm forward: read x from smem, write y to same smem region."""
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
         scratch = cute.make_tensor(
             cute.make_ptr(cutlass.Float32, page_ptr + self.scratch_offset,
@@ -453,23 +379,99 @@ class RMSNormOp(Op):
         with cute.arch.elect_one():
             cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_M)])
 
+
+# =============================================================================
+# RMSNormBwdOp (Backward)
+# =============================================================================
+
+
+class RMSNormBwdOp(Op):
+    """RMSNorm backward operation.
+
+    Computes dx (gradient w.r.t. x), optionally d_residual and dgate.
+    Reuses RMSNormOp's TMA load for x. Same flag-based variants as forward.
+    """
+
+    reads = {
+        "dout": (None, ("M", "D")),
+        "x": (None, ("M", "D")),
+        "weight": (None, ("M", "D")),
+        "gate": (None, ("M", "D")),
+    }
+    writes = {
+        "dx": (None, ("M", "D")),
+        "d_residual": (None, ("M", "D")),
+        "dgate": (None, ("M", "D")),
+    }
+    tile = ("M", "D")
+
+    tma_loads = {"x"}
+    tma_stores = {"dx"}
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        _rmsnorm_init(self, **config)
+
+    # Reuse RMSNormOp's TMA load for x
+    load = RMSNormOp.load
+
+    kernel_config = staticmethod(_kernel_config)
+
     # =========================================================================
-    # Backward Load (G->S) — reuse forward TMA load for x
+    # Scheduling
     # =========================================================================
 
-    backward_load = load
+    @classmethod
+    def _fill_dummies(cls, tensors):
+        """Fill dummy tensors for optional backward inputs."""
+        x, dx = tensors['x'], tensors['dx']
+        has_residual = 'd_residual' in tensors
+        has_gate = 'gate' in tensors
+        if not has_gate:
+            tensors['gate'] = x
+        if not has_residual:
+            tensors['d_residual'] = dx
+        if 'dgate' not in tensors:
+            tensors['dgate'] = dx
+        return has_residual, has_gate
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, residual=False, gemma=False,
+                 per_row_weight=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        """Schedule RMSNorm backward with optional fused-add and/or gating."""
+        tensors = dict(tensors)
+        _expand_weight(tensors)
+        has_residual, has_gate = cls._fill_dummies(tensors)
+
+        tile_sizes = dict(tile_sizes or {})
+        if "M" not in tile_sizes:
+            auto_m = _auto_tile_M(page_size, **tensors)
+            if auto_m is not None:
+                tile_sizes["M"] = auto_m
+
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        if residual:
+            ops[0].static_dims['residual'] = 1
+        if gemma:
+            ops[0].static_dims['gemma'] = 1
+        if has_residual:
+            ops[0].static_dims['has_residual'] = 1
+        if has_gate:
+            ops[0].static_dims['has_gate'] = 1
+        if per_row_weight:
+            ops[0].static_dims['per_row_weight'] = 1
+        ops[0].static_dims['page_size'] = page_size
+        return ops
 
     # =========================================================================
     # Backward Compute (cooperative cross-warp)
     # =========================================================================
 
     @cute.jit
-    def backward_compute(self, page_ptr, tile_M, tile_D,
-                         dout, x, weight, gate, dx, d_residual, dgate):
+    def compute(self, page_ptr, tile_M, tile_D,
+                dout, x, weight, gate, dx, d_residual, dgate):
         """RMSNorm backward: read x from smem, dout+weight+gate from global.
 
-        All effective warps cooperate on each row via cross-warp reduction.
-        x loaded via TMA to smem. dout, weight, gate from global.
         dx written to smem for TMA store. d_residual, dgate to global.
         """
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
@@ -657,7 +659,7 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def backward_store(self, page_ptr, tile_M, tile_D, dx_tma, dx_tma_gmem):
+    def store(self, page_ptr, tile_M, tile_D, dx_tma, dx_tma_gmem):
         """TMA store of dx from shared to global memory."""
         sDX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
@@ -679,4 +681,4 @@ class RMSNormOp(Op):
 FusedAddRMSNormOp = RMSNormOp
 RMSNormGatedOp = RMSNormOp
 
-__all__ = ["RMSNormOp", "FusedAddRMSNormOp", "RMSNormGatedOp", "RMSNORM_EPS"]
+__all__ = ["RMSNormOp", "RMSNormBwdOp", "FusedAddRMSNormOp", "RMSNormGatedOp", "RMSNORM_EPS"]

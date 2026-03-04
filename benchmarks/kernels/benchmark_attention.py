@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from machete.megakernel import Megakernel
-from machete.kernels.attention import FlashAttentionSm120Op
+from machete.kernels.attention import FlashAttentionSm120Op, FlashAttentionSm120BwdOp
 from machete.kernels.attention.ref import flash_attention_pytorch
 from machete.utils.benchmark import Benchmark
 
@@ -216,6 +216,110 @@ def bench_attention(BH, M, N, D):
 
 
 # =============================================================================
+# Backward Benchmark
+# =============================================================================
+
+BWD_CONFIGS = [
+    # (BH, M, N, D) — subset of forward configs for backward
+    # Decode
+    (32, 16, 2048, 128),
+    (32, 16, 4096, 128),
+    (32, 16, 8192, 128),
+    (32, 16, 16384, 128),
+    # Prefill
+    (32, 1024, 1024, 128),
+    (32, 2048, 2048, 128),
+    (32, 4096, 4096, 128),
+    # Chunked prefill
+    (32, 256, 4096, 128),
+    (32, 512, 8192, 128),
+]
+
+
+@Benchmark.configs(["BH", "M", "N", "D"], BWD_CONFIGS)
+def bench_attention_bwd(BH, M, N, D):
+    """Setup attention backward benchmark."""
+    torch_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+
+    funcs = {}
+
+    # PyTorch autograd backward
+    def pytorch_bwd():
+        q_ = q.detach().requires_grad_(True)
+        k_ = k.detach().requires_grad_(True)
+        v_ = v.detach().requires_grad_(True)
+        o = flash_attention_pytorch(q_, k_, v_)
+        o.backward(dout)
+        return q_.grad, k_.grad, v_.grad
+
+    funcs["pytorch"] = pytorch_bwd
+
+    # torch SDPA backward
+    dout4d = dout.unsqueeze(0)
+
+    def sdpa_bwd():
+        q_ = q.unsqueeze(0).detach().requires_grad_(True)
+        k_ = k.unsqueeze(0).detach().requires_grad_(True)
+        v_ = v.unsqueeze(0).detach().requires_grad_(True)
+        o = F.scaled_dot_product_attention(q_, k_, v_)
+        o.backward(dout4d)
+        return q_.grad, k_.grad, v_.grad
+
+    funcs["sdpa"] = sdpa_bwd
+
+    # Megakernel backward (FlashAttentionSm120BwdOp)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            # Run forward to get lse
+            o_mk = torch.zeros_like(q)
+            lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            fwd_ops = FlashAttentionSm120Op.schedule_forward(
+                q=q, k=k, v=v, o=o_mk, lse=lse,
+            )
+            fwd_config = FlashAttentionSm120Op.kernel_config(fwd_ops)
+            fwd_kernel = Megakernel(fwd_ops, config=fwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            # Setup backward
+            dpsum = (dout.float() * o_mk.float()).sum(dim=-1).contiguous()
+            dq_accum = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk = torch.zeros_like(k)
+            dv = torch.zeros_like(v)
+
+            bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
+                dq_accum=dq_accum, dk=dk, dv=dv,
+            )
+            bwd_config = FlashAttentionSm120BwdOp.kernel_config(bwd_ops)
+            bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            def reset_bwd():
+                dq_accum.zero_()
+                dk.zero_()
+                dv.zero_()
+
+            funcs["megakernel"] = bwd_kernel.bench_spec(
+                setup_fn=reset_bwd,
+                keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
+            )
+        except Exception as e:
+            print(f"  megakernel bwd error: {e}")
+
+    return funcs
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -236,6 +340,18 @@ if __name__ == "__main__":
     print()
 
     bench_attention._benchmark.run(
+        mode="kernel",
+        warmup=25,
+        rep=100,
+    )
+
+    print()
+    print("=" * 100)
+    print("Flash Attention Backward Benchmark: Megakernel vs PyTorch vs SDPA")
+    print("=" * 100)
+    print()
+
+    bench_attention_bwd._benchmark.run(
         mode="kernel",
         warmup=25,
         rep=100,

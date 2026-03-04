@@ -573,7 +573,7 @@ class MoeGemmOp(Op):
           - tile_M * tile_N * elem <= page_size  (C epilogue)
         """
         tile_K = 32
-        for tile_M, tile_N in [(128, 64), (64, 64), (64, 32), (32, 32)]:
+        for tile_M, tile_N in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
             data = (2 * tile_M + tile_N) * tile_K * elem_bytes + 32  # +mbar
             c = tile_M * tile_N * elem_bytes
             if max(data, c) <= page_size:

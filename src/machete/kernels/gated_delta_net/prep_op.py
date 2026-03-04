@@ -78,10 +78,10 @@ class GDNPrepOp(Op):
         )
         self.elem_bytes = 2
 
-        # Block sizes
+        # Block sizes (auto-sized from page_size via schedule_forward)
         self.BT = _BT
-        self.BK = _BK
-        self.BV = _BV
+        self.BK = getattr(self, "BK", _BK)
+        self.BV = getattr(self, "BV", _BV)
         self.NK = self.K // self.BK
         self.NV = self.V // self.BV
 
@@ -136,6 +136,34 @@ class GDNPrepOp(Op):
     # =========================================================================
 
     @classmethod
+    def _auto_block_sizes(cls, page_size, K, V, elem_bytes=2):
+        """Compute largest (BK, BV) that fit in page_size.
+
+        Binding constraint is Phase 4 smem:
+            src_base + max(BT*BK, BT*BV) * elem_bytes <= page_size
+        where src_base = aligned(sk_base + BT*BT*4).
+        """
+        BT = _BT
+        scalars = 3 * BT * 4
+        sk_base = ((scalars + 127) // 128) * 128
+        src_base = ((sk_base + BT * BT * 4 + 127) // 128) * 128
+
+        for BK in [128, 64]:
+            if K % BK != 0:
+                continue
+            # Phase 2 (K@K^T) produces [BT, BT] — BK > BT needs
+            # non-square B partition which has LdMatrix alignment issues.
+            if BK > BT:
+                continue
+            for BV in [128, 64]:
+                if V % BV != 0:
+                    continue
+                phase4 = src_base + max(BT * BK, BT * BV) * elem_bytes
+                if phase4 <= page_size:
+                    return BK, BV
+        return 64, 64
+
+    @classmethod
     def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         """Schedule GDN prep Op."""
         tile_sizes = dict(tile_sizes or {})
@@ -143,8 +171,17 @@ class GDNPrepOp(Op):
         tile_sizes.setdefault("H", 1)
         tile_sizes.setdefault("T", _BT)
 
+        k = tensors.get("k")
+        K = k.shape[-1] if k is not None else 64
+        v = tensors.get("v")
+        V = v.shape[-1] if v is not None else 64
+        elem_bytes = k.element_size() if k is not None else 2
+        BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
+
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["BK"] = BK
+        ops[0].static_dims["BV"] = BV
         return ops
 
     @classmethod
@@ -266,7 +303,8 @@ class GDNPrepOp(Op):
         smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
         smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
 
-        # MMA partitions: K as A, K^T as B
+        # MMA partitions: K as A, K^T as B (D += A @ B^T = K @ K^T)
+        # BK == BT guaranteed by _auto_block_sizes, so [BK,BT] is square
         tCsK_A = thr_mma.partition_A(s_k)
         tCrK_A = tiled_mma.make_fragment_A(tCsK_A)
 
