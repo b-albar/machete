@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+# Copyright (c) 2025, Machete Authors
+"""Benchmark MoE Grouped GEMM: Megakernel vs PyTorch loop.
+
+Compares GPU kernel execution time of the megakernel MoeGemmOp against
+a naive PyTorch loop over experts (torch.matmul per expert). Both
+implementations are measured using CUDA event timing for fair comparison.
+
+Usage:
+    python benchmarks/kernels/benchmark_moe_gemm.py
+"""
+
+import contextlib
+import io
+
+import torch
+
+from machete.megakernel import Megakernel
+from machete.kernels.moe import MoeGemmOp, moe_align_sort
+from machete.utils.benchmark import Benchmark
+from machete.utils.benchmark_utils import KernelBenchSpec
+
+try:
+    import cutlass  # noqa: F401
+    CUTLASS_AVAILABLE = True
+except ImportError:
+    CUTLASS_AVAILABLE = False
+
+
+def is_sm90_or_newer():
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor >= 90
+
+
+def moe_gemm_bytes(num_tokens, num_experts, topk, K, N, dtype):
+    """Total bytes read + written for grouped GEMM."""
+    elem_bytes = 2
+    total_tokens = num_tokens * topk
+    return (total_tokens * K + num_experts * N * K + total_tokens * N) * elem_bytes
+
+
+def moe_gemm_flops(num_tokens, num_experts, topk, K, N, dtype):
+    """FLOPs for grouped GEMM: 2 * total_tokens * N * K."""
+    return 2 * num_tokens * topk * N * K
+
+
+def _compute_tile_sizes(total_padded, N, K, page_size=32768, elem_bytes=2):
+    """Compute tile sizes that keep total tile count reasonable.
+
+    The megakernel instruction stream has limited capacity. We target
+    <= 512 total tiles by increasing tile_M and tile_N as needed.
+    """
+    max_tiles = 512
+    tile_k = 32
+
+    for tile_m, tile_n in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
+        # Check smem constraint
+        data = (2 * tile_m + tile_n) * tile_k * elem_bytes + 32
+        c = tile_m * tile_n * elem_bytes
+        if max(data, c) > page_size:
+            continue
+        m_tiles = (total_padded + tile_m - 1) // tile_m
+        n_tiles = (N + tile_n - 1) // tile_n
+        if m_tiles * n_tiles <= max_tiles:
+            return tile_m, tile_n, tile_k
+
+    # Fallback: largest tiles that fit
+    return 128, 64, 32
+
+
+# =============================================================================
+# Benchmark Setup
+# =============================================================================
+
+# Practical MoE configurations:
+#   (num_tokens, topk, num_experts, K, N, dtype)
+# Covers small/medium/large with varying expert counts.
+@Benchmark.configs(
+    ["num_tokens", "topk", "num_experts", "K", "N", "dtype"],
+    [
+        # Small: few tokens, few experts
+        (64, 2, 8, 256, 256, "bfloat16"),
+        (128, 2, 8, 256, 512, "bfloat16"),
+        (256, 2, 8, 512, 512, "bfloat16"),
+        # Medium: moderate scale
+        (256, 2, 8, 512, 1024, "bfloat16"),
+        (512, 2, 8, 1024, 1024, "bfloat16"),
+        (512, 2, 16, 512, 1024, "bfloat16"),
+        # Larger: more tokens and experts
+        (512, 2, 16, 1024, 1024, "bfloat16"),
+        (1024, 2, 8, 512, 1024, "bfloat16"),
+        (1024, 2, 16, 1024, 1024, "bfloat16"),
+        # Many experts (MoE-heavy)
+        (256, 2, 64, 256, 256, "bfloat16"),
+        (512, 2, 64, 256, 512, "bfloat16"),
+        (1024, 2, 64, 512, 512, "bfloat16"),
+    ],
+)
+def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
+    """Setup MoE grouped GEMM benchmark."""
+    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    x = torch.randn(num_tokens, K, dtype=torch_dtype, device=device)
+    w = torch.randn(num_experts, N, K, dtype=torch_dtype, device=device)
+
+    topk_ids = torch.randint(0, num_experts, (num_tokens, topk),
+                             dtype=torch.int32, device=device)
+    topk_weights = torch.randn(num_tokens, topk, dtype=torch.float32,
+                               device=device).softmax(dim=-1)
+
+    # Auto-compute tile sizes based on problem size
+    # Use a temporary align_sort to get total_padded
+    tile_m_initial = 64
+    sorted_token_ids, expert_ids, sorted_weights, _ = (
+        moe_align_sort(topk_ids, topk_weights, num_experts,
+                       block_size=tile_m_initial)
+    )
+    total_padded_est = sorted_token_ids.shape[0]
+
+    tile_m, tile_n, tile_k = _compute_tile_sizes(total_padded_est, N, K)
+
+    # Re-run align_sort with actual tile_m if different
+    if tile_m != tile_m_initial:
+        sorted_token_ids, expert_ids, sorted_weights, _ = (
+            moe_align_sort(topk_ids, topk_weights, num_experts,
+                           block_size=tile_m)
+        )
+    total_padded = sorted_token_ids.shape[0]
+    clamped = sorted_token_ids.clamp(max=num_tokens - 1).long()
+    sorted_x = x[clamped]
+
+    funcs = {}
+
+    # --- PyTorch loop over experts ---
+    # Wrapped as KernelBenchSpec to avoid CUDA graph capture (dynamic masking
+    # is not graph-capturable, and failed capture corrupts allocator state).
+    c_ref = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+
+    def pytorch_loop():
+        c_ref.zero_()
+        for e in range(num_experts):
+            mask = expert_ids == e
+            if not mask.any():
+                continue
+            x_e = sorted_x[mask]
+            c_ref[mask] = (x_e.float() @ w[e].float().t()).to(torch_dtype)
+
+    torch_stream = torch.cuda.Stream()
+    cu_stream = torch_stream.cuda_stream
+    funcs["pytorch_loop"] = KernelBenchSpec(
+        launch_fn=pytorch_loop,
+        stream=(torch_stream, cu_stream),
+        _keep_alive=[sorted_x, w, expert_ids, c_ref],
+    )
+
+    # --- Megakernel MoeGemmOp ---
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        c = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+
+        ops = MoeGemmOp.schedule_forward(
+            sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
+            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        )
+        config = MoeGemmOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["megakernel"] = kernel.bench_spec(
+            setup_fn=lambda: c.zero_(),
+            keep_alive=[sorted_x, w, expert_ids, c],
+        )
+
+    return funcs
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
+if __name__ == "__main__":
+    print("=" * 100)
+    print("MoE Grouped GEMM Benchmark: Megakernel vs PyTorch")
+    print("=" * 100)
+
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        print(f"GPU: {props.name} ({props.multi_processor_count} SMs)")
+        print(f"SM_90+: {is_sm90_or_newer()}")
+    print(f"CUTLASS: {CUTLASS_AVAILABLE}")
+    print()
+
+    bench_moe_gemm._benchmark.run(
+        mode="kernel",
+        flops=moe_gemm_flops,
+        bytes_fn=moe_gemm_bytes,
+        warmup=25,
+        rep=100,
+    )
