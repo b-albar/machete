@@ -1443,7 +1443,18 @@ class Megakernel:
 
                     # Yield when idle: no load dispatched this iteration.
                     if _dl_slot == Int32(-1):
-                        nanosleep(Int32(5000))
+                        # Block on compute_done when all pages are full
+                        _idle_pi = ld_shared_i32(produce_idx_ptr)
+                        _idle_si = ld_shared_i32(store_idx_ptr)
+                        if (_idle_pi - _idle_si) >= Int32(num_pages):
+                            _wait_slot = _idle_pi % Int32(num_pages)
+                            _wait_phase = ((_idle_pi // Int32(num_pages)) + Int32(1)) % Int32(2)
+                            mbarrier_wait(
+                                _compute_done_mbar(smem_base, _wait_slot),
+                                _wait_phase,
+                            )
+                        if (_idle_pi - _idle_si) < Int32(num_pages):
+                            nanosleep(Int32(5000))
 
                     done = ld_shared_i32(load_done_ptr)
 
@@ -1544,7 +1555,12 @@ class Megakernel:
                         if ld_shared_i32(load_done_ptr) == Int32(1):
                             _sw_done = Int32(1)
                         if ld_shared_i32(load_done_ptr) != Int32(1):
-                            nanosleep(Int32(5000))
+                            _sw_next_slot = _s_idx % Int32(num_pages)
+                            _sw_next_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+                            mbarrier_wait(
+                                _work_notify_mbar(smem_base, _sw_next_slot),
+                                _sw_next_phase,
+                            )
 
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
