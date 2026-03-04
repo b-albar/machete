@@ -184,7 +184,7 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_backward(cls, tile_sizes=None, causal=False, page_size=49152, **tensors):
+    def schedule_backward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule backward pass."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("BH", 1)
@@ -226,7 +226,7 @@ class FlashAttentionSm120BwdOp(Op):
         tile_n = ops[0].tile_sizes["N"]
         num_mma_warps = tile_n // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
-        page_size = ops[0].static_dims.get("page_size", 49152)
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
             threads_per_block=threads_per_block,
             page_size=page_size,
