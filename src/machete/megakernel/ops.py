@@ -521,8 +521,8 @@ def _process_op_declarations(cls):
 # Operation Protocol
 # =============================================================================
 
-DEFAULT_PAGE_SIZE: int = 32768
-"""Default page size in bytes (32KB). Single source of truth for all ops."""
+DEFAULT_PAGE_SIZE: int = 49152
+"""Default page size in bytes (48KB). Must match MegakernelConfig.page_size."""
 
 
 class Op:
