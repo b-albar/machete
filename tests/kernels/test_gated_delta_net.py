@@ -57,35 +57,6 @@ requires_gpu_fla = pytest.mark.skipif(
 # =============================================================================
 
 
-def _run_output_op(q, k, v_new, h, g_cumsum, scale):
-    """Run GDNOutputOp megakernel and return output in [B, T, H, V] layout.
-
-    Native [B, T, H, K/V] layout — no transposes needed.
-    """
-    from machete.megakernel import Megakernel
-    from machete.kernels.gated_delta_net.output_op import GDNOutputOp
-
-    B, T, H, K = q.shape
-    V = v_new.shape[-1]
-    dtype = q.dtype
-
-    o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
-
-    ops = GDNOutputOp.schedule_forward(
-        q=q.contiguous(), k=k.contiguous(),
-        v_new=v_new.contiguous(), h=h.contiguous(),
-        g_cumsum=g_cumsum.contiguous(), o=o,
-        scale=scale,
-    )
-    config = GDNOutputOp.kernel_config(ops)
-    kernel = Megakernel(ops, config=config)
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
-
-    return o
-
-
 def _make_inputs(B, T, H, K, V, dtype=torch.float16, device="cuda"):
     """Create random inputs for gated delta net."""
     # Scale down inputs to prevent numerical instability
@@ -388,37 +359,6 @@ class TestGatedDeltaNetEndToEnd:
         )
 
 
-class TestGDNOutputMegakernel:
-    """Test GDNOutputOp megakernel Op against fla's output computation."""
-
-    @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 128, 4, 128, 128),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-        (1, 512, 8, 128, 128),
-    ])
-    def test_output_op_vs_fla(self, B, T, H, K, V):
-        """Compare GDNOutputOp megakernel against fla's output."""
-        q, k, v, g, beta = _make_inputs(B, T, H, K, V)
-        scale = K ** -0.5
-
-        # Use fla for prep + state stages
-        g_cumsum, A, w, u = fla_prep_stage(k, v, g, beta)
-        h, v_new, _ = fla_state_recurrence(k, w, u, g_cumsum)
-
-        # fla reference
-        o_ref = fla_output(q, k, v_new, h, g_cumsum, scale=scale)
-
-        # GDNOutputOp megakernel
-        o_mk = _run_output_op(q, k, v_new, h, g_cumsum, scale=scale)
-
-        torch.testing.assert_close(
-            o_mk.float(), o_ref.float(), atol=5e-2, rtol=2e-2,
-        )
-
-
 def _run_prep_op(k, v, g, beta):
     """Run GDNPrepOp megakernel and return outputs in [B, T, H, ...] layout.
 
@@ -481,85 +421,12 @@ class TestGDNPrepMegakernel:
 
 
 # =============================================================================
-# GDNStateOp megakernel tests
-# =============================================================================
-
-
-def _run_state_op(k, w, u, g_cumsum):
-    """Run GDNStateOp megakernel and return h, v_new in standard layout.
-
-    Native [B, T, H, K/V] layout — no transposes needed.
-    """
-    from machete.megakernel import Megakernel
-    from machete.kernels.gated_delta_net.state_op import GDNStateOp
-
-    B, T, H, K = k.shape
-    V = u.shape[-1]
-    BT = 64
-    NT = T // BT
-    dtype = k.dtype
-
-    k = k.contiguous()
-    w = w.contiguous()
-    u = u.contiguous()
-    g_cumsum = g_cumsum.contiguous()
-
-    h = torch.empty(B, NT, H, K, V, device=k.device, dtype=dtype)
-    vn = torch.empty(B, T, H, V, device=k.device, dtype=dtype)
-
-    ops = GDNStateOp.schedule_forward(
-        k=k, w=w, u=u, g_cumsum=g_cumsum,
-        h=h, v_new=vn,
-    )
-    config = GDNStateOp.kernel_config(ops)
-    kernel = Megakernel(ops, config=config)
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
-
-    return h, vn
-
-
-class TestGDNStateMegakernel:
-    """Test GDNStateOp megakernel Op against fla's state recurrence."""
-
-    @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 64, 1, 128, 128),
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 512, 4, 128, 64),
-    ])
-    def test_state_op_vs_fla(self, B, T, H, K, V):
-        """Compare GDNStateOp megakernel against fla's state recurrence."""
-        from machete.kernels.gated_delta_net import HAS_MEGAKERNEL_OPS
-        if not HAS_MEGAKERNEL_OPS:
-            pytest.skip("Megakernel Ops not available")
-
-        q, k, v, g, beta = _make_inputs(B, T, H, K, V)
-        g_cumsum, A, w, u = fla_prep_stage(k, v, g, beta)
-
-        # fla reference
-        h_ref, v_new_ref, _ = fla_state_recurrence(k, w, u, g_cumsum)
-
-        # GDNStateOp megakernel
-        h_mk, v_new_mk = _run_state_op(k, w, u, g_cumsum)
-
-        torch.testing.assert_close(
-            h_mk.float(), h_ref.float(), atol=5e-2, rtol=2e-2,
-        )
-        torch.testing.assert_close(
-            v_new_mk.float(), v_new_ref.float(), atol=5e-2, rtol=2e-2,
-        )
-
-
-# =============================================================================
-# Fused 3-op megakernel tests (PrepOp + StateOp + OutputOp in one kernel)
+# Fused megakernel tests (PrepOp + FusedOp in one kernel)
 # =============================================================================
 
 
 class TestGDNFusedMegakernel:
-    """Test fused PrepOp+StateOp+OutputOp single megakernel against fla."""
+    """Test fused PrepOp+FusedOp single megakernel against fla."""
 
     @requires_gpu_fla
     @pytest.mark.parametrize("B,T,H,K,V", [
@@ -568,7 +435,7 @@ class TestGDNFusedMegakernel:
         (2, 256, 4, 128, 64),
     ])
     def test_fused_megakernel_vs_fla(self, B, T, H, K, V):
-        """Compare fused 3-op megakernel against fla end-to-end."""
+        """Compare fused PrepOp+FusedOp megakernel against fla end-to-end."""
         from machete.kernels.gated_delta_net import (
             HAS_MEGAKERNEL_OPS, _run_fused_megakernel,
         )
@@ -582,8 +449,67 @@ class TestGDNFusedMegakernel:
         o_ref, _ = fla_full_forward(q, k, v, g, beta, scale=scale)
 
         # Fused megakernel
-        o_mk, _, _, _, _, _, _ = _run_fused_megakernel(q, k, v, g, beta, scale)
+        o_mk, _, _, _, _ = _run_fused_megakernel(q, k, v, g, beta, scale)
 
         torch.testing.assert_close(
             o_mk.float(), o_ref.float(), atol=5e-1, rtol=2e-1,
+        )
+
+
+# =============================================================================
+# GDNFusedOp tests (fused state+output, no h_states/v_new intermediates)
+# =============================================================================
+
+
+def _run_fused_op(q, k, w, u, g_cumsum, scale):
+    """Run GDNFusedOp and return output."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
+
+    B, T, H, K = q.shape
+    V = u.shape[-1]
+    dtype = q.dtype
+
+    o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+
+    ops = GDNFusedOp.schedule_forward(
+        q=q.contiguous(), k=k.contiguous(),
+        w=w.contiguous(), u=u.contiguous(),
+        g_cumsum=g_cumsum.contiguous(), o=o,
+        scale=scale,
+    )
+    config = GDNFusedOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+    torch.cuda.synchronize()
+
+    return o
+
+
+class TestGDNFusedOp:
+    """Test GDNFusedOp (fused state+output) against fla end-to-end."""
+
+    @requires_gpu_fla
+    @pytest.mark.parametrize("B,T,H,K,V", [
+        (1, 64, 1, 128, 128),
+        (1, 128, 2, 128, 64),
+        (1, 256, 4, 128, 128),
+        (2, 512, 4, 128, 64),
+    ])
+    def test_fused_op_vs_fla(self, B, T, H, K, V):
+        """Compare GDNFusedOp against fla's full pipeline."""
+        q, k, v, g, beta = _make_inputs(B, T, H, K, V)
+        scale = K ** -0.5
+
+        # fla prep + reference output
+        g_cumsum, A, w, u = fla_prep_stage(k, v, g, beta)
+        h_ref, v_new_ref, _ = fla_state_recurrence(k, w, u, g_cumsum)
+        o_ref = fla_output(q, k, v_new_ref, h_ref, g_cumsum, scale=scale)
+
+        # GDNFusedOp (no h_states or v_new intermediates)
+        o_fused = _run_fused_op(q, k, w, u, g_cumsum, scale)
+
+        torch.testing.assert_close(
+            o_fused.float(), o_ref.float(), atol=5e-2, rtol=2e-2,
         )

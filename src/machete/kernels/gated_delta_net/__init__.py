@@ -37,8 +37,7 @@ from machete.kernels.gated_delta_net.grad import (
 # Megakernel Ops (fusable with other Ops)
 try:
     from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
-    from machete.kernels.gated_delta_net.state_op import GDNStateOp
-    from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+    from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
     HAS_MEGAKERNEL_OPS = True
 except ImportError:
     HAS_MEGAKERNEL_OPS = False
@@ -67,30 +66,8 @@ def _run_prep_megakernel(k, v, g, beta):
     return g_cumsum, w, u
 
 
-def _run_output_megakernel(q, k, v_new, h, g_cumsum, scale):
-    """Run GDNOutputOp megakernel for output stage (native [B,T,H,K] layout)."""
-    from machete.megakernel import Megakernel
-
-    B, T, H, K = q.shape
-    V = v_new.shape[-1]
-    dtype = q.dtype
-
-    o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
-
-    ops = GDNOutputOp.schedule_forward(
-        q=q.contiguous(), k=k.contiguous(),
-        v_new=v_new.contiguous(), h=h.contiguous(),
-        g_cumsum=g_cumsum.contiguous(), o=o,
-        scale=scale,
-    )
-    config = GDNOutputOp.kernel_config(ops)
-    Megakernel(ops, config=config).run()
-
-    return o
-
-
 def _run_fused_megakernel(q, k, v, g, beta, scale):
-    """Run full forward as a single fused megakernel: PrepOp → StateOp → OutputOp.
+    """Run full forward as a single fused megakernel: PrepOp → FusedOp.
 
     All tensors use native [B, T, H, K/V] layout — no transposes.
     """
@@ -98,8 +75,6 @@ def _run_fused_megakernel(q, k, v, g, beta, scale):
 
     B, T, H, K = q.shape
     V = v.shape[-1]
-    BT = 64
-    NT = T // BT
     dtype = q.dtype
 
     # Ensure contiguous inputs
@@ -113,29 +88,23 @@ def _run_fused_megakernel(q, k, v, g, beta, scale):
     g_cumsum = torch.zeros(B, T, H, device=q.device, dtype=torch.float32)
     w = torch.zeros(B, T, H, K, device=q.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
-    h = torch.empty(B, NT, H, K, V, device=q.device, dtype=dtype)
-    v_new = torch.empty(B, T, H, V, device=q.device, dtype=dtype)
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    # Schedule all 3 ops — dependencies resolved automatically via shared tensors
+    # Schedule PrepOp + FusedOp — dependencies resolved via shared tensors
     prep_ops = GDNPrepOp.schedule_forward(
         k=k, v=v, g=g, beta=beta,
         g_cumsum=g_cumsum, w=w, u=u,
     )
-    state_ops = GDNStateOp.schedule_forward(
-        k=k, w=w, u=u, g_cumsum=g_cumsum,
-        h=h, v_new=v_new,
-    )
-    output_ops = GDNOutputOp.schedule_forward(
-        q=q, k=k, v_new=v_new, h=h, g_cumsum=g_cumsum, o=o,
-        scale=scale,
+    fused_ops = GDNFusedOp.schedule_forward(
+        q=q, k=k, w=w, u=u,
+        g_cumsum=g_cumsum, o=o, scale=scale,
     )
 
-    all_ops = prep_ops + state_ops + output_ops
-    config = GDNStateOp.kernel_config(all_ops)
+    all_ops = prep_ops + fused_ops
+    config = GDNFusedOp.kernel_config(all_ops)
     Megakernel(all_ops, config=config).run()
 
-    return o, g_cumsum, None, w, u, h, v_new
+    return o, g_cumsum, None, w, u
 
 
 def _forward(q, k, v, g, beta, scale, initial_state, output_final_state):

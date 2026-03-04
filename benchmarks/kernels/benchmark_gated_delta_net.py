@@ -92,71 +92,36 @@ def _build_prep_megakernel(k, v, g, beta):
     return kernel, k, v, g, beta, gc, w, u
 
 
-def _build_state_megakernel(k, w, u, g_cumsum):
-    """Build and compile a StateOp megakernel with pre-allocated outputs.
+def _build_fused_megakernel(q, k, w, u, g_cumsum, scale):
+    """Build and compile a FusedOp megakernel (state+output, no intermediates).
 
-    Returns (kernel, k, w, u, gc, h, vn) in native [B,T,H,K] layout.
+    Returns (kernel, q, k, w, u, gc, o) in native [B,T,H,K] layout.
     """
     from machete.megakernel import Megakernel
-    from machete.kernels.gated_delta_net.state_op import GDNStateOp
-
-    B, T, H, K_ = k.shape
-    V = u.shape[-1]
-    BT = 64
-    NT = T // BT
-    dtype = k.dtype
-
-    k = k.contiguous()
-    w = w.contiguous()
-    u = u.contiguous()
-    g_cumsum = g_cumsum.contiguous()
-
-    h = torch.empty(B, NT, H, K_, V, device=k.device, dtype=dtype)
-    vn = torch.empty(B, T, H, V, device=k.device, dtype=dtype)
-
-    ops = GDNStateOp.schedule_forward(
-        k=k, w=w, u=u, g_cumsum=g_cumsum,
-        h=h, v_new=vn,
-    )
-    config = GDNStateOp.kernel_config(ops)
-    kernel = Megakernel(ops, config=config)
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
-
-    return kernel, k, w, u, g_cumsum, h, vn
-
-
-def _build_output_megakernel(q, k, v_new, h, g_cumsum, scale):
-    """Build and compile an OutputOp megakernel with pre-allocated output.
-
-    Returns (kernel, q, k, vn, h, gc, o) in native [B,T,H,K] layout.
-    """
-    from machete.megakernel import Megakernel
-    from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+    from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
 
     B, T, H, K_ = q.shape
-    V = v_new.shape[-1]
+    V = u.shape[-1]
     dtype = q.dtype
 
     q = q.contiguous()
     k = k.contiguous()
-    v_new = v_new.contiguous()
-    h = h.contiguous()
+    w = w.contiguous()
+    u = u.contiguous()
     g_cumsum = g_cumsum.contiguous()
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    ops = GDNOutputOp.schedule_forward(
-        q=q, k=k, v_new=v_new, h=h, g_cumsum=g_cumsum, o=o,
+    ops = GDNFusedOp.schedule_forward(
+        q=q, k=k, w=w, u=u, g_cumsum=g_cumsum, o=o,
         scale=scale,
     )
-    config = GDNOutputOp.kernel_config(ops)
+    config = GDNFusedOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
     torch.cuda.synchronize()
 
-    return kernel, q, k, v_new, h, g_cumsum, o
+    return kernel, q, k, w, u, g_cumsum, o
 
 
 # =============================================================================
@@ -203,11 +168,10 @@ def bench_prep(B, T, H, K, V):
 
 
 # =============================================================================
-# State recurrence benchmark
+# Fused State+Output benchmark (GDNFusedOp vs fla)
 # =============================================================================
 
-STATE_CONFIGS = [
-    # (B, T, H, K, V) — Qwen 3.5 shapes
+FUSED_CONFIGS = [
     (1, 1024, 32, 128, 128),
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
@@ -216,53 +180,9 @@ STATE_CONFIGS = [
 ]
 
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], STATE_CONFIGS)
-def bench_state(B, T, H, K, V):
-    """Setup state recurrence benchmarks: fla vs PyTorch vs MegakernelOp."""
-    q, k, v, g, beta = _make_inputs(B, T, H, K, V)
-
-    funcs = {}
-
-    if FLA_AVAILABLE:
-        from machete.kernels.gated_delta_net.ref import fla_prep_stage, fla_state_recurrence
-        g_cumsum, A, w, u = fla_prep_stage(k, v, g, beta)
-
-        funcs["fla"] = lambda: fla_state_recurrence(k, w, u, g_cumsum)
-
-        from machete.kernels.gated_delta_net.state import run_state_recurrence
-        funcs["pytorch"] = lambda: run_state_recurrence(k, w, u, g_cumsum)
-
-        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
-            try:
-                result = _build_state_megakernel(k, w, u, g_cumsum)
-                state_kernel = result[0]
-
-                funcs["megakernel_op"] = state_kernel.bench_spec(
-                    setup_fn=lambda: None,
-                    keep_alive=list(result[1:]),
-                )
-            except Exception as e:
-                print(f"  MegakernelOp state error: {e}")
-
-    return funcs
-
-
-# =============================================================================
-# Output benchmark
-# =============================================================================
-
-OUTPUT_CONFIGS = [
-    (1, 1024, 32, 128, 128),
-    (1, 2048, 32, 128, 128),
-    (1, 4096, 32, 128, 128),
-    (1, 8192, 32, 128, 128),
-    (4, 2048, 32, 128, 128),
-]
-
-
-@Benchmark.configs(["B", "T", "H", "K", "V"], OUTPUT_CONFIGS)
-def bench_output(B, T, H, K, V):
-    """Setup output kernel benchmarks: fla vs PyTorch vs MegakernelOp."""
+@Benchmark.configs(["B", "T", "H", "K", "V"], FUSED_CONFIGS)
+def bench_fused(B, T, H, K, V):
+    """Benchmark fused state+output vs separate ops vs fla (state+output only)."""
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
     scale = K ** -0.5
 
@@ -273,25 +193,26 @@ def bench_output(B, T, H, K, V):
             fla_prep_stage, fla_state_recurrence, fla_output,
         )
         g_cumsum, A, w, u = fla_prep_stage(k, v, g, beta)
-        h, v_new, _ = fla_state_recurrence(k, w, u, g_cumsum)
 
-        funcs["fla"] = lambda: fla_output(q, k, v_new, h, g_cumsum, scale=scale)
-
-        from machete.kernels.gated_delta_net.output import run_output
-        funcs["pytorch"] = lambda: run_output(q, k, v_new, h, g_cumsum, scale=scale)
+        # fla state+output combined
+        def fla_state_output():
+            h, v_new, _ = fla_state_recurrence(k, w, u, g_cumsum)
+            return fla_output(q, k, v_new, h, g_cumsum, scale=scale)
+        funcs["fla_state+output"] = fla_state_output
 
         if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
             try:
-                result = _build_output_megakernel(
-                    q, k, v_new, h, g_cumsum, scale)
-                out_kernel, o_out = result[0], result[6]
+                fused_result = _build_fused_megakernel(
+                    q, k, w, u, g_cumsum, scale)
+                fused_kernel = fused_result[0]
+                o_fused = fused_result[6]
 
-                funcs["megakernel_op"] = out_kernel.bench_spec(
-                    setup_fn=lambda: o_out.zero_(),
-                    keep_alive=list(result[1:]),
+                funcs["fused_op"] = fused_kernel.bench_spec(
+                    setup_fn=lambda: o_fused.zero_(),
+                    keep_alive=list(fused_result[1:]),
                 )
             except Exception as e:
-                print(f"  MegakernelOp output error: {e}")
+                print(f"  FusedOp error: {e}")
 
     return funcs
 
@@ -318,8 +239,6 @@ def bench_pipeline(B, T, H, K, V):
     """
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
     scale = K ** -0.5
-    BT = 64
-    NT = T // BT
     dtype = k.dtype
 
     funcs = {}
@@ -333,8 +252,7 @@ def bench_pipeline(B, T, H, K, V):
             import cuda.bindings.driver as cuda
             from machete.megakernel import Megakernel
             from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
-            from machete.kernels.gated_delta_net.state_op import GDNStateOp
-            from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+            from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
 
             # Pre-allocate ALL tensors in native [B,T,H,K/V] layout
             q_c = q.contiguous()
@@ -346,26 +264,20 @@ def bench_pipeline(B, T, H, K, V):
             gc = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
             w = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
             u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
-            h_buf = torch.empty(B, NT, H, K, V, device=k.device, dtype=dtype)
-            vn = torch.empty(B, T, H, V, device=k.device, dtype=dtype)
             o = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-            # --- Fused megakernel: PrepOp + StateOp + OutputOp in one kernel ---
+            # --- Fused megakernel: PrepOp + FusedOp in one kernel ---
             try:
                 prep_ops = GDNPrepOp.schedule_forward(
                     k=k_c, v=v_c, g=g_c, beta=beta_c,
                     g_cumsum=gc, w=w, u=u,
                 )
-                state_ops = GDNStateOp.schedule_forward(
-                    k=k_c, w=w, u=u, g_cumsum=gc,
-                    h=h_buf, v_new=vn,
-                )
-                output_ops = GDNOutputOp.schedule_forward(
-                    q=q_c, k=k_c, v_new=vn, h=h_buf,
+                fused_ops = GDNFusedOp.schedule_forward(
+                    q=q_c, k=k_c, w=w, u=u,
                     g_cumsum=gc, o=o, scale=scale,
                 )
-                all_ops = prep_ops + state_ops + output_ops
-                fused_config = GDNStateOp.kernel_config(all_ops)
+                all_ops = prep_ops + fused_ops
+                fused_config = GDNFusedOp.kernel_config(all_ops)
                 fused_kernel = Megakernel(all_ops, config=fused_config)
                 with contextlib.redirect_stdout(io.StringIO()):
                     fused_kernel.run()
@@ -386,7 +298,7 @@ def bench_pipeline(B, T, H, K, V):
                     setup_fn=fused_setup,
                     stream=(fused_stream, fused_cu_stream),
                     _keep_alive=[fused_kernel, k_c, v_c, g_c, beta_c,
-                                 q_c, gc, w, u, h_buf, vn, o],
+                                 q_c, gc, w, u, o],
                 )
             except Exception as e:
                 print(f"  Fused megakernel error: {e}")
@@ -422,15 +334,9 @@ if __name__ == "__main__":
 
     print()
     print("-" * 100)
-    print("State Recurrence Kernel (fla vs PyTorch vs MegakernelOp)")
+    print("Fused State+Output (FusedOp vs fla)")
     print("-" * 100)
-    bench_state._benchmark.run(mode="kernel", warmup=10, rep=100)
-
-    print()
-    print("-" * 100)
-    print("Output Kernel (fla vs PyTorch vs MegakernelOp)")
-    print("-" * 100)
-    bench_output._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_fused._benchmark.run(mode="kernel", warmup=10, rep=100)
 
     print()
     print("-" * 100)
