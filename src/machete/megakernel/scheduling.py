@@ -623,11 +623,12 @@ class InstructionStreamBuilder:
         2. Compute formula coefficients for both sides
         3. Allocate barriers
         """
-        # Track buffer producers by name.
+        # Track buffer producers by name (latest writer wins).
         # When two ops produce the same buffer name but target different
-        # tensors (different data_ptr), they are independent — no conflict.
-        # Only raise if the same buffer name AND same data_ptr are produced
-        # by multiple ops (true conflict).
+        # tensors (different data_ptr), they are independent — skip.
+        # When same data_ptr (ping-pong reuse), update to latest producer.
+        # Safety: transitive dependencies via tensor_ptr_deps guarantee
+        # the earlier write completes before the later write starts.
         buffer_producers: Dict[str, int] = {}
         for rec in self._op_records:
             for buf in rec.op.op_cls.OUTPUTS:
@@ -638,7 +639,6 @@ class InstructionStreamBuilder:
                     if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
                         # Different tensors — independent, no conflict
                         continue
-                    raise ValueError(f"Buffer '{buf}' produced by both op {prev_idx} and op {rec.op_idx}")
                 buffer_producers[buf] = rec.op_idx
 
         # Also track buffer producers by tensor data pointer for automatic dependency detection

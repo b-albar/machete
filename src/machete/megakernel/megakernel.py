@@ -425,6 +425,12 @@ class Megakernel:
 
         write_trace(self._tracing_state, filename)
 
+    def write_trace_perfetto(self, filename: str) -> None:
+        """Write trace as Perfetto JSON. Only valid after run() with tracing=True."""
+        from .tracing import write_trace_perfetto
+
+        write_trace_perfetto(self._tracing_state, filename)
+
     def _build_pipelined_dispatch_fns(self):
         """Build dispatch functions for pipelined execution phases.
 
@@ -1313,7 +1319,7 @@ class Megakernel:
             if is_load_warp:
                 if const_expr(tracing):
                     _dma_lane = begin_lane_dynamic_raw(
-                        Int32(2),
+                        Int32(3),
                         Int32(trace_row_stride),
                         block_id,
                         Int32(0),
@@ -1500,6 +1506,14 @@ class Megakernel:
             # For each tile: optionally issue K-block TMA loads (iterations
             # 1..inner_iters-1), then wait for compute_done, then TMA store.
             if is_store_warp:
+                if const_expr(tracing):
+                    _store_lane = begin_lane_dynamic_raw(
+                        Int32(3),
+                        Int32(trace_row_stride),
+                        block_id,
+                        Int32(2),
+                        lane_id == Int32(0),
+                    )
                 _sw_done = Int32(0)
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
@@ -1558,9 +1572,22 @@ class Megakernel:
                             _iter_idx = _iter_idx + Int32(1)
 
                         # Wait for full compute completion
+                        if const_expr(tracing):
+                            _tsw = trace_start()
                         mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
+                        if const_expr(tracing):
+                            _store_lane = end_event_dynamic_raw_1(
+                                _tsw,
+                                _trace_buf,
+                                Int32(trace_row_stride),
+                                _store_lane,
+                                Int32(trace_compute_wait_fmt),
+                                _ds_op,
+                            )
 
                         # ALL 32 threads dispatch store (TMA warp convergence)
+                        if const_expr(tracing):
+                            _tss = trace_start()
                         dispatch_store(
                             _ds_op,
                             _ds_pp,
@@ -1573,6 +1600,17 @@ class Megakernel:
                         )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        if const_expr(tracing):
+                            for _si in range_constexpr(num_ops):
+                                if _ds_op == Int32(_si):
+                                    _store_lane = end_event_dynamic_raw_1(
+                                        _tss,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _store_lane,
+                                        Int32(trace_store_fmts[_si]),
+                                        _ds_op,
+                                    )
 
                         # Communicate: send results to peer GPUs via TMA S2G
                         # (all 32 threads for TMA warp convergence)
@@ -1621,11 +1659,14 @@ class Megakernel:
                                 _sw_next_phase,
                             )
 
+                if const_expr(tracing):
+                    finish_lane_dynamic_raw(_trace_buf, _store_lane)
+
             # ========== MMA WARP LOOP ==========
             if warp_id < Int32(num_mma_warps):
                 if const_expr(tracing):
                     _mma_lane = begin_lane_dynamic_raw(
-                        Int32(2),
+                        Int32(3),
                         Int32(trace_row_stride),
                         block_id,
                         Int32(1),
