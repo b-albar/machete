@@ -47,30 +47,6 @@ def moe_gemm_flops(num_tokens, num_experts, topk, K, N, dtype):
     return 2 * num_tokens * topk * N * K
 
 
-def _compute_tile_sizes(total_padded, N, K, page_size=32768, elem_bytes=2):
-    """Compute tile sizes that keep total tile count reasonable.
-
-    The megakernel instruction stream has limited capacity. We target
-    <= 512 total tiles by increasing tile_M and tile_N as needed.
-    """
-    max_tiles = 512
-    tile_k = 32
-
-    for tile_m, tile_n in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
-        # Check smem constraint
-        data = (2 * tile_m + tile_n) * tile_k * elem_bytes + 32
-        c = tile_m * tile_n * elem_bytes
-        if max(data, c) > page_size:
-            continue
-        m_tiles = (total_padded + tile_m - 1) // tile_m
-        n_tiles = (N + tile_n - 1) // tile_n
-        if m_tiles * n_tiles <= max_tiles:
-            return tile_m, tile_n, tile_k
-
-    # Fallback: largest tiles that fit
-    return 128, 64, 32
-
-
 # =============================================================================
 # Benchmark Setup
 # =============================================================================
@@ -114,23 +90,12 @@ def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
     topk_weights = torch.randn(num_tokens, topk, dtype=torch.float32,
                                device=device).softmax(dim=-1)
 
-    # Auto-compute tile sizes based on problem size
-    # Use a temporary align_sort to get total_padded
-    tile_m_initial = 64
+    # Use _auto_tiles tile_M as block_size for align_sort
+    tile_m_initial = 128  # _auto_tiles default for 48KB pages
     sorted_token_ids, expert_ids, sorted_weights, _ = (
         moe_align_sort(topk_ids, topk_weights, num_experts,
                        block_size=tile_m_initial)
     )
-    total_padded_est = sorted_token_ids.shape[0]
-
-    tile_m, tile_n, tile_k = _compute_tile_sizes(total_padded_est, N, K)
-
-    # Re-run align_sort with actual tile_m if different
-    if tile_m != tile_m_initial:
-        sorted_token_ids, expert_ids, sorted_weights, _ = (
-            moe_align_sort(topk_ids, topk_weights, num_experts,
-                           block_size=tile_m)
-        )
     total_padded = sorted_token_ids.shape[0]
     clamped = sorted_token_ids.clamp(max=num_tokens - 1).long()
     sorted_x = x[clamped]
@@ -159,13 +124,12 @@ def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
         _keep_alive=[sorted_x, w, expert_ids, c_ref],
     )
 
-    # --- Megakernel MoeGemmOp ---
+    # --- Megakernel MoeGemmOp (let _auto_tiles choose optimal tile sizes) ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         c = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
 
         ops = MoeGemmOp.schedule_forward(
             sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
-            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
         )
         config = MoeGemmOp.kernel_config(ops)
         kernel = Megakernel(ops, config=config)
@@ -184,7 +148,6 @@ def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
         c_so = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
         so_ops = MoeGemmOp.schedule_forward(
             sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c_so,
-            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
         )
         so_kernel = SingleOpKernel(so_ops)
         with contextlib.redirect_stdout(io.StringIO()):

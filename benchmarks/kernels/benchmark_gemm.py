@@ -51,26 +51,6 @@ def gemm_flops(M, K, N, dtype):
     return 2 * M * N * K
 
 
-def compute_tile_sizes(M, K, N, elem_bytes=2, inner_depth=1):
-    """Compute tile sizes that fit in a 16KB page.
-
-    Constraints:
-      - inner_depth * (tile_M + tile_N) * tile_K * elem_bytes <= page_size
-      - tile_M * tile_N * elem_bytes <= page_size  (C during store)
-      - tile_K must be a multiple of 16 (MMA instruction size)
-    """
-    tile_k = 32
-
-    # Start with large tile_M, tile_N and shrink if needed
-    for tile_m, tile_n in [(128, 64), (64, 64), (64, 32), (32, 32)]:
-        ab_bytes = inner_depth * (tile_m + tile_n) * tile_k * elem_bytes
-        c_bytes = tile_m * tile_n * elem_bytes
-        if ab_bytes <= 16384 and c_bytes <= 16384:
-            return tile_m, tile_n, tile_k
-
-    return 32, 32, 16
-
-
 # =============================================================================
 # Benchmark Setup
 # =============================================================================
@@ -84,7 +64,6 @@ def compute_tile_sizes(M, K, N, elem_bytes=2, inner_depth=1):
 def bench_gemm(M, K, N, dtype):
     """Setup GEMM benchmark functions for each implementation."""
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
-    elem_bytes = 2
 
     torch.manual_seed(42)
     a = torch.randn(M, K, dtype=torch_dtype, device="cuda")
@@ -96,18 +75,11 @@ def bench_gemm(M, K, N, dtype):
     # PyTorch (cuBLAS)
     funcs["pytorch"] = lambda: torch.matmul(a, b)
 
-    # Megakernel GemmOp (double-buffered K-pipeline)
+    # Megakernel GemmOp (let _auto_tiles choose optimal tile sizes for 48KB pages)
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        inner_depth = 2
-        tile_m, tile_n, tile_k = compute_tile_sizes(
-            M, K, N, elem_bytes, inner_depth=inner_depth)
         c = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
 
-        ops = GemmOp.schedule(
-            a=a, b=b_t, c=c,
-            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
-            inner_depth=inner_depth,
-        )
+        ops = GemmOp.schedule(a=a, b=b_t, c=c)
         config = GemmOp.kernel_config(ops)
         kernel = Megakernel(ops, config=config)
 
@@ -124,11 +96,7 @@ def bench_gemm(M, K, N, dtype):
     # SingleOpKernel GemmOp
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         c_so = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
-        so_ops = GemmOp.schedule(
-            a=a, b=b_t, c=c_so,
-            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
-            inner_depth=inner_depth,
-        )
+        so_ops = GemmOp.schedule(a=a, b=b_t, c=c_so)
         so_kernel = SingleOpKernel(so_ops)
         with contextlib.redirect_stdout(io.StringIO()):
             so_kernel.run()

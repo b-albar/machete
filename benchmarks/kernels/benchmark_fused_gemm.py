@@ -116,10 +116,7 @@ def bench_fused_gemm(M, D, dtype):
 
         all_ops = []
         for i in range(NUM_GEMMS):
-            ops = GemmOp.schedule(
-                a=inputs[i], b=Ws_t[i], c=outputs[i],
-                inner_depth=2,
-            )
+            ops = GemmOp.schedule(a=inputs[i], b=Ws_t[i], c=outputs[i])
             all_ops.extend(ops)
 
         config = GemmOp.kernel_config(all_ops[:1])
