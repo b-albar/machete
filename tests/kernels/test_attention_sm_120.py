@@ -363,7 +363,7 @@ def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False):
 
     ops = FlashAttentionSm120BwdOp.schedule_backward(
         k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
-        dq_accum=dq_accum, dk=dk, dv=dv, causal=causal,
+        dq=dq_accum, dk=dk, dv=dv, causal=causal,
     )
     config = FlashAttentionSm120BwdOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)

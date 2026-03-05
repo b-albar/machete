@@ -83,26 +83,9 @@ class FlashAttentionSm120BwdOp(Op):
 
     tma_loads = {"k", "v"}
     tma_stores = {"dk", "dv"}
-    tma_reduce_stores = {"dq"}
-
-    @classmethod
-    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
-        """Custom TMA tile shape for dq (M-block sized, not N-tiled)."""
-        if tensor_name == "dq":
-            m_block = tile_sizes["N"]  # m_block = tile_N
-            D = static_dims["D"]
-            return (1, m_block, D)
-        return None
-
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
-        """Swizzled smem layout for K/V/dK/dV TMA, plain for dq."""
-        if tensor_name == "dq":
-            dim0, dim1, dim2 = tma_tile_shape
-            return (
-                f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
-                f"stride=(1, {dim0}, {dim0 * dim1}))"
-            )
+        """Swizzled smem layout for K/V/dK/dV TMA."""
         if tensor_name not in ("k", "v", "dk", "dv"):
             return None
 
@@ -338,7 +321,7 @@ class FlashAttentionSm120BwdOp(Op):
     @cute.jit
     def compute_mma(
         self, page_ptr, tile_BH, tile_N, tile_D,
-        k, v, q, dout, lse, dpsum, dq_accum, dk, dv
+        k, v, q, dout, lse, dpsum, dk, dv, dq
     ):
         """Backward compute: iterate M-blocks, accumulate dK/dV, atomicAdd dQ.
 
@@ -561,8 +544,8 @@ class FlashAttentionSm120BwdOp(Op):
             g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
             dpsum_head_ptr = dpsum.iterator + tile_BH * Int32(self.M)
             g_dpsum = cute.make_tensor(dpsum_head_ptr, cute.make_layout(self.M))
-            dqa_head_ptr = dq_accum.iterator + tile_BH * Int32(self.M * self.D)
-            g_dq_accum = cute.make_tensor(
+            dqa_head_ptr = dq.iterator + tile_BH * Int32(self.M * self.D)
+            g_dq = cute.make_tensor(
                 dqa_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1))
             )
 
@@ -696,7 +679,7 @@ class FlashAttentionSm120BwdOp(Op):
                 for kb in cutlass.range_constexpr(self.tile_size_N // 16):
                     cute.gemm(tiled_mma, acc_dQ, tCrdS_dQ_A[None, None, kb], tCrKt_dQ_B[None, None, kb], acc_dQ)
 
-                # Scale dQ and atomicAdd to global dq_accum
+                # Scale dQ and atomicAdd to global dq
                 acc_dQ_mn = self._make_acc_tensor_mn_view(acc_dQ)
                 for r in cutlass.range_constexpr(num_rows_dQ):
                     row_idx = tSc_dQ_mn[r, 0][0]
@@ -706,7 +689,7 @@ class FlashAttentionSm120BwdOp(Op):
                             col_idx = tSc_dQ_mn[0, c][1]
                             scaled_val = acc_dQ_mn[r, c] * Float32(self.scale_val)
                             elem_offset = global_row * Int32(self.D) + Int32(col_idx)
-                            _atomic_add_f32(scaled_val, g_dq_accum.iterator + elem_offset)
+                            _atomic_add_f32(scaled_val, g_dq.iterator + elem_offset)
 
                 m_idx = m_idx + Int32(1)
 

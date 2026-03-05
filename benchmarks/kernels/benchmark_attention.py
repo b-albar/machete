@@ -296,7 +296,7 @@ def bench_attention_bwd(BH, M, N, D):
 
             bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
                 k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
-                dq_accum=dq_accum, dk=dk, dv=dv,
+                dq=dq_accum, dk=dk, dv=dv,
             )
             bwd_config = FlashAttentionSm120BwdOp.kernel_config(bwd_ops)
             bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
