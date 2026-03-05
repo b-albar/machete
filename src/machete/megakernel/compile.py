@@ -149,7 +149,6 @@ def _build_phase_wrapper(
         expects_tensors = any(
             p not in known_special
             and not p.startswith("tile_")
-            and not p.startswith("prev_tile_")
             and p not in tma_local_names
             for p in method_params
         )
@@ -173,21 +172,7 @@ def _build_phase_wrapper(
 
     is_load_phase = phase_name == "load"
 
-    # Map prev_tile params for load phases: prev_tile_M, prev_tile_D, etc.
-    # Framework passes -1 when the previous tile was a different op.
-    # Load methods can accept these to skip redundant TMA loads when
-    # consecutive tiles share coordinates.
     if is_load_phase:
-        if hasattr(op_cls, "_TILE_DIM_NAMES_ORDERED"):
-            for dim_name in op_cls._TILE_DIM_NAMES_ORDERED:
-                if f"prev_tile_{dim_name}" in method_params:
-                    axis = op_cls.DIM_NAMES[dim_name]
-                    call_args.append(f"prev_{axis}")
-        else:
-            for i in range(5):
-                if f"prev_tile_{i}" in method_params:
-                    call_args.append(f"prev_{i}")
-
         # inner_iter_idx: store warp passes iteration index for K-block loading
         if "inner_iter_idx" in method_params:
             call_args.append("inner_iter_idx")
@@ -200,12 +185,10 @@ def _build_phase_wrapper(
     if extra_params:
         extra_str = ", " + ", ".join(extra_params)
 
-    # For load phases: add prev_0..prev_4 and inner_iter_idx to signature
-    # Values are -1 when previous tile was a different op (or first tile).
-    prev_tile_str = ""
+    # For load phases: add inner_iter_idx to signature
+    load_extra_str = ""
     if is_load_phase:
-        prev_params = ", ".join(f"prev_{i}" for i in range(5))
-        prev_tile_str = f", {prev_params}, inner_iter_idx"
+        load_extra_str = ", inner_iter_idx"
 
     tensor_str = ""
     if tensor_param_names:
@@ -238,7 +221,7 @@ def _build_phase_wrapper(
     fn_source = (
         "@cute.jit\n"
         f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
-        f"{extra_str}{prev_tile_str}{tensor_str}{tma_str}):\n"
+        f"{extra_str}{load_extra_str}{tensor_str}{tma_str}):\n"
         f"{body}"
     )
 

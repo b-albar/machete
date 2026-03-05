@@ -31,7 +31,6 @@ IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by load warp, store warp, and all load-warp threads for communication.
 FLAG_DISPATCH_LOAD: int = 4    # Load warp thread 0 → all load threads: page slot to dispatch
-FLAG_PREV_LINEAR: int = 12     # Previous tile's linear index (same-op page reuse detection)
 FLAG_PRODUCE_IDX: int = 16     # Load warp's produce counter (written by load, read by store)
 FLAG_STORE_IDX: int = 20       # Store warp's store counter (written by store, read by load)
 FLAG_LOAD_DONE: int = 24       # Load warp signals completion (read by store warp + load warp)
@@ -319,7 +318,6 @@ __all__ = [
     "MAX_PAGES",
     "IQ_DEPTH",
     "FLAG_DISPATCH_LOAD",
-    "FLAG_PREV_LINEAR",
     "FLAG_PRODUCE_IDX",
     "FLAG_STORE_IDX",
     "FLAG_LOAD_DONE",

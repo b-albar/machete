@@ -498,7 +498,11 @@ class InstructionStreamBuilder:
                 _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one") for i in range(1, len(self._op_records))
             ]
 
-        # Named buffer dependencies
+        # Named buffer dependencies — track latest producer per buffer name.
+        # Multiple ops may produce the same buffer name (e.g., chained GEMMs
+        # all writing "c" with different or ping-pong-reused data_ptrs).
+        # Validation is handled by _resolve_named_formulas; here we just
+        # need the latest producer for dependency edge resolution.
         buffer_producers: Dict[str, int] = {}
         for rec in self._op_records:
             for buf in rec.op.op_cls.OUTPUTS:
@@ -639,6 +643,16 @@ class InstructionStreamBuilder:
                     if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
                         # Different tensors — independent, no conflict
                         continue
+                    # Same ptr (ping-pong reuse) or both have ptrs — update
+                    # to latest producer. Transitive deps guarantee ordering.
+                    if prev_ptr is None and curr_ptr is None:
+                        # No tensor tracking — ambiguous duplicate
+                        prev_cls = self._op_records[prev_idx].op.op_cls.__name__
+                        cur_cls = rec.op.op_cls.__name__
+                        raise ValueError(
+                            f"Buffer '{buf}' produced by both op {prev_idx} "
+                            f"({prev_cls}) and op {rec.op_idx} ({cur_cls})"
+                        )
                 buffer_producers[buf] = rec.op_idx
 
         # Also track buffer producers by tensor data pointer for automatic dependency detection

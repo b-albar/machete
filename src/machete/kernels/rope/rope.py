@@ -147,26 +147,15 @@ class RopeOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_H, q, cos, sin, work_mbar, prev_tile_M):
+    def load(self, page_ptr, tile_M, tile_H, q, cos, sin, work_mbar):
         """Load q/cos/sin tile from global to shared memory.
 
         Having work_mbar in the signature tells the framework this is an
         async load. The framework wraps non-TMA loads in elect_one(), so
         only one DMA-warp thread executes this body.
-
-        prev_tile_M: tile_M of the previous op that used this page slot,
-        or -1 if different op (or first use). When M matches, cos/sin
-        are still valid in smem (compute doesn't touch them) — skip
-        their G2S loads to save bandwidth.
         """
         pos_start = tile_M * self.tile_size_M
         head_start = tile_H * self.tile_size_H
-
-        # When same op reused this page slot with same M, cos/sin
-        # are still valid in smem (compute only touches q region).
-        _load_cs = Int32(1)
-        if prev_tile_M == tile_M:
-            _load_cs = Int32(0)
 
         # Compute total bytes (handle partial M tiles at boundary)
         q_per_pos_bytes = Int32(self.q_row_elems * self.elem_bytes)
@@ -175,9 +164,7 @@ class RopeOp(Op):
         remaining = Int32(self.M) - pos_start
         if remaining < Int32(self.tile_size_M):
             actual_rows = remaining
-        total_bytes = actual_rows * q_per_pos_bytes
-        if _load_cs == Int32(1):
-            total_bytes = total_bytes + actual_rows * cs_per_pos_bytes
+        total_bytes = actual_rows * (q_per_pos_bytes + cs_per_pos_bytes)
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, total_bytes)
@@ -218,39 +205,37 @@ class RopeOp(Op):
                 gsrc, sdst = group_bulk_copy_modes(g_q, s_q)
                 cute.copy(g2s_q, gsrc, sdst, mbar_ptr=mbar_ptr)
 
-                # cos/sin: skip if same M (still valid in page from prev use)
-                if _load_cs == Int32(1):
-                    # cos: D2 elements
-                    g_cos = cute.make_tensor(
-                        cos.iterator + s * self.D2,
-                        cute.make_layout((self.D2,)),
-                    )
-                    s_cos = cute.make_tensor(
-                        cute.make_ptr(
-                            self.q_dtype,
-                            cos_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
-                            cute.AddressSpace.smem,
-                        ),
-                        cute.make_layout((self.D2,)),
-                    )
-                    gc_src, sc_dst = group_bulk_copy_modes(g_cos, s_cos)
-                    cute.copy(g2s_cs, gc_src, sc_dst, mbar_ptr=mbar_ptr)
+                # cos: D2 elements
+                g_cos = cute.make_tensor(
+                    cos.iterator + s * self.D2,
+                    cute.make_layout((self.D2,)),
+                )
+                s_cos = cute.make_tensor(
+                    cute.make_ptr(
+                        self.q_dtype,
+                        cos_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
+                        cute.AddressSpace.smem,
+                    ),
+                    cute.make_layout((self.D2,)),
+                )
+                gc_src, sc_dst = group_bulk_copy_modes(g_cos, s_cos)
+                cute.copy(g2s_cs, gc_src, sc_dst, mbar_ptr=mbar_ptr)
 
-                    # sin: D2 elements
-                    g_sin = cute.make_tensor(
-                        sin.iterator + s * self.D2,
-                        cute.make_layout((self.D2,)),
-                    )
-                    s_sin = cute.make_tensor(
-                        cute.make_ptr(
-                            self.q_dtype,
-                            sin_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
-                            cute.AddressSpace.smem,
-                        ),
-                        cute.make_layout((self.D2,)),
-                    )
-                    gs_src, ss_dst = group_bulk_copy_modes(g_sin, s_sin)
-                    cute.copy(g2s_cs, gs_src, ss_dst, mbar_ptr=mbar_ptr)
+                # sin: D2 elements
+                g_sin = cute.make_tensor(
+                    sin.iterator + s * self.D2,
+                    cute.make_layout((self.D2,)),
+                )
+                s_sin = cute.make_tensor(
+                    cute.make_ptr(
+                        self.q_dtype,
+                        sin_smem_start + Int32(local_pos * self.D2 * self.elem_bytes),
+                        cute.AddressSpace.smem,
+                    ),
+                    cute.make_layout((self.D2,)),
+                )
+                gs_src, ss_dst = group_bulk_copy_modes(g_sin, s_sin)
+                cute.copy(g2s_cs, gs_src, ss_dst, mbar_ptr=mbar_ptr)
 
     # =========================================================================
     # Forward Compute

@@ -67,7 +67,6 @@ from .paged_memory import (
     ld_shared_v2_b32,
     st_shared_v2_b32,
     FLAG_DISPATCH_LOAD,
-    FLAG_PREV_LINEAR,
     FLAG_PRODUCE_IDX,
     FLAG_STORE_IDX,
     FLAG_LOAD_DONE,
@@ -573,7 +572,6 @@ class Megakernel:
         tensor_params = ", ".join(all_canonical)
 
         tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
-        prev_tile_params = ", ".join(f"prev_{i}" for i in range(MAX_TILE_DIMS))
 
         # TMA params for signature
         tma_params = ", ".join(all_tma_canonical) if all_tma_canonical else ""
@@ -597,7 +595,7 @@ class Megakernel:
                 lines.append(
                     f"    {keyword} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
-                    f"{prev_tile_params}, inner_iter_idx{args_str})"
+                    f"inner_iter_idx{args_str})"
                 )
             else:
                 lines.append(
@@ -611,7 +609,7 @@ class Megakernel:
         tma_sig = f", {tma_params}" if tma_params else ""
         extra_sig = ""
         if is_load:
-            extra_sig = f", work_mbar, {prev_tile_params}, inner_iter_idx"
+            extra_sig = f", work_mbar, inner_iter_idx"
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, {tile_params}, "
@@ -1323,7 +1321,6 @@ class Megakernel:
 
                 # Smem pointers for inter-thread/warp communication
                 dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
-                prev_linear_ptr = flags_ptr + FLAG_PREV_LINEAR
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
                 load_done_ptr = flags_ptr + FLAG_LOAD_DONE
@@ -1387,13 +1384,6 @@ class Megakernel:
                             # Dispatch into ring buffer
                             _p_slot = produce_idx % Int32(num_pages)
                             _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
-                            # Read old tile info to detect same-op page reuse
-                            _old_op = ld_shared_i32(_p_ti)
-                            _ep_linear = Int32(-1)
-                            if _old_op == _found_op:
-                                _ep_linear = ld_shared_i32(_p_ti + 4)
-                            st_shared_i32(prev_linear_ptr, _ep_linear)
-                            # Overwrite slot with new tile info
                             st_shared_v2_b32(_p_ti, _found_op, _found_lin)
                             # Signal all load warp threads to dispatch
                             st_shared_i32(dispatch_load_slot_ptr, _p_slot)
@@ -1430,14 +1420,6 @@ class Megakernel:
                             _dl_cached_config = ld_global_i64(op_configs_ptr, _dl_op)
                             _dl_cached_op_idx = _dl_op
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
-                        _ep_lin = ld_shared_i32(prev_linear_ptr)
-                        _ep_0 = Int32(-1)
-                        _ep_1 = Int32(-1)
-                        _ep_2 = Int32(-1)
-                        _ep_3 = Int32(-1)
-                        _ep_4 = Int32(-1)
-                        if _ep_lin != Int32(-1):
-                            _ep_0, _ep_1, _ep_2, _ep_3, _ep_4 = decompose_tile(_dl_op, _ep_lin)
                         _dl_iter = Int32(0)
                         if const_expr(tracing):
                             _tl = trace_start()
@@ -1451,11 +1433,6 @@ class Megakernel:
                             _dl_4,
                             _dl_cached_config,
                             _dl_mbar,
-                            _ep_0,
-                            _ep_1,
-                            _ep_2,
-                            _ep_3,
-                            _ep_4,
                             _dl_iter,
                         )
                         if const_expr(tracing):
@@ -1483,7 +1460,7 @@ class Megakernel:
                                 _wait_phase,
                             )
                         if (_idle_pi - _idle_si) < Int32(num_pages):
-                            nanosleep(Int32(1000))
+                            nanosleep(Int32(500))
 
                     done = ld_shared_i32(load_done_ptr)
 
@@ -1537,7 +1514,6 @@ class Megakernel:
                         _n_iters = _get_inner_iters(_ds_op)
                         if _n_iters > Int32(1):
                             mbarrier_wait(_ds_mbar, _s_phase)
-                        _no_prev = Int32(-1)
                         _iter_idx = Int32(1)
                         while _iter_idx < _n_iters:
                             dispatch_load(
@@ -1550,11 +1526,6 @@ class Megakernel:
                                 _ds_4,
                                 _ds_cached_config,
                                 _ds_mbar,
-                                _no_prev,
-                                _no_prev,
-                                _no_prev,
-                                _no_prev,
-                                _no_prev,
                                 _iter_idx,
                             )
                             _iter_idx = _iter_idx + Int32(1)
@@ -1773,7 +1744,6 @@ class Megakernel:
                 "tile_info_bytes": tile_info_bytes,
                 "IQ_DEPTH": IQ_DEPTH,
                 "FLAG_DISPATCH_LOAD": FLAG_DISPATCH_LOAD,
-                "FLAG_PREV_LINEAR": FLAG_PREV_LINEAR,
                 "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
                 "FLAG_STORE_IDX": FLAG_STORE_IDX,
                 "FLAG_LOAD_DONE": FLAG_LOAD_DONE,

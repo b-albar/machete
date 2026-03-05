@@ -308,9 +308,6 @@ class SingleOpKernel:
         is_load = phase_name == "load"
         tensor_params = ", ".join(all_canonical)
         tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
-        prev_tile_params = ", ".join(
-            f"prev_{i}" for i in range(MAX_TILE_DIMS)
-        )
         tma_params = (
             ", ".join(all_tma_canonical) if all_tma_canonical else ""
         )
@@ -326,7 +323,7 @@ class SingleOpKernel:
                 lines.append(
                     f"    {kw} op_idx == Int32({i}):\n"
                     f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, "
-                    f"work_mbar, {prev_tile_params}, inner_iter_idx{args_str})"
+                    f"work_mbar, inner_iter_idx{args_str})"
                 )
             else:
                 lines.append(
@@ -340,7 +337,7 @@ class SingleOpKernel:
         tensor_sig = f", {tensor_params}" if tensor_params else ""
         tma_sig = f", {tma_params}" if tma_params else ""
         extra = (
-            f", work_mbar, {prev_tile_params}, inner_iter_idx"
+            f", work_mbar, inner_iter_idx"
             if is_load
             else ""
         )
@@ -445,13 +442,12 @@ class SingleOpKernel:
 
             # LOAD WARP: dispatch iter 0
             if is_load_warp:
-                _no = Int32(-1)
                 _zero = Int32(0)
                 dispatch_load(
                     op_idx, page_ptr,
                     tile_0, tile_1, tile_2, tile_3, tile_4,
                     op_config, _wm,
-                    _no, _no, _no, _no, _no, _zero,
+                    _zero,
                 )
 
             # STORE WARP: inner iters 1+, wait compute, store
@@ -459,14 +455,13 @@ class SingleOpKernel:
                 _n_iters = _get_inner_iters(op_idx)
                 if _n_iters > Int32(1):
                     mbarrier_wait(_wm, Int32(0))
-                _no = Int32(-1)
                 _iter = Int32(1)
                 while _iter < _n_iters:
                     dispatch_load(
                         op_idx, page_ptr,
                         tile_0, tile_1, tile_2, tile_3, tile_4,
                         op_config, _wm,
-                        _no, _no, _no, _no, _no, _iter,
+                        _iter,
                     )
                     _iter = _iter + Int32(1)
                 mbarrier_wait(_cd, Int32(0))
