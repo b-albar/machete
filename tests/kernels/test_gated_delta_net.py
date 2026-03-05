@@ -318,15 +318,27 @@ class TestGatedDeltaNetBwdState:
         from machete.kernels.gated_delta_net.ref import fla_bwd_dv_local, fla_bwd_state_recurrence
         dv_local = fla_bwd_dv_local(q, k, g_cumsum, do, scale=scale)
 
+        # Forward state recurrence to get h (needed for dw computation)
+        from machete.kernels.gated_delta_net.ref import fla_state_recurrence
+        h, v_new, _ = fla_state_recurrence(k, w, u, g_cumsum)
+
         # fla reference
         dh_ref, dh0_ref, dv2_ref = fla_bwd_state_recurrence(
             q, k, w, g_cumsum, h0=None, dht=None, do=do, dv=dv_local, scale=scale,
         )
 
+        # fla reference for dw (from chunk_bwd_dqkwg)
+        from machete.kernels.gated_delta_net.grad import run_bwd_dqkwg
+        _, _, dw_ref, _ = run_bwd_dqkwg(
+            q, k, v_new, w, g_cumsum, h, dv2_ref, do,
+            dh_ref, scale,
+        )
+
         # machete
         from machete.kernels.gated_delta_net.state_bwd import run_bwd_state_recurrence
-        dh_machete, dh0_machete, dv2_machete = run_bwd_state_recurrence(
-            q, k, w, g_cumsum, h0=None, dht=None, do=do, dv_local=dv_local, scale=scale,
+        dh_machete, dh0_machete, dv2_machete, dw_machete = run_bwd_state_recurrence(
+            q, k, w, g_cumsum, h0=None, dht=None, do=do, dv_local=dv_local,
+            h=h, scale=scale,
         )
 
         torch.testing.assert_close(
@@ -334,6 +346,9 @@ class TestGatedDeltaNetBwdState:
         )
         torch.testing.assert_close(
             dv2_machete.float(), dv2_ref.float(), atol=5e-2, rtol=5e-2,
+        )
+        torch.testing.assert_close(
+            dw_machete.float(), dw_ref.float(), atol=5e-2, rtol=5e-2,
         )
 
 

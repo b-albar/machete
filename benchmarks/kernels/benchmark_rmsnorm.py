@@ -23,6 +23,7 @@ import torch
 from machete.megakernel import Megakernel
 from machete.kernels.rms_norm import RMSNormOp, RMSNormBwdOp
 from machete.kernels.rms_norm.ref import rmsnorm_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 if HAS_TRITON:
@@ -116,6 +117,17 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
 
         funcs["megakernel"] = kernel.bench_spec(keep_alive=[x, weight, y])
 
+    # SingleOpKernel (out-of-place)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        y_so = torch.empty_like(x)
+        so_ops = RMSNormOp.schedule(x=x, weight=weight, y=y_so)
+        so_kernel = SingleOpKernel(so_ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            so_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x, weight, y_so])
+
     # Megakernel backward
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         dout = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
@@ -129,6 +141,17 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
         torch.cuda.synchronize()
 
         funcs["megakernel_bwd"] = bwd_kernel.bench_spec(keep_alive=[dout, x, weight, dx])
+
+    # SingleOpKernel backward
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        dx_so = torch.empty_like(x)
+        so_bwd_ops = RMSNormBwdOp.schedule(dout=dout, x=x, weight=weight, dx=dx_so)
+        so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            so_bwd_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["single_op_bwd"] = so_bwd_kernel.bench_spec(keep_alive=[dout, x, weight, dx_so])
 
     return funcs
 

@@ -1,10 +1,11 @@
 # Copyright (c) 2025, Machete Authors
 """Gated Delta Net backward state recurrence.
 
-Reverse-order state recurrence for computing dh and dv2 (Stage 2 of backward).
+Reverse-order state recurrence for computing dh, dv2, and dw (Stage 2 of backward).
 Processes chunks from NT-1 down to 0, maintaining persistent gradient state b_dh.
 
-Matches fla's chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64.
+Matches fla's chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64 for dh/dv2,
+and fla's chunk_bwd_kernel_dqkwg for dw (fused here to avoid a separate pass).
 """
 
 import torch
@@ -22,8 +23,9 @@ def run_bwd_state_recurrence(
     dht: torch.Tensor | None, # [B, H, K, V] (final state gradient, optional)
     do: torch.Tensor,         # [B, T, H, V] (output gradient)
     dv_local: torch.Tensor,   # [B, T, H, V] (local dv from Stage 1)
+    h: torch.Tensor,          # [B, NT, H, K, V] (forward hidden states)
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Backward state recurrence (reverse time order).
 
     For each chunk i_t = NT-1 down to 0:
@@ -32,14 +34,16 @@ def run_bwd_state_recurrence(
         3. b_dv *= exp(g_last - g[t])  (gating)
         4. b_dv += dv_local      (add local attention contribution)
         5. Store dv2[i_t] = b_dv
-        6. b_dh *= exp(g_last)   (decay state gradient)
-        7. b_dh += (q * exp(g))^T @ do * scale  (output contribution)
-        8. b_dh -= w^T @ b_dv    (state update contribution)
+        6. dw[i_t] = -b_dv @ h[i_t]^T  (weight gradient from v_new = u - w@h)
+        7. b_dh *= exp(g_last)   (decay state gradient)
+        8. b_dh += (q * exp(g))^T @ do * scale  (output contribution)
+        9. b_dh -= w^T @ b_dv    (state update contribution)
 
     Returns:
         dh: [B, NT, H, K, V] state gradients (k.dtype)
         dh0: [B, H, K, V] initial state gradient (fp32, or None)
         dv2: [B, T, H, V] accumulated value gradient (k.dtype)
+        dw: [B, T, H, K] weight gradient (k.dtype)
     """
     B, T, H, K = q.shape
     V = do.shape[-1]
@@ -54,6 +58,7 @@ def run_bwd_state_recurrence(
 
     dh = torch.empty(B, NT, H, K, V, device=device, dtype=dtype)
     dv2 = torch.empty(B, T, H, V, device=device, dtype=dtype)
+    dw = torch.empty(B, T, H, K, device=device, dtype=dtype)
 
     for chunk_idx in range(NT - 1, -1, -1):
         t_start = chunk_idx * BT
@@ -86,14 +91,23 @@ def run_bwd_state_recurrence(
         # 6. Store dv2
         dv2[:, t_start:t_end] = b_dv.permute(0, 2, 1, 3).to(dtype)
 
-        # 7. Decay: b_dh *= exp(g_last)
+        # 7. dw = -dv2 @ h^T  (from forward: v_new = u - w@h, so dw = -dv_new @ h^T)
+        #    Match fla's dtype casting: both operands cast to input dtype before matmul
+        h_c = h[:, chunk_idx]  # [B, H, K, V]
+        dw_c = -torch.matmul(
+            b_dv.to(dtype).float(),              # [B, H, cl, V]
+            h_c.to(dtype).float().transpose(-2, -1),  # [B, H, V, K]
+        )  # [B, H, cl, K]
+        dw[:, t_start:t_end] = dw_c.permute(0, 2, 1, 3).to(dtype)
+
+        # 8. Decay: b_dh *= exp(g_last)
         decay = torch.exp(g_cumsum[:, last_idx, :])  # [B, H]
         b_dh = b_dh * decay.unsqueeze(-1).unsqueeze(-1)
 
-        # 8. Gate q: q_gated = q * exp(g)
+        # 9. Gate q: q_gated = q * exp(g)
         q_gated = q_c.float() * torch.exp(g_c).unsqueeze(-1)  # [B, H, cl, K]
 
-        # 9. b_dh += q_gated^T @ do * scale - w^T @ b_dv
+        # 10. b_dh += q_gated^T @ do * scale - w^T @ b_dv
         b_dh = b_dh + torch.matmul(
             q_gated.transpose(-2, -1), do_c.float()
         ) * scale
@@ -102,4 +116,4 @@ def run_bwd_state_recurrence(
         )
 
     dh0 = b_dh if h0 is not None else None
-    return dh, dh0, dv2
+    return dh, dh0, dv2, dw

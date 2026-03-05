@@ -237,7 +237,7 @@ class ScaleOp(Op):
 
 **Scheduling** -- `schedule_forward()` computes tile sizes, sets compile-time constants via `static_dims`, and returns a list of `ScheduledOp`. The framework resolves dependencies between ops by matching tensor pointers.
 
-**Backward pass** -- Declare `backward_reads` / `backward_writes` and implement `backward_load`, `backward_compute`, `backward_store`. Schedule with `schedule_backward()`, run with `Megakernel(ops, backward=True)`.
+**Backward pass** -- Create a separate Op class for the backward pass (e.g., `RMSNormBwdOp`, `RopeBwdOp`). Share code with the forward Op via method references (e.g., `load = ForwardOp.load`). Schedule and run like any other Op.
 
 ## Built-in Kernels
 
@@ -245,8 +245,8 @@ class ScaleOp(Op):
 |--------|----------|-------------|
 | Flash Attention | `FlashAttentionOp` | Auto-selects SM100 (Hopper) or SM120 (Blackwell) |
 | GEMM | `GemmOp` | Tiled matrix multiply with TMA and smem swizzle |
-| RoPE | `RopeOp` | Rotary position embedding (forward + backward) |
-| RMSNorm | `RMSNormOp` | Root mean square normalization (forward + backward) |
+| RoPE | `RopeOp` / `RopeBwdOp` | Rotary position embedding (forward + backward) |
+| RMSNorm | `RMSNormOp` / `RMSNormBwdOp` | Root mean square normalization (forward + backward) |
 | Activation | `ActivationOp` | Element-wise ReLU / SiLU (fuses with GEMM) |
 
 ## License

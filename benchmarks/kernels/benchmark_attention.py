@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from machete.megakernel import Megakernel
 from machete.kernels.attention import FlashAttentionSm120Op, FlashAttentionSm120BwdOp
 from machete.kernels.attention.ref import flash_attention_pytorch
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -212,6 +213,25 @@ def bench_attention(BH, M, N, D):
         except Exception as e:
             print(f"  megakernel error: {e}")
 
+    # SingleOpKernel bf16
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            o_so = torch.zeros_like(q)
+            so_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_so,
+            )
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda: o_so.zero_(),
+                keep_alive=[q, k, v, o_so],
+            )
+        except Exception as e:
+            print(f"  single_op error: {e}")
+
     return funcs
 
 
@@ -315,6 +335,46 @@ def bench_attention_bwd(BH, M, N, D):
             )
         except Exception as e:
             print(f"  megakernel bwd error: {e}")
+
+    # SingleOpKernel backward
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            # Run forward to get lse
+            o_so = torch.zeros_like(q)
+            lse_so = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            so_fwd_ops = FlashAttentionSm120Op.schedule_forward(
+                q=q, k=k, v=v, o=o_so, lse=lse_so,
+            )
+            so_fwd_kernel = SingleOpKernel(so_fwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            dpsum_so = (dout.float() * o_so.float()).sum(dim=-1).contiguous()
+            dq_so = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk_so = torch.zeros_like(k)
+            dv_so = torch.zeros_like(v)
+
+            so_bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse_so, dpsum=dpsum_so,
+                dq=dq_so, dk=dk_so, dv=dv_so,
+            )
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            def reset_so_bwd():
+                dq_so.zero_()
+                dk_so.zero_()
+                dv_so.zero_()
+
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                setup_fn=reset_so_bwd,
+                keep_alive=[q, k, v, dout, lse_so, dpsum_so, dq_so, dk_so, dv_so],
+            )
+        except Exception as e:
+            print(f"  single_op bwd error: {e}")
 
     return funcs
 

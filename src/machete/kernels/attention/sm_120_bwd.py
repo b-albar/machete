@@ -550,34 +550,37 @@ class FlashAttentionSm120BwdOp(Op):
             )
 
             # =============================================================
-            # M-block loop
+            # M-block loop (with Q/dO prefetch overlap)
             # =============================================================
+
+            # Prologue: load Q[0], dO[0] → smem
+            gQ_block = cute.local_tile(gQ_head, (self.m_block, self.D), (Int32(0), Int32(0)))
+            tQgQ = thr_copy_cp.partition_S(gQ_block)
+            for ci in cutlass.range_constexpr(cute.size(tQsQ_cp.shape[2])):
+                cute.copy(gmem_tiled_copy, tQgQ[None, None, ci], tQsQ_cp[None, None, ci])
+
+            gdO_block = cute.local_tile(gdO_head, (self.m_block, self.D), (Int32(0), Int32(0)))
+            tdOgdO = thr_copy_cp.partition_S(gdO_block)
+            for ci in cutlass.range_constexpr(cute.size(tdOsdO_cp.shape[2])):
+                cute.copy(gmem_tiled_copy, tdOgdO[None, None, ci], tdOsdO_cp[None, None, ci])
+
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
             m_idx = Int32(0)
             while m_idx < Int32(self.num_m_blocks):
                 m_start = m_idx * Int32(self.m_block)
 
-                # --- cpasync Q[m] and dO[m] → smem ---
-                gQ_block = cute.local_tile(gQ_head, (self.m_block, self.D), (m_idx, Int32(0)))
-                tQgQ = thr_copy_cp.partition_S(gQ_block)
-                for ci in cutlass.range_constexpr(cute.size(tQsQ_cp.shape[2])):
-                    cute.copy(gmem_tiled_copy, tQgQ[None, None, ci], tQsQ_cp[None, None, ci])
-
-                gdO_block = cute.local_tile(gdO_head, (self.m_block, self.D), (m_idx, Int32(0)))
-                tdOgdO = thr_copy_cp.partition_S(gdO_block)
-                for ci in cutlass.range_constexpr(cute.size(tdOsdO_cp.shape[2])):
-                    cute.copy(gmem_tiled_copy, tdOgdO[None, None, ci], tdOsdO_cp[None, None, ci])
-
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(0)
-                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-
+                # Q[m] and dO[m] are already in smem
                 # --- GEMM 1: S = Q @ K^T (m_block × tile_N), K-dim=D ---
-                for kb in cutlass.range_constexpr(self.D // 16):
-                    cute.copy(smem_copy_Q_A, tQsQ_A[None, None, kb], tQrQ_A_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.D // 16):
-                    cute.copy(smem_copy_K_B, tKsK_B[None, None, kb], tKrK_B_v[None, None, kb])
                 acc_S.fill(0.0)
+                cute.copy(smem_copy_Q_A, tQsQ_A[None, None, 0], tQrQ_A_v[None, None, 0])
+                cute.copy(smem_copy_K_B, tKsK_B[None, None, 0], tKrK_B_v[None, None, 0])
                 for kb in cutlass.range_constexpr(self.D // 16):
+                    kb_next = (kb + 1) % (self.D // 16)
+                    cute.copy(smem_copy_Q_A, tQsQ_A[None, None, kb_next], tQrQ_A_v[None, None, kb_next])
+                    cute.copy(smem_copy_K_B, tKsK_B[None, None, kb_next], tKrK_B_v[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_S, tCrQ_A[None, None, kb], tCrK_B[None, None, kb], acc_S)
 
                 # --- Softmax reconstruction: P = exp2(S * scale_log2e - LSE * log2e) ---
@@ -624,12 +627,13 @@ class FlashAttentionSm120BwdOp(Op):
                             acc_S_mn[r, c] = Float32(0.0)
 
                 # --- GEMM 2: dP = dO @ V^T (m_block × tile_N), K-dim=D ---
-                for kb in cutlass.range_constexpr(self.D // 16):
-                    cute.copy(smem_copy_dO_A, tdOsdO_A[None, None, kb], tdOrO_A_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.D // 16):
-                    cute.copy(smem_copy_V_B, tVsV_B[None, None, kb], tVrV_B_v[None, None, kb])
                 acc_dP.fill(0.0)
+                cute.copy(smem_copy_dO_A, tdOsdO_A[None, None, 0], tdOrO_A_v[None, None, 0])
+                cute.copy(smem_copy_V_B, tVsV_B[None, None, 0], tVrV_B_v[None, None, 0])
                 for kb in cutlass.range_constexpr(self.D // 16):
+                    kb_next = (kb + 1) % (self.D // 16)
+                    cute.copy(smem_copy_dO_A, tdOsdO_A[None, None, kb_next], tdOrO_A_v[None, None, kb_next])
+                    cute.copy(smem_copy_V_B, tVsV_B[None, None, kb_next], tVrV_B_v[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_dP, tCrdO_A[None, None, kb], tCrV_B[None, None, kb], acc_dP)
 
                 # --- dS = P * (dP - dPsum) ---
@@ -655,28 +659,48 @@ class FlashAttentionSm120BwdOp(Op):
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 # --- GEMM 3: dV += P^T @ dO (tile_N × D), K-dim=m_block ---
+                cute.copy(smem_copy_Pt_A, tPsPt_A[None, None, 0], tPrPt_A_v[None, None, 0])
+                cute.copy(smem_copy_dOt_B, tdOsdOt_B[None, None, 0], tdOrdOt_B_v[None, None, 0])
                 for kb in cutlass.range_constexpr(self.m_block // 16):
-                    cute.copy(smem_copy_Pt_A, tPsPt_A[None, None, kb], tPrPt_A_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.m_block // 16):
-                    cute.copy(smem_copy_dOt_B, tdOsdOt_B[None, None, kb], tdOrdOt_B_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.m_block // 16):
+                    kb_next = (kb + 1) % (self.m_block // 16)
+                    cute.copy(smem_copy_Pt_A, tPsPt_A[None, None, kb_next], tPrPt_A_v[None, None, kb_next])
+                    cute.copy(smem_copy_dOt_B, tdOsdOt_B[None, None, kb_next], tdOrdOt_B_v[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_dV, tCrPt_A[None, None, kb], tCrdOt_B[None, None, kb], acc_dV)
 
                 # --- GEMM 4: dK += dS^T @ Q (tile_N × D), K-dim=m_block ---
+                cute.copy(smem_copy_dSt_A, tdSsdSt_A[None, None, 0], tdSrdSt_A_v[None, None, 0])
+                cute.copy(smem_copy_Qt_B, tQsQt_B[None, None, 0], tQrQt_B_v[None, None, 0])
                 for kb in cutlass.range_constexpr(self.m_block // 16):
-                    cute.copy(smem_copy_dSt_A, tdSsdSt_A[None, None, kb], tdSrdSt_A_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.m_block // 16):
-                    cute.copy(smem_copy_Qt_B, tQsQt_B[None, None, kb], tQrQt_B_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.m_block // 16):
+                    kb_next = (kb + 1) % (self.m_block // 16)
+                    cute.copy(smem_copy_dSt_A, tdSsdSt_A[None, None, kb_next], tdSrdSt_A_v[None, None, kb_next])
+                    cute.copy(smem_copy_Qt_B, tQsQt_B[None, None, kb_next], tQrQt_B_v[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_dK, tCrdSt_A[None, None, kb], tCrQt_B[None, None, kb], acc_dK)
 
+                # --- Prefetch Q[m+1]/dO[m+1] overlapped with GEMM 5 ---
+                m_next = m_idx + Int32(1)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))  # ensure all warps done reading Q/dO
+
+                # Prepare next tile pointers (unconditional, just pointer math)
+                gQ_block_next = cute.local_tile(gQ_head, (self.m_block, self.D), (m_next, Int32(0)))
+                tQgQ_next = thr_copy_cp.partition_S(gQ_block_next)
+                gdO_block_next = cute.local_tile(gdO_head, (self.m_block, self.D), (m_next, Int32(0)))
+                tdOgdO_next = thr_copy_cp.partition_S(gdO_block_next)
+
+                if m_next < Int32(self.num_m_blocks):
+                    for ci in cutlass.range_constexpr(cute.size(tQsQ_cp.shape[2])):
+                        cute.copy(gmem_tiled_copy, tQgQ_next[None, None, ci], tQsQ_cp[None, None, ci])
+                    for ci in cutlass.range_constexpr(cute.size(tdOsdO_cp.shape[2])):
+                        cute.copy(gmem_tiled_copy, tdOgdO_next[None, None, ci], tdOsdO_cp[None, None, ci])
+                    cute.arch.cp_async_commit_group()
+
                 # --- GEMM 5: dQ = dS @ K (m_block × D), K-dim=tile_N ---
-                for kb in cutlass.range_constexpr(self.tile_size_N // 16):
-                    cute.copy(smem_copy_dS_dQ_A, tdSsdS_dQ_A[None, None, kb], tdSrdS_dQ_A_v[None, None, kb])
-                for kb in cutlass.range_constexpr(self.tile_size_N // 16):
-                    cute.copy(smem_copy_Kt_dQ_B, tKsKt_dQ_B[None, None, kb], tKrKt_dQ_B_v[None, None, kb])
                 acc_dQ.fill(0.0)
+                cute.copy(smem_copy_dS_dQ_A, tdSsdS_dQ_A[None, None, 0], tdSrdS_dQ_A_v[None, None, 0])
+                cute.copy(smem_copy_Kt_dQ_B, tKsKt_dQ_B[None, None, 0], tKrKt_dQ_B_v[None, None, 0])
                 for kb in cutlass.range_constexpr(self.tile_size_N // 16):
+                    kb_next = (kb + 1) % (self.tile_size_N // 16)
+                    cute.copy(smem_copy_dS_dQ_A, tdSsdS_dQ_A[None, None, kb_next], tdSrdS_dQ_A_v[None, None, kb_next])
+                    cute.copy(smem_copy_Kt_dQ_B, tKsKt_dQ_B[None, None, kb_next], tKrKt_dQ_B_v[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_dQ, tCrdS_dQ_A[None, None, kb], tCrKt_dQ_B[None, None, kb], acc_dQ)
 
                 # Scale dQ and atomicAdd to global dq
@@ -691,7 +715,12 @@ class FlashAttentionSm120BwdOp(Op):
                             elem_offset = global_row * Int32(self.D) + Int32(col_idx)
                             _atomic_add_f32(scaled_val, g_dq.iterator + elem_offset)
 
-                m_idx = m_idx + Int32(1)
+                # Wait for prefetch to complete before next iteration
+                if m_next < Int32(self.num_m_blocks):
+                    cute.arch.cp_async_wait_group(0)
+                    named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+                m_idx = m_next
 
             # =============================================================
             # Epilogue: Scale dK, write dK/dV to K/V smem areas for TMA store

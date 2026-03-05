@@ -19,6 +19,7 @@ import io
 
 import torch
 
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 from machete.utils.benchmark_utils import KernelBenchSpec
 
@@ -164,6 +165,31 @@ def bench_prep(B, T, H, K, V):
             except Exception as e:
                 print(f"  MegakernelOp prep error: {e}")
 
+        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
+            try:
+                from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
+
+                gc_so = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
+                w_so = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
+                u_so = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
+
+                so_ops = GDNPrepOp.schedule_forward(
+                    k=k.contiguous(), v=v.contiguous(),
+                    g=g.contiguous(), beta=beta.contiguous(),
+                    g_cumsum=gc_so, w=w_so, u=u_so,
+                )
+                so_kernel = SingleOpKernel(so_ops)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    so_kernel.run()
+                torch.cuda.synchronize()
+
+                funcs["single_op"] = so_kernel.bench_spec(
+                    setup_fn=lambda: (gc_so.zero_(), w_so.zero_(), u_so.zero_()),
+                    keep_alive=[k, v, g, beta, gc_so, w_so, u_so],
+                )
+            except Exception as e:
+                print(f"  SingleOp prep error: {e}")
+
     return funcs
 
 
@@ -213,6 +239,29 @@ def bench_fused(B, T, H, K, V):
                 )
             except Exception as e:
                 print(f"  FusedOp error: {e}")
+
+        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
+            try:
+                from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
+
+                o_so = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
+                so_ops = GDNFusedOp.schedule_forward(
+                    q=q.contiguous(), k=k.contiguous(),
+                    w=w.contiguous(), u=u.contiguous(),
+                    g_cumsum=g_cumsum.contiguous(), o=o_so,
+                    scale=scale,
+                )
+                so_kernel = SingleOpKernel(so_ops)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    so_kernel.run()
+                torch.cuda.synchronize()
+
+                funcs["single_op"] = so_kernel.bench_spec(
+                    setup_fn=lambda: o_so.zero_(),
+                    keep_alive=[q, k, w, u, g_cumsum, o_so],
+                )
+            except Exception as e:
+                print(f"  SingleOp fused error: {e}")
 
     return funcs
 

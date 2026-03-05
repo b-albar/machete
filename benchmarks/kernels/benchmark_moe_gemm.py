@@ -17,6 +17,7 @@ import torch
 
 from machete.megakernel import Megakernel
 from machete.kernels.moe import MoeGemmOp, moe_align_sort
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 from machete.utils.benchmark_utils import KernelBenchSpec
 
@@ -176,6 +177,23 @@ def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
         funcs["megakernel"] = kernel.bench_spec(
             setup_fn=lambda: c.zero_(),
             keep_alive=[sorted_x, w, expert_ids, c],
+        )
+
+    # SingleOpKernel MoeGemmOp
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        c_so = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+        so_ops = MoeGemmOp.schedule_forward(
+            sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c_so,
+            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        )
+        so_kernel = SingleOpKernel(so_ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            so_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["single_op"] = so_kernel.bench_spec(
+            setup_fn=lambda: c_so.zero_(),
+            keep_alive=[sorted_x, w, expert_ids, c_so],
         )
 
     return funcs

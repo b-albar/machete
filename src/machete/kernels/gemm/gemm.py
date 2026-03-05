@@ -721,8 +721,9 @@ class GemmOp(Op):
         """Return recommended MegakernelConfig for scheduled GemmOps."""
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
-        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
-        tile_m = ops[0].tile_sizes.get('M', 64)
+        page_size = max(op.static_dims.get('page_size', DEFAULT_PAGE_SIZE)
+                        for op in ops)
+        tile_m = max(op.tile_sizes.get('M', 64) for op in ops)
         num_mma_warps = tile_m // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         return MegakernelConfig(threads_per_block=threads_per_block,
@@ -753,10 +754,6 @@ class GemmOp(Op):
 
         dout, a, b = tensors['dout'], tensors['a'], tensors['b']
         da, db = tensors.get('da'), tensors.get('db')
-        ts = tile_sizes or {}
-        tile_m = ts.get("M", 64)
-        tile_n = ts.get("N", 32)
-        tile_k = ts.get("K", 32)
 
         # Compute activation gradient tensor if needed
         act_grad = None
@@ -781,8 +778,15 @@ class GemmOp(Op):
             b_t = b.t().contiguous()
             fwd_kwargs = dict(
                 a=dout, b=b_t, c=da, has_a_scale=use_scale,
-                tile_sizes={"M": tile_m, "N": tile_k, "K": tile_n},
             )
+            if tile_sizes is not None:
+                ts = tile_sizes
+                fwd_kwargs["tile_sizes"] = {
+                    "M": ts.get("M", 64),
+                    "N": ts.get("K", 32),
+                    "K": ts.get("N", 32),
+                }
+            # else: let schedule_forward auto-compute via _auto_tiles
             if act_grad is not None:
                 fwd_kwargs["a_scale"] = act_grad
             ops.extend(cls.schedule_forward(**fwd_kwargs))
@@ -792,8 +796,15 @@ class GemmOp(Op):
             a_t = a.t().contiguous()
             fwd_kwargs = dict(
                 a=dout_t, b=a_t, c=db, has_a_scale=use_scale,
-                tile_sizes={"M": tile_n, "N": tile_k, "K": tile_m},
             )
+            if tile_sizes is not None:
+                ts = tile_sizes
+                fwd_kwargs["tile_sizes"] = {
+                    "M": ts.get("N", 32),
+                    "N": ts.get("K", 32),
+                    "K": ts.get("M", 64),
+                }
+            # else: let schedule_forward auto-compute via _auto_tiles
             if act_grad is not None:
                 fwd_kwargs["a_scale"] = act_grad.t().contiguous()
             ops.extend(cls.schedule_forward(**fwd_kwargs))

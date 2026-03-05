@@ -149,13 +149,13 @@ def _backward(q, k, v, g_cumsum, beta, A, w, u, h, v_new, scale, initial_state, 
     # Stage 1: local dv from causal attention backward
     dv_local = run_bwd_dv_local(q, k, g_cumsum, do, scale)
 
-    # Stage 2: backward state recurrence
-    dh, dh0, dv2 = run_bwd_state_recurrence(
-        q, k, w, g_cumsum, initial_state, dht, do, dv_local, scale,
+    # Stage 2: backward state recurrence + weight gradient
+    dh, dh0, dv2, dw = run_bwd_state_recurrence(
+        q, k, w, g_cumsum, initial_state, dht, do, dv_local, h, scale,
     )
 
-    # Stage 3: dq, dk, dw, dg from attention + gate backward
-    dq, dk, dw, dg = run_bwd_dqkwg(
+    # Stage 3: dq, dk, dg from attention + gate backward
+    dq, dk, _, dg = run_bwd_dqkwg(
         q, k, v_new, w, g_cumsum, h, dv2, do, dh, scale,
     )
 

@@ -18,6 +18,7 @@ import torch
 
 from machete.megakernel import Megakernel
 from machete.kernels.gemm import GemmOp
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -120,6 +121,24 @@ def bench_gemm(M, K, N, dtype):
             keep_alive=[a, b_t, c],
         )
 
+    # SingleOpKernel GemmOp
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        c_so = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
+        so_ops = GemmOp.schedule(
+            a=a, b=b_t, c=c_so,
+            tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+            inner_depth=inner_depth,
+        )
+        so_kernel = SingleOpKernel(so_ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            so_kernel.run()
+        torch.cuda.synchronize()
+
+        funcs["single_op"] = so_kernel.bench_spec(
+            setup_fn=lambda: c_so.zero_(),
+            keep_alive=[a, b_t, c_so],
+        )
+
     return funcs
 
 
@@ -143,9 +162,9 @@ def bench_gemm_bwd(M, K, N, dtype):
 
     funcs = {}
 
-    # PyTorch backward: dA = dout @ B, dB = A^T @ dout
+    # PyTorch backward: dA = dout @ B^T, dB = A^T @ dout
     def pytorch_bwd():
-        da = torch.matmul(dout, b)
+        da = torch.matmul(dout, b_t)
         db = torch.matmul(a.t(), dout)
         return da, db
 
@@ -174,6 +193,28 @@ def bench_gemm_bwd(M, K, N, dtype):
             funcs["megakernel"] = kernel.bench_spec(
                 setup_fn=reset_bwd,
                 keep_alive=[a, b_t, dout, da, db],
+            )
+
+    # SingleOpKernel backward
+    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        da_so = torch.zeros(M, K, dtype=torch_dtype, device="cuda")
+        db_so = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
+        so_bwd_ops = GemmOp.schedule_backward(
+            dout=dout, a=a, b=b_t, da=da_so, db=db_so,
+        )
+        if so_bwd_ops:
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            def reset_so_bwd():
+                da_so.zero_()
+                db_so.zero_()
+
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                setup_fn=reset_so_bwd,
+                keep_alive=[a, b_t, dout, da_so, db_so],
             )
 
     return funcs

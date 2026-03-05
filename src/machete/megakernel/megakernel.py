@@ -1483,7 +1483,7 @@ class Megakernel:
                                 _wait_phase,
                             )
                         if (_idle_pi - _idle_si) < Int32(num_pages):
-                            nanosleep(Int32(5000))
+                            nanosleep(Int32(1000))
 
                     done = ld_shared_i32(load_done_ptr)
 
