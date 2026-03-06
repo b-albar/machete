@@ -702,6 +702,39 @@ class GemmOp(Op):
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
 
     # =========================================================================
+    # Communicate (TMA S->G to peer GPU)
+    # =========================================================================
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_M, tile_N, c_p0_tma, c_p0_tma_gmem):
+        """Send C tile to peer GPU 0 via TMA S2G.
+
+        The TMA atom determines the semantics: regular copy for broadcast
+        (column-parallel), atomic add for reduce (row-parallel all-reduce).
+        """
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_M),
+                             stride=(1, self.tile_size_N)),
+        )
+
+        gC = cute.local_tile(
+            c_p0_tma_gmem, (self.tile_size_N, self.tile_size_M), (None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 2),
+            cute.group_modes(gC, 0, 2),
+        )
+
+        with cute.arch.elect_one():
+            cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+
+    # =========================================================================
     # Scheduling
     # =========================================================================
 
@@ -854,3 +887,60 @@ class GemmOp(Op):
             ops.extend(cls.schedule_forward(**fwd_kwargs))
 
         return ops
+
+    # =========================================================================
+    # Tensor Parallelism Factory
+    # =========================================================================
+
+    @classmethod
+    def schedule_forward_tp(cls, tp_mode='column', **kwargs):
+        """Schedule forward GEMM with tensor parallelism.
+
+        Args:
+            tp_mode: 'column' for column-parallel (broadcast output shard),
+                     'row' for row-parallel (all-reduce via atomic add).
+            **kwargs: Forwarded to schedule_forward().
+
+        Returns:
+            List of ScheduledOps using the appropriate TP subclass.
+
+        Notes:
+            Column-parallel: each GPU has W_shard[N/P, K], computes
+                C_shard = A @ W_shard^T, broadcasts to peers.
+            Row-parallel: each GPU has W[N, K/P], computes
+                C_partial = A_shard @ W^T, atomic-adds to all outputs.
+                All output buffers must be zeroed before kernel launch.
+        """
+        if tp_mode == 'column':
+            return GemmColumnParallelOp.schedule_forward(**kwargs)
+        elif tp_mode == 'row':
+            return GemmRowParallelOp.schedule_forward(**kwargs)
+        else:
+            raise ValueError(f"Unknown tp_mode: {tp_mode!r}. Use 'column' or 'row'.")
+
+
+class GemmColumnParallelOp(GemmOp):
+    """GemmOp with TMA S2G broadcast to peers (column-parallel TP).
+
+    Each GPU computes C_shard[M, N/P] = A @ W_shard[N/P, K]^T and
+    broadcasts the result to peer GPU buffers via TMA S2G copy.
+    """
+
+    peer_stores = {"c"}
+
+
+class GemmRowParallelOp(GemmOp):
+    """GemmOp with TMA S2G broadcast for row-parallel TP.
+
+    Each GPU computes C_partial[M, N] = A_shard[M, K/P] @ W[N, K/P]^T
+    and writes the partial result to both the local output buffer and
+    all peer output buffers via regular TMA S2G copy.
+
+    NOTE: True all-reduce (atomic add to all buffers) requires
+    CopyReduceBulkTensorTileS2GOp, which currently has a 2x output bug
+    in the CUTLASS DSL. As a workaround, this uses regular broadcast
+    (same as column-parallel). The caller must handle reduction
+    externally (e.g., via NCCL all-reduce after kernel completion).
+    """
+
+    peer_stores = {"c"}  # Broadcast partial result to peers

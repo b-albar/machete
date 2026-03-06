@@ -495,6 +495,7 @@ class PeerTMADescriptorInfo:
     smem_layout_shape: Tuple[int, ...]
     dtype: Any
     smem_layout_src: Optional[str] = None
+    direction: str = "s2g"  # "s2g" for regular copy, "s2g_reduce" for atomic add
 
 
 @dataclass
@@ -523,10 +524,11 @@ class PeerTMARegistry:
         tensor_registry: "TensorRegistry",
         peer_buffer_registry: "PeerBufferRegistry",
     ) -> "PeerTMARegistry":
-        """Build PeerTMARegistry from ops that declare peer_stores.
+        """Build PeerTMARegistry from ops that declare peer_stores or peer_reduce_stores.
 
-        For each op's peer_stores tensor, for each peer device, creates
-        a TMA S2G descriptor targeting the peer's buffer.
+        For each op's peer_stores tensor, creates TMA S2G descriptors (regular copy).
+        For each op's peer_reduce_stores tensor, creates TMA S2G reduce descriptors
+        (atomic add) targeting the peer's buffer.
         """
         descriptors: List[PeerTMADescriptorInfo] = []
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
@@ -536,12 +538,17 @@ class PeerTMARegistry:
         for i, op in enumerate(ops):
             op_cls = op.op_cls
             peer_stores = getattr(op_cls, "_PEER_STORES", set())
+            peer_reduce_stores = getattr(op_cls, "_PEER_REDUCE_STORES", set())
             op_mappings[(i, "communicate")] = {}
 
-            if not peer_stores:
+            if not peer_stores and not peer_reduce_stores:
                 continue
 
-            for tensor_name in peer_stores:
+            # Process both regular peer stores and reduce peer stores
+            for tensor_name, direction in (
+                [(n, "s2g") for n in peer_stores]
+                + [(n, "s2g_reduce") for n in peer_reduce_stores]
+            ):
                 # Get canonical tensor name
                 tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
                 if tensor_canonical is None:
@@ -575,6 +582,7 @@ class PeerTMARegistry:
                             smem_layout_shape=tma_tile_shape,
                             dtype=dtype,
                             smem_layout_src=smem_layout_src,
+                            direction=direction,
                         )
                     )
 

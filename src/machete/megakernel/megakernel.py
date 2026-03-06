@@ -822,7 +822,10 @@ class Megakernel:
         if peer_tma_registry.has_peer_tma:
             for desc in peer_tma_registry.descriptors:
                 ptma_src = f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}"
-                copy_op = "CopyBulkTensorTileS2GOp()"
+                if getattr(desc, 'direction', 's2g') == "s2g_reduce":
+                    copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
+                else:
+                    copy_op = "CopyBulkTensorTileS2GOp()"
                 shape_str = ", ".join(str(s) for s in desc.tile_shape)
                 if desc.smem_layout_src:
                     smem_layout_code = desc.smem_layout_src
@@ -914,6 +917,17 @@ class Megakernel:
             from cutlass.cute.nvgpu.cpasync import CopyBulkTensorTileS2GOp
 
             pk_globals["CopyBulkTensorTileS2GOp"] = CopyBulkTensorTileS2GOp
+
+        # Add reduce store op for peer TMA if any peer descriptor uses s2g_reduce
+        if peer_tma_registry.has_peer_tma and any(
+            getattr(d, 'direction', 's2g') == "s2g_reduce"
+            for d in peer_tma_registry.descriptors
+        ):
+            from cutlass.cute.nvgpu.cpasync import CopyReduceBulkTensorTileS2GOp
+            from cutlass.cute.tensor import ReductionOp
+
+            pk_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
+            pk_globals["ReductionOp"] = ReductionOp
 
         compile_mod._compile_counter += 1
         pk_filename = f"<persistent_kernel>_{compile_mod._compile_counter}"
@@ -1063,8 +1077,11 @@ class Megakernel:
         barrier_offset = 0
         first = True
         for i, op in enumerate(self.ops):
-            peer_stores = getattr(op.op_cls, "_PEER_STORES", set())
-            if not peer_stores:
+            has_peer = (
+                getattr(op.op_cls, "_PEER_STORES", set())
+                | getattr(op.op_cls, "_PEER_REDUCE_STORES", set())
+            )
+            if not has_peer:
                 continue
             keyword = "if" if first else "elif"
             first = False
@@ -1105,7 +1122,11 @@ class Megakernel:
         """Number of peer barriers needed for cross-GPU signaling."""
         total = 0
         for op in self.ops:
-            if getattr(op.op_cls, "_PEER_STORES", set()):
+            has_peer = (
+                getattr(op.op_cls, "_PEER_STORES", set())
+                | getattr(op.op_cls, "_PEER_REDUCE_STORES", set())
+            )
+            if has_peer:
                 total += op.total_tiles
         return total
 

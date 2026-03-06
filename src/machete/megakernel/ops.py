@@ -276,18 +276,25 @@ def _process_op_declarations(cls):
 
     # --- Process peer store declarations ---
     # peer_stores: set of tensor names to send to peer GPUs via TMA S2G
+    # peer_reduce_stores: set of tensor names to send via TMA S2G with atomic add
     peer_stores = set(getattr(cls, "peer_stores", set()))
     for name in peer_stores:
         if name not in all_write_names:
             raise ValueError(f"peer_stores tensor '{name}' not found in writes")
     cls._PEER_STORES = peer_stores
 
+    peer_reduce_stores = set(getattr(cls, "peer_reduce_stores", set()))
+    for name in peer_reduce_stores:
+        if name not in all_write_names:
+            raise ValueError(f"peer_reduce_stores tensor '{name}' not found in writes")
+    cls._PEER_REDUCE_STORES = peer_reduce_stores
+
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
     tma_tensor_dims = {}  # {tensor_name: list of dim_names}
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores:
+    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores | peer_reduce_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
     cls._TMA_TENSOR_DIMS = tma_tensor_dims

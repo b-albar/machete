@@ -61,6 +61,7 @@ class MoeGemmOp(Op):
 
     tma_loads = {"sorted_x"}
     tma_stores = {"c"}
+    peer_stores = {"c"}
 
     @classmethod
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
@@ -559,6 +560,30 @@ class MoeGemmOp(Op):
 
         with cute.arch.elect_one():
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+
+    # =========================================================================
+    # Communicate (TMA S->G to peer GPU)
+    # =========================================================================
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_M, tile_N, c_p0_tma, c_p0_tma_gmem):
+        """Send C tile to peer GPU 0 via TMA S2G."""
+        sC = cute.make_tensor(
+            cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_N, self.tile_size_M)),
+        )
+
+        gC = cute.local_tile(
+            c_p0_tma_gmem, (self.tile_size_N, self.tile_size_M), (None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 2),
+            cute.group_modes(gC, 0, 2),
+        )
+
+        with cute.arch.elect_one():
+            cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_M)])
 
     # =========================================================================
     # Scheduling

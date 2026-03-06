@@ -87,6 +87,7 @@ class Conv1dOp(Op):
 
     tma_loads = {"x"}
     tma_stores = {"y"}
+    peer_stores = {"y"}
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -319,6 +320,32 @@ class Conv1dOp(Op):
         )
         with cute.arch.elect_one():
             cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_L, tile_B)])
+
+    # =========================================================================
+    # Communicate (TMA S->G to peer GPU)
+    # =========================================================================
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_B, tile_L, tile_D,
+                    y_p0_tma, y_p0_tma_gmem):
+        """Send y tile to peer GPU 0 via TMA S2G."""
+        sY = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype, page_ptr + self.y_smem_offset,
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.D, self.tile_size_L, 1)),
+        )
+        gY = cute.local_tile(
+            y_p0_tma_gmem, (self.D, self.tile_size_L, 1), (None, None, None),
+        )
+        tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
+            y_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sY, 0, 3),
+            cute.group_modes(gY, 0, 3),
+        )
+        with cute.arch.elect_one():
+            cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_L, tile_B)])
 
 
 __all__ = ["Conv1dOp"]
