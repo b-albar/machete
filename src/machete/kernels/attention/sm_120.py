@@ -150,6 +150,7 @@ class FlashAttentionSm120Op(Op):
         # divide evenly. OOB cpasync reads can produce NaN in V → 0*NaN=NaN
         # in O GEMM (IEEE 754), so avoiding OOB is critical.
         import math
+
         self.n_block = 1 << int(math.log2(max(16, max_n_block)))
         if self.N < self.n_block:
             # Small N: fall back to multiple-of-16 rounding
@@ -177,6 +178,25 @@ class FlashAttentionSm120Op(Op):
             self.swizzle_B = 1
         self.swizzle_M = 4
         self.swizzle_S = 3
+
+        # KV-specific swizzle for bank-conflict-free LdMatrix reads.
+        # K and V use cpasync (not TMA), so they're not limited to S=3.
+        #
+        # LDSM.x4 reads 128 bits (4 consecutive banks) per thread. With 8 threads
+        # at row stride D*2 bytes, bank_start values must differ by ≥4 to avoid
+        # overlap. Standard swizzle (B, 4, 3) gives bank_start stride=2 → 2:1
+        # conflicts (8 wavefronts vs 4 ideal per LDSM.x4).
+        #
+        # With B=4, S=log2(D*2)-4: XOR bits [4,8) with bits [4+S, 8+S). Row index
+        # r (in bits [log2(D*2),...) from r*D*2) maps to bits [4,7) → bank_start=r*4.
+        # Result: {0,4,8,12,16,20,24,28} — stride 4, zero overlap, 0 conflicts.
+        #
+        # Q and O must keep (B, 4, 3) because TMA hardware only supports S=3.
+        import math
+
+        self.swizzle_KV_B = 4
+        self.swizzle_KV_M = 4
+        self.swizzle_KV_S = int(math.log2(self.D * self.elem_bytes)) - 4
 
         # cpasync thread layout for K/V loading
         # 128-bit copies = 8 fp16 elements per thread per copy
@@ -237,6 +257,7 @@ class FlashAttentionSm120Op(Op):
         # Auto-allocate lse output if not provided
         if "lse" not in tensors and q is not None:
             import torch
+
             tensors["lse"] = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
@@ -251,6 +272,7 @@ class FlashAttentionSm120Op(Op):
 
         tile_m = ops[0].tile_sizes["M"]
         from machete.megakernel.megakernel import NUM_DMA_WARPS
+
         num_mma_warps = tile_m // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
@@ -274,7 +296,8 @@ class FlashAttentionSm120Op(Op):
         sQ = cute.make_tensor(
             cute.recast_ptr(
                 cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
-                _q_swz, dtype=self.q_dtype,
+                _q_swz,
+                dtype=self.q_dtype,
             ),
             cute.make_layout((self.D, self.tile_size_M, 1)),
         )
@@ -334,9 +357,7 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @cute.jit
-    def compute_mma(
-        self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, lse
-    ):
+    def compute_mma(self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, lse):
         """Cooperative flash attention: MMA warps do both cpasync loads and MMA.
 
         Q stays in smem persistently (TMA-loaded with swizzle). Each S GEMM
@@ -373,7 +394,8 @@ class FlashAttentionSm120Op(Op):
             sQ = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
-                    swz, dtype=self.q_dtype,
+                    swz,
+                    dtype=self.q_dtype,
                 ),
                 cute.make_layout((self.tile_size_M, self.D), stride=(self.D, 1)),
             )
@@ -408,11 +430,14 @@ class FlashAttentionSm120Op(Op):
             # === KV buffer base (after persistent Q) ===
             _kv_base = page_ptr + Int32(self.q_tile_bytes)
 
-            # === K smem tensor + LdMatrix fragments (buf0, swizzled) ===
+            # === KV swizzle (cpasync-loaded, not TMA-constrained) ===
+            swz_kv = cute.make_swizzle(self.swizzle_KV_B, self.swizzle_KV_M, self.swizzle_KV_S)
+
+            # === K smem tensor + LdMatrix fragments (buf0, KV swizzle) ===
             _sK = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz,
+                    swz_kv,
                     dtype=self.q_dtype,
                 ),
                 cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
@@ -422,12 +447,12 @@ class FlashAttentionSm120Op(Op):
             tKrK_view = smem_thr_copy_K.retile(tCrK)
             tKsK = smem_thr_copy_K.partition_S(_sK)
 
-            # === V smem tensor + LdMatrix fragments (buf1, swizzled transposed) ===
+            # === V smem tensor + LdMatrix fragments (buf1, KV swizzle) ===
             _buf1_base = _kv_base + Int32(self.kv_tile_bytes)
             _sVt = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz,
+                    swz_kv,
                     dtype=self.q_dtype,
                 ),
                 cute.make_layout((self.D, self.n_block), stride=(1, self.D)),
@@ -444,11 +469,11 @@ class FlashAttentionSm120Op(Op):
             gmem_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, copy_thread_layout, copy_value_layout)
             thr_copy = gmem_tiled_copy.get_slice(tidx)
 
-            # cpasync smem destinations (buf0=K, buf1=V, swizzled, after Q)
+            # cpasync smem destinations (buf0=K, buf1=V, KV swizzle, after Q)
             sK_cp = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz,
+                    swz_kv,
                     dtype=self.q_dtype,
                 ),
                 cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
@@ -456,7 +481,7 @@ class FlashAttentionSm120Op(Op):
             sV_cp = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz,
+                    swz_kv,
                     dtype=self.q_dtype,
                 ),
                 cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
@@ -577,8 +602,7 @@ class FlashAttentionSm120Op(Op):
 
                 # --- Online softmax ---
                 _any_correction = Int32(0)
-                corrections = cute.make_fragment(
-                    cute.make_layout(num_rows), Float32)
+                corrections = cute.make_fragment(cute.make_layout(num_rows), Float32)
                 for r in cutlass.range_constexpr(num_rows):
                     acc_S_row = acc_S_mn[r, None].load()
                     row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, Float32(-1e30), 0)
@@ -590,8 +614,7 @@ class FlashAttentionSm120Op(Op):
                     acc_scale_ = (m_old - m_new) * Float32(self.scale_log2e)
                     # Clamp to PTX ex2.approx valid range [-126, 128] to avoid
                     # NaN on first iteration (m_old=-1e30 → acc_scale_≈-1e30).
-                    correction = cute.math.exp2(
-                        cute.arch.fmax(acc_scale_, Float32(-126.0)), fastmath=True)
+                    correction = cute.math.exp2(cute.arch.fmax(acc_scale_, Float32(-126.0)), fastmath=True)
                     if acc_scale_ >= Float32(-self.rescale_threshold):
                         m_new = m_old
                         correction = Float32(1.0)
@@ -609,8 +632,7 @@ class FlashAttentionSm120Op(Op):
                     acc_S_mn[r, None] = acc_S_row_exp
 
                 # Deferred O rescale: skip if max unchanged across all rows/threads
-                _skip_rescale = cute.arch.vote_all_sync(
-                    _any_correction == Int32(0))
+                _skip_rescale = cute.arch.vote_all_sync(_any_correction == Int32(0))
                 if not _skip_rescale:
                     for r in cutlass.range_constexpr(num_rows):
                         acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
