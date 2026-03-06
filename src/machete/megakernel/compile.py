@@ -250,7 +250,8 @@ def _build_phase_wrapper(
 
 
 def compile_phase(instance, phase_name, tensor_param_names=None,
-                  tma_param_names=None, tma_local_mapping=None):
+                  tma_param_names=None, tma_local_mapping=None,
+                  noinline=False):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
     For load phases, detects async vs sync from method
@@ -266,7 +267,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
     if is_load:
         method = getattr(instance, phase_name)
         is_async = "work_mbar" in inspect.signature(method).parameters
-        return _build_phase_wrapper(
+        fn = _build_phase_wrapper(
             instance,
             phase_name,
             tensor_param_names,
@@ -277,7 +278,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_local_mapping=tma_local_mapping,
         )
     else:
-        return _build_phase_wrapper(
+        fn = _build_phase_wrapper(
             instance,
             phase_name,
             tensor_param_names,
@@ -285,6 +286,11 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
         )
+
+    if noinline and hasattr(fn, "__wrapped__"):
+        fn.__wrapped__._noinline = True
+
+    return fn
 
 
 # =============================================================================

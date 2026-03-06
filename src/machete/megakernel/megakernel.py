@@ -104,6 +104,8 @@ class MegakernelConfig:
     tracing: bool = False
     dma_reg_count: int = 40
     mma_reg_count: int = 232
+    noinline: bool = True  # Emit each op's compute as a separate noinline device function
+    opt_level: int = 2  # LLVM opt level (0-3). noinline requires <= 2.
 
     # Multi-GPU communication (ParallelKittens-style peer TMA stores)
     peer_buffers: Optional[Dict[str, List[Any]]] = None  # {tensor_name: [peer0, peer1, ...]}
@@ -497,6 +499,7 @@ class Megakernel:
                     tensor_param_names=tensor_args,
                     tma_param_names=compute_tma_args,
                     tma_local_mapping=compute_tma_mapping,
+                    noinline=self.config.noinline,
                 )
             )
             store_fns.append(
@@ -1804,6 +1807,8 @@ class Megakernel:
             self.config.dma_reg_count,
             self.config.mma_reg_count,
             self.config.num_devices,
+            self.config.noinline,
+            self.config.opt_level,
         )
 
         # Tensors are runtime parameters (not compile-time constants), so
@@ -1841,39 +1846,64 @@ class Megakernel:
             tracing_str = " [traced]" if self.config.tracing else ""
             tma_str = " [TMA]" if self._tma_registry.has_tma else ""
             peer_str = " [peer]" if self._peer_tma_registry.has_peer_tma else ""
+            noinline_str = " [noinline]" if self.config.noinline else ""
             print(
-                f"Compiling persistent kernel ({tracing_str}{tma_str}{peer_str}) for "
+                f"Compiling persistent kernel ({tracing_str}{tma_str}{peer_str}{noinline_str}) for "
                 f"{len(self.ops)} ops, "
                 f"{self.total_tiles} tiles, {self.num_sms} SMs, "
                 f"{self.smem_size // 1024}KB smem..."
             )
-            self._compiled_kernel = self._create_kernel()
 
-            # Force upfront JIT compilation with cute.compile()
-            # This avoids lazy compilation on first run()
-            import cuda.bindings.driver as cuda
+            # Install noinline + opt_level patches during compilation
+            _pipeline_patch = None
+            if self.config.noinline:
+                from . import noinline as noinline_mod
+                noinline_mod.install()
+            if self.config.opt_level != 3:
+                from cutlass.cutlass_dsl.cutlass import CutlassBaseDSL
+                _orig_preprocess = CutlassBaseDSL.preprocess_pipeline
+                target_level = self.config.opt_level
 
-            torch_stream = torch.cuda.current_stream()
-            cu_stream = cuda.CUstream(torch_stream.cuda_stream)
+                def _patched_preprocess(self_dsl, pipeline, arch):
+                    pipeline = _orig_preprocess(self_dsl, pipeline, arch)
+                    return pipeline.replace("opt-level=3", f"opt-level={target_level}")
 
-            # Build TMA tensor args for __call__ (static-layout CuTe tensors)
-            tma_tensor_args = [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else []
-            peer_tma_tensor_args = (
-                [ct for _, _, ct in self._peer_tma_cute_tensors] if self._peer_tma_cute_tensors else []
-            )
+                CutlassBaseDSL.preprocess_pipeline = _patched_preprocess
+                _pipeline_patch = _orig_preprocess
 
-            self._compiled_kernel = cute.compile(
-                self._compiled_kernel,
-                Int64(self._instructions_tensor.data_ptr()),
-                Int64(self._barriers_tensor.data_ptr()),
-                Int64(self._op_configs_tensor.data_ptr()),
-                Int64(0),  # trace_buffer_ptr
-                self._num_instructions_i32,
-                *self._cute_tensors,
-                *tma_tensor_args,
-                *peer_tma_tensor_args,
-                cu_stream,
-            )
+            try:
+                self._compiled_kernel = self._create_kernel()
+
+                # Force upfront JIT compilation with cute.compile()
+                # This avoids lazy compilation on first run()
+                import cuda.bindings.driver as cuda
+
+                torch_stream = torch.cuda.current_stream()
+                cu_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                # Build TMA tensor args for __call__ (static-layout CuTe tensors)
+                tma_tensor_args = [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else []
+                peer_tma_tensor_args = (
+                    [ct for _, _, ct in self._peer_tma_cute_tensors] if self._peer_tma_cute_tensors else []
+                )
+
+                self._compiled_kernel = cute.compile(
+                    self._compiled_kernel,
+                    Int64(self._instructions_tensor.data_ptr()),
+                    Int64(self._barriers_tensor.data_ptr()),
+                    Int64(self._op_configs_tensor.data_ptr()),
+                    Int64(0),  # trace_buffer_ptr
+                    self._num_instructions_i32,
+                    *self._cute_tensors,
+                    *tma_tensor_args,
+                    *peer_tma_tensor_args,
+                    cu_stream,
+                )
+            finally:
+                if self.config.noinline:
+                    noinline_mod.uninstall()
+                if _pipeline_patch is not None:
+                    CutlassBaseDSL.preprocess_pipeline = _pipeline_patch
 
             # Store in class-level cache
             Megakernel._compiled_kernel_cache[cache_key] = self._compiled_kernel

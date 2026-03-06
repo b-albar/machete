@@ -58,6 +58,7 @@ from .autograd_op import AutogradOp, TensorSpec
 from .autograd import MegakernelFunction
 from .kernel_cache import KernelCache
 from .functional import megakernel_apply, MegakernelModule
+from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
 
 __all__ = [
     # Operation Protocol
@@ -95,4 +96,9 @@ __all__ = [
     "KernelCache",
     "megakernel_apply",
     "MegakernelModule",
+    # Debug utilities
+    "dump_ptx",
+    "dump_sass",
+    "dump_cubin",
+    "extract_cubin",
 ]
