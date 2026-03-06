@@ -91,8 +91,6 @@ The megakernel compiles all scheduled ops into a single persistent CUDA kernel. 
 └──────────────────────────────────────────────────────┘
 ```
 
-Each SM has a circular buffer of shared memory **pages**. The load warp fills pages via TMA, compute warps process them, and the store warp drains results back to global memory -- all pipelined with mbarrier synchronization.
-
 ### Configuration
 
 ```python
@@ -224,20 +222,6 @@ class ScaleOp(Op):
         tYsY, tYgY = cute.tma_partition(y_tma, None, sY, gY)
         cute.copy(y_tma, tYsY, tYgY[0])
 ```
-
-### Key concepts
-
-**Tensor declarations** -- `reads` and `writes` map tensor names to `(dtype, dim_names)` tuples. `dtype=None` infers from the tensor at schedule time. Dimension names are tuples of strings like `("M", "D")` or `("BH", "M", "D")`.
-
-**Tiling** -- The `tile` attribute lists which dimensions to tile over. The framework creates one work tile per tile-count along those dimensions. Non-tiled dimensions are processed in full within each tile.
-
-**TMA** -- Tensors listed in `tma_loads` / `tma_stores` are transferred via TMA (Tensor Memory Accelerator). The framework generates TMA descriptors and passes them to `load()` / `store()` as `{name}_tma` and `{name}_tma_gmem` parameters.
-
-**Pipelined phases** -- Each tile passes through `load → compute → store`, pipelined across pages with mbarrier synchronization. The `work_mbar` parameter in `load()` signals the framework that loading is asynchronous.
-
-**Scheduling** -- `schedule_forward()` computes tile sizes, sets compile-time constants via `static_dims`, and returns a list of `ScheduledOp`. The framework resolves dependencies between ops by matching tensor pointers.
-
-**Backward pass** -- Create a separate Op class for the backward pass (e.g., `RMSNormBwdOp`, `RopeBwdOp`). Share code with the forward Op via method references (e.g., `load = ForwardOp.load`). Schedule and run like any other Op.
 
 ## Built-in Kernels
 
