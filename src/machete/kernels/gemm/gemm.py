@@ -98,6 +98,14 @@ class GemmOp(Op):
         self.a_tile_bytes = self.tile_size_M * self.tile_K * self.elem_bytes
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
         self.c_tile_bytes = self.tile_size_M * self.tile_size_N * self.elem_bytes
+
+        # Swizzle for C epilogue (R→S) to avoid smem bank conflicts.
+        if self.tile_size_N % 64 == 0 and self.tile_size_N >= 64:
+            self.swz_B_c = 3   # SW128
+        elif self.tile_size_N % 32 == 0:
+            self.swz_B_c = 2   # SW64
+        else:
+            self.swz_B_c = 1   # SW32
         # Per-buffer layout: [A | (a_scale) | B]
         # a_scale only allocated when has_a_scale=1 (compile-time constant)
         if self.has_a_scale:
@@ -157,8 +165,23 @@ class GemmOp(Op):
                                 tile_sizes, static_dims):
         """Return swizzled smem layout code for TMA descriptor creation."""
         tile_K = static_dims.get("tile_K", 32)
+        if tensor_name == "c":
+            # Swizzled layout for C to avoid smem bank conflicts in epilogue.
+            tile_N = tile_sizes.get("N", 64)
+            if tile_N % 64 == 0 and tile_N >= 64:
+                B_c = 3   # SW128
+            elif tile_N % 32 == 0:
+                B_c = 2   # SW64
+            else:
+                B_c = 1   # SW32
+            dim0, dim1 = tma_tile_shape  # (tile_N, tile_M) after reversal
+            return (
+                f"cute.make_composed_layout("
+                f"cute.make_swizzle({B_c}, 4, 3), 0, "
+                f"cute.make_layout(({dim0}, {dim1}), stride=(1, {dim0})))"
+            )
         if tensor_name not in ("a", "a_scale", "b"):
-            return None  # No swizzle for C
+            return None
 
         if tile_K % 64 == 0 and tile_K >= 64:
             B = 3   # SW128
@@ -615,14 +638,21 @@ class GemmOp(Op):
 
             k_idx = k_idx + Int32(1)
 
-        # --- Epilogue: R->S (write final C to smem for TMA store) ---
+        # --- Epilogue: R->S (write final C to swizzled smem for TMA store) ---
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(
-            cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
             cute.make_layout((self.tile_size_M, self.tile_size_N),
                              stride=(self.tile_size_N, 1)),
         )
-        tCsC = thr_mma.partition_C(sC)
+
+        # Apply activation + convert FP32 acc to output dtype in registers
+        acc_out = cute.make_fragment_like(acc, self.c_dtype)
         for ci in cutlass.range_constexpr(cute.size(acc)):
             val = acc[ci]
             if self.activation == 1:  # ReLU
@@ -631,7 +661,16 @@ class GemmOp(Op):
                 neg_val = Float32(0.0) - val
                 exp_neg = cute.math.exp(neg_val, fastmath=True)
                 val = val / (Float32(1.0) + exp_neg)
-            tCsC[ci] = val.to(self.c_dtype)
+            acc_out[ci] = val.to(self.c_dtype)
+
+        # Use tiled copy C to write to swizzled smem (bank-conflict-free)
+        r2s_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.c_dtype)
+        r2s_copy = cute.make_tiled_copy_C(r2s_atom, tiled_mma)
+        r2s_thr = r2s_copy.get_slice(tidx)
+        tCrC = r2s_thr.retile(acc_out)
+        tCsC = r2s_thr.partition_D(sC)
+        cute.copy(r2s_copy, tCrC, tCsC)
 
     # =========================================================================
     # Forward Store (S->G): Regular TMA store of C
@@ -639,10 +678,15 @@ class GemmOp(Op):
 
     @cute.jit
     def store(self, page_ptr, tile_M, tile_N, c_tma, c_tma_gmem):
-        """TMA store of C from shared to global memory."""
+        """TMA store of C from swizzled shared to global memory."""
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(
-            cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.tile_size_N, self.tile_size_M)),
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_M),
+                             stride=(1, self.tile_size_N)),
         )
 
         gC = cute.local_tile(

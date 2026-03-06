@@ -703,6 +703,45 @@ def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
     return Int32(result)
 
 
+@dsl_user_op
+def prefetch_instruction(
+    instr_ptr: Int64,
+    instr_idx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Prefetch an instruction from global memory into L2 cache.
+
+    Issues a ``prefetch.global.L2`` for the instruction at the given index.
+    This is a non-blocking hint — the hardware starts fetching the cache line
+    so that a subsequent ``ld.global`` hits L2 (~30-50 cycles) instead of
+    DRAM (~200-400 cycles).
+
+    Args:
+        instr_ptr: Pointer to instruction array in global memory (64-bit)
+        instr_idx: Instruction index (byte offset = instr_idx * 8)
+    """
+    llvm.inline_asm(
+        None,
+        [
+            instr_ptr.ir_value(loc=loc, ip=ip),
+            instr_idx.ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .u64 %gaddr;
+            mad.wide.u32 %gaddr, $1, 8, $0;
+            prefetch.global.L2 [%gaddr];
+        }
+        """,
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
@@ -710,6 +749,7 @@ __all__ = [
     "check_barrier_ready",
     "check_barrier_ready_gpu",
     "load_instruction_to_smem",
+    "prefetch_instruction",
     "ld_global_i32",
     "ld_global_i64",
     "st_global_i32",
