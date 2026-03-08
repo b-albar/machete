@@ -70,8 +70,8 @@ class FlashAttentionSm120Op(Op):
 
     reads = {
         "q": (None, ("BH", "M", "D")),
-        "k": (None, ("BH", "N", "D")),
-        "v": (None, ("BH", "N", "D")),
+        "k": (None, ("BH_kv", "N", "D")),
+        "v": (None, ("BH_kv", "N", "D")),
     }
     writes = {"o": (None, ("BH", "M", "D")), "lse": (cutlass.Float32, ("BH", "M"))}
     tile = ("BH", "M", "D")
@@ -106,6 +106,7 @@ class FlashAttentionSm120Op(Op):
         super().__init__(**config)
         self.causal = getattr(self, "causal", 0)
         self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
+        self.kv_group_size = getattr(self, "kv_group_size", 1)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120Op requires fp16 or bf16, got {self.q_dtype}"
@@ -223,7 +224,8 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule_forward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE,
+                         kv_group_size=1, **tensors):
         """Schedule cooperative flash attention forward.
 
         Q persists in smem alongside KV double-buffer, so tile_M is auto-sized
@@ -263,6 +265,8 @@ class FlashAttentionSm120Op(Op):
         ops[0].static_dims["page_size"] = page_size
         if causal:
             ops[0].static_dims["causal"] = 1
+        if kv_group_size > 1:
+            ops[0].static_dims["kv_group_size"] = kv_group_size
         return ops
 
     @classmethod
@@ -492,8 +496,9 @@ class FlashAttentionSm120Op(Op):
             # cpasync global sources: K and V for current head
             # k, v are CuTe tensors (BH, N, D) from framework.
             # .align(16) annotates 16-byte alignment for 128-bit cpasync.
-            k_head_ptr = (k.iterator + tile_BH * Int32(self.N * self.D)).align(16)
-            v_head_ptr = (v.iterator + tile_BH * Int32(self.N * self.D)).align(16)
+            kv_bh = tile_BH // Int32(self.kv_group_size)
+            k_head_ptr = (k.iterator + kv_bh * Int32(self.N * self.D)).align(16)
+            v_head_ptr = (v.iterator + kv_bh * Int32(self.N * self.D)).align(16)
             gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((self.N, self.D), stride=(self.D, 1)))
             gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((self.N, self.D), stride=(self.D, 1)))
 

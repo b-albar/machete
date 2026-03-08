@@ -40,7 +40,8 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _run_attention_coop_forward(q, k, v, tile_m=None, causal=False):
+def _run_attention_coop_forward(q, k, v, tile_m=None, causal=False,
+                                kv_group_size=1):
     """Run FlashAttentionSm120Op forward and return output tensor."""
     from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm120Op
@@ -53,6 +54,7 @@ def _run_attention_coop_forward(q, k, v, tile_m=None, causal=False):
         q=q, k=k, v=v, o=o,
         tile_sizes=tile_sizes,
         causal=causal,
+        kv_group_size=kv_group_size,
     )
     config = FlashAttentionSm120Op.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -330,7 +332,8 @@ class TestFlashAttentionCoopCausal:
 # =============================================================================
 
 
-def _run_attention_coop_forward_with_lse(q, k, v, causal=False):
+def _run_attention_coop_forward_with_lse(q, k, v, causal=False,
+                                         kv_group_size=1):
     """Run forward and return (o, lse) tensors."""
     from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm120Op
@@ -339,6 +342,7 @@ def _run_attention_coop_forward_with_lse(q, k, v, causal=False):
     lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
     ops = FlashAttentionSm120Op.schedule_forward(
         q=q, k=k, v=v, o=o, lse=lse, causal=causal,
+        kv_group_size=kv_group_size,
     )
     config = FlashAttentionSm120Op.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -350,7 +354,8 @@ def _run_attention_coop_forward_with_lse(q, k, v, causal=False):
     return o, lse
 
 
-def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False):
+def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False,
+                                 kv_group_size=1):
     """Run FlashAttentionSm120BwdOp and return (dq, dk, dv)."""
     from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm120BwdOp
@@ -364,6 +369,7 @@ def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False):
     ops = FlashAttentionSm120BwdOp.schedule_backward(
         k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
         dq=dq_accum, dk=dk, dv=dv, causal=causal,
+        kv_group_size=kv_group_size,
     )
     config = FlashAttentionSm120BwdOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -483,6 +489,77 @@ class TestFlashAttentionCoopBwd:
 
         dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
             q, k, v, o, dout, causal=True)
+
+        torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(dq, dq_ref.half(), atol=5e-2, rtol=5e-2)
+
+
+# =============================================================================
+# GQA Tests (Grouped Query Attention)
+# =============================================================================
+
+
+class TestFlashAttentionCoopGQA:
+    """GQA tests: multiple Q heads share K/V heads (cooperative forward)."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH_q,BH_kv,M,N,D,causal", [
+        (4, 2, 32, 32, 64, False),    # kv_group_size=2, D=64
+        (8, 2, 32, 32, 128, False),   # kv_group_size=4, D=128
+        (8, 4, 64, 64, 128, False),   # kv_group_size=2, larger
+        (4, 2, 32, 32, 64, True),     # kv_group_size=2, causal
+        (8, 2, 64, 64, 128, True),    # kv_group_size=4, causal
+    ], ids=[
+        "gqa2_d64", "gqa4_d128", "gqa2_d128_large",
+        "gqa2_d64_causal", "gqa4_d128_causal",
+    ])
+    def test_gqa_forward(self, BH_q, BH_kv, M, N, D, causal):
+        """GQA forward matches PyTorch reference with repeat_interleave."""
+        kv_group_size = BH_q // BH_kv
+        torch.manual_seed(42)
+        q = torch.randn(BH_q, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_coop_forward(
+            q, k, v, causal=causal, kv_group_size=kv_group_size)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(),
+            causal=causal, kv_group_size=kv_group_size).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+
+class TestFlashAttentionCoopGQABwd:
+    """GQA backward tests: dK/dV accumulate across Q-head groups."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH_q,BH_kv,M,N,D,causal", [
+        (4, 2, 32, 32, 64, False),    # kv_group_size=2, D=64
+        (4, 2, 32, 32, 128, False),   # kv_group_size=2, D=128
+        (8, 2, 32, 32, 128, False),   # kv_group_size=4, D=128
+        (4, 2, 32, 32, 64, True),     # kv_group_size=2, causal
+    ], ids=[
+        "gqa2_d64", "gqa2_d128", "gqa4_d128", "gqa2_d64_causal",
+    ])
+    def test_gqa_backward(self, BH_q, BH_kv, M, N, D, causal):
+        """GQA backward matches PyTorch reference."""
+        kv_group_size = BH_q // BH_kv
+        torch.manual_seed(42)
+        q = torch.randn(BH_q, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+        dout = torch.randn(BH_q, M, D, dtype=torch.float16, device="cuda")
+
+        o, lse = _run_attention_coop_forward_with_lse(
+            q, k, v, causal=causal, kv_group_size=kv_group_size)
+        dq, dk, dv = _run_attention_coop_backward(
+            q, k, v, o, dout, lse, causal=causal,
+            kv_group_size=kv_group_size)
+
+        dq_ref, dk_ref, dv_ref = flash_attention_backward_pytorch(
+            q, k, v, o, dout, causal=causal, kv_group_size=kv_group_size)
 
         torch.testing.assert_close(dv, dv_ref.half(), atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(dk, dk_ref.half(), atol=5e-2, rtol=5e-2)

@@ -70,8 +70,8 @@ class FlashAttentionSm100Op(Op):
 
     reads = {
         "q": (None, ("BH", "M", "D")),
-        "k": (None, ("BH", "N", "D")),
-        "v": (None, ("BH", "N", "D")),
+        "k": (None, ("BH_kv", "N", "D")),
+        "v": (None, ("BH_kv", "N", "D")),
     }
     writes = {"o": (None, ("BH", "M", "D"))}
     tile = ("BH", "M", "D")
@@ -118,6 +118,7 @@ class FlashAttentionSm100Op(Op):
         super().__init__(**config)
         self.causal = getattr(self, 'causal', 0)
         self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
+        self.kv_group_size = getattr(self, 'kv_group_size', 1)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm100Op requires fp16 or bf16, got {self.q_dtype}")
@@ -208,6 +209,7 @@ class FlashAttentionSm100Op(Op):
 
     @classmethod
     def schedule_forward(cls, tile_sizes=None, causal=False,
+                         kv_group_size=1,
                          page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule flash attention forward, optionally with causal masking."""
         tile_sizes = dict(tile_sizes or {})
@@ -237,6 +239,7 @@ class FlashAttentionSm100Op(Op):
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims['page_size'] = page_size
         ops[0].static_dims['inner_depth'] = 2  # Double-buffered K/V
+        ops[0].static_dims['kv_group_size'] = kv_group_size
         if q is not None:
             ops[0].static_dims['n_block'] = n_block
         if causal:
@@ -272,6 +275,9 @@ class FlashAttentionSm100Op(Op):
         odd iters 1+:  Wait smem_consumed[1], TMA K → buf 1 (kblock_ready[1])
         even iters 2+: Wait smem_consumed[0], TMA V → buf 0 (kblock_ready[0])
         """
+        # GQA: map Q head index to KV head index
+        kv_bh = tile_BH // Int32(self.kv_group_size)
+
         _buf_base = page_ptr + (
             inner_iter_idx % Int32(self.inner_depth)
         ) * Int32(self.kv_tile_bytes)
@@ -351,7 +357,7 @@ class FlashAttentionSm100Op(Op):
             with cute.arch.elect_one():
                 mbarrier_arrive_expect_tx(_kr_1, nbytes)
             cute.copy(k_tma,
-                      tKgK[(None, Int32(0), kv_block_idx, tile_BH)],
+                      tKgK[(None, Int32(0), kv_block_idx, kv_bh)],
                       tKsK, tma_bar_ptr=_kr_1_ptr)
 
         # --- V load (even iters >= 2: 2, 4, 6, ...) -> buf 0 ---
@@ -389,7 +395,7 @@ class FlashAttentionSm100Op(Op):
                 with cute.arch.elect_one():
                     mbarrier_arrive_expect_tx(_kr_0, nbytes)
                 cute.copy(v_tma,
-                          tVgV[(None, Int32(0), kv_block_idx, tile_BH)],
+                          tVgV[(None, Int32(0), kv_block_idx, kv_bh)],
                           tVsV, tma_bar_ptr=_kr_0_ptr)
 
     # =========================================================================
