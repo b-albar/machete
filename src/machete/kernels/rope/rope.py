@@ -41,6 +41,10 @@ class RopeOp(Op):
     Applies rotary position embedding in-place to a query tensor.
     Pipelined: uses load/compute/store with shared memory staging.
 
+    Supports partial RoPE (partial_rotary_factor < 1.0): only the first
+    2*D2 dimensions of each head are rotated, the rest pass through
+    unchanged. D2 is determined by the cos/sin table shape.
+
     Shared memory layout per page:
         [q_tile:   tile_size_M * tile_size_H * D elements]
         [cos_tile: tile_size_M * D2 elements]
@@ -48,7 +52,7 @@ class RopeOp(Op):
 
     Tensor declarations:
         q:   (M, H, D)   — query tensor, bf16/fp16/fp32, modified in-place
-        cos: (S, D2)     — cosine table, same dtype as q
+        cos: (S, D2)     — cosine table, same dtype as q (D2 = rotary_dim // 2)
         sin: (S, D2)     — sine table, same dtype as q
 
     Tiling:
@@ -87,7 +91,7 @@ class RopeOp(Op):
         self.cs_tile_bytes = self.tile_size_M * self.D2 * self.elem_bytes
         total_smem = self.q_tile_bytes + 2 * self.cs_tile_bytes
 
-        assert self.D2 >= 32, f"RopeOp requires D2 >= 32, got D2={self.D2} (D={self.D})"
+        assert self.D2 >= 16, f"RopeOp requires D2 >= 16, got D2={self.D2} (D={self.D})"
         assert self.H % self.tile_size_H == 0, f"RopeOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
         assert total_smem <= self.page_size, (
             f"RopeOp: tile smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
@@ -108,7 +112,8 @@ class RopeOp(Op):
         if q is None:
             return {}
         M, H, D = q.shape
-        D2 = D // 2
+        cos = tensors.get("cos")
+        D2 = cos.shape[1] if cos is not None else D // 2
         elem_bytes = q.element_size()
         tiles = {}
         # tile_H: target ≥2048 bytes per q row for efficient DMA.
@@ -119,7 +124,7 @@ class RopeOp(Op):
             tile_H -= 1
         tiles["H"] = tile_H
         # tile_M: q(tile_M * tile_H * D) + cos(tile_M * D2) + sin(tile_M * D2)
-        row_bytes = (tile_H * D + D) * elem_bytes
+        row_bytes = (tile_H * D + 2 * D2) * elem_bytes
         tiles["M"] = max(1, page_size // row_bytes)
         return tiles
 
@@ -259,57 +264,59 @@ class RopeOp(Op):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
-        thr_layout = cute.make_layout(32)
+        thr_count = min(self.D2, 32)
+        thr_layout = cute.make_layout(thr_count)
 
         for local_pos in range(self.tile_size_M):
-            cos_row = cute.make_tensor(
-                cos_smem + local_pos * self.D2,
-                cute.make_layout(self.D2),
-            )
-            sin_row = cute.make_tensor(
-                sin_smem + local_pos * self.D2,
-                cute.make_layout(self.D2),
-            )
-            cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
-            sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
-            cos_reg = cute.make_fragment_like(cos_part)
-            sin_reg = cute.make_fragment_like(sin_part)
-            cute.autovec_copy(cos_part, cos_reg)
-            cute.autovec_copy(sin_part, sin_reg)
-
-            for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                q_base = (local_pos * self.tile_size_H + local_h) * self.D
-
-                q0_row = cute.make_tensor(
-                    q_smem + q_base,
+            if lane_idx < Int32(thr_count):
+                cos_row = cute.make_tensor(
+                    cos_smem + local_pos * self.D2,
                     cute.make_layout(self.D2),
                 )
-                q1_row = cute.make_tensor(
-                    q_smem + q_base + self.D2,
+                sin_row = cute.make_tensor(
+                    sin_smem + local_pos * self.D2,
                     cute.make_layout(self.D2),
                 )
+                cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
+                sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
+                cos_reg = cute.make_fragment_like(cos_part)
+                sin_reg = cute.make_fragment_like(sin_part)
+                cute.autovec_copy(cos_part, cos_reg)
+                cute.autovec_copy(sin_part, sin_reg)
 
-                q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
-                q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
-                q0_reg = cute.make_fragment_like(q0_part)
-                q1_reg = cute.make_fragment_like(q1_part)
-                cute.autovec_copy(q0_part, q0_reg)
-                cute.autovec_copy(q1_part, q1_reg)
+                for local_h in range(warp_idx, self.tile_size_H, num_warps):
+                    q_base = (local_pos * self.tile_size_H + local_h) * self.D
 
-                # Compute rotation in fp32
-                out0_reg = cute.make_fragment_like(q0_reg)
-                out1_reg = cute.make_fragment_like(q1_reg)
-                for i in range(cute.size(q0_reg)):
-                    c = cos_reg[i].to(Float32)
-                    sn = sin_reg[i].to(Float32)
-                    v0 = q0_reg[i].to(Float32)
-                    v1 = q1_reg[i].to(Float32)
-                    out0_reg[i] = (v0 * c - v1 * sn).to(self.q_dtype)
-                    out1_reg[i] = (v1 * c + v0 * sn).to(self.q_dtype)
+                    q0_row = cute.make_tensor(
+                        q_smem + q_base,
+                        cute.make_layout(self.D2),
+                    )
+                    q1_row = cute.make_tensor(
+                        q_smem + q_base + self.D2,
+                        cute.make_layout(self.D2),
+                    )
 
-                # Store back to shared memory
-                cute.autovec_copy(out0_reg, q0_part)
-                cute.autovec_copy(out1_reg, q1_part)
+                    q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
+                    q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
+                    q0_reg = cute.make_fragment_like(q0_part)
+                    q1_reg = cute.make_fragment_like(q1_part)
+                    cute.autovec_copy(q0_part, q0_reg)
+                    cute.autovec_copy(q1_part, q1_reg)
+
+                    # Compute rotation in fp32
+                    out0_reg = cute.make_fragment_like(q0_reg)
+                    out1_reg = cute.make_fragment_like(q1_reg)
+                    for i in range(cute.size(q0_reg)):
+                        c = cos_reg[i].to(Float32)
+                        sn = sin_reg[i].to(Float32)
+                        v0 = q0_reg[i].to(Float32)
+                        v1 = q1_reg[i].to(Float32)
+                        out0_reg[i] = (v0 * c - v1 * sn).to(self.q_dtype)
+                        out1_reg[i] = (v1 * c + v0 * sn).to(self.q_dtype)
+
+                    # Store back to shared memory
+                    cute.autovec_copy(out0_reg, q0_part)
+                    cute.autovec_copy(out1_reg, q1_part)
 
     # =========================================================================
     # Store (S→G)
@@ -376,7 +383,7 @@ class RopeBwdOp(Op):
         self.cs_tile_bytes = self.tile_size_M * self.D2 * self.elem_bytes
         total_smem = self.q_tile_bytes + 2 * self.cs_tile_bytes
 
-        assert self.D2 >= 32, f"RopeBwdOp requires D2 >= 32, got D2={self.D2} (D={self.D})"
+        assert self.D2 >= 16, f"RopeBwdOp requires D2 >= 16, got D2={self.D2} (D={self.D})"
         assert self.H % self.tile_size_H == 0, f"RopeBwdOp: tile_size_H={self.tile_size_H} must divide H={self.H}"
         assert total_smem <= self.page_size, (
             f"RopeBwdOp: tile smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
@@ -421,56 +428,58 @@ class RopeBwdOp(Op):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
-        thr_layout = cute.make_layout(32)
+        thr_count = min(self.D2, 32)
+        thr_layout = cute.make_layout(thr_count)
 
         for local_pos in range(self.tile_size_M):
-            cos_row = cute.make_tensor(
-                cos_smem + local_pos * self.D2,
-                cute.make_layout(self.D2),
-            )
-            sin_row = cute.make_tensor(
-                sin_smem + local_pos * self.D2,
-                cute.make_layout(self.D2),
-            )
-            cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
-            sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
-            cos_reg = cute.make_fragment_like(cos_part)
-            sin_reg = cute.make_fragment_like(sin_part)
-            cute.autovec_copy(cos_part, cos_reg)
-            cute.autovec_copy(sin_part, sin_reg)
-
-            for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                q_base = (local_pos * self.tile_size_H + local_h) * self.D
-
-                q0_row = cute.make_tensor(
-                    q_smem + q_base,
+            if lane_idx < Int32(thr_count):
+                cos_row = cute.make_tensor(
+                    cos_smem + local_pos * self.D2,
                     cute.make_layout(self.D2),
                 )
-                q1_row = cute.make_tensor(
-                    q_smem + q_base + self.D2,
+                sin_row = cute.make_tensor(
+                    sin_smem + local_pos * self.D2,
                     cute.make_layout(self.D2),
                 )
+                cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
+                sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
+                cos_reg = cute.make_fragment_like(cos_part)
+                sin_reg = cute.make_fragment_like(sin_part)
+                cute.autovec_copy(cos_part, cos_reg)
+                cute.autovec_copy(sin_part, sin_reg)
 
-                q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
-                q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
-                q0_reg = cute.make_fragment_like(q0_part)
-                q1_reg = cute.make_fragment_like(q1_part)
-                cute.autovec_copy(q0_part, q0_reg)
-                cute.autovec_copy(q1_part, q1_reg)
+                for local_h in range(warp_idx, self.tile_size_H, num_warps):
+                    q_base = (local_pos * self.tile_size_H + local_h) * self.D
 
-                # Compute inverse rotation in fp32 (signs flipped vs forward)
-                out0_reg = cute.make_fragment_like(q0_reg)
-                out1_reg = cute.make_fragment_like(q1_reg)
-                for i in range(cute.size(q0_reg)):
-                    c = cos_reg[i].to(Float32)
-                    sn = sin_reg[i].to(Float32)
-                    v0 = q0_reg[i].to(Float32)
-                    v1 = q1_reg[i].to(Float32)
-                    out0_reg[i] = (v0 * c + v1 * sn).to(self.q_dtype)
-                    out1_reg[i] = (v1 * c - v0 * sn).to(self.q_dtype)
+                    q0_row = cute.make_tensor(
+                        q_smem + q_base,
+                        cute.make_layout(self.D2),
+                    )
+                    q1_row = cute.make_tensor(
+                        q_smem + q_base + self.D2,
+                        cute.make_layout(self.D2),
+                    )
 
-                cute.autovec_copy(out0_reg, q0_part)
-                cute.autovec_copy(out1_reg, q1_part)
+                    q0_part = cute.local_partition(q0_row, thr_layout, lane_idx)
+                    q1_part = cute.local_partition(q1_row, thr_layout, lane_idx)
+                    q0_reg = cute.make_fragment_like(q0_part)
+                    q1_reg = cute.make_fragment_like(q1_part)
+                    cute.autovec_copy(q0_part, q0_reg)
+                    cute.autovec_copy(q1_part, q1_reg)
+
+                    # Compute inverse rotation in fp32 (signs flipped vs forward)
+                    out0_reg = cute.make_fragment_like(q0_reg)
+                    out1_reg = cute.make_fragment_like(q1_reg)
+                    for i in range(cute.size(q0_reg)):
+                        c = cos_reg[i].to(Float32)
+                        sn = sin_reg[i].to(Float32)
+                        v0 = q0_reg[i].to(Float32)
+                        v1 = q1_reg[i].to(Float32)
+                        out0_reg[i] = (v0 * c + v1 * sn).to(self.q_dtype)
+                        out1_reg[i] = (v1 * c - v0 * sn).to(self.q_dtype)
+
+                    cute.autovec_copy(out0_reg, q0_part)
+                    cute.autovec_copy(out1_reg, q1_part)
 
 
 __all__ = ["RopeOp", "RopeBwdOp"]

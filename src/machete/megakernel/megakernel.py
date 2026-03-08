@@ -1581,20 +1581,6 @@ class Megakernel:
                             _ds_4,
                             _ds_cached_config,
                         )
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        if const_expr(tracing):
-                            for _si in range_constexpr(num_ops):
-                                if _ds_op == Int32(_si):
-                                    _store_lane = end_event_dynamic_raw_1(
-                                        _tss,
-                                        _trace_buf,
-                                        Int32(trace_row_stride),
-                                        _store_lane,
-                                        Int32(trace_store_fmts[_si]),
-                                        _ds_op,
-                                    )
-
                         # Communicate: send results to peer GPUs via TMA S2G
                         # (all 32 threads for TMA warp convergence)
                         if const_expr(has_communicate):
@@ -1608,8 +1594,21 @@ class Megakernel:
                                 _ds_4,
                                 _ds_cached_config,
                             )
-                            cute.arch.cp_async_bulk_commit_group()
-                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        # Commit local + peer S2G stores in one group so the
+                        # TMA engine pipelines both concurrently.
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        if const_expr(tracing):
+                            for _si in range_constexpr(num_ops):
+                                if _ds_op == Int32(_si):
+                                    _store_lane = end_event_dynamic_raw_1(
+                                        _tss,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _store_lane,
+                                        Int32(trace_store_fmts[_si]),
+                                        _ds_op,
+                                    )
 
                         # Thread 0: signal barriers + update store_idx
                         if lane_id == Int32(0):
