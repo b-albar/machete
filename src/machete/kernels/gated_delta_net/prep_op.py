@@ -110,6 +110,15 @@ class GDNPrepOp(Op):
         self.v_copy_dim1 = self.BV // self.async_copy_elems
         self.v_copy_dim0 = self.num_mma_threads // self.v_copy_dim1
 
+        # Padded strides for bank-conflict-free shared memory access.
+        # stride=BK (128 bytes/row for fp16) aliases all rows to same 32 banks.
+        # Padding shifts each row to different banks for conflict-free LdMatrix.
+        # s_src/s_srcv use cpasync (128-bit aligned) → pad by 8 (mult of 8).
+        # s_a16 uses autovec_copy (no alignment req) → pad by 2 for perfect banking.
+        self.BK_PAD = self.BK + 8  # stride 72 → banks cycle with period 8 rows
+        self.BV_PAD = self.BV + 8
+        self.BT_PAD = self.BT + 2  # stride 66 → each row hits unique bank
+
         # DMA does nothing — all work in compute
         self.inner_iters = 1
         self.inner_depth = 1
@@ -121,12 +130,14 @@ class GDNPrepOp(Op):
         self._gc_offset = self._beta_offset + self.BT * 4
         # s_k: [BT, BK] swizzled after scalar buffers, 128B aligned
         self._sk_base = ((self._gc_offset + self.BT * 4 + 127) // 128) * 128
+        self._sk_base2 = self._sk_base + self.BT * self.BK * self.elem_bytes
         # Phase 3: a_smem[BT, BT] fp32 at sk_base (16KB, reuses s_k region)
         self._a_base = self._sk_base
-        # Phase 4: s_a16[BT, BT] swizzled fp16 at sk_base (8KB, reuses a_smem lower half)
-        # s_src[BT, BK] swizzled fp16 after a_smem (need fresh region)
+        # Phase 4: s_a16[BT, BT_PAD] padded fp16 at sk_base (reuses a_smem)
+        # s_src[BT, BK_PAD] padded fp16 after a_smem (need fresh region)
         self._src_base = self._a_base + self.BT * self.BT * 4
         self._src_base = ((self._src_base + 127) // 128) * 128
+        self._src_base2 = self._src_base + self.BT * max(self.BK_PAD, self.BV_PAD) * self.elem_bytes
 
         # Override compute method
         self.compute = self.compute_mma
@@ -158,7 +169,11 @@ class GDNPrepOp(Op):
             for BV in [128, 64]:
                 if V % BV != 0:
                     continue
-                phase4 = src_base + max(BT * BK, BT * BV) * elem_bytes
+                # K-loop double-buffered (2×BK_PAD), V-loop single-buffer (1×BV_PAD)
+                # Padding per row for bank-conflict-free smem access
+                BK_PAD = BK + 8  # cpasync requires 128-bit aligned rows
+                BV_PAD = BV + 8
+                phase4 = src_base + max(2 * BT * BK_PAD, BT * BV_PAD) * elem_bytes
                 if phase4 <= page_size:
                     return BK, BV
         return 64, 64
@@ -273,7 +288,11 @@ class GDNPrepOp(Op):
 
     @cute.jit
     def _phase2_kkt(self, page_ptr, tidx, tile_B, tile_H, tile_T, k):
-        """Phase 2: K@K^T with MMA + gating + strictly lower triangular mask."""
+        """Phase 2: K@K^T with MMA + gating + strictly lower triangular mask.
+
+        Double-buffered: cpasync prefetches k[ki+1] while MMA runs on k[ki].
+        Two s_k buffers fit within the 16KB A-matrix region (A written after loop).
+        """
         swz = cute.make_swizzle(self.swizzle_B, 4, 3)
 
         # MMA setup
@@ -285,16 +304,6 @@ class GDNPrepOp(Op):
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
-        # s_k smem
-        s_k = cute.make_tensor(
-            cute.recast_ptr(
-                cute.make_ptr(self.k_dtype, page_ptr + Int32(self._sk_base),
-                              cute.AddressSpace.smem, assumed_align=128),
-                swz, dtype=self.k_dtype,
-            ),
-            cute.make_layout((self.BT, self.BK), stride=(self.BK, 1)),
-        )
-
         # LdMatrix B
         smem_copy_atom_B = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
@@ -302,18 +311,6 @@ class GDNPrepOp(Op):
         )
         smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
         smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
-
-        # MMA partitions: K as A, K^T as B (D += A @ B^T = K @ K^T)
-        # BK == BT guaranteed by _auto_block_sizes, so [BK,BT] is square
-        tCsK_A = thr_mma.partition_A(s_k)
-        tCrK_A = tiled_mma.make_fragment_A(tCsK_A)
-
-        s_kt_B = cute.make_tensor(s_k.iterator,
-            cute.make_layout((self.BK, self.BT), stride=(1, self.BK)))
-        _tBsKt = thr_mma.partition_B(s_kt_B)
-        tCrKt_B = tiled_mma.make_fragment_B(_tBsKt)
-        tKrKt_view = smem_thr_copy_B.retile(tCrKt_B)
-        tKsKt = smem_thr_copy_B.partition_S(s_kt_B)
 
         # cpasync setup for K loads
         k_async_atom = cute.make_copy_atom(
@@ -325,7 +322,36 @@ class GDNPrepOp(Op):
             cute.make_layout((1, self.async_copy_elems)),
         )
         k_thr_copy = k_tiled_copy.get_slice(tidx)
-        tK_s = k_thr_copy.partition_D(s_k)
+
+        # Two s_k buffers (swizzled) for double-buffering
+        sk_offsets = [self._sk_base, self._sk_base2]
+        s_k_bufs = []
+        tK_s_bufs = []
+        tCsK_A_bufs = []
+        tKsKt_bufs = []
+        for bi in cutlass.range_constexpr(2):
+            s_k_bi = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.k_dtype, page_ptr + Int32(sk_offsets[bi]),
+                                  cute.AddressSpace.smem, assumed_align=128),
+                    swz, dtype=self.k_dtype,
+                ),
+                cute.make_layout((self.BT, self.BK), stride=(self.BK, 1)),
+            )
+            s_k_bufs.append(s_k_bi)
+            tK_s_bufs.append(k_thr_copy.partition_D(s_k_bi))
+            tCsK_A_bufs.append(thr_mma.partition_A(s_k_bi))
+            s_kt_bi = cute.make_tensor(s_k_bi.iterator,
+                cute.make_layout((self.BK, self.BT), stride=(1, self.BK)))
+            tKsKt_bufs.append(smem_thr_copy_B.partition_S(s_kt_bi))
+
+        # Register fragments (same shape for both buffers)
+        s_kt_0 = cute.make_tensor(s_k_bufs[0].iterator,
+            cute.make_layout((self.BK, self.BT), stride=(1, self.BK)))
+        _tBsKt = thr_mma.partition_B(s_kt_0)
+        tCrK_A = tiled_mma.make_fragment_A(tCsK_A_bufs[0])
+        tCrKt_B = tiled_mma.make_fragment_B(_tBsKt)
+        tKrKt_view = smem_thr_copy_B.retile(tCrKt_B)
 
         # Identity for coordinate extraction
         mc_AA = cute.make_identity_tensor((self.BT, self.BT))
@@ -355,22 +381,39 @@ class GDNPrepOp(Op):
             tiled_mma.partition_shape_C((self.BT, self.BT)), Float32)
         acc_A.fill(0.0)
 
-        for ki in cutlass.range_constexpr(self.NK):
-            gK_tile = cute.local_tile(gK_head, (self.BT, self.BK),
-                                      (chunk_idx, Int32(ki)))
-            tK_g = k_thr_copy.partition_S(gK_tile)
-            for ci in cutlass.range_constexpr(cute.size(tK_s.shape[2])):
-                cute.copy(k_tiled_copy, tK_g[None, None, ci], tK_s[None, None, ci])
+        # Prefetch k[0] -> buf[0]
+        gK_tile0 = cute.local_tile(gK_head, (self.BT, self.BK),
+                                   (chunk_idx, Int32(0)))
+        tK_g0 = k_thr_copy.partition_S(gK_tile0)
+        for ci in cutlass.range_constexpr(cute.size(tK_s_bufs[0].shape[2])):
+            cute.copy(k_tiled_copy, tK_g0[None, None, ci],
+                      tK_s_bufs[0][None, None, ci])
+        cute.arch.cp_async_commit_group()
 
-            cute.arch.cp_async_commit_group()
+        for ki in cutlass.range_constexpr(self.NK):
+            buf = ki % 2
             cute.arch.cp_async_wait_group(0)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
+            # Prefetch next tile to other buffer
+            if ki + 1 < self.NK:
+                next_buf = (ki + 1) % 2
+                gK_next = cute.local_tile(gK_head, (self.BT, self.BK),
+                                          (chunk_idx, Int32(ki + 1)))
+                tK_g_next = k_thr_copy.partition_S(gK_next)
+                for ci in cutlass.range_constexpr(cute.size(tK_s_bufs[next_buf].shape[2])):
+                    cute.copy(k_tiled_copy, tK_g_next[None, None, ci],
+                              tK_s_bufs[next_buf][None, None, ci])
+                cute.arch.cp_async_commit_group()
+
             # MMA: acc_A += K @ K^T
             for kb in cutlass.range_constexpr(self.BK // 16):
-                cute.copy(smem_tiled_copy_B, tKsKt[None, None, kb], tKrKt_view[None, None, kb])
-                cute.autovec_copy(tCsK_A[None, None, kb], tCrK_A[None, None, kb])
-                cute.gemm(tiled_mma, acc_A, tCrK_A[None, None, kb], tCrKt_B[None, None, kb], acc_A)
+                cute.copy(smem_tiled_copy_B, tKsKt_bufs[buf][None, None, kb],
+                          tKrKt_view[None, None, kb])
+                cute.autovec_copy(tCsK_A_bufs[buf][None, None, kb],
+                                  tCrK_A[None, None, kb])
+                cute.gemm(tiled_mma, acc_A, tCrK_A[None, None, kb],
+                          tCrKt_B[None, None, kb], acc_A)
 
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
@@ -454,11 +497,9 @@ class GDNPrepOp(Op):
     def _phase4_wu(self, page_ptr, tidx, tile_B, tile_H, tile_T, k, v, w, u):
         """Phase 4: A_solved @ k_weighted -> w, A_solved @ v_weighted -> u.
 
-        Reads A_solved from a_smem (fp32), converts to fp16 in s_a16.
-        Then for each K-block: loads k, applies weighting, MMA A_solved @ k_weighted.
-        Same for each V-block with v.
+        Double-buffered cpasync: prefetch next tile while computing current tile.
+        Two s_src buffers at _src_base and _src_base2.
         """
-        swz = cute.make_swizzle(self.swizzle_B, 4, 3)
         chunk_idx = tile_T
 
         # Read A_solved from fp32 smem
@@ -497,18 +538,11 @@ class GDNPrepOp(Op):
         smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
         smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
 
-        # s_a16: [BT, BT] fp16 at sk_base (8KB) — NOT swizzled (need element access)
+        # s_a16: [BT, BT] fp16 at sk_base — padded stride for bank-conflict-free access
         s_a16 = cute.make_tensor(
             cute.make_ptr(self.k_dtype, page_ptr + Int32(self._sk_base),
                           cute.AddressSpace.smem, assumed_align=128),
-            cute.make_layout((self.BT, self.BT), stride=(self.BT, 1)),
-        )
-
-        # s_src: [BT, BK] fp16 for weighted source data — NOT swizzled (need element access)
-        s_src = cute.make_tensor(
-            cute.make_ptr(self.k_dtype, page_ptr + Int32(self._src_base),
-                          cute.AddressSpace.smem, assumed_align=128),
-            cute.make_layout((self.BT, self.BK), stride=(self.BK, 1)),
+            cute.make_layout((self.BT, self.BT), stride=(self.BT_PAD, 1)),
         )
 
         # Convert A_solved fp32 -> fp16 in s_a16, thread-parallel
@@ -527,14 +561,6 @@ class GDNPrepOp(Op):
         tCsA16 = thr_mma.partition_A(s_a16)
         tCrA16 = tiled_mma.make_fragment_A(tCsA16)
 
-        # src as B operand: [BK, BT] transposed view of s_src
-        s_src_B = cute.make_tensor(s_src.iterator,
-            cute.make_layout((self.BK, self.BT), stride=(1, self.BK)))
-        _tBsSrc = thr_mma.partition_B(s_src_B)
-        tCrSrc_B = tiled_mma.make_fragment_B(_tBsSrc)
-        tSrSrc_view = smem_thr_copy_B.retile(tCrSrc_B)
-        tSsSrc = smem_thr_copy_B.partition_S(s_src_B)
-
         # cpasync for BK-wide loads
         k_async_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), self.k_dtype, num_bits_per_copy=128)
@@ -545,7 +571,30 @@ class GDNPrepOp(Op):
             cute.make_layout((1, self.async_copy_elems)),
         )
         k_thr_copy = k_tiled_copy.get_slice(tidx)
-        tSrc_s = k_thr_copy.partition_D(s_src)
+
+        # Two s_src buffers for double-buffered K loads (padded stride)
+        src_offsets = [self._src_base, self._src_base2]
+        s_src_bufs = []
+        tSrc_s_bufs = []
+        tSsSrc_bufs = []
+        for bi in cutlass.range_constexpr(2):
+            s_src_bi = cute.make_tensor(
+                cute.make_ptr(self.k_dtype, page_ptr + Int32(src_offsets[bi]),
+                              cute.AddressSpace.smem, assumed_align=128),
+                cute.make_layout((self.BT, self.BK), stride=(self.BK_PAD, 1)),
+            )
+            s_src_bufs.append(s_src_bi)
+            tSrc_s_bufs.append(k_thr_copy.partition_D(s_src_bi))
+            s_src_B_bi = cute.make_tensor(s_src_bi.iterator,
+                cute.make_layout((self.BK, self.BT), stride=(1, self.BK_PAD)))
+            tSsSrc_bufs.append(smem_thr_copy_B.partition_S(s_src_B_bi))
+
+        # Register fragments for B (same shape for both buffers)
+        s_src_B_0 = cute.make_tensor(s_src_bufs[0].iterator,
+            cute.make_layout((self.BK, self.BT), stride=(1, self.BK_PAD)))
+        _tBsSrc = thr_mma.partition_B(s_src_B_0)
+        tCrSrc_B = tiled_mma.make_fragment_B(_tBsSrc)
+        tSrSrc_view = smem_thr_copy_B.retile(tCrSrc_B)
 
         # Identity for coordinates
         mc_out = cute.make_identity_tensor((self.BT, self.BK))
@@ -557,42 +606,48 @@ class GDNPrepOp(Op):
             (k.iterator + kw_base).align(16),
             cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
 
-        uv_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.V)
-        gV_head = cute.make_tensor(
-            (v.iterator + uv_base).align(16),
-            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
-
         gW_head = cute.make_tensor(
             (w.iterator + kw_base).align(16),
             cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
 
-        gU_head = cute.make_tensor(
-            (u.iterator + uv_base).align(16),
-            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+        # ---- Phase 4a: w = A_solved @ k_weighted (double-buffered) ----
+        # Prefetch k[0] -> buf[0]
+        gK_tile0 = cute.local_tile(gK_head, (self.BT, self.BK),
+                                   (chunk_idx, Int32(0)))
+        tK_g0 = k_thr_copy.partition_S(gK_tile0)
+        for ci in cutlass.range_constexpr(cute.size(tSrc_s_bufs[0].shape[2])):
+            cute.copy(k_tiled_copy, tK_g0[None, None, ci],
+                      tSrc_s_bufs[0][None, None, ci])
+        cute.arch.cp_async_commit_group()
 
-        # ---- Phase 4a: w = A_solved @ k_weighted ----
-        # k_weighted[t, :] = k[t, :] * beta[t] * exp(g_cumsum[t])
         for ki in cutlass.range_constexpr(self.NK):
-            # Load k[BT, BK] via cpasync
-            gK_tile = cute.local_tile(gK_head, (self.BT, self.BK),
-                                      (chunk_idx, Int32(ki)))
-            tK_g = k_thr_copy.partition_S(gK_tile)
-            for ci in cutlass.range_constexpr(cute.size(tSrc_s.shape[2])):
-                cute.copy(k_tiled_copy, tK_g[None, None, ci], tSrc_s[None, None, ci])
+            # Extract buffer refs before dynamic code (avoid SSA wrapping of Python ints)
+            _cur_src = s_src_bufs[ki % 2]
+            _cur_tSsSrc = tSsSrc_bufs[ki % 2]
 
-            cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-            # Apply weighting in-place: s_src[row, col] *= beta[row] * exp(gc[row])
+            # Prefetch next K-tile to other buffer
+            if ki + 1 < self.NK:
+                _next_tSrc = tSrc_s_bufs[(ki + 1) % 2]
+                gK_next = cute.local_tile(gK_head, (self.BT, self.BK),
+                                          (chunk_idx, Int32(ki + 1)))
+                tK_g_next = k_thr_copy.partition_S(gK_next)
+                for ci in cutlass.range_constexpr(cute.size(_next_tSrc.shape[2])):
+                    cute.copy(k_tiled_copy, tK_g_next[None, None, ci],
+                              _next_tSrc[None, None, ci])
+                cute.arch.cp_async_commit_group()
+
+            # Apply weighting in-place on current buffer
             for ei in cutlass.range_constexpr(_elems_per_thread):
                 flat_idx = tidx + Int32(ei * _nthreads)
                 row_s = flat_idx // Int32(self.BK)
                 col_s = flat_idx % Int32(self.BK)
                 if row_s < Int32(self.BT):
-                    old_val = s_src[row_s, col_s].to(Float32)
+                    old_val = _cur_src[row_s, col_s].to(Float32)
                     weight = beta_buf[row_s] * cute.math.exp(gc_buf[row_s], fastmath=True)
-                    s_src[row_s, col_s] = (old_val * weight).to(self.k_dtype)
+                    _cur_src[row_s, col_s] = (old_val * weight).to(self.k_dtype)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
             # MMA: acc_w = A_solved @ k_weighted  [BT,BT] x [BT,BK] -> [BT,BK]
@@ -601,9 +656,11 @@ class GDNPrepOp(Op):
             acc_w.fill(0.0)
 
             for kb in cutlass.range_constexpr(self.BT // 16):
-                cute.copy(smem_tiled_copy_B, tSsSrc[None, None, kb], tSrSrc_view[None, None, kb])
+                cute.copy(smem_tiled_copy_B, _cur_tSsSrc[None, None, kb],
+                          tSrSrc_view[None, None, kb])
                 cute.autovec_copy(tCsA16[None, None, kb], tCrA16[None, None, kb])
-                cute.gemm(tiled_mma, acc_w, tCrA16[None, None, kb], tCrSrc_B[None, None, kb], acc_w)
+                cute.gemm(tiled_mma, acc_w, tCrA16[None, None, kb],
+                          tCrSrc_B[None, None, kb], acc_w)
 
             # Write w[BT, BK] to global
             gW_tile = cute.local_tile(gW_head, (self.BT, self.BK),
@@ -615,8 +672,7 @@ class GDNPrepOp(Op):
 
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-        # ---- Phase 4b: u = A_solved @ v_weighted ----
-        # v_weighted[t, :] = v[t, :] * beta[t]
+        # ---- Phase 4b: u = A_solved @ v_weighted (double-buffered) ----
         v_async_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), self.k_dtype, num_bits_per_copy=128)
         v_tiled_copy = cute.make_tiled_copy_tv(
@@ -627,21 +683,28 @@ class GDNPrepOp(Op):
         )
         v_thr_copy = v_tiled_copy.get_slice(tidx)
 
-        # s_src_v: [BT, BV] — reuse s_src region since BV == BK (NOT swizzled)
-        s_src_v = cute.make_tensor(
-            cute.make_ptr(self.k_dtype, page_ptr + Int32(self._src_base),
-                          cute.AddressSpace.smem, assumed_align=128),
-            cute.make_layout((self.BT, self.BV), stride=(self.BV, 1)),
-        )
-        tSrcV_s = v_thr_copy.partition_D(s_src_v)
+        # Two s_src_v buffers for double-buffered V loads (padded stride, reuse src regions)
+        s_srcv_bufs = []
+        tSrcV_s_bufs = []
+        tSsSrcV_bufs = []
+        for bi in cutlass.range_constexpr(2):
+            s_srcv_bi = cute.make_tensor(
+                cute.make_ptr(self.k_dtype, page_ptr + Int32(src_offsets[bi]),
+                              cute.AddressSpace.smem, assumed_align=128),
+                cute.make_layout((self.BT, self.BV), stride=(self.BV_PAD, 1)),
+            )
+            s_srcv_bufs.append(s_srcv_bi)
+            tSrcV_s_bufs.append(v_thr_copy.partition_D(s_srcv_bi))
+            s_srcv_B_bi = cute.make_tensor(s_srcv_bi.iterator,
+                cute.make_layout((self.BV, self.BT), stride=(1, self.BV_PAD)))
+            tSsSrcV_bufs.append(smem_thr_copy_B.partition_S(s_srcv_B_bi))
 
-        # B operand for [BV, BT] transposed
-        s_srcv_B = cute.make_tensor(s_src_v.iterator,
-            cute.make_layout((self.BV, self.BT), stride=(1, self.BV)))
-        _tBsSrcV = thr_mma.partition_B(s_srcv_B)
+        # Register fragments for V B operand
+        s_srcv_B_0 = cute.make_tensor(s_srcv_bufs[0].iterator,
+            cute.make_layout((self.BV, self.BT), stride=(1, self.BV_PAD)))
+        _tBsSrcV = thr_mma.partition_B(s_srcv_B_0)
         tCrSrcV_B = tiled_mma.make_fragment_B(_tBsSrcV)
         tSrSrcV_view = smem_thr_copy_B.retile(tCrSrcV_B)
-        tSsSrcV = smem_thr_copy_B.partition_S(s_srcv_B)
 
         # Identity for V-dim output coordinates
         mc_outv = cute.make_identity_tensor((self.BT, self.BV))
@@ -649,17 +712,42 @@ class GDNPrepOp(Op):
 
         _elems_per_thread_v = (self.BT * self.BV) // _nthreads
 
-        for vi in cutlass.range_constexpr(self.NV):
-            # Load v[BT, BV] via cpasync
-            gV_tile = cute.local_tile(gV_head, (self.BT, self.BV),
-                                      (chunk_idx, Int32(vi)))
-            tV_g = v_thr_copy.partition_S(gV_tile)
-            for ci in cutlass.range_constexpr(cute.size(tSrcV_s.shape[2])):
-                cute.copy(v_tiled_copy, tV_g[None, None, ci], tSrcV_s[None, None, ci])
+        uv_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.V)
+        gV_head = cute.make_tensor(
+            (v.iterator + uv_base).align(16),
+            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
 
-            cute.arch.cp_async_commit_group()
+        gU_head = cute.make_tensor(
+            (u.iterator + uv_base).align(16),
+            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+
+        # Prefetch v[0] -> buf[0]
+        gV_tile0 = cute.local_tile(gV_head, (self.BT, self.BV),
+                                   (chunk_idx, Int32(0)))
+        tV_g0 = v_thr_copy.partition_S(gV_tile0)
+        for ci in cutlass.range_constexpr(cute.size(tSrcV_s_bufs[0].shape[2])):
+            cute.copy(v_tiled_copy, tV_g0[None, None, ci],
+                      tSrcV_s_bufs[0][None, None, ci])
+        cute.arch.cp_async_commit_group()
+
+        for vi in cutlass.range_constexpr(self.NV):
+            # Extract buffer refs before dynamic code (avoid SSA wrapping)
+            _cur_srcv = s_srcv_bufs[vi % 2]
+            _cur_tSsSrcV = tSsSrcV_bufs[vi % 2]
+
             cute.arch.cp_async_wait_group(0)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+            # Prefetch next V-tile to other buffer
+            if vi + 1 < self.NV:
+                _next_tSrcV = tSrcV_s_bufs[(vi + 1) % 2]
+                gV_next = cute.local_tile(gV_head, (self.BT, self.BV),
+                                          (chunk_idx, Int32(vi + 1)))
+                tV_g_next = v_thr_copy.partition_S(gV_next)
+                for ci in cutlass.range_constexpr(cute.size(_next_tSrcV.shape[2])):
+                    cute.copy(v_tiled_copy, tV_g_next[None, None, ci],
+                              _next_tSrcV[None, None, ci])
+                cute.arch.cp_async_commit_group()
 
             # Apply weighting: v_weighted = v * beta
             for ei in cutlass.range_constexpr(_elems_per_thread_v):
@@ -667,9 +755,9 @@ class GDNPrepOp(Op):
                 row_s = flat_idx // Int32(self.BV)
                 col_s = flat_idx % Int32(self.BV)
                 if row_s < Int32(self.BT):
-                    old_val = s_src_v[row_s, col_s].to(Float32)
+                    old_val = _cur_srcv[row_s, col_s].to(Float32)
                     weight = beta_buf[row_s]
-                    s_src_v[row_s, col_s] = (old_val * weight).to(self.k_dtype)
+                    _cur_srcv[row_s, col_s] = (old_val * weight).to(self.k_dtype)
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
             # MMA: acc_u = A_solved @ v_weighted  [BT,BT] x [BT,BV] -> [BT,BV]
@@ -678,9 +766,11 @@ class GDNPrepOp(Op):
             acc_u.fill(0.0)
 
             for kb in cutlass.range_constexpr(self.BT // 16):
-                cute.copy(smem_tiled_copy_B, tSsSrcV[None, None, kb], tSrSrcV_view[None, None, kb])
+                cute.copy(smem_tiled_copy_B, _cur_tSsSrcV[None, None, kb],
+                          tSrSrcV_view[None, None, kb])
                 cute.autovec_copy(tCsA16[None, None, kb], tCrA16[None, None, kb])
-                cute.gemm(tiled_mma, acc_u, tCrA16[None, None, kb], tCrSrcV_B[None, None, kb], acc_u)
+                cute.gemm(tiled_mma, acc_u, tCrA16[None, None, kb],
+                          tCrSrcV_B[None, None, kb], acc_u)
 
             # Write u[BT, BV] to global
             gU_tile = cute.local_tile(gU_head, (self.BT, self.BV),

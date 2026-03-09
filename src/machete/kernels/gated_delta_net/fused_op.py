@@ -550,31 +550,41 @@ class GDNFusedOp(Op):
                     tiled_mma.partition_shape_C((self.BT, self.BT)), Float32)
                 acc_A.fill(0.0)
 
+                # Phase A prologue: h[0] → s_h + prefetch w[0]+K[0]
+                _h0_tmp = cute.make_fragment_like(h_accs[0], self.q_dtype)
+                for ci in cutlass.range_constexpr(cute.size(h_accs[0])):
+                    _h0_tmp[ci] = h_accs[0][ci].to(self.q_dtype)
+                _tOrH0 = smem_thr_copy_C.retile(_h0_tmp)
+                _tOsH0 = smem_thr_copy_C.partition_D(s_h)
+                cute.copy(smem_tiled_copy_C, _tOrH0, _tOsH0)
+
+                _gW0 = cute.local_tile(gW_head, (self.BT, self.BK),
+                                        (chunk_idx, Int32(0)))
+                _tWg0 = wk_thr_copy.partition_S(_gW0)
+                for ci in cutlass.range_constexpr(cute.size(tWK_s_bufs[0].shape[2])):
+                    cute.copy(wk_tiled_copy, _tWg0[None, None, ci],
+                              tWK_s_bufs[0][None, None, ci])
+                _gK0 = cute.local_tile(gK_head, (self.BT, self.BK),
+                                        (chunk_idx, Int32(0)))
+                _tKg0 = wk_thr_copy.partition_S(_gK0)
+                for ci in cutlass.range_constexpr(cute.size(tK_s_bufs[0].shape[2])):
+                    cute.copy(wk_tiled_copy, _tKg0[None, None, ci],
+                              tK_s_bufs[0][None, None, ci])
+                cute.arch.cp_async_commit_group()
+
                 for ki in cutlass.range_constexpr(self.NK):
                     cur = ki % 2
 
-                    # h[ki] → s_h (fp32→fp16)
-                    h_tmp = cute.make_fragment_like(h_accs[ki], self.q_dtype)
-                    for ci in cutlass.range_constexpr(cute.size(h_accs[ki])):
-                        h_tmp[ci] = h_accs[ki][ci].to(self.q_dtype)
-                    tOrH = smem_thr_copy_C.retile(h_tmp)
-                    tOsH = smem_thr_copy_C.partition_D(s_h)
-                    cute.copy(smem_tiled_copy_C, tOrH, tOsH)
+                    if ki > 0:
+                        # h[ki] → s_h (safe: previous GEMMs done after barrier)
+                        h_tmp = cute.make_fragment_like(h_accs[ki], self.q_dtype)
+                        for ci in cutlass.range_constexpr(cute.size(h_accs[ki])):
+                            h_tmp[ci] = h_accs[ki][ci].to(self.q_dtype)
+                        tOrH = smem_thr_copy_C.retile(h_tmp)
+                        tOsH = smem_thr_copy_C.partition_D(s_h)
+                        cute.copy(smem_tiled_copy_C, tOrH, tOsH)
 
-                    # Load w[ki] → s_wk[cur] and K[ki] → s_q_bufs[ki]
-                    gW_tile = cute.local_tile(gW_head, (self.BT, self.BK),
-                                              (chunk_idx, Int32(ki)))
-                    tWK_g = wk_thr_copy.partition_S(gW_tile)
-                    for ci in cutlass.range_constexpr(cute.size(tWK_s_bufs[cur].shape[2])):
-                        cute.copy(wk_tiled_copy, tWK_g[None, None, ci],
-                                  tWK_s_bufs[cur][None, None, ci])
-                    gK_tile = cute.local_tile(gK_head, (self.BT, self.BK),
-                                              (chunk_idx, Int32(ki)))
-                    tK_g = wk_thr_copy.partition_S(gK_tile)
-                    for ci in cutlass.range_constexpr(cute.size(tK_s_bufs[ki].shape[2])):
-                        cute.copy(wk_tiled_copy, tK_g[None, None, ci],
-                                  tK_s_bufs[ki][None, None, ci])
-                    cute.arch.cp_async_commit_group()
+                    # Wait for prefetched w[ki]+K[ki]
                     cute.arch.cp_async_wait_group(0)
                     named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
@@ -591,6 +601,28 @@ class GDNFusedOp(Op):
                         cute.gemm(tiled_mma, acc_o,
                                   tCrQ_full_parts[ki][None, None, kb],
                                   tCrB[None, None, kb], acc_o)
+
+                    # Prefetch w[ki+1]+K[ki+1] (overlaps with GEMM3 below)
+                    # Clamp indices to valid range (AST rewriter traces both
+                    # if-branches; list access must be safe even in dead branch)
+                    _nxt_safe = min(ki + 1, self.NK - 1)
+                    _nxt_cur_safe = _nxt_safe % 2
+                    if ki < self.NK - 1:
+                        _gW_nxt = cute.local_tile(gW_head, (self.BT, self.BK),
+                                                   (chunk_idx, Int32(_nxt_safe)))
+                        _tWg_nxt = wk_thr_copy.partition_S(_gW_nxt)
+                        for ci in cutlass.range_constexpr(
+                                cute.size(tWK_s_bufs[_nxt_cur_safe].shape[2])):
+                            cute.copy(wk_tiled_copy, _tWg_nxt[None, None, ci],
+                                      tWK_s_bufs[_nxt_cur_safe][None, None, ci])
+                        _gK_nxt = cute.local_tile(gK_head, (self.BT, self.BK),
+                                                   (chunk_idx, Int32(_nxt_safe)))
+                        _tKg_nxt = wk_thr_copy.partition_S(_gK_nxt)
+                        for ci in cutlass.range_constexpr(
+                                cute.size(tK_s_bufs[_nxt_safe].shape[2])):
+                            cute.copy(wk_tiled_copy, _tKg_nxt[None, None, ci],
+                                      tK_s_bufs[_nxt_safe][None, None, ci])
+                        cute.arch.cp_async_commit_group()
 
                     # GEMM2-output: acc_A += Q @ K^T (K from s_q_bufs[ki])
                     for kb in cutlass.range_constexpr(self.BK // 16):
