@@ -281,6 +281,60 @@ class TileScheduler(ABC):
             return min(consumer_cursor + 1, producer_total)
 
 
+def _compute_op_depths(num_ops: int, edges: List["_DepEdge"]) -> List[int]:
+    """Compute per-op depth via BFS from sinks.
+
+    Depth = longest path from this op to any sink. Sinks have depth 0,
+    their producers have depth 1, etc. Disconnected ops get max_depth + 1.
+    """
+    producer_deps: Dict[int, List[int]] = {i: [] for i in range(num_ops)}
+    for edge in edges:
+        producer_deps[edge.consumer_idx].append(edge.producer_idx)
+
+    depth = [-1] * num_ops
+    has_consumer = set()
+    for edge in edges:
+        has_consumer.add(edge.producer_idx)
+
+    queue = deque()
+    for i in range(num_ops):
+        if i not in has_consumer:
+            depth[i] = 0
+            queue.append(i)
+
+    while queue:
+        op_idx = queue.popleft()
+        for prod_idx in producer_deps[op_idx]:
+            new_depth = depth[op_idx] + 1
+            if depth[prod_idx] < new_depth:
+                depth[prod_idx] = new_depth
+                queue.append(prod_idx)
+
+    max_depth = max(depth) if depth else 0
+    for i in range(num_ops):
+        if depth[i] < 0:
+            depth[i] = max_depth + 1
+
+    return depth
+
+
+def _depth_sorted_instructions(
+    op_records: List["_OpRecord"],
+    depth: List[int],
+) -> List[TileInstruction]:
+    """Sort tiles by (-depth, op_idx, tile_idx) and return instructions."""
+    entries = []
+    for rec in op_records:
+        op_depth = depth[rec.op_idx]
+        for tile_idx, tile in enumerate(rec.tiles):
+            entries.append((-op_depth, rec.op_idx, tile_idx, tile))
+    entries.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [
+        TileInstruction(op_idx=op_idx, tiles=tile)
+        for _, op_idx, _, tile in entries
+    ]
+
+
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
 
@@ -293,11 +347,6 @@ class BackwardScheduler(TileScheduler):
     instruction stream, runtime barrier waits never stall — by the time
     an SM fetches a consumer tile, all producer tiles are already in
     flight or completed.
-
-    Algorithm:
-    1. Compute depth per op via BFS from sinks
-    2. Sort tiles by (-depth, op_idx, tile_idx)
-    3. Emit in sorted order
     """
 
     def schedule(
@@ -306,54 +355,86 @@ class BackwardScheduler(TileScheduler):
         consumer_deps: Dict[int, List["_DepEdge"]],
         edges: List["_DepEdge"],
     ) -> List[TileInstruction]:
-        num_ops = len(op_records)
-        if num_ops == 0:
+        if not op_records:
+            return []
+        depth = _compute_op_depths(len(op_records), edges)
+        return _depth_sorted_instructions(op_records, depth)
+
+
+class GroupedScheduler(TileScheduler):
+    """Interleaved scheduler that groups tiles by shared dimensions.
+
+    For ops with many-to-one dependencies (e.g., PrepOp(B,H,T) → FusedOp(B,H,V)),
+    groups tiles by the shared dims (B,H) and interleaves groups:
+
+    Instead of: all PrepOp(b,h,*) then all FusedOp(b,h,*)
+    Produces:   PrepOp(0,0,*) FusedOp(0,0,*) PrepOp(0,1,*) FusedOp(0,1,*) ...
+
+    This enables FusedOp(0,0,*) to start as soon as PrepOp(0,0,*) completes,
+    while PrepOp(0,1,*) runs on other SMs — overlapping producer and consumer
+    across groups.
+
+    Falls back to BackwardScheduler ordering when no shared dimensions exist.
+    """
+
+    @staticmethod
+    def _find_shared_dims(
+        op_records: List["_OpRecord"],
+        edges: List["_DepEdge"],
+    ) -> Optional[Set[str]]:
+        """Find dimensions shared across all dependency edges."""
+        shared_dims: Optional[Set[str]] = None
+        for edge in edges:
+            p_dims = set(op_records[edge.producer_idx].op.dim_names.keys())
+            c_dims = set(op_records[edge.consumer_idx].op.dim_names.keys())
+            edge_shared = p_dims & c_dims
+            if shared_dims is None:
+                shared_dims = edge_shared
+            else:
+                shared_dims &= edge_shared
+        return shared_dims if shared_dims else None
+
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        if not op_records:
             return []
 
-        # Compute depth: longest path FROM this op TO any sink
-        # Sinks have depth 0, their producers have depth 1, etc.
-        producer_deps: Dict[int, List[int]] = {i: [] for i in range(num_ops)}
-        for edge in edges:
-            producer_deps[edge.consumer_idx].append(edge.producer_idx)
+        depth = _compute_op_depths(len(op_records), edges)
+        shared_dims = self._find_shared_dims(op_records, edges)
 
-        depth = [-1] * num_ops
-        has_consumer = set()
-        for edge in edges:
-            has_consumer.add(edge.producer_idx)
+        if not shared_dims:
+            return _depth_sorted_instructions(op_records, depth)
 
-        queue = deque()
-        for i in range(num_ops):
-            if i not in has_consumer:
-                depth[i] = 0
-                queue.append(i)
-
-        while queue:
-            op_idx = queue.popleft()
-            for prod_idx in producer_deps[op_idx]:
-                new_depth = depth[op_idx] + 1
-                if depth[prod_idx] < new_depth:
-                    depth[prod_idx] = new_depth
-                    queue.append(prod_idx)
-
-        # Handle disconnected ops
-        max_depth = max(depth) if depth else 0
-        for i in range(num_ops):
-            if depth[i] < 0:
-                depth[i] = max_depth + 1
-
-        # Sort all tiles by (-depth, op_idx, tile_idx)
-        # Higher depth = earlier in schedule (producers before consumers)
-        instructions = []
+        # Map shared dims to tile axes for each op
+        sorted_shared = sorted(shared_dims)
+        op_group_axes: Dict[int, List[Optional[int]]] = {}
         for rec in op_records:
+            op_group_axes[rec.op_idx] = [
+                rec.op.dim_names.get(dim) for dim in sorted_shared
+            ]
+
+        # Build (group_key, -depth, op_idx, tile_idx) and sort
+        entries = []
+        for rec in op_records:
+            axes = op_group_axes[rec.op_idx]
             op_depth = depth[rec.op_idx]
             for tile_idx, tile in enumerate(rec.tiles):
-                instructions.append((-op_depth, rec.op_idx, tile_idx, tile))
+                group_key = tuple(
+                    tile[ax] if ax is not None else 0 for ax in axes
+                )
+                entries.append(
+                    (group_key, -op_depth, rec.op_idx, tile_idx, tile)
+                )
 
-        instructions.sort(key=lambda x: (x[0], x[1], x[2]))
+        entries.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
         return [
             TileInstruction(op_idx=op_idx, tiles=tile)
-            for _, op_idx, _, tile in instructions
+            for _, _, op_idx, _, tile in entries
         ]
 
 
@@ -919,7 +1000,7 @@ class InstructionStreamBuilder:
         instructions.append(TileInstruction.end_instruction())
         return instructions
 
-    def build_tensor(self, device: str = "cuda"):
+    def build_tensor(self, device: str = "cuda", scheduler: Optional[TileScheduler] = None):
         """Build instruction stream as GPU tensor.
 
         Returns:
@@ -928,7 +1009,7 @@ class InstructionStreamBuilder:
         """
         import torch
 
-        instructions = self.build()
+        instructions = self.build(scheduler=scheduler)
         # Precompute row-major strides per op for linearization
         strides_by_op = {
             r.op_idx: _linear_strides(r.op.tile_counts)
@@ -1049,6 +1130,7 @@ __all__ = [
     "TileInstruction",
     "TileScheduler",
     "BackwardScheduler",
+    "GroupedScheduler",
     "get_default_scheduler",
     "set_default_scheduler",
     "InstructionStreamBuilder",

@@ -162,10 +162,12 @@ class Megakernel:
         ops: List[ScheduledOp],
         config: Optional[MegakernelConfig] = None,
         device: str = "cuda",
+        scheduler: Optional["TileScheduler"] = None,
     ):
         self.ops = ops
         self.config = config or MegakernelConfig()
         self.device = device
+        self._scheduler = scheduler
 
         # Detect SM count if not specified
         if self.config.num_sms is None:
@@ -262,7 +264,9 @@ class Megakernel:
     def _prepare_tensors(self) -> None:
         """Prepare instruction, barrier, and config tensors on GPU."""
         if self._instructions_tensor is None:
-            self._instructions_tensor = self._builder.build_tensor(self.device)
+            self._instructions_tensor = self._builder.build_tensor(
+                self.device, scheduler=self._scheduler
+            )
             self._num_instructions = self._instructions_tensor.shape[0]
             self._num_instructions_i32 = Int32(self._num_instructions)
 

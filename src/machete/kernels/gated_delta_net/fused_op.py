@@ -700,19 +700,10 @@ class GDNFusedOp(Op):
                               tCrVt[None, None, kb], acc_intra)
 
                 # -------------------------------------------------------
-                # Phase E: Write O to global (element-wise)
-                # -------------------------------------------------------
-                gO_tile = cute.local_tile(gO_head, (self.BT, self.BV),
-                                          (chunk_idx, tile_V))
-                for ci in cutlass.range_constexpr(cute.size(acc_o)):
-                    row = tCcTV[ci][0]
-                    col = tCcTV[ci][1]
-                    o_val = (acc_o[ci] + acc_intra[ci]) * Float32(self.scale_val)
-                    gO_tile[Int32(row), Int32(col)] = o_val.to(self.q_dtype)
-
-                # -------------------------------------------------------
                 # Phase F: State GEMM2 — h[ki] = decay*h[ki] + k^T @ v_gated
-                #   K[ki] already in s_q_bufs[ki] from Phase A (single K-loop)
+                #   K[ki] already in s_q_bufs[ki] from Phase A.
+                #   Moved BEFORE Phase E so pipeline cpasync overlaps with
+                #   O global writes (different HW units: copy engine vs stores).
                 # -------------------------------------------------------
                 # Write gated v_new → s_v (overwrite non-gated)
                 tOrVG = smem_thr_copy_C.retile(vgated_regs)
@@ -738,6 +729,7 @@ class GDNFusedOp(Op):
                                   tCrA[None, None, kb], tCrB[None, None, kb], h_accs[ki])
 
                 # Pipeline: Q[chunk+1] + u[chunk+1] cpasync
+                # Issued after Phase F frees s_q_bufs (K^T) and s_v (v_gated).
                 next_chunk = chunk_idx + Int32(1)
                 if next_chunk < Int32(self.NT_val):
                     for qi in cutlass.range_constexpr(self.NK):
@@ -757,6 +749,19 @@ class GDNFusedOp(Op):
                         cute.copy(uv_tiled_copy, tU_g_nxt[None, None, ci],
                                   tU_s[None, None, ci])
                     cute.arch.cp_async_commit_group()
+
+                # -------------------------------------------------------
+                # Phase E: Write O to global (element-wise)
+                # After pipeline cpasync — O stores overlap with copy engine.
+                # acc_o + acc_intra are registers, no smem dependency.
+                # -------------------------------------------------------
+                gO_tile = cute.local_tile(gO_head, (self.BT, self.BV),
+                                          (chunk_idx, tile_V))
+                for ci in cutlass.range_constexpr(cute.size(acc_o)):
+                    row = tCcTV[ci][0]
+                    col = tCcTV[ci][1]
+                    o_val = (acc_o[ci] + acc_intra[ci]) * Float32(self.scale_val)
+                    gO_tile[Int32(row), Int32(col)] = o_val.to(self.q_dtype)
 
                 chunk_idx = chunk_idx + Int32(1)
 
