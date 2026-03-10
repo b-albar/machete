@@ -209,7 +209,8 @@ class GDNFusedOp(Op):
         if tensor_name != "q":
             return None
         K = static_dims["K"]
-        return (tile_sizes.get("B", 1), _BT, tile_sizes.get("H", 1), K)
+        # 3D tile (BT, H, K) — framework merges B*T into one dim.
+        return (_BT, tile_sizes.get("H", 1), K)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
@@ -240,26 +241,29 @@ class GDNFusedOp(Op):
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
 
-        # Q TMA tile shape (reversed from (B, T, H, K)): (K, H, BT, B)
+        # Merged B*T coordinate (framework collapses B and T into one CuTe mode)
+        merged_t = tile_B * Int32(self.T // self.BT)
+
+        # Q TMA tile shape (reversed from (BT, H, K)): (K, H, BT)
         sQ = cute.make_tensor(
             cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.K, 1, self.BT, 1)),
+            cute.make_layout((self.K, 1, self.BT)),
         )
         gQ = cute.local_tile(
             q_tma_gmem,
-            (self.K, 1, self.BT, 1),
-            (None, None, None, None),
+            (self.K, 1, self.BT),
+            (None, None, None),
         )
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
             q_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sQ, 0, 4), cute.group_modes(gQ, 0, 4),
+            cute.group_modes(sQ, 0, 3), cute.group_modes(gQ, 0, 3),
         )
 
         nbytes = Int32(self.q_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        # Copy index: (None, K_coord=0, H_coord, T_coord=0, B_coord)
-        cute.copy(q_tma, tQgQ[(None, Int32(0), tile_H, Int32(0), tile_B)],
+        # Copy index: (None, K_coord=0, H_coord, merged_BT_coord)
+        cute.copy(q_tma, tQgQ[(None, Int32(0), tile_H, merged_t)],
                   tQsQ, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -802,7 +806,8 @@ class GDNFusedBwdOp(Op):
         if tensor_name != "do":
             return None
         BV = static_dims.get("BV", _BV)
-        return (tile_sizes.get("B", 1), _BT, tile_sizes.get("H", 1), BV)
+        # 3D tile (BT, H, BV) — framework merges B*T into one dim.
+        return (_BT, tile_sizes.get("H", 1), BV)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
@@ -836,27 +841,30 @@ class GDNFusedBwdOp(Op):
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
 
-        # do TMA tile shape (reversed from (B, T, H, V)): (BV, H, BT, B)
+        # Merged B*T coordinate (framework collapses B and T into one CuTe mode)
+        last_chunk = Int32(self.NT_val - 1)
+        merged_t = tile_B * Int32(self.T // self.BT) + last_chunk
+
+        # do TMA tile shape (reversed from (BT, H, BV)): (BV, H, BT)
         sDO = cute.make_tensor(
             cute.make_ptr(self.do_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.BV, 1, self.BT, 1)),
+            cute.make_layout((self.BV, 1, self.BT)),
         )
         gDO = cute.local_tile(
             do_tma_gmem,
-            (self.BV, 1, self.BT, 1),
-            (None, None, None, None),
+            (self.BV, 1, self.BT),
+            (None, None, None),
         )
         tDOsDO, tDOgDO = cute.nvgpu.cpasync.tma_partition(
             do_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sDO, 0, 4), cute.group_modes(gDO, 0, 4),
+            cute.group_modes(sDO, 0, 3), cute.group_modes(gDO, 0, 3),
         )
 
         nbytes = Int32(self.do_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        # Copy index: (None, V_coord=tile_V, H_coord, T_coord=last_chunk, B_coord)
-        last_chunk = Int32(self.NT_val - 1)
-        cute.copy(do_tma, tDOgDO[(None, tile_V, tile_H, last_chunk * Int32(self.BT), tile_B)],
+        # Copy index: (None, V_coord=tile_V, H_coord, merged_BT_coord)
+        cute.copy(do_tma, tDOgDO[(None, tile_V, tile_H, merged_t)],
                   tDOsDO, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================

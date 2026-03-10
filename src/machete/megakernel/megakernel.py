@@ -346,6 +346,18 @@ class Megakernel:
             for canonical_name, tensor, dtype in self._tensor_registry.tensors:
                 if canonical_name == desc.tensor_canonical:
                     t = tensor.detach()
+                    # Match tensor ndim to TMA tile dimensionality.
+                    # from_dlpack can merge contiguous modes unpredictably
+                    # (e.g., 4D (B,T,H,K) → 3D after T*B merge). Reshape
+                    # leading PyTorch dims (trailing CuTe dims) before
+                    # permute to guarantee mode count matches tile_shape.
+                    target_ndim = len(desc.tile_shape)
+                    if t.ndim > target_ndim:
+                        keep = target_ndim - 1
+                        if keep > 0:
+                            t = t.reshape(-1, *t.shape[-keep:])
+                        else:
+                            t = t.reshape(-1)
                     # TMA requires CuTe mode 0 to be contiguous (stride 1).
                     # PyTorch row-major tensors have mode 0 = rows (stride N),
                     # so we reverse dims to get mode 0 = last dim (stride 1).

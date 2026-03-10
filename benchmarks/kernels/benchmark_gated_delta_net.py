@@ -354,6 +354,7 @@ def bench_pipeline(B, T, H, K, V):
             except Exception as e:
                 print(f"  Fused megakernel error: {e}")
 
+
         except Exception as e:
             print(f"  Pipeline setup error: {e}")
 

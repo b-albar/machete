@@ -75,7 +75,9 @@ class GDNPrepOp(Op):
         if tensor_name != "k":
             return None
         BK = static_dims.get("BK", _BK)
-        return (tile_sizes.get("B", 1), _BT, tile_sizes.get("H", 1), BK)
+        # 3D tile (BT, H, BK) — framework merges B*T into one dim.
+        # After reversal: (BK, H_tile, BT).
+        return (_BT, tile_sizes.get("H", 1), BK)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -83,13 +85,13 @@ class GDNPrepOp(Op):
         if tensor_name != "k":
             return None
         # SW128 swizzle for bank-conflict-free LdMatrix reads in Phase 2.
-        # TMA tile shape reversed: (BK, 1, BT, 1)
+        # 3D smem layout matching tile (BK, H_tile=1, BT).
         BK = static_dims.get("BK", _BK)
         return (
             f"cute.make_composed_layout("
             f"cute.make_swizzle(3, 4, 3), 0, "
-            f"cute.make_layout(({BK}, 1, {_BT}, 1), "
-            f"stride=(1, {BK}, {BK}, {BK * _BT})))"
+            f"cute.make_layout(({BK}, 1, {_BT}), "
+            f"stride=(1, {BK}, {BK})))"
         )
 
     def __init__(self, **config):
@@ -207,11 +209,13 @@ class GDNPrepOp(Op):
         elem_bytes = k.element_size() if k is not None else 2
         BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
 
+        T = k.shape[1] if k is not None else 64
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["BV"] = BV
         ops[0].static_dims["K"] = K
+        ops[0].static_dims["T"] = T
         return ops
 
     @classmethod
@@ -238,11 +242,15 @@ class GDNPrepOp(Op):
         """TMA k load: NK sub-blocks [BT, BK] into double buffer.
 
         iter 0: loads tma_k_blocks (up to 2) K-blocks into buf 0 and buf 1.
+        Gmem tensor is 3D (K, H, B*T) — framework merges B and T dims.
         """
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         swz = cute.make_swizzle(3, 4, 3)  # SW128
+
+        # Merged B*T coordinate: framework collapses B and T into one CuTe mode
+        merged_t = tile_B * Int32(self.T // self.BT) + tile_T
 
         if inner_iter_idx == Int32(0):
             nbytes = Int32(self._k_tma_bytes)
@@ -256,21 +264,20 @@ class GDNPrepOp(Op):
                         cute.make_ptr(self.k_dtype, _buf_base,
                                       cute.AddressSpace.smem),
                         swz, dtype=self.k_dtype),
-                    cute.make_layout((self.BK, 1, self.BT, 1),
-                                     stride=(1, self.BK, self.BK,
-                                             self.BK * self.BT)),
+                    cute.make_layout((self.BK, 1, self.BT),
+                                     stride=(1, self.BK, self.BK)),
                 )
                 gK = cute.local_tile(
                     k_tma_gmem,
-                    (self.BK, 1, self.BT, 1),
-                    (None, None, None, None),
+                    (self.BK, 1, self.BT),
+                    (None, None, None),
                 )
                 tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
                     k_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sK, 0, 4), cute.group_modes(gK, 0, 4),
+                    cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
                 )
-                # Coords: (None, K_block, H_coord, T_coord, B_coord)
-                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_H, tile_T, tile_B)],
+                # Coords: (None, K_block, H_coord, merged_BT_coord)
+                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_H, merged_t)],
                           tKsK, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================

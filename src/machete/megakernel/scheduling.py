@@ -567,6 +567,89 @@ class InstructionStreamBuilder:
         """Check if any op declares INPUTS or OUTPUTS."""
         return any(r.op.op_cls.INPUTS or r.op.op_cls.OUTPUTS for r in self._op_records)
 
+    def _build_buffer_producers(self, *, strict: bool = False) -> Dict[str, int]:
+        """Track latest producer op_idx per buffer name, respecting tensor identity.
+
+        When two ops produce the same buffer name but target different tensors
+        (different data_ptr), they are independent — the earlier producer is
+        NOT overwritten.
+
+        Args:
+            strict: If True, raise ValueError when both ops lack tensor_ptrs
+                (ambiguous duplicate). Used by _resolve_named_formulas.
+        """
+        buffer_producers: Dict[str, int] = {}
+        for rec in self._op_records:
+            for buf in rec.op.op_cls.OUTPUTS:
+                if buf in buffer_producers:
+                    prev_idx = buffer_producers[buf]
+                    prev_ptr = self._op_records[prev_idx].op.tensor_ptrs.get(buf)
+                    curr_ptr = rec.op.tensor_ptrs.get(buf)
+                    if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
+                        continue  # Different tensors — independent
+                    if strict and prev_ptr is None and curr_ptr is None:
+                        prev_cls = self._op_records[prev_idx].op.op_cls.__name__
+                        cur_cls = rec.op.op_cls.__name__
+                        raise ValueError(
+                            f"Buffer '{buf}' produced by both op {prev_idx} "
+                            f"({prev_cls}) and op {rec.op_idx} ({cur_cls})"
+                        )
+                buffer_producers[buf] = rec.op_idx
+        return buffer_producers
+
+    def _build_tensor_ptr_deps(self) -> Dict[Tuple[int, str], int]:
+        """Detect cross-buffer dependencies by tensor pointer identity.
+
+        Maps (consumer_op_idx, consumer_input_buf) → producer_op_idx when
+        a consumer's input shares the same data_ptr as a producer's output,
+        even though their buffer names differ. E.g., RopeOp writes 'q'
+        (ptr=k_flat) and PrepOp reads 'k' (ptr=k_f) where both are views
+        of the same storage.
+        """
+        tensor_ptr_deps: Dict[Tuple[int, str], int] = {}
+        for cons_rec in self._op_records:
+            for cons_buf in cons_rec.op.op_cls.INPUTS:
+                cons_ptr = cons_rec.op.tensor_ptrs.get(cons_buf)
+                if cons_ptr is None:
+                    continue
+                for prod_rec in self._op_records:
+                    if prod_rec.op_idx >= cons_rec.op_idx:
+                        continue
+                    for prod_buf in prod_rec.op.op_cls.OUTPUTS:
+                        prod_ptr = prod_rec.op.tensor_ptrs.get(prod_buf)
+                        if prod_ptr is not None and prod_ptr == cons_ptr:
+                            tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
+        return tensor_ptr_deps
+
+    def _find_producer(
+        self,
+        rec: "_OpRecord",
+        buf: str,
+        buffer_producers: Dict[str, int],
+        tensor_ptr_deps: Dict[Tuple[int, str], int],
+    ) -> Optional[int]:
+        """Find the producer op_idx for a consumer's input buffer.
+
+        Checks buffer name match first (skipping false matches where tensor
+        ptrs differ), then falls back to tensor pointer identity.
+        Returns None for external inputs or true self-dependencies.
+        """
+        prod_idx = buffer_producers.get(buf)
+        # Skip false name matches (same name, different tensor)
+        if prod_idx is not None and prod_idx != rec.op_idx:
+            prod_ptr = self._op_records[prod_idx].op.tensor_ptrs.get(buf)
+            cons_ptr = rec.op.tensor_ptrs.get(buf)
+            if prod_ptr is not None and cons_ptr is not None and prod_ptr != cons_ptr:
+                prod_idx = None
+        # Fall back to tensor pointer identity for cross-buffer deps
+        if prod_idx is None or prod_idx == rec.op_idx:
+            ptr_prod = tensor_ptr_deps.get((rec.op_idx, buf))
+            if ptr_prod is not None:
+                prod_idx = ptr_prod
+        if prod_idx is None or prod_idx == rec.op_idx:
+            return None
+        return prod_idx
+
     def _resolve_dep_edges(self) -> List[_DepEdge]:
         """Resolve op-level dependency edges for tile scheduling.
 
@@ -574,52 +657,44 @@ class InstructionStreamBuilder:
         dependency kind. Used by build() to determine tile emission order.
         """
         if not self._has_named_buffers():
-            # Linear chain fallback: each op depends on previous, 1:1
             return [
-                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one") for i in range(1, len(self._op_records))
+                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one")
+                for i in range(1, len(self._op_records))
             ]
 
-        # Named buffer dependencies — track latest producer per buffer name.
-        # Multiple ops may produce the same buffer name (e.g., chained GEMMs
-        # all writing "c" with different or ping-pong-reused data_ptrs).
-        # Validation is handled by _resolve_named_formulas; here we just
-        # need the latest producer for dependency edge resolution.
-        buffer_producers: Dict[str, int] = {}
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.OUTPUTS:
-                buffer_producers[buf] = rec.op_idx
+        buffer_producers = self._build_buffer_producers()
+        tensor_ptr_deps = self._build_tensor_ptr_deps()
 
         edges: List[_DepEdge] = []
+        seen: Set[Tuple[int, int]] = set()
         for rec in self._op_records:
             for buf in rec.op.op_cls.INPUTS:
-                if buf not in buffer_producers:
-                    continue  # External input (provided by host, not by another op)
-                prod_idx = buffer_producers[buf]
-                if prod_idx == rec.op_idx:
-                    continue  # Self-dependency (in-place op reads/writes same buffer)
-                producer = self._op_records[prod_idx]
+                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
+                if prod_idx is None:
+                    continue
+                pair = (prod_idx, rec.op_idx)
+                if pair in seen:
+                    continue
+                seen.add(pair)
 
+                producer = self._op_records[prod_idx]
                 p_dims = set(producer.op.dim_names.keys())
                 c_dims = set(rec.op.dim_names.keys())
                 producer_only = p_dims - c_dims
                 consumer_only = c_dims - p_dims
 
                 if producer_only:
-                    # Producer has extra dims (many-to-one on shared dims).
-                    # Applies whether or not consumer also has extra dims.
                     kind = "many_to_one"
-                elif consumer_only and not producer_only:
+                elif consumer_only:
                     kind = "one_to_many"
                 else:
                     kind = "one_to_one"
 
-                edges.append(
-                    _DepEdge(
-                        producer_idx=prod_idx,
-                        consumer_idx=rec.op_idx,
-                        kind=kind,
-                    )
-                )
+                edges.append(_DepEdge(
+                    producer_idx=prod_idx,
+                    consumer_idx=rec.op_idx,
+                    kind=kind,
+                ))
 
         return edges
 
@@ -708,77 +783,19 @@ class InstructionStreamBuilder:
         2. Compute formula coefficients for both sides
         3. Allocate barriers
         """
-        # Track buffer producers by name (latest writer wins).
-        # When two ops produce the same buffer name but target different
-        # tensors (different data_ptr), they are independent — skip.
-        # When same data_ptr (ping-pong reuse), update to latest producer.
-        # Safety: transitive dependencies via tensor_ptr_deps guarantee
-        # the earlier write completes before the later write starts.
-        buffer_producers: Dict[str, int] = {}
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.OUTPUTS:
-                if buf in buffer_producers:
-                    prev_idx = buffer_producers[buf]
-                    prev_ptr = self._op_records[prev_idx].op.tensor_ptrs.get(buf)
-                    curr_ptr = rec.op.tensor_ptrs.get(buf)
-                    if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
-                        # Different tensors — independent, no conflict
-                        continue
-                    # Same ptr (ping-pong reuse) or both have ptrs — update
-                    # to latest producer. Transitive deps guarantee ordering.
-                    if prev_ptr is None and curr_ptr is None:
-                        # No tensor tracking — ambiguous duplicate
-                        prev_cls = self._op_records[prev_idx].op.op_cls.__name__
-                        cur_cls = rec.op.op_cls.__name__
-                        raise ValueError(
-                            f"Buffer '{buf}' produced by both op {prev_idx} "
-                            f"({prev_cls}) and op {rec.op_idx} ({cur_cls})"
-                        )
-                buffer_producers[buf] = rec.op_idx
+        buffer_producers = self._build_buffer_producers(strict=True)
+        tensor_ptr_deps = self._build_tensor_ptr_deps()
 
-        # Also track buffer producers by tensor data pointer for automatic dependency detection
-        # This maps (consumer_op_idx, consumer_input_buf) -> producer_op_idx
-        # when tensors share the same data pointer but have different buffer names
-        tensor_ptr_deps: Dict[Tuple[int, str], int] = {}
-        for cons_rec in self._op_records:
-            for cons_buf in cons_rec.op.op_cls.INPUTS:
-                cons_ptr = cons_rec.op.tensor_ptrs.get(cons_buf)
-                if cons_ptr is None:
-                    continue
-                # Look for a producer with matching tensor pointer
-                for prod_rec in self._op_records:
-                    if prod_rec.op_idx >= cons_rec.op_idx:
-                        continue  # Only look at earlier ops
-                    for prod_buf in prod_rec.op.op_cls.OUTPUTS:
-                        prod_ptr = prod_rec.op.tensor_ptrs.get(prod_buf)
-                        if prod_ptr is not None and prod_ptr == cons_ptr:
-                            # Found a match by tensor identity
-                            tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
-
-        # Init per-op formula lists
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {
             i: ([], []) for i in range(len(self._op_records))
         }
         barrier_counter = 0
 
-        # Process each dependency edge
         for rec in self._op_records:
             for buf in rec.op.op_cls.INPUTS:
-                # First try matching by buffer name
-                prod_idx = buffer_producers.get(buf)
-
-                # If no name match, or name matches self (in-place op), try tensor identity
-                # This handles cases like RopeOp (q->q in-place) depending on RMSNormOp (->y)
-                # where the tensor pointers match but buffer names differ
-                if prod_idx is None or prod_idx == rec.op_idx:
-                    ptr_prod_idx = tensor_ptr_deps.get((rec.op_idx, buf))
-                    if ptr_prod_idx is not None:
-                        prod_idx = ptr_prod_idx
-
+                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
                 if prod_idx is None:
-                    continue  # External input (provided by host, not by another op)
-                if prod_idx == rec.op_idx:
-                    continue  # True self-dependency (same op produces and consumes)
+                    continue
                 producer = self._op_records[prod_idx]
                 consumer = rec
 
