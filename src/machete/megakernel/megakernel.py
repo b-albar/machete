@@ -336,22 +336,34 @@ class Megakernel:
         from cutlass.cute.runtime import from_dlpack
 
         self._tma_cute_tensors = []
-        # Collect unique tensors needed for TMA (by canonical tensor name)
+        # Collect unique tensors needed for TMA, deduped by (canonical_name, ndim).
+        # Different ops may reference the same underlying storage with different
+        # TMA dimensionalities (e.g., GEMM 2D store vs GDN 3D load on the same
+        # data_ptr). Each unique ndim needs its own CuTe tensor with the correct
+        # reshape so make_tiled_tma_atom can compose the tile.
         seen = set()
         for desc in self._tma_registry.descriptors:
-            if desc.tensor_canonical in seen:
+            ndim = len(desc.tile_shape)
+            key = (desc.tensor_canonical, ndim)
+            if key in seen:
                 continue
-            seen.add(desc.tensor_canonical)
+            seen.add(key)
             # Find the torch.Tensor from tensor registry
             for canonical_name, tensor, dtype in self._tensor_registry.tensors:
                 if canonical_name == desc.tensor_canonical:
                     t = tensor.detach()
+                    # The registry deduplicates by data_ptr, so t may have
+                    # different ndim than this descriptor's op expects (e.g.,
+                    # 2D GEMM output vs 4D GDN input). Reshape to the
+                    # descriptor's original tensor shape first.
+                    if desc.tensor_shape and tuple(t.shape) != desc.tensor_shape:
+                        t = t.reshape(desc.tensor_shape)
                     # Match tensor ndim to TMA tile dimensionality.
                     # from_dlpack can merge contiguous modes unpredictably
                     # (e.g., 4D (B,T,H,K) → 3D after T*B merge). Reshape
                     # leading PyTorch dims (trailing CuTe dims) before
                     # permute to guarantee mode count matches tile_shape.
-                    target_ndim = len(desc.tile_shape)
+                    target_ndim = ndim
                     if t.ndim > target_ndim:
                         keep = target_ndim - 1
                         if keep > 0:
@@ -365,7 +377,8 @@ class Megakernel:
                     if t.ndim >= 2:
                         t = t.permute(*reversed(range(t.ndim)))
                     cute_t = from_dlpack(t, assumed_align=16)
-                    self._tma_cute_tensors.append((desc.tensor_canonical, cute_t))
+                    self._tma_cute_tensors.append(
+                        (f"{desc.tensor_canonical}_{ndim}d", cute_t))
                     break
 
     def _prepare_peer_tma_tensors(self) -> None:
@@ -776,10 +789,11 @@ class Megakernel:
         # TMA tensors need separate static-layout params for descriptor creation.
         # These are passed to __call__ as tma_t0, tma_t1, ... and used to create
         # TMA descriptors in __call__ before launching the kernel.
-        tma_tensor_names = []  # canonical names like "tma_t0", "tma_t1"
+        tma_tensor_names = []  # param names like "tma_t0_2d", "tma_t0_3d"
         tma_tensor_seen = set()
         for desc in tma_registry.descriptors:
-            tname = f"tma_{desc.tensor_canonical}"
+            ndim = len(desc.tile_shape)
+            tname = f"tma_{desc.tensor_canonical}_{ndim}d"
             if tname not in tma_tensor_seen:
                 tma_tensor_seen.add(tname)
                 tma_tensor_names.append(tname)
@@ -792,7 +806,8 @@ class Megakernel:
         tma_kernel_args = []  # TMA args to pass from __call__ to kernel
         if tma_registry.has_tma:
             for desc in tma_registry.descriptors:
-                tma_src = f"tma_{desc.tensor_canonical}"
+                ndim = len(desc.tile_shape)
+                tma_src = f"tma_{desc.tensor_canonical}_{ndim}d"
                 if desc.direction == "g2s":
                     copy_op = "CopyBulkTensorTileG2SOp()"
                 elif desc.direction == "s2g":

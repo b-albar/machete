@@ -328,6 +328,7 @@ class TMADescriptorInfo:
     tile_shape: Tuple[int, ...]
     smem_layout_shape: Tuple[int, ...]
     dtype: Any
+    tensor_shape: Tuple[int, ...] = ()  # original tensor shape from the op
     smem_layout_src: Optional[str] = None
 
 
@@ -402,6 +403,12 @@ class TMARegistry:
                             tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
                         )
 
+                    # Store the original tensor shape from the op so
+                    # _prepare_tma_tensors can reshape correctly when the
+                    # registry tensor has different ndim (e.g., 2D GEMM
+                    # output vs 4D GDN input sharing the same data_ptr).
+                    tensor_shape = tuple(op.tensor_refs[tensor_name].shape)
+
                     descriptors.append(
                         TMADescriptorInfo(
                             canonical_atom=canonical_atom,
@@ -411,6 +418,7 @@ class TMARegistry:
                             tile_shape=tma_tile_shape,
                             smem_layout_shape=tma_tile_shape,
                             dtype=dtype,
+                            tensor_shape=tensor_shape,
                             smem_layout_src=smem_layout_src,
                         )
                     )
