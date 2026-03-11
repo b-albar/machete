@@ -906,6 +906,7 @@ class Megakernel:
             "            block=[self.threads_per_block, 1, 1],\n"
             "            smem=self.smem_size,\n"
             "            stream=stream,\n"
+            "            min_blocks_per_mp=1,\n"
             "        )\n"
             "\n"
             "    @cute.kernel\n"
