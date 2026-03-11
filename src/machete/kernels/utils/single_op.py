@@ -154,6 +154,17 @@ class SingleOpKernel:
             for cn, tensor, _ in self._tensor_registry.tensors:
                 if cn == desc.tensor_canonical:
                     t = tensor.detach()
+                    # Reshape to match TMA tile dimensionality (same as
+                    # Megakernel._prepare_tma_tensors: merge leading dims).
+                    if desc.tensor_shape and tuple(t.shape) != desc.tensor_shape:
+                        t = t.reshape(desc.tensor_shape)
+                    target_ndim = len(desc.tile_shape)
+                    if t.ndim > target_ndim:
+                        keep = target_ndim - 1
+                        if keep > 0:
+                            t = t.reshape(-1, *t.shape[-keep:])
+                        else:
+                            t = t.reshape(-1)
                     if t.ndim >= 2:
                         t = t.permute(*reversed(range(t.ndim)))
                     self._tma_cute_tensors.append(
