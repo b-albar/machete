@@ -66,18 +66,19 @@ def bench_gemm(M, K, N, dtype):
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
     torch.manual_seed(42)
-    a = torch.randn(M, K, dtype=torch_dtype, device="cuda")
+    a = torch.randn(1, M, K, dtype=torch_dtype, device="cuda")
     b = torch.randn(K, N, dtype=torch_dtype, device="cuda")
     b_t = b.t().contiguous()  # (N, K) layout for GemmOp
 
     funcs = {}
 
-    # PyTorch (cuBLAS)
-    funcs["pytorch"] = lambda: torch.matmul(a, b)
+    # PyTorch (cuBLAS) — squeeze to 2D for matmul
+    a_2d = a.squeeze(0)
+    funcs["pytorch"] = lambda: torch.matmul(a_2d, b)
 
     # Megakernel GemmOp (let _auto_tiles choose optimal tile sizes for 48KB pages)
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
+        c = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
 
         ops = GemmOp.schedule(a=a, b=b_t, c=c)
         config = GemmOp.kernel_config(ops)
@@ -95,7 +96,7 @@ def bench_gemm(M, K, N, dtype):
 
     # SingleOpKernel GemmOp
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c_so = torch.zeros(M, N, dtype=torch_dtype, device="cuda")
+        c_so = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
         so_ops = GemmOp.schedule(a=a, b=b_t, c=c_so)
         so_kernel = SingleOpKernel(so_ops)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -123,24 +124,26 @@ def bench_gemm_bwd(M, K, N, dtype):
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
     torch.manual_seed(42)
-    a = torch.randn(M, K, dtype=torch_dtype, device="cuda")
+    a = torch.randn(1, M, K, dtype=torch_dtype, device="cuda")
     b = torch.randn(K, N, dtype=torch_dtype, device="cuda")
     b_t = b.t().contiguous()  # (N, K) layout for GemmOp
-    dout = torch.randn(M, N, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(1, M, N, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
-    # PyTorch backward: dA = dout @ B^T, dB = A^T @ dout
+    # PyTorch backward: dA = dout @ B^T, dB = A^T @ dout (squeeze to 2D)
+    a_2d = a.squeeze(0)
+    dout_2d = dout.squeeze(0)
     def pytorch_bwd():
-        da = torch.matmul(dout, b_t)
-        db = torch.matmul(a.t(), dout)
+        da = torch.matmul(dout_2d, b_t)
+        db = torch.matmul(a_2d.t(), dout_2d)
         return da, db
 
     funcs["pytorch"] = pytorch_bwd
 
     # Megakernel backward (GemmOp.schedule_backward)
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        da = torch.zeros(M, K, dtype=torch_dtype, device="cuda")
+        da = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
         db = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
 
         ops = GemmOp.schedule_backward(
@@ -165,7 +168,7 @@ def bench_gemm_bwd(M, K, N, dtype):
 
     # SingleOpKernel backward
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        da_so = torch.zeros(M, K, dtype=torch_dtype, device="cuda")
+        da_so = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
         db_so = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
         so_bwd_ops = GemmOp.schedule_backward(
             dout=dout, a=a, b=b_t, da=da_so, db=db_so,

@@ -24,7 +24,7 @@ Backward (GDNFusedBwdOp):
 
 Architecture: DMA warp does TMA load (q for fwd, do for bwd).
               MMA warps do cpasync loads + all compute + global stores.
-Tiling: (B, H, V) — all T chunks sequential inside compute.
+Tiling: (B, NH, V) — all S chunks sequential inside compute.
 """
 
 import struct
@@ -45,7 +45,6 @@ from machete.megakernel.interpreter import named_barrier_sync
 _BT = 64
 _BK = 64
 _BV = 64
-_PAGE_SIZE = 48 * 1024  # 48KB
 
 
 # =============================================================================
@@ -105,11 +104,11 @@ def _fused_init(self):
     self.BK = getattr(self, "BK", _BK)
     self.BV = getattr(self, "BV", _BV)
     self.NK = self.K // self.BK
-    self.NT_val = self.T // self.BT
+    self.NT_val = self.S // self.BT
 
     assert self.K % self.BK == 0
     assert self.V % self.BV == 0
-    assert self.T % self.BT == 0
+    assert self.S % self.BT == 0
     assert self.NK <= 2, "K-block loading assumes NK <= 2 (K <= 128)"
 
     self.num_mma_warps = self.BT // 16
@@ -154,7 +153,7 @@ def _schedule(cls, scale, page_size, tile_sizes, tensors, k_tensor_name, v_tenso
     """Shared scheduling logic for forward and backward."""
     tile_sizes = dict(tile_sizes or {})
     tile_sizes.setdefault("B", 1)
-    tile_sizes.setdefault("H", 1)
+    tile_sizes.setdefault("NH", 1)
     tile_sizes.setdefault("V", _BV)
 
     k_tens = tensors.get(k_tensor_name)
@@ -188,20 +187,20 @@ def _schedule(cls, scale, page_size, tile_sizes, tensors, k_tensor_name, v_tenso
 class GDNFusedOp(Op):
     """Gated Delta Net forward fused state+output Op.
 
-    Tiling: tile_B=1, tile_H=1, tile_V=BV. All chunks loop inside compute.
+    Tiling: tile_B=1, tile_NH=1, tile_V=BV. All chunks loop inside compute.
     """
 
     reads = {
-        "q":        (None, ("B", "T", "H", "K")),
-        "k":        (None, ("B", "T", "H", "K")),
-        "w":        (None, ("B", "T", "H", "K")),
-        "u":        (None, ("B", "T", "H", "V")),
-        "g_cumsum": (cutlass.Float32, ("B", "T", "H")),
+        "q":        (None, ("B", "S", "NH", "K")),
+        "k":        (None, ("B", "S", "NH", "K")),
+        "w":        (None, ("B", "S", "NH", "K")),
+        "u":        (None, ("B", "S", "NH", "V")),
+        "g_cumsum": (cutlass.Float32, ("B", "S", "NH")),
     }
     writes = {
-        "o": (None, ("B", "T", "H", "V")),
+        "o": (None, ("B", "S", "NH", "V")),
     }
-    tile = ("B", "H", "V")
+    tile = ("B", "NH", "V")
     tma_loads = {"q"}
 
     @classmethod
@@ -209,8 +208,8 @@ class GDNFusedOp(Op):
         if tensor_name != "q":
             return None
         K = static_dims["K"]
-        # 3D tile (BT, H, K) — framework merges B*T into one dim.
-        return (_BT, tile_sizes.get("H", 1), K)
+        # 3D tile (BT, NH, K) — framework merges B*S into one dim.
+        return (_BT, tile_sizes.get("NH", 1), K)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
@@ -224,7 +223,7 @@ class GDNFusedOp(Op):
         self.compute = self.compute_mma
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "u")
 
     kernel_config = staticmethod(_kernel_config)
@@ -234,7 +233,7 @@ class GDNFusedOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_B, tile_H, tile_V,
+    def load(self, page_ptr, tile_B, tile_NH, tile_V,
              q_tma, q_tma_gmem, work_mbar):
         """TMA Q load into page (single shot, plain layout [BT, K])."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -242,7 +241,7 @@ class GDNFusedOp(Op):
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
 
         # Merged B*T coordinate (framework collapses B and T into one CuTe mode)
-        merged_t = tile_B * Int32(self.T // self.BT)
+        merged_t = tile_B * Int32(self.S // self.BT)
 
         # Q TMA tile shape (reversed from (BT, H, K)): (K, H, BT)
         sQ = cute.make_tensor(
@@ -263,7 +262,7 @@ class GDNFusedOp(Op):
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
         # Copy index: (None, K_coord=0, H_coord, merged_BT_coord)
-        cute.copy(q_tma, tQgQ[(None, Int32(0), tile_H, merged_t)],
+        cute.copy(q_tma, tQgQ[(None, Int32(0), tile_NH, merged_t)],
                   tQsQ, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -272,7 +271,7 @@ class GDNFusedOp(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_B, tile_H, tile_V,
+        self, page_ptr, tile_B, tile_NH, tile_V,
         q, k, w, u, g_cumsum, o,
     ):
         tidx = cute.arch.thread_idx()[0]
@@ -411,15 +410,14 @@ class GDNFusedOp(Op):
 
             tCrA = tiled_mma.make_fragment_A(tCsA_bufs[0])
 
-            # v_new as B operand [BV, BT]
+            # v_new as B operand [BV, BT] — smem partitions only,
+            # register fragment created in Phase D to reduce live range
             s_v_B = cute.make_tensor(s_v.iterator,
                 cute.make_layout((self.BV, self.BT), stride=(1, self.BV)))
-            _tBsVt = thr_mma.partition_B(s_v_B)
-            tCrVt = tiled_mma.make_fragment_B(_tBsVt)
-            tVrVt_view = smem_thr_copy_B.retile(tCrVt)
             tVsVt = smem_thr_copy_B.partition_S(s_v_B)
 
             # Scores as A operand [BT, BT] (reuses s_buf0 region)
+            # Register fragment created in Phase D to reduce live range
             s_a = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, page_ptr + Int32(self._s_buf0_offset),
@@ -429,7 +427,6 @@ class GDNFusedOp(Op):
                 cute.make_layout((self.BT, self.BT), stride=(self.BT, 1)),
             )
             tCsA_scores = thr_mma.partition_A(s_a)
-            tCrA_scores = tiled_mma.make_fragment_A(tCsA_scores)
 
             # === cpasync setup ===
             wk_async_atom = cute.make_copy_atom(
@@ -476,6 +473,10 @@ class GDNFusedOp(Op):
                 _acc.fill(0.0)
                 h_accs.append(_acc)
 
+            # Reusable bf16 fragment for f32→bf16 conversions (h→smem, acc_A→smem).
+            # BK=BV=BT=64 so partition_shape_C is the same for all.
+            conv_tmp = cute.make_fragment(acc_h_shape, self.q_dtype)
+
             # === Identity tensors ===
             mc_tv = cute.make_identity_tensor((self.BT, self.BV))
             tCcTV = thr_mma.partition_C(mc_tv)
@@ -483,27 +484,27 @@ class GDNFusedOp(Op):
             tCcAA = thr_mma.partition_C(mc_AA)
 
             # === Global tensors ===
-            kw_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.K)
-            uv_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.V)
-            g_head_base = tile_B * Int32(self.T * self.H) + tile_H
+            kw_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.K)
+            uv_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.V)
+            g_head_base = tile_B * Int32(self.S * self.NH) + tile_NH
 
             gQ_head = cute.make_tensor(
                 (q.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gK_head = cute.make_tensor(
                 (k.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gW_head = cute.make_tensor(
                 (w.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gU_head = cute.make_tensor(
                 (u.iterator + uv_base).align(16),
-                cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+                cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
             gG_head = cute.make_tensor(g_cumsum.iterator + g_head_base,
-                cute.make_layout((self.T,), stride=(self.H,)))
+                cute.make_layout((self.S,), stride=(self.NH,)))
             gO_head = cute.make_tensor(
                 (o.iterator + uv_base).align(16),
-                cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+                cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
 
             # === Prologue: issue u[0] cpasync (Q[0] loaded by TMA) ===
             _gU_pre = cute.local_tile(gU_head, (self.BT, self.BV), (Int32(0), tile_V))
@@ -555,10 +556,9 @@ class GDNFusedOp(Op):
                 acc_A.fill(0.0)
 
                 # Phase A prologue: h[0] → s_h + prefetch w[0]+K[0]
-                _h0_tmp = cute.make_fragment_like(h_accs[0], self.q_dtype)
                 for ci in cutlass.range_constexpr(cute.size(h_accs[0])):
-                    _h0_tmp[ci] = h_accs[0][ci].to(self.q_dtype)
-                _tOrH0 = smem_thr_copy_C.retile(_h0_tmp)
+                    conv_tmp[ci] = h_accs[0][ci].to(self.q_dtype)
+                _tOrH0 = smem_thr_copy_C.retile(conv_tmp)
                 _tOsH0 = smem_thr_copy_C.partition_D(s_h)
                 cute.copy(smem_tiled_copy_C, _tOrH0, _tOsH0)
 
@@ -581,10 +581,9 @@ class GDNFusedOp(Op):
 
                     if ki > 0:
                         # h[ki] → s_h (safe: previous GEMMs done after barrier)
-                        h_tmp = cute.make_fragment_like(h_accs[ki], self.q_dtype)
                         for ci in cutlass.range_constexpr(cute.size(h_accs[ki])):
-                            h_tmp[ci] = h_accs[ki][ci].to(self.q_dtype)
-                        tOrH = smem_thr_copy_C.retile(h_tmp)
+                            conv_tmp[ci] = h_accs[ki][ci].to(self.q_dtype)
+                        tOrH = smem_thr_copy_C.retile(conv_tmp)
                         tOsH = smem_thr_copy_C.partition_D(s_h)
                         cute.copy(smem_tiled_copy_C, tOrH, tOsH)
 
@@ -678,10 +677,9 @@ class GDNFusedOp(Op):
                 cute.copy(smem_tiled_copy_C, tOrVN, tOsVN)
 
                 # Write scores → s_a (at page_ptr, [BT,BT])
-                a_tmp = cute.make_fragment_like(acc_A, self.q_dtype)
                 for ci in cutlass.range_constexpr(cute.size(acc_A)):
-                    a_tmp[ci] = acc_A[ci].to(self.q_dtype)
-                tOrA = smem_thr_copy_C.retile(a_tmp)
+                    conv_tmp[ci] = acc_A[ci].to(self.q_dtype)
+                tOrA = smem_thr_copy_C.retile(conv_tmp)
                 tOsA = smem_thr_copy_C.partition_D(s_a)
                 cute.copy(smem_tiled_copy_C, tOrA, tOsA)
 
@@ -689,7 +687,13 @@ class GDNFusedOp(Op):
 
                 # -------------------------------------------------------
                 # Phase D: GEMM3 — acc_intra = scores @ v_new
+                # Create register fragments here (not top-of-function)
+                # to reduce live register range during Phases A-C.
                 # -------------------------------------------------------
+                _tBsVt = thr_mma.partition_B(s_v_B)
+                tCrVt = tiled_mma.make_fragment_B(_tBsVt)
+                tVrVt_view = smem_thr_copy_B.retile(tCrVt)
+                tCrA_scores = tiled_mma.make_fragment_A(tCsA_scores)
                 acc_intra = cute.make_fragment(
                     tiled_mma.partition_shape_C((self.BT, self.BV)), Float32)
                 acc_intra.fill(0.0)
@@ -785,20 +789,20 @@ class GDNFusedBwdOp(Op):
         Phase B: GEMM3 k@b_dh → acc_bdv, gate, add dv_local → b_dv, write dv
         Phase C: decay b_dh, GEMM4 q_gated^T@do, GEMM5 w^T@b_dv → update b_dh
 
-    Tiling: tile_B=1, tile_H=1, tile_V=BV. All chunks loop inside compute.
+    Tiling: tile_B=1, tile_NH=1, tile_V=BV. All chunks loop inside compute.
     """
 
     reads = {
-        "q":        (None, ("B", "T", "H", "K")),
-        "k":        (None, ("B", "T", "H", "K")),
-        "w":        (None, ("B", "T", "H", "K")),
-        "g_cumsum": (cutlass.Float32, ("B", "T", "H")),
-        "do":       (None, ("B", "T", "H", "V")),
+        "q":        (None, ("B", "S", "NH", "K")),
+        "k":        (None, ("B", "S", "NH", "K")),
+        "w":        (None, ("B", "S", "NH", "K")),
+        "g_cumsum": (cutlass.Float32, ("B", "S", "NH")),
+        "do":       (None, ("B", "S", "NH", "V")),
     }
     writes = {
-        "dv": (None, ("B", "T", "H", "V")),
+        "dv": (None, ("B", "S", "NH", "V")),
     }
-    tile = ("B", "H", "V")
+    tile = ("B", "NH", "V")
     tma_loads = {"do"}
 
     @classmethod
@@ -806,8 +810,8 @@ class GDNFusedBwdOp(Op):
         if tensor_name != "do":
             return None
         BV = static_dims.get("BV", _BV)
-        # 3D tile (BT, H, BV) — framework merges B*T into one dim.
-        return (_BT, tile_sizes.get("H", 1), BV)
+        # 3D tile (BT, NH, BV) — framework merges B*S into one dim.
+        return (_BT, tile_sizes.get("NH", 1), BV)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
@@ -824,7 +828,7 @@ class GDNFusedBwdOp(Op):
         self.compute = self.compute_mma
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "do")
 
     kernel_config = staticmethod(_kernel_config)
@@ -834,7 +838,7 @@ class GDNFusedBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_B, tile_H, tile_V,
+    def load(self, page_ptr, tile_B, tile_NH, tile_V,
              do_tma, do_tma_gmem, work_mbar):
         """TMA do load into page (single shot, plain layout [BT, BV])."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -843,7 +847,7 @@ class GDNFusedBwdOp(Op):
 
         # Merged B*T coordinate (framework collapses B and T into one CuTe mode)
         last_chunk = Int32(self.NT_val - 1)
-        merged_t = tile_B * Int32(self.T // self.BT) + last_chunk
+        merged_t = tile_B * Int32(self.S // self.BT) + last_chunk
 
         # do TMA tile shape (reversed from (BT, H, BV)): (BV, H, BT)
         sDO = cute.make_tensor(
@@ -864,7 +868,7 @@ class GDNFusedBwdOp(Op):
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
         # Copy index: (None, V_coord=tile_V, H_coord, merged_BT_coord)
-        cute.copy(do_tma, tDOgDO[(None, tile_V, tile_H, merged_t)],
+        cute.copy(do_tma, tDOgDO[(None, tile_V, tile_NH, merged_t)],
                   tDOsDO, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -873,7 +877,7 @@ class GDNFusedBwdOp(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_B, tile_H, tile_V,
+        self, page_ptr, tile_B, tile_NH, tile_V,
         q, k, w, g_cumsum, do, dv,
     ):
         tidx = cute.arch.thread_idx()[0]
@@ -1062,27 +1066,27 @@ class GDNFusedBwdOp(Op):
             mc_AA = cute.make_identity_tensor((self.BT, self.BT))
             tCcAA = thr_mma.partition_C(mc_AA)
             # === Global tensors ===
-            kw_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.K)
-            uv_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.V)
-            g_head_base = tile_B * Int32(self.T * self.H) + tile_H
+            kw_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.K)
+            uv_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.V)
+            g_head_base = tile_B * Int32(self.S * self.NH) + tile_NH
 
             gQ_head = cute.make_tensor(
                 (q.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gK_head = cute.make_tensor(
                 (k.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gW_head = cute.make_tensor(
                 (w.iterator + kw_base).align(16),
-                cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+                cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
             gDO_head = cute.make_tensor(
                 (do.iterator + uv_base).align(16),
-                cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+                cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
             gG_head = cute.make_tensor(g_cumsum.iterator + g_head_base,
-                cute.make_layout((self.T,), stride=(self.H,)))
+                cute.make_layout((self.S,), stride=(self.NH,)))
             gDV_head = cute.make_tensor(
                 (dv.iterator + uv_base).align(16),
-                cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+                cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
 
             # ===================================================================
             # Main chunk loop (REVERSE order)

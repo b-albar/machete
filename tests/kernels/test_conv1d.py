@@ -39,7 +39,7 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _run_conv1d(x, w, activation=None, tile_l=None, page_size=None):
+def _run_conv1d(x, w, activation=None, tile_s=None, page_size=None):
     """Run Conv1dOp and return output tensor."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.conv1d import Conv1dOp
@@ -48,14 +48,14 @@ def _run_conv1d(x, w, activation=None, tile_l=None, page_size=None):
     elem_bytes = 2 if x.dtype in (torch.float16, torch.bfloat16) else 4
     if page_size is None:
         page_size = 49152  # 48KB
-    if tile_l is None:
+    if tile_s is None:
         # 2x smem: x tile (TMA loaded) + y tile (compute output)
-        tile_l = max(1, page_size // (2 * D * elem_bytes))
+        tile_s = max(1, page_size // (2 * D * elem_bytes))
 
     y = torch.empty_like(x)
     ops = Conv1dOp.schedule(
         x=x, w=w, y=y, activation=activation,
-        tile_sizes={"L": tile_l}, page_size=page_size,
+        tile_sizes={"S": tile_s}, page_size=page_size,
     )
     config = Conv1dOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -143,7 +143,7 @@ class TestConv1dStandalone:
         x = torch.randn(B, L, D, dtype=dtype, device="cuda")
         w = torch.randn(D, K, dtype=dtype, device="cuda") * 0.1
 
-        y = _run_conv1d(x, w, tile_l=4)
+        y = _run_conv1d(x, w, tile_s=4)
         y_ref = causal_conv1d_ref(x, w).to(dtype)
 
         torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)

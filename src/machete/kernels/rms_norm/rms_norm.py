@@ -8,7 +8,7 @@ Supports all RMSNorm variants via flags:
     - Gemma:       y = rmsnorm(x, (1+w))
     - Fused add:   residual_out = x + residual_in; y = rmsnorm(residual_out, w)
     - Gated:       y = rmsnorm(x, w) * silu(gate)
-    - Per-row weight: weight is (M, D) instead of shared (D,)
+    - Per-row weight: weight is (B, S, D) instead of shared (D,)
 
 Pipelined load/compute/store with shared memory staging:
     load:    TMA async G->S (x tile)
@@ -59,7 +59,7 @@ def _rmsnorm_init(self, **config):
     else:
         self.elem_bytes = 4
 
-    self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
+    self.x_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
     self.scratch_offset = self.x_tile_bytes
 
     assert self.D >= 32 and self.D % 32 == 0, (
@@ -67,7 +67,7 @@ def _rmsnorm_init(self, **config):
     )
     assert self.x_tile_bytes + SCRATCH_BYTES <= self.page_size, (
         f"RMSNorm: tile smem ({self.x_tile_bytes}B) + scratch ({SCRATCH_BYTES}B) "
-        f"exceeds page_size ({self.page_size}B). Reduce tile_size_M={self.tile_size_M}."
+        f"exceeds page_size ({self.page_size}B). Reduce tile_size_S={self.tile_size_S}."
     )
 
     max_et = min(self.D, self.threads_per_row)
@@ -78,23 +78,23 @@ def _rmsnorm_init(self, **config):
     self.effective_warps = self.effective_threads // 32
 
 
-def _auto_tile_M(page_size, **tensors):
-    """Compute largest tile_size_M that fits in page_size minus scratch."""
+def _auto_tile_S(page_size, **tensors):
+    """Compute largest tile_size_S that fits in page_size minus scratch."""
     x = tensors.get('x')
     if x is None:
         return None
-    D = x.shape[1]
+    D = x.shape[2]
     elem_bytes = x.element_size()
     usable = page_size - SCRATCH_BYTES
     return max(1, usable // (D * elem_bytes))
 
 
 def _expand_weight(tensors):
-    """Auto-expand 1D weight (D,) to 2D (M, D) for uniform handling."""
+    """Auto-expand 1D weight (D,) to 3D (B, S, D) for uniform handling."""
     w = tensors.get('weight')
     if w is not None and w.ndim == 1:
-        M = tensors['x'].shape[0]
-        tensors['weight'] = w.unsqueeze(0).expand(M, -1).contiguous()
+        B, S = tensors['x'].shape[0], tensors['x'].shape[1]
+        tensors['weight'] = w.reshape(1, 1, -1).expand(B, S, -1).contiguous()
 
 
 def _kernel_config(ops):
@@ -127,16 +127,16 @@ class RMSNormOp(Op):
     """
 
     reads = {
-        "x": (None, ("M", "D")),
-        "weight": (None, ("M", "D")),
-        "residual_in": (None, ("M", "D")),
-        "gate": (None, ("M", "D")),
+        "x": (None, ("B", "S", "D")),
+        "weight": (None, ("B", "S", "D")),
+        "residual_in": (None, ("B", "S", "D")),
+        "gate": (None, ("B", "S", "D")),
     }
     writes = {
-        "y": (None, ("M", "D")),
-        "residual_out": (None, ("M", "D")),
+        "y": (None, ("B", "S", "D")),
+        "residual_out": (None, ("B", "S", "D")),
     }
-    tile = ("M", "D")
+    tile = ("B", "S", "D")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -172,10 +172,11 @@ class RMSNormOp(Op):
         has_residual, has_gate = cls._fill_dummies(tensors)
 
         tile_sizes = dict(tile_sizes or {})
-        if "M" not in tile_sizes:
-            auto_m = _auto_tile_M(page_size, **tensors)
-            if auto_m is not None:
-                tile_sizes["M"] = auto_m
+        if "S" not in tile_sizes:
+            auto_s = _auto_tile_S(page_size, **tensors)
+            if auto_s is not None:
+                tile_sizes["S"] = auto_s
+        tile_sizes.setdefault("B", 1)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         if residual:
@@ -198,19 +199,19 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_D, x_tma, x_tma_gmem, work_mbar):
+    def load(self, page_ptr, tile_B, tile_S, tile_D, x_tma, x_tma_gmem, work_mbar):
         """TMA load of x tile from global to shared memory."""
         sX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gX = cute.local_tile(
-            x_tma_gmem, (self.D, self.tile_size_M), (None, None),
+            x_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
             x_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sX, 0, 2),
-            cute.group_modes(gX, 0, 2),
+            cute.group_modes(sX, 0, 3),
+            cute.group_modes(gX, 0, 3),
         )
 
         nbytes = Int32(self.x_tile_bytes)
@@ -219,7 +220,7 @@ class RMSNormOp(Op):
         )
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(x_tma, tXgX[(None, tile_D, tile_M)], tXsX,
+        cute.copy(x_tma, tXgX[(None, tile_D, tile_S, tile_B)], tXsX,
                   tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -227,7 +228,7 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_D,
+    def compute(self, page_ptr, tile_B, tile_S, tile_D,
                 x, weight, residual_in, gate, y, residual_out):
         """RMSNorm forward: read x from smem, write y to same smem region."""
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
@@ -244,7 +245,8 @@ class RMSNormOp(Op):
         thr_layout = cute.make_layout(self.effective_threads)
 
         if tidx < self.effective_threads:
-            row_start = tile_M * self.tile_size_M
+            row_start = tile_S * self.tile_size_S
+            batch_offset = tile_B * self.S * self.D
 
             # Pre-allocate weight registers; load shared weight ONCE
             w_row_0 = cute.make_tensor(
@@ -260,14 +262,16 @@ class RMSNormOp(Op):
                     for i in range(cute.size(w_reg)):
                         w_reg[i] = (w_reg[i].to(Float32) + Float32(1.0)).to(self.x_dtype)
 
-            for local_row in range(self.tile_size_M):
+            for local_row in range(self.tile_size_S):
                 row_idx = row_start + local_row
 
-                if row_idx < self.M:
+                if row_idx < self.S:
+                    global_offset = batch_offset + row_idx * self.D
+
                     # Per-row weight: reload from the correct row
                     if const_expr(self.per_row_weight):
                         w_row = cute.make_tensor(
-                            weight.iterator + row_idx * self.D,
+                            weight.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         w_part = cute.local_partition(w_row, thr_layout, tidx)
@@ -288,7 +292,7 @@ class RMSNormOp(Op):
                     # --- Fused add: x_reg += residual_in ---
                     if const_expr(self.has_residual):
                         res_row = cute.make_tensor(
-                            residual_in.iterator + row_idx * self.D,
+                            residual_in.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         res_part = cute.local_partition(res_row, thr_layout, tidx)
@@ -300,7 +304,7 @@ class RMSNormOp(Op):
 
                         # Write residual_out to global
                         res_out_row = cute.make_tensor(
-                            residual_out.iterator + row_idx * self.D,
+                            residual_out.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         res_out_part = cute.local_partition(res_out_row, thr_layout, tidx)
@@ -329,7 +333,7 @@ class RMSNormOp(Op):
 
                     if const_expr(self.has_gate):
                         gate_row = cute.make_tensor(
-                            gate.iterator + row_idx * self.D,
+                            gate.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         gate_part = cute.local_partition(gate_row, thr_layout, tidx)
@@ -362,22 +366,22 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_D, y_tma, y_tma_gmem):
+    def store(self, page_ptr, tile_B, tile_S, tile_D, y_tma, y_tma_gmem):
         """TMA store of y from shared to global memory."""
         sY = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gY = cute.local_tile(
-            y_tma_gmem, (self.D, self.tile_size_M), (None, None),
+            y_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
             y_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sY, 0, 2),
-            cute.group_modes(gY, 0, 2),
+            cute.group_modes(sY, 0, 3),
+            cute.group_modes(gY, 0, 3),
         )
         with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_M)])
+            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
 # =============================================================================
@@ -393,17 +397,17 @@ class RMSNormBwdOp(Op):
     """
 
     reads = {
-        "dout": (None, ("M", "D")),
-        "x": (None, ("M", "D")),
-        "weight": (None, ("M", "D")),
-        "gate": (None, ("M", "D")),
+        "dout": (None, ("B", "S", "D")),
+        "x": (None, ("B", "S", "D")),
+        "weight": (None, ("B", "S", "D")),
+        "gate": (None, ("B", "S", "D")),
     }
     writes = {
-        "dx": (None, ("M", "D")),
-        "d_residual": (None, ("M", "D")),
-        "dgate": (None, ("M", "D")),
+        "dx": (None, ("B", "S", "D")),
+        "d_residual": (None, ("B", "S", "D")),
+        "dgate": (None, ("B", "S", "D")),
     }
-    tile = ("M", "D")
+    tile = ("B", "S", "D")
 
     tma_loads = {"x"}
     tma_stores = {"dx"}
@@ -444,10 +448,11 @@ class RMSNormBwdOp(Op):
         has_residual, has_gate = cls._fill_dummies(tensors)
 
         tile_sizes = dict(tile_sizes or {})
-        if "M" not in tile_sizes:
-            auto_m = _auto_tile_M(page_size, **tensors)
-            if auto_m is not None:
-                tile_sizes["M"] = auto_m
+        if "S" not in tile_sizes:
+            auto_s = _auto_tile_S(page_size, **tensors)
+            if auto_s is not None:
+                tile_sizes["S"] = auto_s
+        tile_sizes.setdefault("B", 1)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         if residual:
@@ -468,7 +473,7 @@ class RMSNormBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_D,
+    def compute(self, page_ptr, tile_B, tile_S, tile_D,
                 dout, x, weight, gate, dx, d_residual, dgate):
         """RMSNorm backward: read x from smem, dout+weight+gate from global.
 
@@ -488,7 +493,8 @@ class RMSNormBwdOp(Op):
         thr_layout = cute.make_layout(self.effective_threads)
 
         if tidx < self.effective_threads:
-            row_start = tile_M * self.tile_size_M
+            row_start = tile_S * self.tile_size_S
+            batch_offset = tile_B * self.S * self.D
 
             # Pre-allocate weight registers; load shared weight ONCE
             w_row_0 = cute.make_tensor(
@@ -504,14 +510,16 @@ class RMSNormBwdOp(Op):
                     for i in range(cute.size(w_reg)):
                         w_reg[i] = (w_reg[i].to(Float32) + Float32(1.0)).to(self.x_dtype)
 
-            for local_row in range(self.tile_size_M):
+            for local_row in range(self.tile_size_S):
                 row_idx = row_start + local_row
 
-                if row_idx < self.M:
+                if row_idx < self.S:
+                    global_offset = batch_offset + row_idx * self.D
+
                     # Per-row weight: reload from the correct row
                     if const_expr(self.per_row_weight):
                         w_row = cute.make_tensor(
-                            weight.iterator + row_idx * self.D,
+                            weight.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         w_part = cute.local_partition(w_row, thr_layout, tidx)
@@ -549,7 +557,7 @@ class RMSNormBwdOp(Op):
 
                     # --- Load dout from global ---
                     dout_row = cute.make_tensor(
-                        dout.iterator + row_idx * self.D,
+                        dout.iterator + global_offset,
                         cute.make_layout(self.D),
                     )
                     dout_part = cute.local_partition(dout_row, thr_layout, tidx)
@@ -561,7 +569,7 @@ class RMSNormBwdOp(Op):
 
                     if const_expr(self.has_gate):
                         gate_row = cute.make_tensor(
-                            gate.iterator + row_idx * self.D,
+                            gate.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         gate_part = cute.local_partition(gate_row, thr_layout, tidx)
@@ -621,7 +629,7 @@ class RMSNormBwdOp(Op):
 
                         # Write dgate to global
                         dgate_row = cute.make_tensor(
-                            dgate.iterator + row_idx * self.D,
+                            dgate.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         dgate_part = cute.local_partition(dgate_row, thr_layout, tidx)
@@ -648,7 +656,7 @@ class RMSNormBwdOp(Op):
                     # Write d_residual to global (same as dx, for fused-add backward)
                     if const_expr(self.has_residual):
                         dres_row = cute.make_tensor(
-                            d_residual.iterator + row_idx * self.D,
+                            d_residual.iterator + global_offset,
                             cute.make_layout(self.D),
                         )
                         dres_part = cute.local_partition(dres_row, thr_layout, tidx)
@@ -659,22 +667,22 @@ class RMSNormBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_D, dx_tma, dx_tma_gmem):
+    def store(self, page_ptr, tile_B, tile_S, tile_D, dx_tma, dx_tma_gmem):
         """TMA store of dx from shared to global memory."""
         sDX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gDX = cute.local_tile(
-            dx_tma_gmem, (self.D, self.tile_size_M), (None, None),
+            dx_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tDXsDX, tDXgDX = cute.nvgpu.cpasync.tma_partition(
             dx_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sDX, 0, 2),
-            cute.group_modes(gDX, 0, 2),
+            cute.group_modes(sDX, 0, 3),
+            cute.group_modes(gDX, 0, 3),
         )
         with cute.arch.elect_one():
-            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_M)])
+            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
 
 
 # Backward-compatible aliases

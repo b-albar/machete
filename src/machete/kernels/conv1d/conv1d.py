@@ -72,18 +72,18 @@ class Conv1dOp(Op):
         y: (B, L, D) — output tensor
 
     Tiling:
-        tile_B=1, tile_D=D (full extent), tile_L auto-computed.
-        2 * tile_L * D * elem_bytes <= page_size.
+        tile_B=1, tile_D=D (full extent), tile_S auto-computed.
+        2 * tile_S * D * elem_bytes <= page_size.
     """
 
     reads = {
-        "x": (None, ("B", "L", "D")),
+        "x": (None, ("B", "S", "D")),
         "w": (None, ("K", "D")),
     }
     writes = {
-        "y": (None, ("B", "L", "D")),
+        "y": (None, ("B", "S", "D")),
     }
-    tile = ("B", "L", "D")
+    tile = ("B", "S", "D")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -101,13 +101,13 @@ class Conv1dOp(Op):
         else:
             self.elem_bytes = 4
 
-        self.x_tile_bytes = self.tile_size_L * self.D * self.elem_bytes
+        self.x_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
         self.y_smem_offset = self.x_tile_bytes
         self.total_smem = 2 * self.x_tile_bytes
 
         assert self.total_smem <= self.page_size, (
             f"Conv1dOp: tile smem ({self.total_smem}B) exceeds "
-            f"page_size ({self.page_size}B). Reduce tile_size_L={self.tile_size_L}."
+            f"page_size ({self.page_size}B). Reduce tile_size_S={self.tile_size_S}."
         )
 
         self.num_warps = self.threads_per_row // 32
@@ -122,11 +122,11 @@ class Conv1dOp(Op):
         """Schedule causal conv1d forward.
 
         Args:
-            tile_sizes: optional {"L": int} override.
+            tile_sizes: optional {"S": int} override.
             activation: None, 'silu', or 'swish'.
             page_size: shared memory page size in bytes.
-            **tensors: x (B,L,D) required, w (D,K) required,
-                       y (B,L,D) optional (allocated if omitted).
+            **tensors: x (B,S,D) required, w (D,K) required,
+                       y (B,S,D) optional (allocated if omitted).
         """
         tile_sizes = dict(tile_sizes or {})
 
@@ -140,9 +140,9 @@ class Conv1dOp(Op):
         if x is not None:
             D = x.shape[2]
             elem_bytes = x.element_size()
-            if "L" not in tile_sizes:
+            if "S" not in tile_sizes:
                 # 2x smem: x tile + y tile
-                tile_sizes["L"] = max(1, page_size // (2 * D * elem_bytes))
+                tile_sizes["S"] = max(1, page_size // (2 * D * elem_bytes))
             # One batch per tile; D is full extent (one tile along D)
             tile_sizes.setdefault("B", 1)
             tile_sizes["D"] = D
@@ -168,14 +168,14 @@ class Conv1dOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_B, tile_L, tile_D, x_tma, x_tma_gmem, work_mbar):
+    def load(self, page_ptr, tile_B, tile_S, tile_D, x_tma, x_tma_gmem, work_mbar):
         """TMA load of x tile from global to shared memory."""
         sX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_L, 1)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gX = cute.local_tile(
-            x_tma_gmem, (self.D, self.tile_size_L, 1), (None, None, None),
+            x_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
             x_tma, Int32(0), cute.make_layout(1),
@@ -189,7 +189,7 @@ class Conv1dOp(Op):
         )
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(x_tma, tXgX[(None, tile_D, tile_L, tile_B)], tXsX,
+        cute.copy(x_tma, tXgX[(None, tile_D, tile_S, tile_B)], tXsX,
                   tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -197,14 +197,14 @@ class Conv1dOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_L, tile_D, x, w, y):
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, x, w, y):
         """Causal depthwise conv1d: read x from smem/global, write y to smem.
 
-        For each output position l in [tile_start, tile_start + tile_L):
+        For each output position l in [tile_start, tile_start + tile_S):
             y[b, l, d] = sum(w[K-1-j, d] * x[b, l-j, d] for j in 0..K-1)
         with optional SiLU activation.
 
-        x is read from smem for in-tile positions (src_l in [l_start, l_start+tile_L)).
+        x is read from smem for in-tile positions (src_l in [l_start, l_start+tile_S)).
         For halo positions (src_l < l_start), x is read from global memory.
         y is written to smem at y_smem_offset for TMA store.
         """
@@ -219,7 +219,7 @@ class Conv1dOp(Op):
         thr_layout = cute.make_layout(32)
 
         b = tile_B
-        l_start = tile_L * self.tile_size_L
+        l_start = tile_S * self.tile_size_S
 
         # Pre-load weight taps into registers: w_regs[j] = w[K-1-j, :]
         w_regs = []
@@ -234,10 +234,10 @@ class Conv1dOp(Op):
             w_regs.append(w_reg)
 
         # Each warp processes different L positions in round-robin
-        for local_l in range(warp_idx, self.tile_size_L, num_warps):
+        for local_l in range(warp_idx, self.tile_size_S, num_warps):
             l_idx = l_start + local_l
 
-            if l_idx < self.L:
+            if l_idx < self.S:
                 # Output row in y smem region
                 out_row = cute.make_tensor(
                     y_smem + local_l * self.D,
@@ -272,7 +272,7 @@ class Conv1dOp(Op):
                     if src_local < Int32(0):
                         if src_l >= Int32(0):
                             xg_row = cute.make_tensor(
-                                x.iterator + b * self.L * self.D + src_l * self.D,
+                                x.iterator + b * self.S * self.D + src_l * self.D,
                                 cute.make_layout(self.D),
                             )
                             xg_part = cute.local_partition(xg_row, thr_layout, lane_idx)
@@ -301,17 +301,17 @@ class Conv1dOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_B, tile_L, tile_D, y_tma, y_tma_gmem):
+    def store(self, page_ptr, tile_B, tile_S, tile_D, y_tma, y_tma_gmem):
         """TMA store of conv1d result from shared to global memory."""
         sY = cute.make_tensor(
             cute.make_ptr(
                 self.x_dtype, page_ptr + self.y_smem_offset,
                 cute.AddressSpace.smem,
             ),
-            cute.make_layout((self.D, self.tile_size_L, 1)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gY = cute.local_tile(
-            y_tma_gmem, (self.D, self.tile_size_L, 1), (None, None, None),
+            y_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
             y_tma, Int32(0), cute.make_layout(1),
@@ -319,14 +319,14 @@ class Conv1dOp(Op):
             cute.group_modes(gY, 0, 3),
         )
         with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_L, tile_B)])
+            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
     # =========================================================================
 
     @cute.jit
-    def communicate(self, page_ptr, tile_B, tile_L, tile_D,
+    def communicate(self, page_ptr, tile_B, tile_S, tile_D,
                     y_p0_tma, y_p0_tma_gmem):
         """Send y tile to peer GPU 0 via TMA S2G."""
         sY = cute.make_tensor(
@@ -334,10 +334,10 @@ class Conv1dOp(Op):
                 self.x_dtype, page_ptr + self.y_smem_offset,
                 cute.AddressSpace.smem,
             ),
-            cute.make_layout((self.D, self.tile_size_L, 1)),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gY = cute.local_tile(
-            y_p0_tma_gmem, (self.D, self.tile_size_L, 1), (None, None, None),
+            y_p0_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
         )
         tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
             y_p0_tma, Int32(0), cute.make_layout(1),
@@ -345,7 +345,7 @@ class Conv1dOp(Op):
             cute.group_modes(gY, 0, 3),
         )
         with cute.arch.elect_one():
-            cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_L, tile_B)])
+            cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
 __all__ = ["Conv1dOp"]

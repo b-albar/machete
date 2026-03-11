@@ -64,17 +64,16 @@ def run_rope_megakernel(q_4d, cos, sin, op_cls=None, num_sms=2):
     """
     if op_cls is None:
         op_cls = RopeOp
-    b, s, h, d = q_4d.shape
-    q_flat = q_4d.float().view(b * s, h, d).contiguous()
+    q_f32 = q_4d.float().contiguous()
     cos_f32 = cos.float().contiguous()
     sin_f32 = sin.float().contiguous()
 
-    ops = op_cls.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)
+    ops = op_cls.schedule(q=q_f32, cos=cos_f32, sin=sin_f32)
     mk_config = MegakernelConfig(num_sms=num_sms)
     kernel = Megakernel(ops, config=mk_config)
     kernel.run()
 
-    q_4d.copy_(q_flat.view(b, s, h, d).to(q_4d.dtype))
+    q_4d.copy_(q_f32.to(q_4d.dtype))
 
 
 def mk_rope_forward(q, cos, sin):

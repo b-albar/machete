@@ -4,7 +4,7 @@
 
 Models a chain of linear projections: x → W1 → W2 → W3 → W4 → W5 → y
 where each GEMM's output is the next one's input. All weight matrices
-are square (D×D) so the chain is: [M,D] @ [D,D] → [M,D] @ [D,D] → ...
+are square (D×D) so the chain is: [1,M,D] @ [D,D] → [1,M,D] @ [D,D] → ...
 
 Compares:
   1. Sequential torch.matmul calls (cuBLAS)
@@ -44,7 +44,7 @@ def is_sm90_or_newer():
 def total_bytes(M, D, dtype):
     """Total bytes for chained GEMMs.
 
-    Each GEMM reads input [M,D] + weight [D,D], writes output [M,D].
+    Each GEMM reads input [1,M,D] + weight [D,D], writes output [1,M,D].
     First GEMM reads x, last writes y, intermediates are read+written.
     """
     elem_bytes = 2 if dtype in ("float16", "bfloat16") else 4
@@ -72,6 +72,7 @@ def bench_fused_gemm(M, D, dtype):
 
     # Chain buffers: x → h0 → h1 → h2 → h3 → h4 (=y)
     # We need NUM_GEMMS + 1 activation buffers but can alias with 2 (ping-pong)
+    # 2D buffers for cuBLAS / CUDA graph paths
     buf_a = torch.randn(M, D, dtype=torch_dtype, device="cuda")   # input / even steps
     buf_b = torch.zeros(M, D, dtype=torch_dtype, device="cuda")   # odd steps
 
@@ -105,11 +106,11 @@ def bench_fused_gemm(M, D, dtype):
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         Ws_t = [w.t().contiguous() for w in Ws]  # GemmOp expects (N, K) layout
 
-        # Separate buffers for megakernel (can't alias with cuBLAS buffers)
-        mk_a = buf_a.clone()
-        mk_b = torch.zeros(M, D, dtype=torch_dtype, device="cuda")
+        # Separate 3D buffers for megakernel: (B=1, S=M, K=D)
+        mk_a = buf_a.clone().unsqueeze(0)  # (1, M, D)
+        mk_b = torch.zeros(1, M, D, dtype=torch_dtype, device="cuda")
 
-        # Chain: mk_a → W0 → mk_b → W1 → mk_a → W2 → mk_b → W3 → mk_a → W4 → mk_b
+        # Chain: mk_a(1,M,D) → W0 → mk_b → W1 → mk_a → W2 → mk_b → W3 → mk_a → W4 → mk_b
         # Framework auto-detects dependencies via shared tensor pointers
         inputs =  [mk_a, mk_b, mk_a, mk_b, mk_a]
         outputs = [mk_b, mk_a, mk_b, mk_a, mk_b]
@@ -127,7 +128,7 @@ def bench_fused_gemm(M, D, dtype):
         torch.cuda.synchronize()
 
         def mk_setup():
-            mk_a.copy_(buf_a)
+            mk_a[0].copy_(buf_a)
             mk_b.zero_()
 
         funcs["megakernel"] = kernel.bench_spec(

@@ -88,11 +88,9 @@ def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
 
     # Megakernel (in-place)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        b, s, h, d = batch, seq_len, n_heads, head_dim
         q_mk = q.clone()
-        q_flat = q_mk.view(b * s, h, d)
 
-        ops = RopeOp.schedule(q=q_flat, cos=cos, sin=sin)
+        ops = RopeOp.schedule(q=q_mk, cos=cos, sin=sin)
         config = RopeOp.kernel_config(ops)
         kernel = Megakernel(ops, config=config)
 
@@ -102,14 +100,13 @@ def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
 
         funcs["megakernel"] = kernel.bench_spec(
             setup_fn=lambda: q_mk.copy_(q),
-            keep_alive=[q_flat, cos, sin],
+            keep_alive=[q_mk, cos, sin],
         )
 
     # SingleOpKernel (in-place)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         q_so = q.clone()
-        q_so_flat = q_so.view(b * s, h, d)
-        so_ops = RopeOp.schedule(q=q_so_flat, cos=cos, sin=sin)
+        so_ops = RopeOp.schedule(q=q_so, cos=cos, sin=sin)
         so_kernel = SingleOpKernel(so_ops)
         with contextlib.redirect_stdout(io.StringIO()):
             so_kernel.run()
@@ -117,7 +114,7 @@ def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
 
         funcs["single_op"] = so_kernel.bench_spec(
             setup_fn=lambda: q_so.copy_(q),
-            keep_alive=[q_so_flat, cos, sin],
+            keep_alive=[q_so, cos, sin],
         )
 
     return funcs
@@ -146,11 +143,9 @@ def bench_rope_bwd(batch, seq_len, n_heads, head_dim):
 
     # Megakernel backward (inverse rotation)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        b, s, h, d = batch, seq_len, n_heads, head_dim
         q_bwd = q.clone()
-        q_bwd_flat = q_bwd.view(b * s, h, d)
 
-        bwd_ops = RopeBwdOp.schedule(q=q_bwd_flat, cos=cos, sin=sin)
+        bwd_ops = RopeBwdOp.schedule(q=q_bwd, cos=cos, sin=sin)
         bwd_config = RopeBwdOp.kernel_config(bwd_ops)
         bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
 
@@ -160,14 +155,13 @@ def bench_rope_bwd(batch, seq_len, n_heads, head_dim):
 
         funcs["megakernel"] = bwd_kernel.bench_spec(
             setup_fn=lambda: q_bwd.copy_(q),
-            keep_alive=[q_bwd_flat, cos, sin],
+            keep_alive=[q_bwd, cos, sin],
         )
 
     # SingleOpKernel backward
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         q_so_bwd = q.clone()
-        q_so_bwd_flat = q_so_bwd.view(b * s, h, d)
-        so_bwd_ops = RopeBwdOp.schedule(q=q_so_bwd_flat, cos=cos, sin=sin)
+        so_bwd_ops = RopeBwdOp.schedule(q=q_so_bwd, cos=cos, sin=sin)
         so_bwd_kernel = SingleOpKernel(so_bwd_ops)
         with contextlib.redirect_stdout(io.StringIO()):
             so_bwd_kernel.run()
@@ -175,7 +169,7 @@ def bench_rope_bwd(batch, seq_len, n_heads, head_dim):
 
         funcs["single_op"] = so_bwd_kernel.bench_spec(
             setup_fn=lambda: q_so_bwd.copy_(q),
-            keep_alive=[q_so_bwd_flat, cos, sin],
+            keep_alive=[q_so_bwd, cos, sin],
         )
 
     return funcs

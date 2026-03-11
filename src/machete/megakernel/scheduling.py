@@ -218,7 +218,8 @@ def _compute_formula_coeffs(
         for i in range(len(s_counts) - 1, -1, -1):
             coeffs[i] = stride
             stride *= s_counts[i]
-    # else: named ops with no shared dims → all zeros (all tiles map to same barrier)
+    # else: named ops with no shared dims — should not happen
+    # (_resolve_named_formulas raises ValueError before reaching here)
 
     return tuple(coeffs)
 
@@ -805,23 +806,27 @@ class InstructionStreamBuilder:
                 c_dims = set(c_op.dim_names.keys())
                 shared_dims = p_dims & c_dims
                 producer_only = p_dims - c_dims
-                consumer_only = c_dims - p_dims
 
-                # Handle non-divisible tile sizes on shared dims.
-                # When tile sizes don't divide evenly (e.g., producer M=4,
-                # consumer M=3), the integer division in BarrierFormula can't
-                # express the correct per-tile mapping. Move such dims to
-                # producer_only so all producer tiles on that dim get collapsed
-                # into a single barrier group (conservative but correct).
-                non_divisible = set()
+                # Validate tile sizes on shared dims are divisible.
+                # Non-divisible tile sizes (e.g., producer S=4, consumer S=3)
+                # cannot be expressed by BarrierFormula integer division.
+                # All ops sharing a dependency MUST have compatible tile sizes.
                 for dim in shared_dims:
                     p_ts = p_op.tile_sizes.get(dim, 1)
                     c_ts = c_op.tile_sizes.get(dim, 1)
                     if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        non_divisible.add(dim)
-                if non_divisible:
-                    shared_dims = shared_dims - non_divisible
-                    producer_only = producer_only | non_divisible
+                        raise ValueError(
+                            f"Incompatible tile sizes on shared dim '{dim}': "
+                            f"producer {p_op.op_cls.__name__} has tile_size={p_ts}, "
+                            f"consumer {c_op.op_cls.__name__} has tile_size={c_ts}. "
+                            f"Tile sizes on shared dims must be equal or "
+                            f"one must divide the other."
+                        )
+
+                # When named ops share no dimensions, all tiles map to the
+                # same barrier (all-or-nothing). This is correct but suboptimal.
+                # TODO: Once all ops use standardized dims (B, S, ...), add
+                # an error here to enforce tile-level barriers.
 
                 # Determine target side and compute barrier count / expected
                 # Also compute divisors for tile size ratio handling
@@ -829,140 +834,65 @@ class InstructionStreamBuilder:
                 c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
                 expected = 1
 
+                # Handle tile size ratios on shared dims
+                for dim in shared_dims:
+                    p_axis = p_op.dim_names[dim]
+                    c_axis = c_op.dim_names[dim]
+                    p_ts = p_op.tile_sizes.get(dim, 1)
+                    c_ts = c_op.tile_sizes.get(dim, 1)
+                    if p_ts > c_ts:
+                        ratio = p_ts // c_ts
+                        c_divs[c_axis] = ratio
+                    elif c_ts > p_ts:
+                        ratio = c_ts // p_ts
+                        p_divs[p_axis] = ratio
+                        expected *= ratio
+
+                # Barrier count: product of min tile counts on shared dims
+                num_barriers = 1
+                for dim in shared_dims:
+                    p_axis = p_op.dim_names[dim]
+                    c_axis = c_op.dim_names[dim]
+                    num_barriers *= min(
+                        p_op.tiles_for_axis(p_axis),
+                        c_op.tiles_for_axis(c_axis),
+                    )
+
                 if producer_only:
-                    # Many-to-one: producer has extra dims not in consumer.
-                    # Also handles both-sides-extra: consumer extra dims are
-                    # broadcast (all consumer tiles with same shared-dim values
-                    # wait on the same barrier, so extra consumer dims get
-                    # coefficient 0 in the formula).
-
-                    # Handle tile size ratios on shared dims
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-                            expected *= ratio
-
-                    # Barrier count: min tile counts on shared dims
-                    num_barriers = 1
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        num_barriers *= min(
-                            p_op.tiles_for_axis(p_axis),
-                            c_op.tiles_for_axis(c_axis),
-                        )
-
-                    # Collapse producer-only dims
+                    # Many-to-one (or both-sides-extra): collapse
+                    # producer-only dims — all producer tiles on those dims
+                    # signal the same barrier, so consumer expects them all.
                     collapsed = 1
                     for dim in producer_only:
                         axis = p_op.dim_names[dim]
                         collapsed *= p_op.tiles_for_axis(axis)
                     expected *= collapsed
 
-                    if consumer_only:
-                        # Both-sides-extra: compute coefficients using
-                        # shared-dim-only strides (not target_op strides)
-                        # so consumer extra dims get coefficient 0.
-                        shared_dims_sorted = sorted(shared_dims)
-                        shared_strides: Dict[str, int] = {}
-                        stride = 1
-                        for dim in reversed(shared_dims_sorted):
-                            shared_strides[dim] = stride
-                            p_axis = p_op.dim_names[dim]
-                            c_axis = c_op.dim_names[dim]
-                            stride *= min(
-                                p_op.tiles_for_axis(p_axis),
-                                c_op.tiles_for_axis(c_axis),
-                            )
+                # Compute coefficients using dense shared strides.
+                # Extra dims (producer-only / consumer-only) get coefficient 0
+                # since they don't appear in shared_dims. This correctly
+                # handles different axis orderings and tile size differences.
+                shared_dims_sorted = sorted(shared_dims)
+                shared_strides: Dict[str, int] = {}
+                stride = 1
+                for dim in reversed(shared_dims_sorted):
+                    shared_strides[dim] = stride
+                    p_axis = p_op.dim_names[dim]
+                    c_axis = c_op.dim_names[dim]
+                    stride *= min(
+                        p_op.tiles_for_axis(p_axis),
+                        c_op.tiles_for_axis(c_axis),
+                    )
 
-                        p_coeffs_list = [0] * MAX_TILE_DIMS
-                        for dim in shared_dims:
-                            p_coeffs_list[p_op.dim_names[dim]] = shared_strides[dim]
-                        p_coeffs = tuple(p_coeffs_list)
+                p_coeffs_list = [0] * MAX_TILE_DIMS
+                for dim in shared_dims:
+                    p_coeffs_list[p_op.dim_names[dim]] = shared_strides[dim]
+                p_coeffs = tuple(p_coeffs_list)
 
-                        c_coeffs_list = [0] * MAX_TILE_DIMS
-                        for dim in shared_dims:
-                            c_coeffs_list[c_op.dim_names[dim]] = shared_strides[dim]
-                        c_coeffs = tuple(c_coeffs_list)
-
-                        # Skip _compute_formula_coeffs below
-                        formulas[prod_idx][1].append(
-                            BarrierFormula(
-                                base=barrier_counter,
-                                coeffs=p_coeffs,
-                                divs=tuple(p_divs),
-                            )
-                        )
-                        formulas[rec.op_idx][0].append(
-                            BarrierFormula(
-                                base=barrier_counter,
-                                coeffs=c_coeffs,
-                                divs=tuple(c_divs),
-                                expected=expected,
-                            )
-                        )
-                        barrier_counter += num_barriers
-                        continue
-                    else:
-                        target_op = c_op
-
-                elif consumer_only and not producer_only:
-                    # One-to-many: producer has fewer dims
-                    target_op = p_op
-
-                    # Handle tile size ratios on shared dims
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-
-                    # Barrier count: min tile counts on shared dims
-                    num_barriers = 1
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        num_barriers *= min(
-                            p_op.tiles_for_axis(p_axis),
-                            c_op.tiles_for_axis(c_axis),
-                        )
-                    expected = 1
-                else:
-                    # Same dims (or no dims) - check for tile size differences
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-                            expected *= ratio
-
-                    target_op = c_op
-                    num_barriers = min(p_op.total_tiles, c_op.total_tiles)
-
-                # Compute formula coefficients
-                p_coeffs = _compute_formula_coeffs(p_op, target_op, shared_dims)
-                c_coeffs = _compute_formula_coeffs(c_op, target_op, shared_dims)
+                c_coeffs_list = [0] * MAX_TILE_DIMS
+                for dim in shared_dims:
+                    c_coeffs_list[c_op.dim_names[dim]] = shared_strides[dim]
+                c_coeffs = tuple(c_coeffs_list)
 
                 # Producer signal formula
                 formulas[prod_idx][1].append(

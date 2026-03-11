@@ -85,10 +85,10 @@ class TestGemmTPSingleGPU:
 
         M, K, N = 64, 64, 32
         torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
-        peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
         ops = GemmColumnParallelOp.schedule(a=a, b=b, c=c)
         base_config = GemmColumnParallelOp.kernel_config(ops)
@@ -106,9 +106,9 @@ class TestGemmTPSingleGPU:
             kernel.run()
         torch.cuda.synchronize()
 
-        ref = _gemm_ref(a, b)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-        torch.testing.assert_close(peer_c, ref, atol=1e-1, rtol=1e-2)
+        ref = _gemm_ref(a.squeeze(0), b)
+        torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(peer_c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
 
     @requires_gpu
     def test_row_parallel_smoke(self):
@@ -118,10 +118,10 @@ class TestGemmTPSingleGPU:
 
         M, K, N = 64, 64, 32
         torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
-        peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
         ops = GemmRowParallelOp.schedule(a=a, b=b, c=c)
         base_config = GemmRowParallelOp.kernel_config(ops)
@@ -139,9 +139,9 @@ class TestGemmTPSingleGPU:
             kernel.run()
         torch.cuda.synchronize()
 
-        ref = _gemm_ref(a, b)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-        torch.testing.assert_close(peer_c, ref, atol=1e-1, rtol=1e-2)
+        ref = _gemm_ref(a.squeeze(0), b)
+        torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(peer_c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
 
     @requires_gpu
     def test_schedule_forward_tp_column(self):
@@ -149,9 +149,9 @@ class TestGemmTPSingleGPU:
         from machete.kernels.gemm import GemmOp, GemmColumnParallelOp
 
         M, K, N = 64, 64, 32
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
         ops = GemmOp.schedule_forward_tp(tp_mode='column', a=a, b=b, c=c)
         assert ops[0].op_cls is GemmColumnParallelOp
@@ -162,9 +162,9 @@ class TestGemmTPSingleGPU:
         from machete.kernels.gemm import GemmOp, GemmRowParallelOp
 
         M, K, N = 64, 64, 32
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
         ops = GemmOp.schedule_forward_tp(tp_mode='row', a=a, b=b, c=c)
         assert ops[0].op_cls is GemmRowParallelOp
@@ -190,10 +190,10 @@ class TestGemmTPColumnParallel:
 
         M, K, N = 64, 64, 32
         torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda:0")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda:0")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda:0")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda:0")
-        peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda:1")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:0")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:1")
 
         ops = GemmColumnParallelOp.schedule(a=a, b=b, c=c)
         base_config = GemmColumnParallelOp.kernel_config(ops)
@@ -211,10 +211,10 @@ class TestGemmTPColumnParallel:
             kernel.run()
         torch.cuda.synchronize()
 
-        ref = _gemm_ref(a, b)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+        ref = _gemm_ref(a.squeeze(0), b)
+        torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(
-            peer_c.to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
+            peer_c.squeeze(0).to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
 
     def test_broadcast_multi_tile(self):
         """Multi-tile column-parallel broadcast."""
@@ -226,10 +226,10 @@ class TestGemmTPColumnParallel:
 
         M, K, N = 256, 64, 64
         torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda:0")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda:0")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda:0")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda:0")
-        peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda:1")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:0")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:1")
 
         ops = GemmColumnParallelOp.schedule(a=a, b=b, c=c)
         base_config = GemmColumnParallelOp.kernel_config(ops)
@@ -247,10 +247,10 @@ class TestGemmTPColumnParallel:
             kernel.run()
         torch.cuda.synchronize()
 
-        ref = _gemm_ref(a, b)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+        ref = _gemm_ref(a.squeeze(0), b)
+        torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(
-            peer_c.to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
+            peer_c.squeeze(0).to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
 
 
 # =============================================================================
@@ -282,10 +282,10 @@ class TestGemmTPRowParallel:
 
         M, K, N = 64, 64, 32
         torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda:0")
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda:0")
         b = torch.randn(N, K, dtype=torch.float16, device="cuda:0")
-        c = torch.zeros(M, N, dtype=torch.float16, device="cuda:0")
-        peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda:1")
+        c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:0")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda:1")
 
         ops = GemmRowParallelOp.schedule(a=a, b=b, c=c)
         base_config = GemmRowParallelOp.kernel_config(ops)
@@ -303,10 +303,10 @@ class TestGemmTPRowParallel:
             kernel.run()
         torch.cuda.synchronize()
 
-        ref = _gemm_ref(a, b)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+        ref = _gemm_ref(a.squeeze(0), b)
+        torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(
-            peer_c.to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
+            peer_c.squeeze(0).to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
 
 
 if __name__ == "__main__":

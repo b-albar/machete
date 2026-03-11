@@ -15,7 +15,7 @@ Usage:
     from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})
+    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"S": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -223,6 +223,9 @@ class Megakernel:
             self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
             self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
         self._peer_tma_cute_tensors: Optional[List] = None
+
+        # Validate barrier formulas eagerly (catches incompatible tile sizes early)
+        _ = self._builder.num_barriers
 
         # Trace setup
         from .tracing import setup_tracing
@@ -1863,10 +1866,19 @@ class Megakernel:
             self.config.opt_level,
         )
 
-        # Tensors are runtime parameters (not compile-time constants), so
-        # the cache key does NOT include tensor addresses. Same shapes/dtypes
-        # (captured in static_dims and tensor_dtypes above) share compiled kernels.
-        return (tuple(op_keys), config_key)
+        # TMA descriptors are baked into the compiled kernel by cute.compile()
+        # (they contain tensor base addresses). Include data_ptrs of TMA tensors
+        # so different tensor allocations don't share stale TMA descriptors.
+        tma_data_ptrs = ()
+        if self._tma_registry.has_tma:
+            tma_names = {d.tensor_canonical for d in self._tma_registry.descriptors}
+            ptrs = []
+            for canonical_name, tensor, dtype in self._tensor_registry.tensors:
+                if canonical_name in tma_names:
+                    ptrs.append(tensor.data_ptr())
+            tma_data_ptrs = tuple(ptrs)
+
+        return (tuple(op_keys), config_key, tma_data_ptrs)
 
     def compile(self) -> None:
         """Compile the kernel without running it.

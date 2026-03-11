@@ -42,32 +42,32 @@ _BV = 64   # V-strip
 class GDNPrepOp(Op):
     """Gated Delta Net Prep — cooperative cpasync + MMA megakernel Op.
 
-    Tensors (native [B, T, H, K/V] layout, no transposes):
-        k:       (B, T, H, K)  -- keys  (fp16 or bf16)
-        v:       (B, T, H, V)  -- values
-        g:       (B, T, H)     -- log-space gates (fp32, <= 0)
-        beta:    (B, T, H)     -- beta values (fp32, in [0,1])
-        g_cumsum:(B, T, H)     -- output: cumulative gates (fp32)
-        w:       (B, T, H, K)  -- output: transformed keys
-        u:       (B, T, H, V)  -- output: transformed values
+    Tensors (native [B, S, NH, K/V] layout, no transposes):
+        k:       (B, S, NH, K)  -- keys  (fp16 or bf16)
+        v:       (B, S, NH, V)  -- values
+        g:       (B, S, NH)     -- log-space gates (fp32, <= 0)
+        beta:    (B, S, NH)     -- beta values (fp32, in [0,1])
+        g_cumsum:(B, S, NH)     -- output: cumulative gates (fp32)
+        w:       (B, S, NH, K)  -- output: transformed keys
+        u:       (B, S, NH, V)  -- output: transformed values
 
     Tiling:
-        tile_B=1, tile_H=1 (per batch-head), tile_T=BT=64 (per chunk).
+        tile_B=1, tile_NH=1 (per batch-head), tile_S=BT=64 (per chunk).
         K and V are looped over in blocks of BK/BV inside compute.
     """
 
     reads = {
-        "k":    (None, ("B", "T", "H", "K")),
-        "v":    (None, ("B", "T", "H", "V")),
-        "g":    (cutlass.Float32, ("B", "T", "H")),
-        "beta": (cutlass.Float32, ("B", "T", "H")),
+        "k":    (None, ("B", "S", "NH", "K")),
+        "v":    (None, ("B", "S", "NH", "V")),
+        "g":    (cutlass.Float32, ("B", "S", "NH")),
+        "beta": (cutlass.Float32, ("B", "S", "NH")),
     }
     writes = {
-        "g_cumsum": (cutlass.Float32, ("B", "T", "H")),
-        "w":        (None, ("B", "T", "H", "K")),
-        "u":        (None, ("B", "T", "H", "V")),
+        "g_cumsum": (cutlass.Float32, ("B", "S", "NH")),
+        "w":        (None, ("B", "S", "NH", "K")),
+        "u":        (None, ("B", "S", "NH", "V")),
     }
-    tile = ("B", "H", "T")
+    tile = ("B", "NH", "S")
     tma_loads = {"k"}
 
     @classmethod
@@ -77,7 +77,7 @@ class GDNPrepOp(Op):
         BK = static_dims.get("BK", _BK)
         # 3D tile (BT, H, BK) — framework merges B*T into one dim.
         # After reversal: (BK, H_tile, BT).
-        return (_BT, tile_sizes.get("H", 1), BK)
+        return (_BT, tile_sizes.get("NH", 1), BK)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -112,7 +112,7 @@ class GDNPrepOp(Op):
 
         assert self.K % self.BK == 0
         assert self.V % self.BV == 0
-        assert self.T % self.BT == 0
+        assert self.S % self.BT == 0
 
         # MMA setup
         self.num_mma_warps = self.BT // 16  # 4 warps for BT=64
@@ -199,8 +199,8 @@ class GDNPrepOp(Op):
         """Schedule GDN prep Op."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("H", 1)
-        tile_sizes.setdefault("T", _BT)
+        tile_sizes.setdefault("NH", 1)
+        tile_sizes.setdefault("S", _BT)
 
         k = tensors.get("k")
         K = k.shape[-1] if k is not None else 64
@@ -209,13 +209,13 @@ class GDNPrepOp(Op):
         elem_bytes = k.element_size() if k is not None else 2
         BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
 
-        T = k.shape[1] if k is not None else 64
+        S = k.shape[1] if k is not None else 64
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["BV"] = BV
         ops[0].static_dims["K"] = K
-        ops[0].static_dims["T"] = T
+        ops[0].static_dims["S"] = S
         return ops
 
     @classmethod
@@ -237,7 +237,7 @@ class GDNPrepOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_B, tile_H, tile_T,
+    def load(self, page_ptr, tile_B, tile_NH, tile_S,
              k_tma, k_tma_gmem, work_mbar, inner_iter_idx):
         """TMA k load: NK sub-blocks [BT, BK] into double buffer.
 
@@ -250,7 +250,7 @@ class GDNPrepOp(Op):
         swz = cute.make_swizzle(3, 4, 3)  # SW128
 
         # Merged B*T coordinate: framework collapses B and T into one CuTe mode
-        merged_t = tile_B * Int32(self.T // self.BT) + tile_T
+        merged_t = tile_B * Int32(self.S // self.BT) + tile_S
 
         if inner_iter_idx == Int32(0):
             nbytes = Int32(self._k_tma_bytes)
@@ -277,7 +277,7 @@ class GDNPrepOp(Op):
                     cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
                 )
                 # Coords: (None, K_block, H_coord, merged_BT_coord)
-                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_H, merged_t)],
+                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_NH, merged_t)],
                           tKsK, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -286,7 +286,7 @@ class GDNPrepOp(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_B, tile_H, tile_T,
+        self, page_ptr, tile_B, tile_NH, tile_S,
         k, v, g, beta, g_cumsum, w, u,
     ):
         """Cooperative GDN prep: 4 fused sub-stages."""
@@ -294,13 +294,13 @@ class GDNPrepOp(Op):
         warp_idx = cute.arch.warp_idx()
 
         if warp_idx < Int32(self.num_mma_warps):
-            self._phase1_cumsum(page_ptr, tidx, tile_B, tile_H, tile_T, g, beta, g_cumsum)
+            self._phase1_cumsum(page_ptr, tidx, tile_B, tile_NH, tile_S, g, beta, g_cumsum)
             self._phase2_kkt(page_ptr, tidx)
             self._phase3_solve(page_ptr, tidx)
-            self._phase4_wu(page_ptr, tidx, tile_B, tile_H, tile_T, k, v, w, u)
+            self._phase4_wu(page_ptr, tidx, tile_B, tile_NH, tile_S, k, v, w, u)
 
     @cute.jit
-    def _phase1_cumsum(self, page_ptr, tidx, tile_B, tile_H, tile_T, g, beta, g_cumsum):
+    def _phase1_cumsum(self, page_ptr, tidx, tile_B, tile_NH, tile_S, g, beta, g_cumsum):
         """Phase 1: Load g + beta, prefix sum -> g_cumsum, write global."""
         g_buf = cute.make_tensor(
             cute.make_ptr(Float32, page_ptr + Int32(self._gbuf_offset),
@@ -318,20 +318,20 @@ class GDNPrepOp(Op):
             cute.make_layout(self.BT),
         )
 
-        chunk_idx = tile_T
+        chunk_idx = tile_S
 
-        # Global tiles — g, beta, g_cumsum are [B, T, H] with stride (T*H, H, 1)
-        g_head_base = tile_B * Int32(self.T * self.H) + tile_H
+        # Global tiles — g, beta, g_cumsum are [B, S, NH] with stride (S*NH, NH, 1)
+        g_head_base = tile_B * Int32(self.S * self.NH) + tile_NH
         gG = cute.make_tensor(g.iterator + g_head_base,
-            cute.make_layout((self.T,), stride=(self.H,)))
+            cute.make_layout((self.S,), stride=(self.NH,)))
         gG_tile = cute.local_tile(gG, (self.BT,), (chunk_idx,))
 
         gBeta = cute.make_tensor(beta.iterator + g_head_base,
-            cute.make_layout((self.T,), stride=(self.H,)))
+            cute.make_layout((self.S,), stride=(self.NH,)))
         gBeta_tile = cute.local_tile(gBeta, (self.BT,), (chunk_idx,))
 
         gGC = cute.make_tensor(g_cumsum.iterator + g_head_base,
-            cute.make_layout((self.T,), stride=(self.H,)))
+            cute.make_layout((self.S,), stride=(self.NH,)))
         gGC_tile = cute.local_tile(gGC, (self.BT,), (chunk_idx,))
 
         # Load g and beta
@@ -533,13 +533,13 @@ class GDNPrepOp(Op):
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
     @cute.jit
-    def _phase4_wu(self, page_ptr, tidx, tile_B, tile_H, tile_T, k, v, w, u):
+    def _phase4_wu(self, page_ptr, tidx, tile_B, tile_NH, tile_S, k, v, w, u):
         """Phase 4: A_solved @ k_weighted -> w, A_solved @ v_weighted -> u.
 
         Double-buffered cpasync: prefetch next tile while computing current tile.
         Two s_src buffers at _src_base and _src_base2.
         """
-        chunk_idx = tile_T
+        chunk_idx = tile_S
 
         # Read A_solved from fp32 smem
         a_smem = cute.make_tensor(
@@ -639,15 +639,15 @@ class GDNPrepOp(Op):
         mc_out = cute.make_identity_tensor((self.BT, self.BK))
         tCcOut = thr_mma.partition_C(mc_out)
 
-        # Global tensors — [B, T, H, K/V] with H-strided per-head access
-        kw_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.K)
+        # Global tensors — [B, S, NH, K/V] with NH-strided per-head access
+        kw_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.K)
         gK_head = cute.make_tensor(
             (k.iterator + kw_base).align(16),
-            cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+            cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
 
         gW_head = cute.make_tensor(
             (w.iterator + kw_base).align(16),
-            cute.make_layout((self.T, self.K), stride=(self.H * self.K, 1)))
+            cute.make_layout((self.S, self.K), stride=(self.NH * self.K, 1)))
 
         # ---- Phase 4a: w = A_solved @ k_weighted (double-buffered) ----
         # Prefetch k[0] -> buf[0]
@@ -751,14 +751,14 @@ class GDNPrepOp(Op):
 
         _elems_per_thread_v = (self.BT * self.BV) // _nthreads
 
-        uv_base = (tile_B * Int32(self.T * self.H) + tile_H) * Int32(self.V)
+        uv_base = (tile_B * Int32(self.S * self.NH) + tile_NH) * Int32(self.V)
         gV_head = cute.make_tensor(
             (v.iterator + uv_base).align(16),
-            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+            cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
 
         gU_head = cute.make_tensor(
             (u.iterator + uv_base).align(16),
-            cute.make_layout((self.T, self.V), stride=(self.H * self.V, 1)))
+            cute.make_layout((self.S, self.V), stride=(self.NH * self.V, 1)))
 
         # Prefetch v[0] -> buf[0]
         gV_tile0 = cute.local_tile(gV_head, (self.BT, self.BV),
