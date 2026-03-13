@@ -42,6 +42,24 @@ try:
 except ImportError:
     HAS_MEGAKERNEL_OPS = False
 
+# 4-Op decomposition (lower register pressure)
+try:
+    from machete.kernels.gated_delta_net.solve_op import GDNSolveOp
+    from machete.kernels.gated_delta_net.wu_op import GDNWUOp
+    from machete.kernels.gated_delta_net.state_op import GDNStateOp
+    from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+    HAS_4OP = True
+except ImportError:
+    HAS_4OP = False
+
+# 5-Op decomposition (StateOp split into StateRecurrence + VNew)
+try:
+    from machete.kernels.gated_delta_net.state_recurrence_op import GDNStateRecurrenceOp
+    from machete.kernels.gated_delta_net.vnew_op import GDNVNewOp
+    HAS_5OP = True
+except ImportError:
+    HAS_5OP = False
+
 
 def _run_prep_megakernel(k, v, g, beta):
     """Run GDNPrepOp megakernel for prep stage (native [B,T,H,K] layout)."""
@@ -134,6 +152,135 @@ def _run_fused_bwd_megakernel(q, k, w, g_cumsum, do, scale):
     Megakernel(ops, config=config).run()
 
     return dv
+
+
+def _run_4op_megakernel(q, k, v, g, beta, scale, page_size=None):
+    """Run full forward as a 4-op fused megakernel: Solve → WU → State → Output.
+
+    Lower register pressure than the 2-op version (PrepOp + FusedOp).
+    All tensors use native [B, T, H, K/V] layout — no transposes.
+    """
+    from machete.megakernel import Megakernel
+    from machete.megakernel.ops import DEFAULT_PAGE_SIZE
+
+    if page_size is None:
+        page_size = DEFAULT_PAGE_SIZE
+
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    NT = T // 64
+    dtype = q.dtype
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+
+    # Allocate intermediates and output
+    g_cumsum = torch.zeros(B, T, H, device=q.device, dtype=torch.float32)
+    a_solved = torch.zeros(B, T, H, 64, device=q.device, dtype=dtype)
+    w = torch.zeros(B, T, H, K, device=q.device, dtype=dtype)
+    u = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+    v_new = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+    h_states = torch.zeros(B, NT, H, K, V, device=q.device, dtype=dtype)
+    o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+
+    # Schedule all 4 ops — framework auto-detects deps via shared data_ptrs
+    solve_ops = GDNSolveOp.schedule_forward(
+        k=k, g=g, beta=beta,
+        g_cumsum=g_cumsum, a_solved=a_solved,
+        page_size=page_size,
+    )
+    wu_ops = GDNWUOp.schedule_forward(
+        a_solved=a_solved, k=k, v=v,
+        g_cumsum=g_cumsum, beta=beta,
+        w=w, u=u,
+        page_size=page_size,
+    )
+    state_ops = GDNStateOp.schedule_forward(
+        k=k, w=w, u=u, g_cumsum=g_cumsum,
+        v_new=v_new, h_states=h_states,
+        page_size=page_size,
+    )
+    output_ops = GDNOutputOp.schedule_forward(
+        q=q, k=k, v_new=v_new, h_states=h_states,
+        g_cumsum=g_cumsum, o=o, scale=scale,
+        page_size=page_size,
+    )
+
+    all_ops = solve_ops + wu_ops + state_ops + output_ops
+    config = GDNOutputOp.kernel_config(all_ops)
+    Megakernel(all_ops, config=config).run()
+
+    return o
+
+
+def _run_5op_megakernel(q, k, v, g, beta, scale, page_size=None):
+    """Run full forward as a 5-op fused megakernel: Solve → WU → StateRecurrence → VNew → Output.
+
+    Splits StateOp into sequential StateRecurrence (h_states only) + parallel VNew (v_new = u - w@h).
+    All tensors use native [B, T, H, K/V] layout — no transposes.
+    """
+    from machete.megakernel import Megakernel
+    from machete.megakernel.ops import DEFAULT_PAGE_SIZE
+
+    if page_size is None:
+        page_size = DEFAULT_PAGE_SIZE
+
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    NT = T // 64
+    dtype = q.dtype
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+
+    # Allocate intermediates and output
+    g_cumsum = torch.zeros(B, T, H, device=q.device, dtype=torch.float32)
+    a_solved = torch.zeros(B, T, H, 64, device=q.device, dtype=dtype)
+    w = torch.zeros(B, T, H, K, device=q.device, dtype=dtype)
+    u = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+    v_new = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+    h_states = torch.zeros(B, NT, H, K, V, device=q.device, dtype=dtype)
+    o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
+
+    # Schedule all 5 ops
+    solve_ops = GDNSolveOp.schedule_forward(
+        k=k, g=g, beta=beta,
+        g_cumsum=g_cumsum, a_solved=a_solved,
+        page_size=page_size,
+    )
+    wu_ops = GDNWUOp.schedule_forward(
+        a_solved=a_solved, k=k, v=v,
+        g_cumsum=g_cumsum, beta=beta,
+        w=w, u=u,
+        page_size=page_size,
+    )
+    state_ops = GDNStateRecurrenceOp.schedule_forward(
+        k=k, w=w, u=u, g_cumsum=g_cumsum,
+        h_states=h_states,
+        page_size=page_size,
+    )
+    vnew_ops = GDNVNewOp.schedule_forward(
+        w=w, u=u, h_states=h_states,
+        v_new=v_new,
+        page_size=page_size,
+    )
+    output_ops = GDNOutputOp.schedule_forward(
+        q=q, k=k, v_new=v_new, h_states=h_states,
+        g_cumsum=g_cumsum, o=o, scale=scale,
+        page_size=page_size,
+    )
+
+    all_ops = solve_ops + wu_ops + state_ops + vnew_ops + output_ops
+    config = GDNOutputOp.kernel_config(all_ops)
+    Megakernel(all_ops, config=config).run()
+
+    return o
 
 
 def _forward(q, k, v, g, beta, scale, initial_state, output_final_state):
@@ -256,6 +403,10 @@ def chunk_gated_delta_rule(
 __all__ = [
     "chunk_gated_delta_rule",
     "HAS_MEGAKERNEL_OPS",
+    "HAS_4OP",
+    "HAS_5OP",
     "_run_fused_megakernel",
     "_run_fused_bwd_megakernel",
+    "_run_4op_megakernel",
+    "_run_5op_megakernel",
 ]
