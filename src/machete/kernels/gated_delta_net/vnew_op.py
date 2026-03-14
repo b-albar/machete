@@ -133,7 +133,6 @@ class GDNVNewOp(Op):
         self._s_uv_offset = ((uv_start + 127) // 128) * 128
         mbar_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._mbar_offset = ((mbar_start + 7) // 8) * 8
-        self._total_smem = self._mbar_offset + _MBAR_BYTES
 
         self.compute = self.compute_mma
 

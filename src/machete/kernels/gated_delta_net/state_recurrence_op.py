@@ -111,7 +111,6 @@ class GDNStateRecurrenceOp(Op):
         self._s_uv_offset = ((uv_start + 127) // 128) * 128
         gbuf_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._gbuf_offset = ((gbuf_start + 15) // 16) * 16
-        self._total_smem = self._gbuf_offset + self.BT * 4
 
         self.compute = self.compute_mma
 
@@ -139,7 +138,7 @@ class GDNStateRecurrenceOp(Op):
         return 32, 32
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE,
                          num_stages=2, tile_sizes=None, **tensors):
         """Schedule GDN state recurrence Op."""
         tile_sizes = dict(tile_sizes or {})
