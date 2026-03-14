@@ -207,6 +207,8 @@ def _build_phase_wrapper(
     # TMA ops handle thread selection internally (elect_one for mbarrier,
     # cute.copy outside for warp-convergent TMA copy).
     has_tma = bool(tma_local_mapping)
+    is_compute = phase_name == "compute"
+    is_store = phase_name in ("store", "communicate")
     if is_load_phase and not has_tma:
         # Non-TMA loads: elect_one so only one thread issues the G2S copy.
         body = f"    with cute.arch.elect_one():\n"
@@ -217,6 +219,15 @@ def _build_phase_wrapper(
         body = f"    _instance.{phase_name}({call_str})\n"
         if append_mbar:
             body += "    mbarrier_arrive(work_mbar)\n"
+
+    # Prevent LLVM DCE of noinline compute/store wrappers with empty bodies.
+    # When an op's method is a no-op (pass), the wrapper generates no code.
+    # LLVM marks the function as readnone and eliminates the call, which can
+    # corrupt control flow in the MMA/store warp loops.  A zero-cost
+    # nanosleep.u32 0 acts as a compiler barrier with no runtime overhead.
+    needs_fence = is_compute or is_store
+    if needs_fence:
+        body += "    _compiler_fence()\n"
 
     fn_source = (
         "@cute.jit\n"
@@ -235,6 +246,14 @@ def _build_phase_wrapper(
         from .interpreter import mbarrier_arrive
 
         exec_globals["mbarrier_arrive"] = mbarrier_arrive
+    if needs_fence:
+        from .interpreter import nanosleep
+
+        @cute.jit
+        def _compiler_fence():
+            nanosleep(Int32(0))
+
+        exec_globals["_compiler_fence"] = _compiler_fence
 
     linecache.cache[unique_filename] = (
         len(fn_source),

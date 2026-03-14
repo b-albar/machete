@@ -133,20 +133,14 @@ class GDNWUOp(Op):
         self.v_copy_dim1 = self.BV // self.async_copy_elems
         self.v_copy_dim0 = self.num_mma_threads // self.v_copy_dim1
 
-        # Padded strides for V cpasync (bank-conflict-free)
-        self.BK_PAD = self.BK + 8  # K uses compact for TMA but padded for B-view
+        # Padded stride for V cpasync (bank-conflict-free)
         self.BV_PAD = self.BV + 8
-
-        # DMA warp loads a_solved + K via TMA
-        self.inner_iters = max(1, self.NK - 1)
-        self.inner_depth = 1
-        self._tma_k_blocks = min(2, self.NK)
 
         # Smem layout:
         #   a_solved [BT, BT] fp16 from TMA at offset 0 (8KB)
         #   gc_buf [BT] fp32 + beta_buf [BT] fp32
-        #   K-phase: k_buf×2 [BT,BK] TMA compact + 4 mbarriers (32B)
-        #   V-phase: v_buf×2 [BT,BV_PAD] cpasync padded (reuses K area)
+        #   K-phase: k_buf×1-2 [BT,BK] TMA compact + 4 mbarriers (32B)
+        #   V-phase: v_buf×1-2 [BT,BV_PAD] cpasync padded (reuses K area)
         self._a_bytes = self.BT * self.BT * self.elem_bytes
 
         scalars_start = ((self._a_bytes + 15) // 16) * 16
@@ -158,12 +152,25 @@ class GDNWUOp(Op):
 
         # K TMA buffers (compact, no swizzle — writable for weighting)
         k_buf_bytes = self.BT * self.BK * self.elem_bytes
+        k_double_total = self._src_base + 2 * k_buf_bytes + _MBAR_BYTES
+        self._single_buf_k = k_double_total > self.page_size
+
         self._k_buf0_offset = self._src_base
-        self._k_buf1_offset = self._src_base + k_buf_bytes
         self._k_buf_stride = k_buf_bytes
+        if self._single_buf_k:
+            self._k_buf1_offset = self._k_buf0_offset
+            self._tma_k_blocks = min(1, self.NK)
+            k_region_end = self._k_buf0_offset + k_buf_bytes
+        else:
+            self._k_buf1_offset = self._src_base + k_buf_bytes
+            self._tma_k_blocks = min(2, self.NK)
+            k_region_end = self._k_buf1_offset + k_buf_bytes
         self._tma_k_bytes = self._tma_k_blocks * k_buf_bytes
-        k_region_end = self._k_buf1_offset + k_buf_bytes
         self._mbar_offset = ((k_region_end + 7) // 8) * 8
+
+        # DMA warp loads a_solved + K via TMA
+        self.inner_iters = max(1, self.NK - self._tma_k_blocks + 1)
+        self.inner_depth = 1
 
         # V cpasync buffers (padded, reuse same smem area)
         v_buf_bytes = self.BT * self.BV_PAD * self.elem_bytes
@@ -189,8 +196,8 @@ class GDNWUOp(Op):
         Smem layout (two phases sharing src area):
             a_solved [BT, BT] fp16           8KB
             gc_buf + beta_buf                512B
-            K-phase: 2 × [BT, BK] + mbar    2*BT*BK*2 + 32
-            V-phase: 2 × [BT, BV_PAD]       2*BT*(BV+8)*2
+            K-phase: 1-2 × [BT, BK] + mbar  (1 or 2)*BT*BK*2 + 32
+            V-phase: 1-2 × [BT, BV_PAD]     (1 or 2)*BT*(BV+8)*2
         """
         BT = _BT
         a_bytes = BT * BT * elem_bytes
@@ -205,14 +212,21 @@ class GDNWUOp(Op):
                 if V % BV != 0 or BV > BT:
                     continue
                 BV_PAD = BV + 8
-                k_total = src_base + 2 * BT * BK * elem_bytes + _MBAR_BYTES
-                v_total = src_base + 2 * BT * BV_PAD * elem_bytes
-                # Both K and V phases must fit
-                if max(k_total, v_total) <= page_size:
-                    return BK, BV
-                # Try single-buffer V fallback
+                k_double = src_base + 2 * BT * BK * elem_bytes + _MBAR_BYTES
+                k_single = src_base + BT * BK * elem_bytes + _MBAR_BYTES
+                v_double = src_base + 2 * BT * BV_PAD * elem_bytes
                 v_single = src_base + BT * BV_PAD * elem_bytes
-                if max(k_total, v_single) <= page_size:
+                # Try double-buf K + double-buf V
+                if max(k_double, v_double) <= page_size:
+                    return BK, BV
+                # Try double-buf K + single-buf V
+                if max(k_double, v_single) <= page_size:
+                    return BK, BV
+                # Try single-buf K + double-buf V
+                if max(k_single, v_double) <= page_size:
+                    return BK, BV
+                # Try single-buf K + single-buf V
+                if max(k_single, v_single) <= page_size:
                     return BK, BV
         return 32, 32
 
@@ -335,29 +349,36 @@ class GDNWUOp(Op):
                           tKsK, tma_bar_ptr=mbar_ptr)
 
         if inner_iter_idx > Int32(0):
-            # Store warp: load K[k_block] into freed buffer
-            _k_block = inner_iter_idx + Int32(1)
-            _buf_idx = _k_block % Int32(2)
-
-            # Wait for compute to free this buffer
-            _bf_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-            if _buf_idx == Int32(0):
-                mbarrier_wait(_bf_0, _bf_phase)
-            if _buf_idx == Int32(1):
-                mbarrier_wait(_bf_1, _bf_phase)
-
-            # Set up TMA bar for kblock_ready
+            # Load K[k_block] into freed buffer
+            _k_block = inner_iter_idx + Int32(self._tma_k_blocks - 1)
+            # Initialize before control flow (CuTe DSL: no constexpr-if)
             _buf_base = page_ptr + Int32(self._k_buf0_offset)
-            if _buf_idx == Int32(1):
-                _buf_base = page_ptr + Int32(self._k_buf1_offset)
             _kr_mbar = _kr_0
-            if _buf_idx == Int32(1):
-                _kr_mbar = _kr_1
+
+            if self._single_buf_k:
+                # Single-buf: always buf 0, phase alternates every iteration
+                _bf_phase = (inner_iter_idx - Int32(1)) % Int32(2)
+                mbarrier_wait(_bf_0, _bf_phase)
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(_kr_0, Int32(self._k_buf_stride))
+            else:
+                # Double-buf: alternate between buf 0 and buf 1
+                _buf_idx = _k_block % Int32(2)
+                _bf_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
+                if _buf_idx == Int32(0):
+                    mbarrier_wait(_bf_0, _bf_phase)
+                if _buf_idx == Int32(1):
+                    mbarrier_wait(_bf_1, _bf_phase)
+
+                if _buf_idx == Int32(1):
+                    _buf_base = page_ptr + Int32(self._k_buf1_offset)
+                if _buf_idx == Int32(1):
+                    _kr_mbar = _kr_1
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(_kr_mbar, Int32(self._k_buf_stride))
+
             _kr_ptr = cute.make_ptr(cutlass.Int64, _kr_mbar,
                                     cute.AddressSpace.smem)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(_kr_mbar, Int32(self._k_buf_stride))
-
             sK = cute.make_tensor(
                 cute.make_ptr(self.k_dtype, _buf_base,
                               cute.AddressSpace.smem),
@@ -532,9 +553,10 @@ class GDNWUOp(Op):
 
     @cute.jit
     def _compute_w(self, page_ptr, tidx, tile_B, tile_NH, tile_S, w):
-        """w = A_solved @ (beta * exp(gc) * k), K-blocked with TMA double-buf.
+        """w = A_solved @ (beta * exp(gc) * k), K-blocked with TMA buf.
 
         K loaded by DMA via TMA (compact layout). Weighted in-place before MMA.
+        Supports single-buf (small pages) and double-buf (large pages) K modes.
         """
         chunk_idx = tile_S
         _nthreads = self.num_mma_threads
@@ -545,55 +567,76 @@ class GDNWUOp(Op):
         _kr_0 = page_ptr + Int32(self._mbar_offset + 16)
         _kr_1 = page_ptr + Int32(self._mbar_offset + 24)
 
-        # === K-block 0 from buf 0 (TMA pre-loaded) ===
-        self._weight_mma_k_block(page_ptr, tidx, Int32(0), Int32(0),
-                                  chunk_idx, tile_B, tile_NH, w)
-
-        # Signal buf 0 free
-        named_barrier_sync(Int32(2), Int32(_nthreads))
-        if tidx == Int32(0):
-            mbarrier_arrive(_bf_0)
-
-        # === K-block 1 from buf 1 (if NK >= 2, TMA pre-loaded) ===
-        if self.NK >= 2:
-            self._weight_mma_k_block(page_ptr, tidx, Int32(1), Int32(1),
+        if self._single_buf_k:
+            # === Single-buf K: always buf 0 ===
+            # K-block 0 (TMA pre-loaded)
+            self._weight_mma_k_block(page_ptr, tidx, Int32(0), Int32(0),
                                       chunk_idx, tile_B, tile_NH, w)
-
             named_barrier_sync(Int32(2), Int32(_nthreads))
             if tidx == Int32(0):
-                mbarrier_arrive(_bf_1)
+                mbarrier_arrive(_bf_0)
 
-        # === K-blocks 2+ — wait kblock_ready, process, signal buf_free ===
-        _kr_phase_0 = Int32(0)
-        _kr_phase_1 = Int32(0)
-        k_idx = Int32(2)
-        while k_idx < Int32(self.NK):
-            _cur_buf = k_idx % Int32(2)
+            # K-blocks 1+ — wait kblock_ready[0], process buf 0, signal bf[0]
+            _kr_phase = Int32(0)
+            k_idx = Int32(1)
+            while k_idx < Int32(self.NK):
+                mbarrier_wait(_kr_0, _kr_phase)
+                _kr_phase = _kr_phase ^ Int32(1)
 
-            # Wait for store warp's TMA to deliver this K-block
-            if _cur_buf == Int32(0):
-                mbarrier_wait(_kr_0, _kr_phase_0)
-                _kr_phase_0 = _kr_phase_0 ^ Int32(1)
-            if _cur_buf == Int32(1):
-                mbarrier_wait(_kr_1, _kr_phase_1)
-                _kr_phase_1 = _kr_phase_1 ^ Int32(1)
+                self._weight_mma_k_block(page_ptr, tidx, Int32(0), k_idx,
+                                          chunk_idx, tile_B, tile_NH, w)
 
-            self._weight_mma_k_block(page_ptr, tidx, _cur_buf, k_idx,
-                                      chunk_idx, tile_B, tile_NH, w)
-
-            # Signal buffer free
-            named_barrier_sync(Int32(2), Int32(_nthreads))
-            if tidx == Int32(0):
-                if _cur_buf == Int32(0):
+                named_barrier_sync(Int32(2), Int32(_nthreads))
+                if tidx == Int32(0):
                     mbarrier_arrive(_bf_0)
-                if _cur_buf == Int32(1):
+
+                k_idx = k_idx + Int32(1)
+        else:
+            # === Double-buf K: alternate buf 0 and buf 1 ===
+            # K-block 0 from buf 0 (TMA pre-loaded)
+            self._weight_mma_k_block(page_ptr, tidx, Int32(0), Int32(0),
+                                      chunk_idx, tile_B, tile_NH, w)
+            named_barrier_sync(Int32(2), Int32(_nthreads))
+            if tidx == Int32(0):
+                mbarrier_arrive(_bf_0)
+
+            # K-block 1 from buf 1 (if NK >= 2, TMA pre-loaded)
+            if self.NK >= 2:
+                self._weight_mma_k_block(page_ptr, tidx, Int32(1), Int32(1),
+                                          chunk_idx, tile_B, tile_NH, w)
+                named_barrier_sync(Int32(2), Int32(_nthreads))
+                if tidx == Int32(0):
                     mbarrier_arrive(_bf_1)
 
-            k_idx = k_idx + Int32(1)
+            # K-blocks 2+ — wait kblock_ready, process, signal buf_free
+            _kr_phase_0 = Int32(0)
+            _kr_phase_1 = Int32(0)
+            k_idx = Int32(2)
+            while k_idx < Int32(self.NK):
+                _cur_buf = k_idx % Int32(2)
+
+                if _cur_buf == Int32(0):
+                    mbarrier_wait(_kr_0, _kr_phase_0)
+                    _kr_phase_0 = _kr_phase_0 ^ Int32(1)
+                if _cur_buf == Int32(1):
+                    mbarrier_wait(_kr_1, _kr_phase_1)
+                    _kr_phase_1 = _kr_phase_1 ^ Int32(1)
+
+                self._weight_mma_k_block(page_ptr, tidx, _cur_buf, k_idx,
+                                          chunk_idx, tile_B, tile_NH, w)
+
+                named_barrier_sync(Int32(2), Int32(_nthreads))
+                if tidx == Int32(0):
+                    if _cur_buf == Int32(0):
+                        mbarrier_arrive(_bf_0)
+                    if _cur_buf == Int32(1):
+                        mbarrier_arrive(_bf_1)
+
+                k_idx = k_idx + Int32(1)
 
     @cute.jit
     def _compute_u(self, page_ptr, tidx, tile_B, tile_NH, tile_S, v, u):
-        """u = A_solved @ (beta * v), V-blocked with cpasync double-buf."""
+        """u = A_solved @ (beta * v), V-blocked with cpasync."""
         chunk_idx = tile_S
         _nthreads = self.num_mma_threads
 

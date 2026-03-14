@@ -587,34 +587,6 @@ def _run_wu_op(a_solved, k, v, g_cumsum, beta, page_size=49152):
     return w, u
 
 
-def _run_state_op(k, w, u, g_cumsum, page_size=49152):
-    """Run GDNStateOp megakernel."""
-    from machete.megakernel import Megakernel
-    from machete.kernels.gated_delta_net.state_op import GDNStateOp
-
-    B, T, H, K = k.shape
-    V = u.shape[-1]
-    NT = T // 64
-    dtype = k.dtype
-
-    v_new = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
-    h_states = torch.zeros(B, NT, H, K, V, device=k.device, dtype=dtype)
-
-    ops = GDNStateOp.schedule_forward(
-        k=k.contiguous(), w=w.contiguous(), u=u.contiguous(),
-        g_cumsum=g_cumsum.contiguous(),
-        v_new=v_new, h_states=h_states,
-        page_size=page_size,
-    )
-    config = GDNStateOp.kernel_config(ops)
-    kernel = Megakernel(ops, config=config)
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
-
-    return h_states, v_new
-
-
 def _run_output_op(q, k, v_new, h_states, g_cumsum, scale, page_size=49152):
     """Run GDNOutputOp megakernel."""
     from machete.megakernel import Megakernel
@@ -692,38 +664,6 @@ class TestGDNSolveWUOp:
         )
 
 
-class TestGDNStateOp:
-    """Test GDNStateOp against fla state recurrence."""
-
-    @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
-    def test_state_op_vs_fla(self, B, T, H, K, V):
-        """Compare GDNStateOp against fla state recurrence."""
-        q, k, v, g, beta = _make_inputs(B, T, H, K, V)
-        g_cumsum, _, w, u = fla_prep_stage(k, v, g, beta)
-
-        # fla reference
-        h_ref, v_new_ref, _ = fla_state_recurrence(k, w, u, g_cumsum)
-
-        # machete reference (PyTorch)
-        from machete.kernels.gated_delta_net.state import run_state_recurrence
-        h_py, v_new_py = run_state_recurrence(k, w, u, g_cumsum)
-
-        # GDNStateOp
-        h_mk, v_new_mk = _run_state_op(k, w, u, g_cumsum)
-
-        torch.testing.assert_close(
-            v_new_mk.float(), v_new_py.float(), atol=5e-2, rtol=2e-2,
-        )
-        torch.testing.assert_close(
-            h_mk.float(), h_py.float(), atol=5e-2, rtol=2e-2,
-        )
-
-
 class TestGDNOutputOp:
     """Test GDNOutputOp against fla output."""
 
@@ -746,32 +686,6 @@ class TestGDNOutputOp:
 
         torch.testing.assert_close(
             o_mk.float(), o_ref.float(), atol=5e-2, rtol=2e-2,
-        )
-
-
-class TestGDN4OpMegakernel:
-    """Test full 4-op fused megakernel against fla."""
-
-    @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
-    def test_4op_vs_fla(self, B, T, H, K, V):
-        """Compare 4-op fused megakernel against fla end-to-end."""
-        from machete.kernels.gated_delta_net import HAS_4OP, _run_4op_megakernel
-        if not HAS_4OP:
-            pytest.skip("4-Op decomposition not available")
-
-        q, k, v, g, beta = _make_inputs(B, T, H, K, V)
-        scale = K ** -0.5
-
-        o_ref, _ = fla_full_forward(q, k, v, g, beta, scale=scale)
-        o_4op = _run_4op_megakernel(q, k, v, g, beta, scale)
-
-        torch.testing.assert_close(
-            o_4op.float(), o_ref.float(), atol=5e-1, rtol=2e-1,
         )
 
 
@@ -892,13 +806,13 @@ class TestGDNStateRecurrenceVNewOp:
         (1, 256, 4, 128, 128),
         (2, 256, 4, 128, 64),
     ])
-    def test_combined_vs_state_op(self, B, T, H, K, V):
-        """StateRecurrenceOp + VNewOp should produce same as GDNStateOp."""
+    def test_combined_vs_fla(self, B, T, H, K, V):
+        """StateRecurrenceOp + VNewOp should match fla state recurrence."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
         g_cumsum, _, w, u = fla_prep_stage(k, v, g, beta)
 
-        # Reference: original StateOp
-        h_ref, v_new_ref = _run_state_op(k, w, u, g_cumsum)
+        # fla reference
+        h_ref, v_new_ref, _ = fla_state_recurrence(k, w, u, g_cumsum)
 
         # 2-step: StateRecurrenceOp → VNewOp
         h_mk = _run_state_recurrence_op(k, w, u, g_cumsum)

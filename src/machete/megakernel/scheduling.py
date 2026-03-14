@@ -968,6 +968,42 @@ class InstructionStreamBuilder:
         ]
         return torch.tensor(packed, dtype=torch.int32, device=device)
 
+    @property
+    def max_wait_deps(self) -> int:
+        """Maximum number of wait dependencies across all ops."""
+        formulas, _ = self._resolve()
+        return max((len(wf) for wf, _ in formulas.values()), default=0)
+
+    def build_wait_info_tensor(self, instructions, device="cuda"):
+        """Pre-compute (barrier_idx, expected) per instruction.
+
+        Returns tensor [num_instr, max_waits * 2]:
+        [wait0_barrier_idx, wait0_expected, wait1_barrier_idx, wait1_expected, ...]
+        barrier_idx = -1 means skip.
+        """
+        import torch
+
+        formulas, _ = self._resolve()
+        max_waits = max(1, self.max_wait_deps)
+
+        wait_data = []
+        for instr in instructions:
+            entry = []
+            if instr.op_idx == TileInstruction.END_MARKER:
+                entry = [-1, 0] * max_waits
+            else:
+                wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
+                for wf in wait_formulas:
+                    if wf.has_guard and not wf.is_guarded(instr.tiles):
+                        entry.extend([-1, 0])
+                    else:
+                        entry.extend([wf.compute_index(instr.tiles), wf.expected])
+                while len(entry) < max_waits * 2:
+                    entry.extend([-1, 0])
+            wait_data.append(entry)
+
+        return torch.tensor(wait_data, dtype=torch.int32, device=device)
+
     def build_decompose_tile_fn(self):
         """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).
 

@@ -14,7 +14,8 @@ Usage:
     python benchmarks/kernels/benchmark_gated_delta_net.py
 """
 
-PAGE_SIZE = 49152  # 48KB default page size
+PAGE_SIZE = 49152       # 48KB default page size
+PAGE_SIZE_16KB = 16384  # 16KB small page size
 
 import contextlib
 import io
@@ -44,9 +45,9 @@ except ImportError:
     HAS_MEGAKERNEL_OPS = False
 
 try:
-    from machete.kernels.gated_delta_net import HAS_4OP
+    from machete.kernels.gated_delta_net import HAS_5OP
 except ImportError:
-    HAS_4OP = False
+    HAS_5OP = False
 
 
 def is_hopper_or_newer():
@@ -373,10 +374,10 @@ def bench_pipeline(B, T, H, K, V):
 
 
 # =============================================================================
-# 4-Op Pipeline benchmark (SolveOp + WUOp + StateOp + OutputOp)
+# 5-Op Pipeline benchmark
 # =============================================================================
 
-PIPELINE_4OP_CONFIGS = [
+PIPELINE_5OP_CONFIGS = [
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
     (1, 8192, 32, 128, 128),
@@ -386,12 +387,64 @@ PIPELINE_4OP_CONFIGS = [
 ]
 
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_4OP_CONFIGS)
-def bench_pipeline_4op(B, T, H, K, V):
-    """Setup 4-op pipeline benchmarks: fla vs 2-op vs 4-op megakernel."""
+def _build_5op_kernel(q_c, k_c, v_c, g_c, beta_c, scale, page_size):
+    """Build and warmup a 5-op megakernel, return (kernel, buffers)."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.gated_delta_net.solve_op import GDNSolveOp
+    from machete.kernels.gated_delta_net.wu_op import GDNWUOp
+    from machete.kernels.gated_delta_net.state_recurrence_op import GDNStateRecurrenceOp
+    from machete.kernels.gated_delta_net.vnew_op import GDNVNewOp
+    from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+
+    B, T, H, K = q_c.shape
+    V = v_c.shape[-1]
+    NT = T // 64
+    dtype = q_c.dtype
+
+    gc = torch.zeros(B, T, H, device=q_c.device, dtype=torch.float32)
+    a_solved = torch.zeros(B, T, H, 64, device=q_c.device, dtype=dtype)
+    w = torch.zeros(B, T, H, K, device=q_c.device, dtype=dtype)
+    u = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
+    v_new = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
+    h_states = torch.zeros(B, NT, H, K, V, device=q_c.device, dtype=dtype)
+    o = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
+
+    solve_ops = GDNSolveOp.schedule_forward(
+        k=k_c, g=g_c, beta=beta_c,
+        g_cumsum=gc, a_solved=a_solved, page_size=page_size,
+    )
+    wu_ops = GDNWUOp.schedule_forward(
+        a_solved=a_solved, k=k_c, v=v_c,
+        g_cumsum=gc, beta=beta_c, w=w, u=u, page_size=page_size,
+    )
+    state_ops = GDNStateRecurrenceOp.schedule_forward(
+        k=k_c, w=w, u=u, g_cumsum=gc,
+        h_states=h_states, page_size=page_size,
+    )
+    vnew_ops = GDNVNewOp.schedule_forward(
+        w=w, u=u, h_states=h_states,
+        v_new=v_new, page_size=page_size,
+    )
+    output_ops = GDNOutputOp.schedule_forward(
+        q=q_c, k=k_c, v_new=v_new, h_states=h_states,
+        g_cumsum=gc, o=o, scale=scale, page_size=page_size,
+    )
+
+    all_ops = solve_ops + wu_ops + state_ops + vnew_ops + output_ops
+    config = GDNOutputOp.kernel_config(all_ops)
+    kernel = Megakernel(all_ops, config=config)
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+    torch.cuda.synchronize()
+
+    buffers = [gc, a_solved, w, u, v_new, h_states, o]
+    return kernel, buffers
+
+
+def _bench_5op(B, T, H, K, V, page_size, label):
+    """Shared implementation for 5-op pipeline benchmarks."""
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
     scale = K ** -0.5
-    dtype = k.dtype
 
     funcs = {}
 
@@ -399,86 +452,45 @@ def bench_pipeline_4op(B, T, H, K, V):
         from machete.kernels.gated_delta_net.ref import fla_full_forward
         funcs["fla"] = lambda: fla_full_forward(q, k, v, g, beta, scale=scale)
 
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_4OP:
-        try:
-            import cuda.bindings.driver as cuda
-            from machete.megakernel import Megakernel
-            from machete.kernels.gated_delta_net.solve_op import GDNSolveOp
-            from machete.kernels.gated_delta_net.wu_op import GDNWUOp
-            from machete.kernels.gated_delta_net.state_op import GDNStateOp
-            from machete.kernels.gated_delta_net.output_op import GDNOutputOp
+    if not (is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_5OP):
+        return funcs
 
-            q_c = q.contiguous()
-            k_c = k.contiguous()
-            v_c = v.contiguous()
-            g_c = g.contiguous()
-            beta_c = beta.contiguous()
-            NT = T // 64
+    import cuda.bindings.driver as cuda
 
-            gc = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
-            a_solved = torch.zeros(B, T, H, 64, device=k.device, dtype=dtype)
-            w = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
-            u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
-            v_new = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
-            h_states = torch.zeros(B, NT, H, K, V, device=k.device, dtype=dtype)
-            o = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    g_c = g.contiguous()
+    beta_c = beta.contiguous()
 
-            try:
-                solve_ops = GDNSolveOp.schedule_forward(
-                    k=k_c, g=g_c, beta=beta_c,
-                    g_cumsum=gc, a_solved=a_solved,
-                    page_size=PAGE_SIZE,
-                )
-                wu_ops = GDNWUOp.schedule_forward(
-                    a_solved=a_solved, k=k_c, v=v_c,
-                    g_cumsum=gc, beta=beta_c, w=w, u=u,
-                    page_size=PAGE_SIZE,
-                )
-                state_ops = GDNStateOp.schedule_forward(
-                    k=k_c, w=w, u=u, g_cumsum=gc,
-                    v_new=v_new, h_states=h_states,
-                    page_size=PAGE_SIZE,
-                )
-                output_ops = GDNOutputOp.schedule_forward(
-                    q=q_c, k=k_c, v_new=v_new, h_states=h_states,
-                    g_cumsum=gc, o=o, scale=scale,
-                    page_size=PAGE_SIZE,
-                )
+    try:
+        kern5, bufs5 = _build_5op_kernel(
+            q_c, k_c, v_c, g_c, beta_c, scale, page_size)
+        s5 = torch.cuda.Stream()
+        cs5 = cuda.CUstream(s5.cuda_stream)
 
-                all_ops = solve_ops + wu_ops + state_ops + output_ops
-                config_4op = GDNOutputOp.kernel_config(all_ops)
-                kernel_4op = Megakernel(all_ops, config=config_4op)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    kernel_4op.run()
-                torch.cuda.synchronize()
-
-                stream_4op = torch.cuda.Stream()
-                cu_stream_4op = cuda.CUstream(stream_4op.cuda_stream)
-
-                def setup_4op():
-                    gc.zero_()
-                    a_solved.zero_()
-                    w.zero_()
-                    u.zero_()
-                    v_new.zero_()
-                    h_states.zero_()
-                    o.zero_()
-
-                funcs["4op_megakernel"] = KernelBenchSpec(
-                    launch_fn=lambda: kernel_4op.run(
-                        stream=cu_stream_4op, sync=False),
-                    setup_fn=setup_4op,
-                    stream=(stream_4op, cu_stream_4op),
-                    _keep_alive=[kernel_4op, q_c, k_c, v_c, g_c, beta_c,
-                                 gc, a_solved, w, u, v_new, h_states, o],
-                )
-            except Exception as e:
-                print(f"  4-Op megakernel error: {e}")
-
-        except Exception as e:
-            print(f"  4-Op setup error: {e}")
+        funcs[label] = KernelBenchSpec(
+            launch_fn=lambda: kern5.run(stream=cs5, sync=False),
+            setup_fn=lambda: [b.zero_() for b in bufs5],
+            stream=(s5, cs5),
+            _keep_alive=[kern5, q_c, k_c, v_c, g_c, beta_c] + bufs5,
+        )
+    except Exception as e:
+        print(f"  5-Op {label} error: {e}")
 
     return funcs
+
+
+@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_5OP_CONFIGS)
+def bench_pipeline_5op(B, T, H, K, V):
+    """Benchmark 5-op megakernel (Solve+WU+StateRecurrence+VNew+Output) vs fla."""
+    return _bench_5op(B, T, H, K, V, PAGE_SIZE, "5op")
+
+
+@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_5OP_CONFIGS)
+def bench_pipeline_5op_16kb(B, T, H, K, V):
+    """Benchmark 5-op megakernel at 16KB page size vs fla."""
+    return _bench_5op(B, T, H, K, V, PAGE_SIZE_16KB, "5op_16kb")
 
 
 # =============================================================================
@@ -497,7 +509,7 @@ if __name__ == "__main__":
         print(f"Hopper+: {is_hopper_or_newer()}")
     print(f"CUTLASS: {CUTLASS_AVAILABLE}")
     print(f"fla: {FLA_AVAILABLE}")
-    print(f"4-Op: {HAS_4OP}")
+    print(f"5-Op: {HAS_5OP}")
     print()
 
     print("-" * 100)
@@ -519,6 +531,12 @@ if __name__ == "__main__":
 
     print()
     print("-" * 100)
-    print("Full Pipeline 4-Op (fla vs 4-Op Megakernel)")
+    print("5-Op Pipeline 48KB (fla vs 5-Op Megakernel)")
     print("-" * 100)
-    bench_pipeline_4op._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_pipeline_5op._benchmark.run(mode="kernel", warmup=10, rep=100)
+
+    print()
+    print("-" * 100)
+    print("5-Op Pipeline 16KB (fla vs 5-Op Megakernel)")
+    print("-" * 100)
+    bench_pipeline_5op_16kb._benchmark.run(mode="kernel", warmup=10, rep=100)
