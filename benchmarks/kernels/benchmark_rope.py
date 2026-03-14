@@ -33,6 +33,8 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 def is_hopper_or_newer():
     if not torch.cuda.is_available():
@@ -41,7 +43,7 @@ def is_hopper_or_newer():
     return major >= 9
 
 
-def rope_bytes(batch, seq_len, n_heads, head_dim):
+def rope_bytes(batch, seq_len, n_heads, head_dim, page_size):
     """Total bytes read + written for RoPE.
 
     Reads: q (B*S*H*D) + cos (S*D/2) + sin (S*D/2)
@@ -58,11 +60,12 @@ def rope_bytes(batch, seq_len, n_heads, head_dim):
 # =============================================================================
 
 
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("batch", [1, 4, 8])
 @Benchmark.parametrize("seq_len", [128, 512, 2048])
 @Benchmark.parametrize("n_heads", [32])
 @Benchmark.parametrize("head_dim", [64, 128])
-def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
+def bench_rope_fwd(head_dim, n_heads, seq_len, batch, page_size):
     """Setup RoPE forward benchmark functions."""
     torch.manual_seed(42)
     q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
@@ -86,36 +89,36 @@ def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
 
         funcs["triton"] = triton_fn
 
-    # Megakernel (in-place)
+    # Megakernel + SingleOp
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        q_mk = q.clone()
+        try:
+            q_mk = q.clone()
+            ops = RopeOp.schedule(q=q_mk, cos=cos, sin=sin, page_size=page_size)
+            config = RopeOp.kernel_config(ops)
+            kernel = Megakernel(ops, config=config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = kernel.bench_spec(
+                setup_fn=lambda q_mk=q_mk: q_mk.copy_(q),
+                keep_alive=[q_mk, cos, sin],
+            )
+        except Exception:
+            pass
 
-        ops = RopeOp.schedule(q=q_mk, cos=cos, sin=sin)
-        config = RopeOp.kernel_config(ops)
-        kernel = Megakernel(ops, config=config)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["megakernel"] = kernel.bench_spec(
-            setup_fn=lambda: q_mk.copy_(q),
-            keep_alive=[q_mk, cos, sin],
-        )
-
-    # SingleOpKernel (in-place)
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        q_so = q.clone()
-        so_ops = RopeOp.schedule(q=q_so, cos=cos, sin=sin)
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["single_op"] = so_kernel.bench_spec(
-            setup_fn=lambda: q_so.copy_(q),
-            keep_alive=[q_so, cos, sin],
-        )
+        try:
+            q_so = q.clone()
+            so_ops = RopeOp.schedule(q=q_so, cos=cos, sin=sin, page_size=page_size)
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda q_so=q_so: q_so.copy_(q),
+                keep_alive=[q_so, cos, sin],
+            )
+        except Exception:
+            pass
 
     return funcs
 
@@ -125,11 +128,12 @@ def bench_rope_fwd(batch, seq_len, n_heads, head_dim):
 # =============================================================================
 
 
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("batch", [1, 4, 8])
 @Benchmark.parametrize("seq_len", [128, 512, 2048])
 @Benchmark.parametrize("n_heads", [32])
 @Benchmark.parametrize("head_dim", [64, 128])
-def bench_rope_bwd(batch, seq_len, n_heads, head_dim):
+def bench_rope_bwd(head_dim, n_heads, seq_len, batch, page_size):
     """Setup RoPE backward benchmark functions."""
     torch.manual_seed(42)
     q = torch.randn(batch, seq_len, n_heads, head_dim, dtype=torch.bfloat16, device="cuda")
@@ -141,36 +145,36 @@ def bench_rope_bwd(batch, seq_len, n_heads, head_dim):
     # PyTorch (out-of-place, inverse rotation)
     funcs["pytorch"] = lambda: rope_pytorch(q, cos, -sin)
 
-    # Megakernel backward (inverse rotation)
+    # Megakernel + SingleOp backward
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        q_bwd = q.clone()
+        try:
+            q_bwd = q.clone()
+            bwd_ops = RopeBwdOp.schedule(q=q_bwd, cos=cos, sin=sin, page_size=page_size)
+            bwd_config = RopeBwdOp.kernel_config(bwd_ops)
+            bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bwd_kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = bwd_kernel.bench_spec(
+                setup_fn=lambda q_bwd=q_bwd: q_bwd.copy_(q),
+                keep_alive=[q_bwd, cos, sin],
+            )
+        except Exception:
+            pass
 
-        bwd_ops = RopeBwdOp.schedule(q=q_bwd, cos=cos, sin=sin)
-        bwd_config = RopeBwdOp.kernel_config(bwd_ops)
-        bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            bwd_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["megakernel"] = bwd_kernel.bench_spec(
-            setup_fn=lambda: q_bwd.copy_(q),
-            keep_alive=[q_bwd, cos, sin],
-        )
-
-    # SingleOpKernel backward
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        q_so_bwd = q.clone()
-        so_bwd_ops = RopeBwdOp.schedule(q=q_so_bwd, cos=cos, sin=sin)
-        so_bwd_kernel = SingleOpKernel(so_bwd_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_bwd_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["single_op"] = so_bwd_kernel.bench_spec(
-            setup_fn=lambda: q_so_bwd.copy_(q),
-            keep_alive=[q_so_bwd, cos, sin],
-        )
+        try:
+            q_so_bwd = q.clone()
+            so_bwd_ops = RopeBwdOp.schedule(q=q_so_bwd, cos=cos, sin=sin, page_size=page_size)
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                setup_fn=lambda q_so_bwd=q_so_bwd: q_so_bwd.copy_(q),
+                keep_alive=[q_so_bwd, cos, sin],
+            )
+        except Exception:
+            pass
 
     return funcs
 

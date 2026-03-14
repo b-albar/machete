@@ -135,7 +135,9 @@ class GDNStateRecurrenceOp(Op):
                 total = gbuf_off + BT * 4
                 if total <= page_size:
                     return BK, BV
-        return 32, 32
+        raise ValueError(
+            f"page_size={page_size} too small for GDNStateRecurrenceOp (K={K}, V={V})."
+        )
 
     @classmethod
     def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE,

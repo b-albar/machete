@@ -54,8 +54,10 @@ _BV = 64
 def _auto_block_sizes(page_size, K, V, elem_bytes=2):
     """Compute largest (BK, BV) that fit in page_size.
 
-    All regions are live simultaneously:
-        BT*K*eb + 2*BT*BK*eb + BK*BV*eb + BT*BV*eb + BT*4 + align <= page_size
+    Regions: s_primary(BT*K) + s_buf×2(BT*BK) + s_state(BK*BV) + s_aux(BT*BV).
+    g_buf (BT*4=256B) overlaps with s_primary when total would overflow
+    (forward: q consumed in Phase A before g_buf written in Phase B;
+     backward: primary is smaller so it always fits without overlap).
     Also: s_a (scores [BT,BT]) reuses s_wk0, so BT*BK*eb >= BT*BT*eb.
     """
     BT = _BT
@@ -72,10 +74,12 @@ def _auto_block_sizes(page_size, K, V, elem_bytes=2):
             sh_off = ((q_bytes + 2 * wk_bytes + 127) // 128) * 128
             suv_off = ((sh_off + BK * BV * elem_bytes + 127) // 128) * 128
             gbuf_off = ((suv_off + BT * BV * elem_bytes + 15) // 16) * 16
-            total = gbuf_off + BT * 4
-            if total <= page_size:
+            # g_buf (BT*4) can overlap with s_primary, so don't count it
+            if gbuf_off <= page_size:
                 return BK, BV
-    return 64, 64
+    raise ValueError(
+        f"page_size={page_size} too small for GDNFusedOp (need ≥32KB for K={K}, V={V})."
+    )
 
 
 def _kernel_config(ops):
@@ -144,9 +148,18 @@ def _fused_init(self):
     self._s_state_offset = ((self._s_state_offset + 127) // 128) * 128
     self._s_aux_offset = self._s_state_offset + self.BK * self.BV * self.elem_bytes
     self._s_aux_offset = ((self._s_aux_offset + 127) // 128) * 128
-    self._gbuf_offset = self._s_aux_offset + self.BT * self.BV * self.elem_bytes
-    self._gbuf_offset = ((self._gbuf_offset + 15) // 16) * 16
-    self._total_smem = self._gbuf_offset + self.BT * 4
+    gbuf_end = self._s_aux_offset + self.BT * self.BV * self.elem_bytes
+    gbuf_end = ((gbuf_end + 15) // 16) * 16
+    gbuf_bytes = self.BT * 4
+    if gbuf_end + gbuf_bytes > self.page_size:
+        # Overlap g_buf with s_primary (forward: q consumed in Phase A
+        # before g_buf written in Phase B; backward has smaller primary
+        # so gbuf_end + gbuf_bytes always fits without this branch).
+        self._gbuf_offset = 0
+        self._total_smem = gbuf_end
+    else:
+        self._gbuf_offset = gbuf_end
+        self._total_smem = gbuf_end + gbuf_bytes
 
 
 def _schedule(cls, scale, page_size, tile_sizes, tensors, k_tensor_name, v_tensor_name):

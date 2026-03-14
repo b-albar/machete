@@ -851,7 +851,8 @@ class GemmOp(Op):
 
     @classmethod
     def schedule_backward(cls, tile_sizes=None, activation=None,
-                          c=None, pre_act=None, **tensors):
+                          c=None, pre_act=None, page_size=DEFAULT_PAGE_SIZE,
+                          **tensors):
         """Schedule GEMM backward as forward-equivalent ops.
 
         dA[B,S,K] = dout[B,S,N] @ B[N,K]  (contracts over N)
@@ -911,7 +912,7 @@ class GemmOp(Op):
             # else: let schedule_forward auto-compute via _auto_tiles
             if act_grad is not None:
                 fwd_kwargs["a_scale"] = act_grad
-            ops.extend(cls.schedule_forward(**fwd_kwargs))
+            ops.extend(cls.schedule_forward(**fwd_kwargs, page_size=page_size))
 
         if db is not None:
             # dB[N,K] = dout^T[N,B*S] @ A[B*S,K]  — flatten B*S, transpose
@@ -936,7 +937,7 @@ class GemmOp(Op):
             if act_grad is not None:
                 act_flat = act_grad.reshape(BS, act_grad.shape[2])
                 fwd_kwargs["a_scale"] = act_flat.t().contiguous().unsqueeze(0)
-            ops.extend(cls.schedule_forward(**fwd_kwargs))
+            ops.extend(cls.schedule_forward(**fwd_kwargs, page_size=page_size))
 
         return ops
 

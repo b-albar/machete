@@ -333,6 +333,7 @@ class Benchmark:
         warmup: int = 25,
         rep: int = 100,
         print_summary: bool = True,
+        columns: Optional[list] = None,
     ):
         if self._configs is not None:
             param_names = self._config_names
@@ -344,8 +345,13 @@ class Benchmark:
 
         results = {}
 
-        names_seen = set()
-        names_ordered = []
+        # Use explicit columns if provided, otherwise discover dynamically
+        if columns is not None:
+            names_seen = set(columns)
+            names_ordered = list(columns)
+        else:
+            names_seen = set()
+            names_ordered = []
         _header_printed = False
 
         for combination in all_combinations:
@@ -354,33 +360,17 @@ class Benchmark:
             try:
                 funcs = self.func(**params)
                 # Update known names from successful retrieval
-                if funcs and not names_seen:
-                    names_seen = set(funcs.keys())
-                    names_ordered = list(funcs.keys())
+                if funcs:
+                    for name in funcs:
+                        if name not in names_seen:
+                            names_seen.add(name)
+                            names_ordered.append(name)
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM during setup for params: {params}")
                 torch.cuda.empty_cache()
-                if names_seen:
-                    if mode == "kernel":
-                        results[str(params)] = {
-                            name: {"time_ms": 0.0, "gbps": 0.0} for name in names_seen
-                        }
-                    else:
-                        results[str(params)] = {
-                            name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen
-                        }
                 continue
             except Exception as e:
                 print(f"Error during setup for params: {params}, error: {e}")
-                if names_seen:
-                    if mode == "kernel":
-                        results[str(params)] = {
-                            name: {"time_ms": 0.0, "gbps": 0.0} for name in names_seen
-                        }
-                    else:
-                        results[str(params)] = {
-                            name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen
-                        }
                 continue
 
             for func_name, func in funcs.items():

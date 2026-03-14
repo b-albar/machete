@@ -30,6 +30,8 @@ try:
 except ImportError:
     HAS_MEGAKERNEL_OPS = False
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 def is_hopper_or_newer():
     if not torch.cuda.is_available():
@@ -87,7 +89,7 @@ def _build_and_run(ops, config):
 # 1. GEMM + RoPE: sequential (2 launches) vs fused (1 launch)
 # =============================================================================
 
-CONFIGS = [
+_BASE_CONFIGS = [
     # (B, T, H, K, V)
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
@@ -96,9 +98,11 @@ CONFIGS = [
     (8, 2048, 32, 128, 128),
 ]
 
+GEMM_ROPE_CONFIGS = [c + (ps,) for c in _BASE_CONFIGS for ps in PAGE_SIZES]
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], CONFIGS)
-def bench_gemm_rope(B, T, H, K, V):
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], GEMM_ROPE_CONFIGS)
+def bench_gemm_rope(B, T, H, K, V, page_size):
     """GEMM(Q,K,V) + RoPE(Q,K): 2 launches vs 1."""
     if not (is_hopper_or_newer() and CUTLASS_AVAILABLE):
         return {}
@@ -119,35 +123,30 @@ def bench_gemm_rope(B, T, H, K, V):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s))
+        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
         k_s4 = k_s.view(B, T, H, K)
-        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin)
-                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin))
+        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin, page_size=page_size))
         rope_kern = _build_and_run(rope_ops, RopeOp.kernel_config(rope_ops))
 
         s_stream = torch.cuda.Stream()
         s_cu = cuda.CUstream(s_stream.cuda_stream)
 
-        def s_setup():
-            q_s.zero_(); k_s.zero_(); v_s.zero_()
-
-        def s_launch():
-            gemm_kern.run(stream=s_cu, sync=False)
-            rope_kern.run(stream=s_cu, sync=False)
-
         funcs["sequential"] = KernelBenchSpec(
-            launch_fn=s_launch, setup_fn=s_setup,
+            launch_fn=lambda gk=gemm_kern, rk=rope_kern, sc=s_cu: (
+                gk.run(stream=sc, sync=False), rk.run(stream=sc, sync=False)),
+            setup_fn=lambda qs=q_s, ks=k_s, vs=v_s: (qs.zero_(), ks.zero_(), vs.zero_()),
             stream=(s_stream, s_cu),
             _keep_alive=[gemm_kern, rope_kern, x_s, wq, wk, wv,
                          q_s, k_s, v_s, cos, sin],
         )
-    except Exception as e:
-        print(f"  Sequential GEMM+RoPE error: {e}")
+    except Exception:
+        pass
 
     # --- Fused: single megakernel ---
     try:
@@ -159,11 +158,11 @@ def bench_gemm_rope(B, T, H, K, V):
         q_f4 = q_f.view(B, T, H, K)
         k_f4 = k_f.view(B, T, H, K)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f))
-        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin)
-                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin))
+        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
+        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin, page_size=page_size))
 
         all_ops = gemm_ops + rope_ops
         config = GemmOp.kernel_config(all_ops)
@@ -172,18 +171,15 @@ def bench_gemm_rope(B, T, H, K, V):
         f_stream = torch.cuda.Stream()
         f_cu = cuda.CUstream(f_stream.cuda_stream)
 
-        def f_setup():
-            q_f.zero_(); k_f.zero_(); v_f.zero_()
-
         funcs["fused"] = KernelBenchSpec(
-            launch_fn=lambda: fused_kern.run(stream=f_cu, sync=False),
-            setup_fn=f_setup,
+            launch_fn=lambda fk=fused_kern, fc=f_cu: fk.run(stream=fc, sync=False),
+            setup_fn=lambda qf=q_f, kf=k_f, vf=v_f: (qf.zero_(), kf.zero_(), vf.zero_()),
             stream=(f_stream, f_cu),
             _keep_alive=[fused_kern, x_f, wq, wk, wv,
                          q_f, k_f, v_f, cos, sin],
         )
-    except Exception as e:
-        print(f"  Fused GEMM+RoPE error: {e}")
+    except Exception:
+        pass
 
     return funcs
 
@@ -192,8 +188,11 @@ def bench_gemm_rope(B, T, H, K, V):
 # 2. GEMM + GDN: sequential (2 launches) vs fused (1 launch)
 # =============================================================================
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], CONFIGS)
-def bench_gemm_gdn(B, T, H, K, V):
+GEMM_GDN_CONFIGS = [c + (ps,) for c in _BASE_CONFIGS for ps in PAGE_SIZES]
+
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], GEMM_GDN_CONFIGS)
+def bench_gemm_gdn(B, T, H, K, V, page_size):
     """GEMM(Q,K,V) + GDN(prep+fused): 2 launches vs 1."""
     if not (is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS):
         return {}
@@ -222,9 +221,9 @@ def bench_gemm_gdn(B, T, H, K, V):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s))
+        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
@@ -233,32 +232,27 @@ def bench_gemm_gdn(B, T, H, K, V):
         gc_s, w_s, u_s, o_s = _gdn_intermediates()
 
         prep_ops = GDNPrepOp.schedule_forward(
-            k=k_s4, v=v_s4, g=g, beta=beta, g_cumsum=gc_s, w=w_s, u=u_s)
+            k=k_s4, v=v_s4, g=g, beta=beta, g_cumsum=gc_s, w=w_s, u=u_s, page_size=page_size)
         fused_ops = GDNFusedOp.schedule_forward(
-            q=q_s4, k=k_s4, w=w_s, u=u_s, g_cumsum=gc_s, o=o_s, scale=scale)
+            q=q_s4, k=k_s4, w=w_s, u=u_s, g_cumsum=gc_s, o=o_s, scale=scale, page_size=page_size)
         gdn_ops = prep_ops + fused_ops
         gdn_kern = _build_and_run(gdn_ops, GDNFusedOp.kernel_config(gdn_ops))
 
         s_stream = torch.cuda.Stream()
         s_cu = cuda.CUstream(s_stream.cuda_stream)
 
-        def s_setup():
-            q_s.zero_(); k_s.zero_(); v_s.zero_()
-            gc_s.zero_(); w_s.zero_(); u_s.zero_(); o_s.zero_()
-
-        def s_launch():
-            gemm_kern.run(stream=s_cu, sync=False)
-            gdn_kern.run(stream=s_cu, sync=False)
-
         funcs["sequential"] = KernelBenchSpec(
-            launch_fn=s_launch, setup_fn=s_setup,
+            launch_fn=lambda gk=gemm_kern, dk=gdn_kern, sc=s_cu: (
+                gk.run(stream=sc, sync=False), dk.run(stream=sc, sync=False)),
+            setup_fn=lambda qs=q_s, ks=k_s, vs=v_s, gc=gc_s, ws=w_s, us=u_s, os_=o_s: (
+                qs.zero_(), ks.zero_(), vs.zero_(), gc.zero_(), ws.zero_(), us.zero_(), os_.zero_()),
             stream=(s_stream, s_cu),
             _keep_alive=[gemm_kern, gdn_kern, x_s, wq, wk, wv,
                          q_s, k_s, v_s, g, beta,
                          gc_s, w_s, u_s, o_s],
         )
-    except Exception as e:
-        print(f"  Sequential GEMM+GDN error: {e}")
+    except Exception:
+        pass
 
     # --- Fused: single megakernel ---
     try:
@@ -272,13 +266,13 @@ def bench_gemm_gdn(B, T, H, K, V):
         k_f4 = k_f.view(B, T, H, K)
         v_f4 = v_f.view(B, T, H, V)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f))
+        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
         prep_ops = GDNPrepOp.schedule_forward(
-            k=k_f4, v=v_f4, g=g, beta=beta, g_cumsum=gc_f, w=w_f, u=u_f)
+            k=k_f4, v=v_f4, g=g, beta=beta, g_cumsum=gc_f, w=w_f, u=u_f, page_size=page_size)
         fused_ops = GDNFusedOp.schedule_forward(
-            q=q_f4, k=k_f4, w=w_f, u=u_f, g_cumsum=gc_f, o=o_f, scale=scale)
+            q=q_f4, k=k_f4, w=w_f, u=u_f, g_cumsum=gc_f, o=o_f, scale=scale, page_size=page_size)
 
         all_ops = gemm_ops + prep_ops + fused_ops
         config = _merged_config(
@@ -290,20 +284,17 @@ def bench_gemm_gdn(B, T, H, K, V):
         f_stream = torch.cuda.Stream()
         f_cu = cuda.CUstream(f_stream.cuda_stream)
 
-        def f_setup():
-            q_f.zero_(); k_f.zero_(); v_f.zero_()
-            gc_f.zero_(); w_f.zero_(); u_f.zero_(); o_f.zero_()
-
         funcs["fused"] = KernelBenchSpec(
-            launch_fn=lambda: fused_kern.run(stream=f_cu, sync=False),
-            setup_fn=f_setup,
+            launch_fn=lambda fk=fused_kern, fc=f_cu: fk.run(stream=fc, sync=False),
+            setup_fn=lambda qf=q_f, kf=k_f, vf=v_f, gc=gc_f, wf=w_f, uf=u_f, of=o_f: (
+                qf.zero_(), kf.zero_(), vf.zero_(), gc.zero_(), wf.zero_(), uf.zero_(), of.zero_()),
             stream=(f_stream, f_cu),
             _keep_alive=[fused_kern, x_f, wq, wk, wv,
                          q_f, k_f, v_f, g, beta,
                          gc_f, w_f, u_f, o_f],
         )
-    except Exception as e:
-        print(f"  Fused GEMM+GDN error: {e}")
+    except Exception:
+        pass
 
     return funcs
 
@@ -312,8 +303,11 @@ def bench_gemm_gdn(B, T, H, K, V):
 # 3. GEMM + RoPE + GDN: sequential (3 launches) vs fused (1 launch)
 # =============================================================================
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], CONFIGS)
-def bench_gemm_rope_gdn(B, T, H, K, V):
+GEMM_ROPE_GDN_CONFIGS = [c + (ps,) for c in _BASE_CONFIGS for ps in PAGE_SIZES]
+
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], GEMM_ROPE_GDN_CONFIGS)
+def bench_gemm_rope_gdn(B, T, H, K, V, page_size):
     """GEMM(Q,K,V) + RoPE(Q,K) + GDN: 3 launches vs 1."""
     if not (is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS):
         return {}
@@ -343,48 +337,43 @@ def bench_gemm_rope_gdn(B, T, H, K, V):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s))
+        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
         k_s4 = k_s.view(B, T, H, K)
-        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin)
-                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin))
+        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin, page_size=page_size))
         rope_kern = _build_and_run(rope_ops, RopeOp.kernel_config(rope_ops))
 
         v_s4 = v_s.view(B, T, H, V)
         gc_s, w_s, u_s, o_s = _gdn_intermediates()
 
         prep_ops = GDNPrepOp.schedule_forward(
-            k=k_s4, v=v_s4, g=g, beta=beta, g_cumsum=gc_s, w=w_s, u=u_s)
+            k=k_s4, v=v_s4, g=g, beta=beta, g_cumsum=gc_s, w=w_s, u=u_s, page_size=page_size)
         fused_ops = GDNFusedOp.schedule_forward(
-            q=q_s4, k=k_s4, w=w_s, u=u_s, g_cumsum=gc_s, o=o_s, scale=scale)
+            q=q_s4, k=k_s4, w=w_s, u=u_s, g_cumsum=gc_s, o=o_s, scale=scale, page_size=page_size)
         gdn_ops = prep_ops + fused_ops
         gdn_kern = _build_and_run(gdn_ops, GDNFusedOp.kernel_config(gdn_ops))
 
         s_stream = torch.cuda.Stream()
         s_cu = cuda.CUstream(s_stream.cuda_stream)
 
-        def s_setup():
-            q_s.zero_(); k_s.zero_(); v_s.zero_()
-            gc_s.zero_(); w_s.zero_(); u_s.zero_(); o_s.zero_()
-
-        def s_launch():
-            gemm_kern.run(stream=s_cu, sync=False)
-            rope_kern.run(stream=s_cu, sync=False)
-            gdn_kern.run(stream=s_cu, sync=False)
-
         funcs["sequential"] = KernelBenchSpec(
-            launch_fn=s_launch, setup_fn=s_setup,
+            launch_fn=lambda gk=gemm_kern, rk=rope_kern, dk=gdn_kern, sc=s_cu: (
+                gk.run(stream=sc, sync=False), rk.run(stream=sc, sync=False),
+                dk.run(stream=sc, sync=False)),
+            setup_fn=lambda qs=q_s, ks=k_s, vs=v_s, gc=gc_s, ws=w_s, us=u_s, os_=o_s: (
+                qs.zero_(), ks.zero_(), vs.zero_(), gc.zero_(), ws.zero_(), us.zero_(), os_.zero_()),
             stream=(s_stream, s_cu),
             _keep_alive=[gemm_kern, rope_kern, gdn_kern,
                          x_s, wq, wk, wv, q_s, k_s, v_s,
                          g, beta, cos, sin, gc_s, w_s, u_s, o_s],
         )
-    except Exception as e:
-        print(f"  Sequential GEMM+RoPE+GDN error: {e}")
+    except Exception:
+        pass
 
     # --- Fused: single megakernel ---
     try:
@@ -398,15 +387,15 @@ def bench_gemm_rope_gdn(B, T, H, K, V):
         k_f4 = k_f.view(B, T, H, K)
         v_f4 = v_f.view(B, T, H, V)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f))
-        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin)
-                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin))
+        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
+        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin, page_size=page_size))
         prep_ops = GDNPrepOp.schedule_forward(
-            k=k_f4, v=v_f4, g=g, beta=beta, g_cumsum=gc_f, w=w_f, u=u_f)
+            k=k_f4, v=v_f4, g=g, beta=beta, g_cumsum=gc_f, w=w_f, u=u_f, page_size=page_size)
         fused_ops = GDNFusedOp.schedule_forward(
-            q=q_f4, k=k_f4, w=w_f, u=u_f, g_cumsum=gc_f, o=o_f, scale=scale)
+            q=q_f4, k=k_f4, w=w_f, u=u_f, g_cumsum=gc_f, o=o_f, scale=scale, page_size=page_size)
 
         all_ops = gemm_ops + rope_ops + prep_ops + fused_ops
         config = _merged_config(
@@ -418,20 +407,17 @@ def bench_gemm_rope_gdn(B, T, H, K, V):
         f_stream = torch.cuda.Stream()
         f_cu = cuda.CUstream(f_stream.cuda_stream)
 
-        def f_setup():
-            q_f.zero_(); k_f.zero_(); v_f.zero_()
-            gc_f.zero_(); w_f.zero_(); u_f.zero_(); o_f.zero_()
-
         funcs["fused"] = KernelBenchSpec(
-            launch_fn=lambda: fused_kern.run(stream=f_cu, sync=False),
-            setup_fn=f_setup,
+            launch_fn=lambda fk=fused_kern, fc=f_cu: fk.run(stream=fc, sync=False),
+            setup_fn=lambda qf=q_f, kf=k_f, vf=v_f, gc=gc_f, wf=w_f, uf=u_f, of=o_f: (
+                qf.zero_(), kf.zero_(), vf.zero_(), gc.zero_(), wf.zero_(), uf.zero_(), of.zero_()),
             stream=(f_stream, f_cu),
             _keep_alive=[fused_kern, x_f, wq, wk, wv,
                          q_f, k_f, v_f, g, beta, cos, sin,
                          gc_f, w_f, u_f, o_f],
         )
-    except Exception as e:
-        print(f"  Fused GEMM+RoPE+GDN error: {e}")
+    except Exception:
+        pass
 
     return funcs
 

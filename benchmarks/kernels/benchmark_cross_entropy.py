@@ -29,12 +29,14 @@ except ImportError:
     LIGER_AVAILABLE = False
     print("Liger-Kernel not available, skipping Liger benchmarks")
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 # =============================================================================
 # Benchmark configs
 # =============================================================================
 
-CONFIGS = [
+_BASE_CONFIGS = [
     # (BT, V) — realistic LLM shapes
     (256, 32000),
     (256, 128256),
@@ -45,14 +47,16 @@ CONFIGS = [
     (16384, 32000),
 ]
 
+CONFIGS = [c + (ps,) for c in _BASE_CONFIGS for ps in PAGE_SIZES]
+
 
 # =============================================================================
 # Benchmark function
 # =============================================================================
 
 
-@Benchmark.configs(["BT", "V"], CONFIGS)
-def benchmark_cross_entropy(BT, V):
+@Benchmark.configs(["BT", "V", "page_size"], CONFIGS)
+def benchmark_cross_entropy(BT, V, page_size):
     torch.manual_seed(42)
     logits = torch.randn(BT, V, dtype=torch.bfloat16, device="cuda")
     targets = torch.randint(0, V, (BT,), device="cuda")
@@ -81,42 +85,43 @@ def benchmark_cross_entropy(BT, V):
 
         results["Liger"] = liger_ce
 
-    # --- Megakernel CrossEntropyOp ---
-    loss_buf = torch.zeros(BT, dtype=torch.float32, device="cuda")
-    grad_buf = torch.zeros_like(logits)
+    # --- Megakernel + SingleOp CrossEntropyOp ---
+    try:
+        loss_buf = torch.zeros(BT, dtype=torch.float32, device="cuda")
+        grad_buf = torch.zeros_like(logits)
+        ops = CrossEntropyOp.schedule_forward(
+            logits=logits,
+            targets=targets.int(),
+            loss=loss_buf,
+            grad_logits=grad_buf,
+            page_size=page_size,
+        )
+        config = CrossEntropyOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel.run()
+        torch.cuda.synchronize()
+        results["megakernel"] = kernel.bench_spec()
+    except Exception:
+        pass
 
-    ops = CrossEntropyOp.schedule_forward(
-        logits=logits,
-        targets=targets.int(),
-        loss=loss_buf,
-        grad_logits=grad_buf,
-    )
-    config = CrossEntropyOp.kernel_config(ops)
-    kernel = Megakernel(ops, config=config)
-
-    # Warmup
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
-
-    results["Megakernel"] = kernel.bench_spec()
-
-    # --- SingleOpKernel CrossEntropyOp ---
-    loss_so = torch.zeros(BT, dtype=torch.float32, device="cuda")
-    grad_so = torch.zeros_like(logits)
-
-    so_ops = CrossEntropyOp.schedule_forward(
-        logits=logits,
-        targets=targets.int(),
-        loss=loss_so,
-        grad_logits=grad_so,
-    )
-    so_kernel = SingleOpKernel(so_ops)
-    with contextlib.redirect_stdout(io.StringIO()):
-        so_kernel.run()
-    torch.cuda.synchronize()
-
-    results["SingleOp"] = so_kernel.bench_spec()
+    try:
+        loss_so = torch.zeros(BT, dtype=torch.float32, device="cuda")
+        grad_so = torch.zeros_like(logits)
+        so_ops = CrossEntropyOp.schedule_forward(
+            logits=logits,
+            targets=targets.int(),
+            loss=loss_so,
+            grad_logits=grad_so,
+            page_size=page_size,
+        )
+        so_kernel = SingleOpKernel(so_ops)
+        with contextlib.redirect_stdout(io.StringIO()):
+            so_kernel.run()
+        torch.cuda.synchronize()
+        results["single_op"] = so_kernel.bench_spec()
+    except Exception:
+        pass
 
     return results
 

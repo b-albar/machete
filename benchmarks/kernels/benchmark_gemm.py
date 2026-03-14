@@ -28,6 +28,8 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 def is_sm90_or_newer():
     if not torch.cuda.is_available():
@@ -36,7 +38,7 @@ def is_sm90_or_newer():
     return major * 10 + minor >= 90
 
 
-def gemm_bytes(M, K, N, dtype):
+def gemm_bytes(M, K, N, dtype, page_size):
     """Total bytes read + written for GEMM.
 
     Reads: A (M*K) + B (N*K)
@@ -46,7 +48,7 @@ def gemm_bytes(M, K, N, dtype):
     return (M * K + N * K + M * N) * elem_bytes
 
 
-def gemm_flops(M, K, N, dtype):
+def gemm_flops(M, K, N, dtype, page_size):
     """FLOPs for GEMM: 2*M*N*K (multiply-add)."""
     return 2 * M * N * K
 
@@ -57,11 +59,12 @@ def gemm_flops(M, K, N, dtype):
 
 # LLM-scale shapes: (batch*seq, hidden, proj)
 # Typical hidden=4096, FFN=4*hidden=16384, batch*seq=1-8192
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("dtype", ["bfloat16"])
 @Benchmark.parametrize("N", [4096, 8192, 16384])
 @Benchmark.parametrize("K", [4096, 8192])
 @Benchmark.parametrize("M", [128, 512, 2048, 4096])
-def bench_gemm(M, K, N, dtype):
+def bench_gemm(M, K, N, dtype, page_size):
     """Setup GEMM benchmark functions for each implementation."""
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
@@ -76,37 +79,36 @@ def bench_gemm(M, K, N, dtype):
     a_2d = a.squeeze(0)
     funcs["pytorch"] = lambda: torch.matmul(a_2d, b)
 
-    # Megakernel GemmOp (let _auto_tiles choose optimal tile sizes for 48KB pages)
+    # Megakernel GemmOp
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
+        try:
+            c = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
+            ops = GemmOp.schedule(a=a, b=b_t, c=c, page_size=page_size)
+            config = GemmOp.kernel_config(ops)
+            kernel = Megakernel(ops, config=config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = kernel.bench_spec(
+                setup_fn=lambda c=c: c.zero_(),
+                keep_alive=[a, b_t, c],
+            )
+        except Exception:
+            pass
 
-        ops = GemmOp.schedule(a=a, b=b_t, c=c)
-        config = GemmOp.kernel_config(ops)
-        kernel = Megakernel(ops, config=config)
-
-        # Trigger compilation + first run
-        with contextlib.redirect_stdout(io.StringIO()):
-            kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["megakernel"] = kernel.bench_spec(
-            setup_fn=lambda: c.zero_(),
-            keep_alive=[a, b_t, c],
-        )
-
-    # SingleOpKernel GemmOp
-    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c_so = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
-        so_ops = GemmOp.schedule(a=a, b=b_t, c=c_so)
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["single_op"] = so_kernel.bench_spec(
-            setup_fn=lambda: c_so.zero_(),
-            keep_alive=[a, b_t, c_so],
-        )
+        try:
+            c_so = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
+            so_ops = GemmOp.schedule(a=a, b=b_t, c=c_so, page_size=page_size)
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda c_so=c_so: c_so.zero_(),
+                keep_alive=[a, b_t, c_so],
+            )
+        except Exception:
+            pass
 
     return funcs
 
@@ -115,11 +117,12 @@ def bench_gemm(M, K, N, dtype):
 # Backward Benchmark
 # =============================================================================
 
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("dtype", ["bfloat16"])
 @Benchmark.parametrize("N", [4096, 8192])
 @Benchmark.parametrize("K", [4096, 8192])
 @Benchmark.parametrize("M", [128, 512, 2048, 4096])
-def bench_gemm_bwd(M, K, N, dtype):
+def bench_gemm_bwd(M, K, N, dtype, page_size):
     """Setup GEMM backward benchmark (dA and dB gradients)."""
     torch_dtype = torch.float16 if dtype == "float16" else torch.bfloat16
 
@@ -141,52 +144,44 @@ def bench_gemm_bwd(M, K, N, dtype):
 
     funcs["pytorch"] = pytorch_bwd
 
-    # Megakernel backward (GemmOp.schedule_backward)
+    # Megakernel backward
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        da = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
-        db = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
-
-        ops = GemmOp.schedule_backward(
-            dout=dout, a=a, b=b_t, da=da, db=db,
-        )
-        if ops:
-            config = GemmOp.kernel_config(ops)
-            kernel = Megakernel(ops, config=config)
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                kernel.run()
-            torch.cuda.synchronize()
-
-            def reset_bwd():
-                da.zero_()
-                db.zero_()
-
-            funcs["megakernel"] = kernel.bench_spec(
-                setup_fn=reset_bwd,
-                keep_alive=[a, b_t, dout, da, db],
+        try:
+            da = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
+            db = torch.zeros(1, N, K, dtype=torch_dtype, device="cuda")
+            ops = GemmOp.schedule_backward(
+                dout=dout, a=a, b=b_t, da=da, db=db, page_size=page_size,
             )
+            if ops:
+                config = GemmOp.kernel_config(ops)
+                kernel = Megakernel(ops, config=config)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kernel.run()
+                torch.cuda.synchronize()
+                funcs["megakernel"] = kernel.bench_spec(
+                    setup_fn=lambda da=da, db=db: (da.zero_(), db.zero_()),
+                    keep_alive=[a, b_t, dout, da, db],
+                )
+        except Exception:
+            pass
 
-    # SingleOpKernel backward
-    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        da_so = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
-        db_so = torch.zeros(N, K, dtype=torch_dtype, device="cuda")
-        so_bwd_ops = GemmOp.schedule_backward(
-            dout=dout, a=a, b=b_t, da=da_so, db=db_so,
-        )
-        if so_bwd_ops:
-            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_bwd_kernel.run()
-            torch.cuda.synchronize()
-
-            def reset_so_bwd():
-                da_so.zero_()
-                db_so.zero_()
-
-            funcs["single_op"] = so_bwd_kernel.bench_spec(
-                setup_fn=reset_so_bwd,
-                keep_alive=[a, b_t, dout, da_so, db_so],
+        try:
+            da_so = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
+            db_so = torch.zeros(1, N, K, dtype=torch_dtype, device="cuda")
+            so_bwd_ops = GemmOp.schedule_backward(
+                dout=dout, a=a, b=b_t, da=da_so, db=db_so, page_size=page_size,
             )
+            if so_bwd_ops:
+                so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    so_bwd_kernel.run()
+                torch.cuda.synchronize()
+                funcs["single_op"] = so_bwd_kernel.bench_spec(
+                    setup_fn=lambda da_so=da_so, db_so=db_so: (da_so.zero_(), db_so.zero_()),
+                    keep_alive=[a, b_t, dout, da_so, db_so],
+                )
+        except Exception:
+            pass
 
     return funcs
 

@@ -149,7 +149,7 @@ class GDNSolveOp(Op):
                 f"Minimum page_size for GDNSolveOp is {a_smem}B."
             )
 
-        for BK in [128, 64, 32]:
+        for BK in [128, 64]:
             if K % BK != 0:
                 continue
             if BK > BT:
@@ -158,7 +158,9 @@ class GDNSolveOp(Op):
             phase12 = k_bufs + scalars
             if phase12 <= page_size:
                 return BK
-        return 32
+        raise ValueError(
+            f"page_size={page_size} too small for GDNSolveOp (K={K})."
+        )
 
     @classmethod
     def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):

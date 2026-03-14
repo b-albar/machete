@@ -14,8 +14,7 @@ Usage:
     python benchmarks/kernels/benchmark_gated_delta_net.py
 """
 
-PAGE_SIZE = 49152       # 48KB default page size
-PAGE_SIZE_16KB = 16384  # 16KB small page size
+PAGE_SIZES = [16384, 32768, 49152]
 
 import contextlib
 import io
@@ -91,7 +90,6 @@ def _build_prep_megakernel(k, v, g, beta):
     ops = GDNPrepOp.schedule_forward(
         k=k, v=v, g=g, beta=beta,
         g_cumsum=gc, w=w, u=u,
-        page_size=PAGE_SIZE,
     )
     config = GDNPrepOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -123,7 +121,7 @@ def _build_fused_megakernel(q, k, w, u, g_cumsum, scale):
 
     ops = GDNFusedOp.schedule_forward(
         q=q, k=k, w=w, u=u, g_cumsum=g_cumsum, o=o,
-        scale=scale, page_size=PAGE_SIZE,
+        scale=scale,
     )
     config = GDNFusedOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -138,7 +136,7 @@ def _build_fused_megakernel(q, k, w, u, g_cumsum, scale):
 # Prep benchmark
 # =============================================================================
 
-PREP_CONFIGS = [
+_BASE_PREP_CONFIGS = [
     (1, 1024, 32, 128, 128),
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
@@ -146,9 +144,11 @@ PREP_CONFIGS = [
     (4, 2048, 32, 128, 128),
 ]
 
+PREP_CONFIGS = [c + (49152,) for c in _BASE_PREP_CONFIGS]
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], PREP_CONFIGS)
-def bench_prep(B, T, H, K, V):
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], PREP_CONFIGS)
+def bench_prep(B, T, H, K, V, page_size):
     """Setup prep kernel benchmarks: fla vs PyTorch vs MegakernelOp."""
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
 
@@ -161,44 +161,55 @@ def bench_prep(B, T, H, K, V):
         from machete.kernels.gated_delta_net.prep import run_prep
         funcs["pytorch"] = lambda: run_prep(k, v, g, beta)
 
-        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
-            try:
-                result = _build_prep_megakernel(k, v, g, beta)
-                prep_kernel = result[0]
-                gc, w_out, u_out = result[5], result[6], result[7]
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
+        from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
 
-                funcs["megakernel_op"] = prep_kernel.bench_spec(
-                    setup_fn=lambda: (gc.zero_(), w_out.zero_(), u_out.zero_()),
-                    keep_alive=list(result[1:]),
-                )
-            except Exception as e:
-                print(f"  MegakernelOp prep error: {e}")
+        try:
+            from machete.megakernel import Megakernel
 
-        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
-            try:
-                from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
+            gc_mk = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
+            w_mk = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
+            u_mk = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
 
-                gc_so = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
-                w_so = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
-                u_so = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
+            mk_ops = GDNPrepOp.schedule_forward(
+                k=k.contiguous(), v=v.contiguous(),
+                g=g.contiguous(), beta=beta.contiguous(),
+                g_cumsum=gc_mk, w=w_mk, u=u_mk, page_size=page_size,
+            )
+            mk_config = GDNPrepOp.kernel_config(mk_ops)
+            mk_kernel = Megakernel(mk_ops, config=mk_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                mk_kernel.run()
+            torch.cuda.synchronize()
 
-                so_ops = GDNPrepOp.schedule_forward(
-                    k=k.contiguous(), v=v.contiguous(),
-                    g=g.contiguous(), beta=beta.contiguous(),
-                    g_cumsum=gc_so, w=w_so, u=u_so,
-                    page_size=PAGE_SIZE,
-                )
-                so_kernel = SingleOpKernel(so_ops)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    so_kernel.run()
-                torch.cuda.synchronize()
+            funcs["megakernel"] = mk_kernel.bench_spec(
+                setup_fn=lambda gc=gc_mk, w=w_mk, u=u_mk: (gc.zero_(), w.zero_(), u.zero_()),
+                keep_alive=[k, v, g, beta, gc_mk, w_mk, u_mk],
+            )
+        except Exception:
+            pass
 
-                funcs["single_op"] = so_kernel.bench_spec(
-                    setup_fn=lambda: (gc_so.zero_(), w_so.zero_(), u_so.zero_()),
-                    keep_alive=[k, v, g, beta, gc_so, w_so, u_so],
-                )
-            except Exception as e:
-                print(f"  SingleOp prep error: {e}")
+        try:
+            gc_so = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
+            w_so = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
+            u_so = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
+
+            so_ops = GDNPrepOp.schedule_forward(
+                k=k.contiguous(), v=v.contiguous(),
+                g=g.contiguous(), beta=beta.contiguous(),
+                g_cumsum=gc_so, w=w_so, u=u_so, page_size=page_size,
+            )
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda gc=gc_so, w=w_so, u=u_so: (gc.zero_(), w.zero_(), u.zero_()),
+                keep_alive=[k, v, g, beta, gc_so, w_so, u_so],
+            )
+        except Exception:
+            pass
 
     return funcs
 
@@ -207,7 +218,7 @@ def bench_prep(B, T, H, K, V):
 # Fused State+Output benchmark (GDNFusedOp vs fla)
 # =============================================================================
 
-FUSED_CONFIGS = [
+_BASE_FUSED_CONFIGS = [
     (1, 1024, 32, 128, 128),
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
@@ -215,9 +226,11 @@ FUSED_CONFIGS = [
     (4, 2048, 32, 128, 128),
 ]
 
+FUSED_CONFIGS = [c + (49152,) for c in _BASE_FUSED_CONFIGS]
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], FUSED_CONFIGS)
-def bench_fused(B, T, H, K, V):
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], FUSED_CONFIGS)
+def bench_fused(B, T, H, K, V, page_size):
     """Benchmark fused state+output vs separate ops vs fla (state+output only)."""
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
     scale = K ** -0.5
@@ -237,29 +250,37 @@ def bench_fused(B, T, H, K, V):
         funcs["fla_state+output"] = fla_state_output
 
         if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
-            try:
-                fused_result = _build_fused_megakernel(
-                    q, k, w, u, g_cumsum, scale)
-                fused_kernel = fused_result[0]
-                o_fused = fused_result[6]
+            from machete.megakernel import Megakernel
+            from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
 
-                funcs["fused_op"] = fused_kernel.bench_spec(
-                    setup_fn=lambda: o_fused.zero_(),
-                    keep_alive=list(fused_result[1:]),
+            try:
+                o_mk = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
+                mk_ops = GDNFusedOp.schedule_forward(
+                    q=q.contiguous(), k=k.contiguous(),
+                    w=w.contiguous(), u=u.contiguous(),
+                    g_cumsum=g_cumsum.contiguous(), o=o_mk,
+                    scale=scale, page_size=page_size,
                 )
-            except Exception as e:
-                print(f"  FusedOp error: {e}")
+                mk_config = GDNFusedOp.kernel_config(mk_ops)
+                mk_kernel = Megakernel(mk_ops, config=mk_config)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    mk_kernel.run()
+                torch.cuda.synchronize()
 
-        if is_hopper_or_newer() and CUTLASS_AVAILABLE and HAS_MEGAKERNEL_OPS:
+                funcs["fused_op"] = mk_kernel.bench_spec(
+                    setup_fn=lambda o=o_mk: o.zero_(),
+                    keep_alive=[q, k, w, u, g_cumsum, o_mk],
+                )
+            except Exception:
+                pass
+
             try:
-                from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
-
                 o_so = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
                 so_ops = GDNFusedOp.schedule_forward(
                     q=q.contiguous(), k=k.contiguous(),
                     w=w.contiguous(), u=u.contiguous(),
                     g_cumsum=g_cumsum.contiguous(), o=o_so,
-                    scale=scale, page_size=PAGE_SIZE,
+                    scale=scale, page_size=page_size,
                 )
                 so_kernel = SingleOpKernel(so_ops)
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -267,11 +288,11 @@ def bench_fused(B, T, H, K, V):
                 torch.cuda.synchronize()
 
                 funcs["single_op"] = so_kernel.bench_spec(
-                    setup_fn=lambda: o_so.zero_(),
+                    setup_fn=lambda o=o_so: o.zero_(),
                     keep_alive=[q, k, w, u, g_cumsum, o_so],
                 )
-            except Exception as e:
-                print(f"  SingleOp fused error: {e}")
+            except Exception:
+                pass
 
     return funcs
 
@@ -280,7 +301,7 @@ def bench_fused(B, T, H, K, V):
 # Full forward pipeline benchmark
 # =============================================================================
 
-PIPELINE_CONFIGS = [
+_BASE_PIPELINE_CONFIGS = [
     # B*H*2 >= 70 SMs to saturate FusedOp tiles
     (1, 2048, 32, 128, 128),   # 64 FusedOp tiles
     (1, 4096, 32, 128, 128),   # 64 FusedOp tiles
@@ -290,9 +311,11 @@ PIPELINE_CONFIGS = [
     (8, 2048, 32, 128, 128),   # 512 FusedOp tiles
 ]
 
+PIPELINE_CONFIGS = [c + (49152,) for c in _BASE_PIPELINE_CONFIGS]
 
-@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_CONFIGS)
-def bench_pipeline(B, T, H, K, V):
+
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], PIPELINE_CONFIGS)
+def bench_pipeline(B, T, H, K, V, page_size):
     """Setup full pipeline benchmarks: fla vs Fused Megakernel.
 
     Pre-allocates all tensors and builds the fused megakernel once so only
@@ -322,53 +345,40 @@ def bench_pipeline(B, T, H, K, V):
             g_c = g.contiguous()
             beta_c = beta.contiguous()
 
-            gc = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
-            w = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
-            u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
-            o = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
+            gc_ps = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
+            w_ps = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
+            u_ps = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
+            o_ps = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-            # --- Fused megakernel: PrepOp + FusedOp in one kernel ---
-            try:
-                prep_ops = GDNPrepOp.schedule_forward(
-                    k=k_c, v=v_c, g=g_c, beta=beta_c,
-                    g_cumsum=gc, w=w, u=u,
-                    page_size=PAGE_SIZE,
-                )
-                fused_ops = GDNFusedOp.schedule_forward(
-                    q=q_c, k=k_c, w=w, u=u,
-                    g_cumsum=gc, o=o, scale=scale,
-                    page_size=PAGE_SIZE,
-                )
-                all_ops = prep_ops + fused_ops
-                fused_config = GDNFusedOp.kernel_config(all_ops)
-                fused_kernel = Megakernel(all_ops, config=fused_config)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    fused_kernel.run()
-                torch.cuda.synchronize()
+            prep_ops = GDNPrepOp.schedule_forward(
+                k=k_c, v=v_c, g=g_c, beta=beta_c,
+                g_cumsum=gc_ps, w=w_ps, u=u_ps, page_size=page_size,
+            )
+            fused_ops = GDNFusedOp.schedule_forward(
+                q=q_c, k=k_c, w=w_ps, u=u_ps,
+                g_cumsum=gc_ps, o=o_ps, scale=scale, page_size=page_size,
+            )
+            all_ops = prep_ops + fused_ops
+            fused_config = GDNFusedOp.kernel_config(all_ops)
+            fused_kernel = Megakernel(all_ops, config=fused_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fused_kernel.run()
+            torch.cuda.synchronize()
 
-                fused_stream = torch.cuda.Stream()
-                fused_cu_stream = cuda.CUstream(fused_stream.cuda_stream)
+            fused_stream = torch.cuda.Stream()
+            fused_cu_stream = cuda.CUstream(fused_stream.cuda_stream)
 
-                def fused_setup():
-                    gc.zero_()
-                    w.zero_()
-                    u.zero_()
-                    o.zero_()
-
-                funcs["fused_megakernel"] = KernelBenchSpec(
-                    launch_fn=lambda: fused_kernel.run(
-                        stream=fused_cu_stream, sync=False),
-                    setup_fn=fused_setup,
-                    stream=(fused_stream, fused_cu_stream),
-                    _keep_alive=[fused_kernel, k_c, v_c, g_c, beta_c,
-                                 q_c, gc, w, u, o],
-                )
-            except Exception as e:
-                print(f"  Fused megakernel error: {e}")
-
-
-        except Exception as e:
-            print(f"  Pipeline setup error: {e}")
+            funcs["fused"] = KernelBenchSpec(
+                launch_fn=lambda fk=fused_kernel, fc=fused_cu_stream: fk.run(
+                    stream=fc, sync=False),
+                setup_fn=lambda gc=gc_ps, w=w_ps, u=u_ps, o=o_ps: (
+                    gc.zero_(), w.zero_(), u.zero_(), o.zero_()),
+                stream=(fused_stream, fused_cu_stream),
+                _keep_alive=[fused_kernel, k_c, v_c, g_c, beta_c,
+                             q_c, gc_ps, w_ps, u_ps, o_ps],
+            )
+        except Exception:
+            pass
 
     return funcs
 
@@ -377,7 +387,7 @@ def bench_pipeline(B, T, H, K, V):
 # 5-Op Pipeline benchmark
 # =============================================================================
 
-PIPELINE_5OP_CONFIGS = [
+_BASE_PIPELINE_5OP_CONFIGS = [
     (1, 2048, 32, 128, 128),
     (1, 4096, 32, 128, 128),
     (1, 8192, 32, 128, 128),
@@ -385,6 +395,8 @@ PIPELINE_5OP_CONFIGS = [
     (4, 4096, 32, 128, 128),
     (8, 2048, 32, 128, 128),
 ]
+
+PIPELINE_5OP_CONFIGS = [c + (ps,) for c in _BASE_PIPELINE_5OP_CONFIGS for ps in PAGE_SIZES]
 
 
 def _build_5op_kernel(q_c, k_c, v_c, g_c, beta_c, scale, page_size):
@@ -441,8 +453,9 @@ def _build_5op_kernel(q_c, k_c, v_c, g_c, beta_c, scale, page_size):
     return kernel, buffers
 
 
-def _bench_5op(B, T, H, K, V, page_size, label):
-    """Shared implementation for 5-op pipeline benchmarks."""
+@Benchmark.configs(["B", "T", "H", "K", "V", "page_size"], PIPELINE_5OP_CONFIGS)
+def bench_pipeline_5op(B, T, H, K, V, page_size):
+    """Benchmark 5-op megakernel vs fla."""
     q, k, v, g, beta = _make_inputs(B, T, H, K, V)
     scale = K ** -0.5
 
@@ -469,28 +482,16 @@ def _bench_5op(B, T, H, K, V, page_size, label):
         s5 = torch.cuda.Stream()
         cs5 = cuda.CUstream(s5.cuda_stream)
 
-        funcs[label] = KernelBenchSpec(
+        funcs["5op"] = KernelBenchSpec(
             launch_fn=lambda: kern5.run(stream=cs5, sync=False),
             setup_fn=lambda: [b.zero_() for b in bufs5],
             stream=(s5, cs5),
             _keep_alive=[kern5, q_c, k_c, v_c, g_c, beta_c] + bufs5,
         )
-    except Exception as e:
-        print(f"  5-Op {label} error: {e}")
+    except Exception:
+        pass
 
     return funcs
-
-
-@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_5OP_CONFIGS)
-def bench_pipeline_5op(B, T, H, K, V):
-    """Benchmark 5-op megakernel (Solve+WU+StateRecurrence+VNew+Output) vs fla."""
-    return _bench_5op(B, T, H, K, V, PAGE_SIZE, "5op")
-
-
-@Benchmark.configs(["B", "T", "H", "K", "V"], PIPELINE_5OP_CONFIGS)
-def bench_pipeline_5op_16kb(B, T, H, K, V):
-    """Benchmark 5-op megakernel at 16KB page size vs fla."""
-    return _bench_5op(B, T, H, K, V, PAGE_SIZE_16KB, "5op_16kb")
 
 
 # =============================================================================
@@ -515,28 +516,34 @@ if __name__ == "__main__":
     print("-" * 100)
     print("Prep Kernel (fla vs PyTorch vs MegakernelOp)")
     print("-" * 100)
-    bench_prep._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_prep._benchmark.run(
+        mode="kernel", warmup=10, rep=100,
+        columns=["fla", "pytorch", "megakernel", "single_op"],
+    )
 
     print()
     print("-" * 100)
     print("Fused State+Output (FusedOp vs fla)")
     print("-" * 100)
-    bench_fused._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_fused._benchmark.run(
+        mode="kernel", warmup=10, rep=100,
+        columns=["fla_state+output", "fused_op", "single_op"],
+    )
 
     print()
     print("-" * 100)
     print("Full Pipeline 2-Op (fla vs Fused Megakernel)")
     print("-" * 100)
-    bench_pipeline._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_pipeline._benchmark.run(
+        mode="kernel", warmup=10, rep=100,
+        columns=["fla", "fused"],
+    )
 
     print()
     print("-" * 100)
-    print("5-Op Pipeline 48KB (fla vs 5-Op Megakernel)")
+    print("5-Op Pipeline (fla vs 5-Op Megakernel)")
     print("-" * 100)
-    bench_pipeline_5op._benchmark.run(mode="kernel", warmup=10, rep=100)
-
-    print()
-    print("-" * 100)
-    print("5-Op Pipeline 16KB (fla vs 5-Op Megakernel)")
-    print("-" * 100)
-    bench_pipeline_5op_16kb._benchmark.run(mode="kernel", warmup=10, rep=100)
+    bench_pipeline_5op._benchmark.run(
+        mode="kernel", warmup=10, rep=100,
+        columns=["fla", "5op"],
+    )

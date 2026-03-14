@@ -43,6 +43,8 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 def is_hopper_or_newer():
     if not torch.cuda.is_available():
@@ -51,7 +53,7 @@ def is_hopper_or_newer():
     return major >= 9
 
 
-def rmsnorm_bytes(batch, seq_len, hidden_dim):
+def rmsnorm_bytes(batch, seq_len, hidden_dim, page_size):
     """Total bytes read + written for RMSNorm.
 
     Reads: x (B*S*D) + weight (D)
@@ -68,10 +70,11 @@ def rmsnorm_bytes(batch, seq_len, hidden_dim):
 # =============================================================================
 
 
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("batch", [1, 4])
 @Benchmark.parametrize("seq_len", [512, 2048, 8192, 32768])
 @Benchmark.parametrize("hidden_dim", [1024, 2048, 4096])
-def bench_rmsnorm(batch, seq_len, hidden_dim):
+def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
     """Setup RMSNorm benchmark functions for each implementation."""
     torch.manual_seed(42)
     M = batch * seq_len
@@ -92,66 +95,104 @@ def bench_rmsnorm(batch, seq_len, hidden_dim):
         funcs["triton"] = lambda: rmsnorm_triton(x, weight)
 
     # CUTLASS (out-of-place, SM90+ only)
-    # Note: CUTLASS standalone kernel may fail to compile due to dynamic layout
-    # issues with the CuTe DSL. This is gracefully skipped if it fails.
     if HAS_CUTLASS_RMSNORM:
         try:
-            # Warmup CUTLASS JIT
             rmsnorm_cutlass(x, weight)
             torch.cuda.synchronize()
             funcs["cutlass"] = lambda: rmsnorm_cutlass(x, weight)
         except Exception:
-            pass  # Skip CUTLASS standalone if compilation fails
+            pass
 
-    # Megakernel (out-of-place, via bench_spec for raw kernel timing)
+    # Megakernel + SingleOp forward
+    # RMSNormOp expects 3D tensors (B, S, D) — reshape from 2D (M, D)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        y = torch.empty_like(x)
-        ops = RMSNormOp.schedule(x=x, weight=weight, y=y)
-        config = RMSNormOp.kernel_config(ops)
-        kernel = Megakernel(ops, config=config)
+        x_3d = x.view(batch, seq_len, D)
+        try:
+            y_3d = torch.empty_like(x_3d)
+            ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_3d, page_size=page_size)
+            config = RMSNormOp.kernel_config(ops)
+            kernel = Megakernel(ops, config=config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = kernel.bench_spec(keep_alive=[x_3d, weight, y_3d])
+        except Exception:
+            pass
 
-        # Trigger compilation + first run
-        with contextlib.redirect_stdout(io.StringIO()):
-            kernel.run()
-        torch.cuda.synchronize()
+        try:
+            y_so_3d = torch.empty_like(x_3d)
+            so_ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_so_3d, page_size=page_size)
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x_3d, weight, y_so_3d])
+        except Exception:
+            pass
 
-        funcs["megakernel"] = kernel.bench_spec(keep_alive=[x, weight, y])
+    return funcs
 
-    # SingleOpKernel (out-of-place)
+
+# =============================================================================
+# Backward Benchmark
+# =============================================================================
+
+
+def rmsnorm_bwd_bytes(batch, seq_len, hidden_dim, page_size):
+    """Total bytes read + written for RMSNorm backward.
+
+    Reads: dout (B*S*D) + x (B*S*D) + weight (D)
+    Writes: dx (B*S*D)
+    All bfloat16 (2 bytes).
+    """
+    x_elems = batch * seq_len * hidden_dim
+    w_elems = hidden_dim
+    return (3 * x_elems + w_elems) * 2
+
+
+@Benchmark.parametrize("page_size", PAGE_SIZES)
+@Benchmark.parametrize("batch", [1, 4])
+@Benchmark.parametrize("seq_len", [512, 2048, 8192, 32768])
+@Benchmark.parametrize("hidden_dim", [1024, 2048, 4096])
+def bench_rmsnorm_bwd(hidden_dim, seq_len, batch, page_size):
+    """Setup RMSNorm backward benchmark functions."""
+    torch.manual_seed(42)
+    M = batch * seq_len
+    D = hidden_dim
+    x = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(D, dtype=torch.bfloat16, device="cuda")
+
+    funcs = {}
+
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        y_so = torch.empty_like(x)
-        so_ops = RMSNormOp.schedule(x=x, weight=weight, y=y_so)
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
+        x_3d = x.view(batch, seq_len, D)
+        dout_3d = torch.randn(batch, seq_len, D, dtype=torch.bfloat16, device="cuda")
+        try:
+            dx_3d = torch.empty_like(x_3d)
+            bwd_ops = RMSNormBwdOp.schedule(
+                dout=dout_3d, x=x_3d, weight=weight, dx=dx_3d, page_size=page_size)
+            bwd_config = RMSNormBwdOp.kernel_config(bwd_ops)
+            bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bwd_kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = bwd_kernel.bench_spec(
+                keep_alive=[dout_3d, x_3d, weight, dx_3d])
+        except Exception:
+            pass
 
-        funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x, weight, y_so])
-
-    # Megakernel backward
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        dout = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
-        dx = torch.empty_like(x)
-        bwd_ops = RMSNormBwdOp.schedule(dout=dout, x=x, weight=weight, dx=dx)
-        bwd_config = RMSNormBwdOp.kernel_config(bwd_ops)
-        bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            bwd_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["megakernel_bwd"] = bwd_kernel.bench_spec(keep_alive=[dout, x, weight, dx])
-
-    # SingleOpKernel backward
-    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        dx_so = torch.empty_like(x)
-        so_bwd_ops = RMSNormBwdOp.schedule(dout=dout, x=x, weight=weight, dx=dx_so)
-        so_bwd_kernel = SingleOpKernel(so_bwd_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_bwd_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["single_op_bwd"] = so_bwd_kernel.bench_spec(keep_alive=[dout, x, weight, dx_so])
+        try:
+            dx_so_3d = torch.empty_like(x_3d)
+            so_bwd_ops = RMSNormBwdOp.schedule(
+                dout=dout_3d, x=x_3d, weight=weight, dx=dx_so_3d, page_size=page_size)
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                keep_alive=[dout_3d, x_3d, weight, dx_so_3d])
+        except Exception:
+            pass
 
     return funcs
 
@@ -178,6 +219,19 @@ if __name__ == "__main__":
     bench_rmsnorm._benchmark.run(
         mode="kernel",
         bytes_fn=rmsnorm_bytes,
+        warmup=10,
+        rep=50,
+    )
+
+    print()
+    print("=" * 100)
+    print("RMSNorm Backward Benchmark")
+    print("=" * 100)
+    print()
+
+    bench_rmsnorm_bwd._benchmark.run(
+        mode="kernel",
+        bytes_fn=rmsnorm_bwd_bytes,
         warmup=10,
         rep=50,
     )

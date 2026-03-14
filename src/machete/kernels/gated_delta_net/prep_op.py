@@ -184,7 +184,7 @@ class GDNPrepOp(Op):
             scalars_end = k_bufs_end + scalars
             a_end = BT * BT * 4  # a_smem at offset 0
             src_base = ((max(a_end, scalars_end) + 127) // 128) * 128
-            for BV in [128, 64]:
+            for BV in [128, 64, 32]:
                 if V % BV != 0:
                     continue
                 BK_PAD = BK + 8
@@ -192,7 +192,9 @@ class GDNPrepOp(Op):
                 phase4 = src_base + max(2 * BT * BK_PAD, BT * BV_PAD) * elem_bytes
                 if phase4 <= page_size:
                     return BK, BV
-        return 64, 64
+        raise ValueError(
+            f"page_size={page_size} too small for GDNPrepOp (K={K}, V={V})."
+        )
 
     @classmethod
     def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):

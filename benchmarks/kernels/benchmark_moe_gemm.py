@@ -27,6 +27,8 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+PAGE_SIZES = [16384, 32768, 49152]
+
 
 def is_sm90_or_newer():
     if not torch.cuda.is_available():
@@ -35,14 +37,14 @@ def is_sm90_or_newer():
     return major * 10 + minor >= 90
 
 
-def moe_gemm_bytes(num_tokens, num_experts, topk, K, N, dtype):
+def moe_gemm_bytes(num_tokens, num_experts, topk, K, N, dtype, page_size):
     """Total bytes read + written for grouped GEMM."""
     elem_bytes = 2
     total_tokens = num_tokens * topk
     return (total_tokens * K + num_experts * N * K + total_tokens * N) * elem_bytes
 
 
-def moe_gemm_flops(num_tokens, num_experts, topk, K, N, dtype):
+def moe_gemm_flops(num_tokens, num_experts, topk, K, N, dtype, page_size):
     """FLOPs for grouped GEMM: 2 * total_tokens * N * K."""
     return 2 * num_tokens * topk * N * K
 
@@ -54,28 +56,33 @@ def moe_gemm_flops(num_tokens, num_experts, topk, K, N, dtype):
 # Practical MoE configurations:
 #   (num_tokens, topk, num_experts, K, N, dtype)
 # Covers small/medium/large with varying expert counts.
+_BASE_CONFIGS = [
+    # Small: few tokens, few experts
+    (64, 2, 8, 256, 256, "bfloat16"),
+    (128, 2, 8, 256, 512, "bfloat16"),
+    (256, 2, 8, 512, 512, "bfloat16"),
+    # Medium: moderate scale
+    (256, 2, 8, 512, 1024, "bfloat16"),
+    (512, 2, 8, 1024, 1024, "bfloat16"),
+    (512, 2, 16, 512, 1024, "bfloat16"),
+    # Larger: more tokens and experts
+    (512, 2, 16, 1024, 1024, "bfloat16"),
+    (1024, 2, 8, 512, 1024, "bfloat16"),
+    (1024, 2, 16, 1024, 1024, "bfloat16"),
+    # Many experts (MoE-heavy)
+    (256, 2, 64, 256, 256, "bfloat16"),
+    (512, 2, 64, 256, 512, "bfloat16"),
+    (1024, 2, 64, 512, 512, "bfloat16"),
+]
+
+CONFIGS = [c + (ps,) for c in _BASE_CONFIGS for ps in PAGE_SIZES]
+
+
 @Benchmark.configs(
-    ["num_tokens", "topk", "num_experts", "K", "N", "dtype"],
-    [
-        # Small: few tokens, few experts
-        (64, 2, 8, 256, 256, "bfloat16"),
-        (128, 2, 8, 256, 512, "bfloat16"),
-        (256, 2, 8, 512, 512, "bfloat16"),
-        # Medium: moderate scale
-        (256, 2, 8, 512, 1024, "bfloat16"),
-        (512, 2, 8, 1024, 1024, "bfloat16"),
-        (512, 2, 16, 512, 1024, "bfloat16"),
-        # Larger: more tokens and experts
-        (512, 2, 16, 1024, 1024, "bfloat16"),
-        (1024, 2, 8, 512, 1024, "bfloat16"),
-        (1024, 2, 16, 1024, 1024, "bfloat16"),
-        # Many experts (MoE-heavy)
-        (256, 2, 64, 256, 256, "bfloat16"),
-        (512, 2, 64, 256, 512, "bfloat16"),
-        (1024, 2, 64, 512, 512, "bfloat16"),
-    ],
+    ["num_tokens", "num_experts", "topk", "K", "N", "dtype", "page_size"],
+    CONFIGS,
 )
-def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
+def bench_moe_gemm(num_tokens, num_experts, topk, K, N, dtype, page_size):
     """Setup MoE grouped GEMM benchmark."""
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
 
@@ -124,40 +131,40 @@ def bench_moe_gemm(num_tokens, topk, num_experts, K, N, dtype):
         _keep_alive=[sorted_x, w, expert_ids, c_ref],
     )
 
-    # --- Megakernel MoeGemmOp (let _auto_tiles choose optimal tile sizes) ---
+    # --- Megakernel + SingleOp MoeGemmOp ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+        try:
+            c = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+            ops = MoeGemmOp.schedule_forward(
+                sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c, page_size=page_size,
+            )
+            config = MoeGemmOp.kernel_config(ops)
+            kernel = Megakernel(ops, config=config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = kernel.bench_spec(
+                setup_fn=lambda c=c: c.zero_(),
+                keep_alive=[sorted_x, w, expert_ids, c],
+            )
+        except Exception:
+            pass
 
-        ops = MoeGemmOp.schedule_forward(
-            sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
-        )
-        config = MoeGemmOp.kernel_config(ops)
-        kernel = Megakernel(ops, config=config)
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["megakernel"] = kernel.bench_spec(
-            setup_fn=lambda: c.zero_(),
-            keep_alive=[sorted_x, w, expert_ids, c],
-        )
-
-    # SingleOpKernel MoeGemmOp
-    if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        c_so = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
-        so_ops = MoeGemmOp.schedule_forward(
-            sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c_so,
-        )
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
-
-        funcs["single_op"] = so_kernel.bench_spec(
-            setup_fn=lambda: c_so.zero_(),
-            keep_alive=[sorted_x, w, expert_ids, c_so],
-        )
+        try:
+            c_so = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
+            so_ops = MoeGemmOp.schedule_forward(
+                sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c_so, page_size=page_size,
+            )
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda c_so=c_so: c_so.zero_(),
+                keep_alive=[sorted_x, w, expert_ids, c_so],
+            )
+        except Exception:
+            pass
 
     return funcs
 

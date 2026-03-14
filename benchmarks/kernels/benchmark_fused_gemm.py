@@ -30,6 +30,7 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+PAGE_SIZES = [16384, 32768, 49152]
 
 NUM_GEMMS = 5
 
@@ -41,7 +42,7 @@ def is_sm90_or_newer():
     return major * 10 + minor >= 90
 
 
-def total_bytes(M, D, dtype):
+def total_bytes(M, D, dtype, page_size):
     """Total bytes for chained GEMMs.
 
     Each GEMM reads input [1,M,D] + weight [D,D], writes output [1,M,D].
@@ -53,15 +54,16 @@ def total_bytes(M, D, dtype):
     return weight_bytes + activation_bytes
 
 
-def total_flops(M, D, dtype):
+def total_flops(M, D, dtype, page_size):
     """Total FLOPs for NUM_GEMMS chained GEMMs: each is 2*M*D*D."""
     return 2 * M * D * D * NUM_GEMMS
 
 
+@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("dtype", ["bfloat16"])
 @Benchmark.parametrize("D", [1024, 2048, 4096, 8192])
 @Benchmark.parametrize("M", [128, 512, 2048, 4096])
-def bench_fused_gemm(M, D, dtype):
+def bench_fused_gemm(M, D, dtype, page_size):
     """Benchmark 5 chained GEMMs: x → W1 → W2 → W3 → W4 → W5 → y."""
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
 
@@ -106,35 +108,30 @@ def bench_fused_gemm(M, D, dtype):
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         Ws_t = [w.t().contiguous() for w in Ws]  # GemmOp expects (N, K) layout
 
-        # Separate 3D buffers for megakernel: (B=1, S=M, K=D)
-        mk_a = buf_a.clone().unsqueeze(0)  # (1, M, D)
-        mk_b = torch.zeros(1, M, D, dtype=torch_dtype, device="cuda")
+        try:
+            mk_a = buf_a.clone().unsqueeze(0)  # (1, M, D)
+            mk_b = torch.zeros(1, M, D, dtype=torch_dtype, device="cuda")
 
-        # Chain: mk_a(1,M,D) → W0 → mk_b → W1 → mk_a → W2 → mk_b → W3 → mk_a → W4 → mk_b
-        # Framework auto-detects dependencies via shared tensor pointers
-        inputs =  [mk_a, mk_b, mk_a, mk_b, mk_a]
-        outputs = [mk_b, mk_a, mk_b, mk_a, mk_b]
+            inputs =  [mk_a, mk_b, mk_a, mk_b, mk_a]
+            outputs = [mk_b, mk_a, mk_b, mk_a, mk_b]
 
-        all_ops = []
-        for i in range(NUM_GEMMS):
-            ops = GemmOp.schedule(a=inputs[i], b=Ws_t[i], c=outputs[i])
-            all_ops.extend(ops)
+            all_ops = []
+            for i in range(NUM_GEMMS):
+                ops = GemmOp.schedule(a=inputs[i], b=Ws_t[i], c=outputs[i], page_size=page_size)
+                all_ops.extend(ops)
 
-        config = GemmOp.kernel_config(all_ops[:1])
-        kernel = Megakernel(all_ops, config=config)
+            config = GemmOp.kernel_config(all_ops[:1])
+            kernel = Megakernel(all_ops, config=config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel.run()
+            torch.cuda.synchronize()
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            kernel.run()
-        torch.cuda.synchronize()
-
-        def mk_setup():
-            mk_a[0].copy_(buf_a)
-            mk_b.zero_()
-
-        funcs["megakernel"] = kernel.bench_spec(
-            setup_fn=mk_setup,
-            keep_alive=[mk_a, mk_b, Ws_t],
-        )
+            funcs["megakernel"] = kernel.bench_spec(
+                setup_fn=lambda mk_a=mk_a, mk_b=mk_b: (mk_a[0].copy_(buf_a), mk_b.zero_()),
+                keep_alive=[mk_a, mk_b, Ws_t],
+            )
+        except Exception:
+            pass
 
     return funcs
 
