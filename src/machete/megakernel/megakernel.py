@@ -15,7 +15,7 @@ Usage:
     from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"S": 4})
+    ops = RMSNormOp.schedule(x=x, weight=w, y=y)
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -1005,7 +1005,7 @@ class Megakernel:
             parts = [f"Int32({wf.base})"]
             for j in range(MAX_TILE_DIMS):
                 if wf.coeffs[j] != 0:
-                    parts.append(f"(Int32({wf.coeffs[j]}) * tile_{j}) // Int32({wf.divs[j]})")
+                    parts.append(f"Int32({wf.coeffs[j]}) * (tile_{j} // Int32({wf.divs[j]}))")
             return " + ".join(parts)
 
         # Build if/elif branches for each op

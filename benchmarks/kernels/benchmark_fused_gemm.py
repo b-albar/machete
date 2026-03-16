@@ -88,23 +88,9 @@ def bench_fused_gemm(M, D, dtype, page_size):
         torch.matmul(buf_b, Ws[3], out=buf_a)
         torch.matmul(buf_a, Ws[4], out=buf_b)
 
-    funcs["cublas_seq"] = seq_matmul
+    funcs["cublas"] = seq_matmul
 
-    # --- 2. CUDA graph ---
-    seq_matmul()
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        torch.matmul(buf_a, Ws[0], out=buf_b)
-        torch.matmul(buf_b, Ws[1], out=buf_a)
-        torch.matmul(buf_a, Ws[2], out=buf_b)
-        torch.matmul(buf_b, Ws[3], out=buf_a)
-        torch.matmul(buf_a, Ws[4], out=buf_b)
-
-    funcs["cublas_graph"] = lambda: graph.replay()
-
-    # --- 3. Megakernel fusion ---
+    # --- 2. Megakernel fusion ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         Ws_t = [w.t().contiguous() for w in Ws]  # GemmOp expects (N, K) layout
 
@@ -139,9 +125,8 @@ def bench_fused_gemm(M, D, dtype, page_size):
 if __name__ == "__main__":
     print("=" * 100)
     print(f"Chained GEMM Benchmark: x → W1 → W2 → ... → W{NUM_GEMMS} → y")
-    print("cublas_seq   = 5 sequential torch.matmul")
-    print("cublas_graph = CUDA graph replaying the chain")
-    print("megakernel   = single persistent kernel with auto dependencies")
+    print("cublas     = 5 sequential torch.matmul (CUDA-graph captured by framework)")
+    print("megakernel = single persistent kernel with auto dependencies")
     print("=" * 100)
 
     if torch.cuda.is_available():
@@ -155,4 +140,5 @@ if __name__ == "__main__":
         bytes_fn=total_bytes,
         warmup=25,
         rep=100,
+        columns=["cublas", "megakernel"],
     )

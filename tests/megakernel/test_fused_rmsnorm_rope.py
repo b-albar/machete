@@ -30,33 +30,6 @@ def get_tolerances(dtype):
     return {"rtol": 1e-2, "atol": 1e-2}
 
 
-def _compute_tile_sizes(n_heads, head_dim, dtype):
-    """Compute tile sizes for both RMSNorm and RoPE that fit in a 16KB page.
-
-    Since both ops share the S dimension in fused execution, tile_S must be
-    the same for both (or one must divide the other). We use the minimum.
-    """
-    elem_bytes = 4 if dtype == torch.float32 else 2
-    hidden_dim = n_heads * head_dim
-
-    # RMSNorm: tile_s * hidden_dim * elem_bytes <= 16384
-    max_tile_s_rms = min(4, max(1, 16384 // (hidden_dim * elem_bytes)))
-
-    # RoPE tile_size_NH: largest <= 8 that divides n_heads
-    tile_nh = min(n_heads, 8)
-    while n_heads % tile_nh != 0:
-        tile_nh -= 1
-
-    # RoPE smem: q (tile_s * tile_nh * D) + cos (tile_s * D/2) + sin (tile_s * D/2)
-    rope_row_bytes = (tile_nh * head_dim + head_dim) * elem_bytes
-    max_tile_s_rope = min(4, max(1, 16384 // rope_row_bytes))
-
-    # Use minimum so tile_S is compatible for both ops in fused execution
-    tile_s = min(max_tile_s_rms, max_tile_s_rope)
-
-    return tile_s, tile_nh, tile_s
-
-
 # (batch, seq_len, n_heads, head_dim)
 SHAPE_PARAMS = [
     (1, 8, 1, 64),      # minimal: single head
@@ -94,7 +67,11 @@ class TestFusedRMSNormRoPE:
         Also verifies barrier reset by running the kernel multiple times.
         """
         hidden_dim = n_heads * head_dim
-        tile_s_rms, tile_nh, tile_s_rope = _compute_tile_sizes(n_heads, head_dim, dtype)
+
+        # RoPE tile_size_NH: largest <= 8 that divides n_heads
+        tile_nh = min(n_heads, 8)
+        while n_heads % tile_nh != 0:
+            tile_nh -= 1
 
         # Input for RMSNorm (3D: B, S, D)
         x = torch.randn(batch, seq_len, hidden_dim, dtype=dtype, device="cuda")
@@ -109,9 +86,11 @@ class TestFusedRMSNormRoPE:
         sin = torch.randn(seq_len, head_dim // 2, dtype=dtype, device="cuda")
 
         # Fused megakernel: RMSNorm -> RoPE
-        # Dependency is auto-detected via tensor pointer matching
-        ops = (RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"S": tile_s_rms, "B": 1})
-               + RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"S": tile_s_rope, "NH": tile_nh, "B": 1}))
+        # RMSNormOp uses tile_S=1 (one row per block), RoPE uses its own tile_S
+        rms_ops = RMSNormOp.schedule(x=x, weight=weight, y=y)
+        rope_ops = RopeOp.schedule(q=q, cos=cos, sin=sin,
+                                   tile_sizes={"NH": tile_nh, "B": 1})
+        ops = rms_ops + rope_ops
         config = MegakernelConfig(threads_per_block=128)
         kernel = Megakernel(ops, config=config)
 

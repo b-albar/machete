@@ -9,7 +9,7 @@ Implementations:
 - PyTorch: Pure PyTorch reference
 - Triton: Triton JIT-compiled kernel
 - CUTLASS: NVIDIA CUTLASS standalone kernel (SM90+ only, cluster-based reduction)
-- Megakernel: Machete megakernel framework
+- Megakernel: Machete megakernel framework (direct global access)
 
 Usage:
     python benchmarks/kernels/benchmark_rmsnorm.py
@@ -22,12 +22,12 @@ import torch
 
 from machete.megakernel import Megakernel
 from machete.kernels.rms_norm import RMSNormOp, RMSNormBwdOp
-from machete.kernels.rms_norm.ref import rmsnorm_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
+from machete.kernels.rms_norm.ref import rmsnorm_pytorch, rmsnorm_backward_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
 from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 if HAS_TRITON:
-    from machete.kernels.rms_norm.ref import rmsnorm_triton
+    from machete.kernels.rms_norm.ref import rmsnorm_triton, rmsnorm_backward_triton
 else:
     print("WARNING: Triton not available — Triton benchmark will be skipped.")
 
@@ -43,8 +43,6 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
-PAGE_SIZES = [16384, 32768, 49152]
-
 
 def is_hopper_or_newer():
     if not torch.cuda.is_available():
@@ -53,13 +51,8 @@ def is_hopper_or_newer():
     return major >= 9
 
 
-def rmsnorm_bytes(batch, seq_len, hidden_dim, page_size):
-    """Total bytes read + written for RMSNorm.
-
-    Reads: x (B*S*D) + weight (D)
-    Writes: y (B*S*D)
-    All bfloat16 (2 bytes).
-    """
+def rmsnorm_bytes_fwd(batch, seq_len, hidden_dim):
+    """Total bytes read + written for RMSNorm forward."""
     x_elems = batch * seq_len * hidden_dim
     w_elems = hidden_dim
     return (2 * x_elems + w_elems) * 2
@@ -70,11 +63,10 @@ def rmsnorm_bytes(batch, seq_len, hidden_dim, page_size):
 # =============================================================================
 
 
-@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("batch", [1, 4])
 @Benchmark.parametrize("seq_len", [512, 2048, 8192, 32768])
 @Benchmark.parametrize("hidden_dim", [1024, 2048, 4096])
-def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
+def bench_rmsnorm(hidden_dim, seq_len, batch):
     """Setup RMSNorm benchmark functions for each implementation."""
     torch.manual_seed(42)
     M = batch * seq_len
@@ -89,7 +81,6 @@ def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
 
     # Triton (out-of-place)
     if HAS_TRITON:
-        # Warmup Triton JIT
         rmsnorm_triton(x, weight)
         torch.cuda.synchronize()
         funcs["triton"] = lambda: rmsnorm_triton(x, weight)
@@ -104,12 +95,11 @@ def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
             pass
 
     # Megakernel + SingleOp forward
-    # RMSNormOp expects 3D tensors (B, S, D) — reshape from 2D (M, D)
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         x_3d = x.view(batch, seq_len, D)
         try:
             y_3d = torch.empty_like(x_3d)
-            ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_3d, page_size=page_size)
+            ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_3d)
             config = RMSNormOp.kernel_config(ops)
             kernel = Megakernel(ops, config=config)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -121,8 +111,9 @@ def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
 
         try:
             y_so_3d = torch.empty_like(x_3d)
-            so_ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_so_3d, page_size=page_size)
-            so_kernel = SingleOpKernel(so_ops)
+            so_ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_so_3d)
+            so_config = RMSNormOp.kernel_config(so_ops)
+            so_kernel = SingleOpKernel(so_ops, config=so_config)
             with contextlib.redirect_stdout(io.StringIO()):
                 so_kernel.run()
             torch.cuda.synchronize()
@@ -138,39 +129,42 @@ def bench_rmsnorm(hidden_dim, seq_len, batch, page_size):
 # =============================================================================
 
 
-def rmsnorm_bwd_bytes(batch, seq_len, hidden_dim, page_size):
-    """Total bytes read + written for RMSNorm backward.
-
-    Reads: dout (B*S*D) + x (B*S*D) + weight (D)
-    Writes: dx (B*S*D)
-    All bfloat16 (2 bytes).
-    """
+def rmsnorm_bytes_bwd(batch, seq_len, hidden_dim):
+    """Total bytes read + written for RMSNorm backward."""
     x_elems = batch * seq_len * hidden_dim
     w_elems = hidden_dim
     return (3 * x_elems + w_elems) * 2
 
 
-@Benchmark.parametrize("page_size", PAGE_SIZES)
 @Benchmark.parametrize("batch", [1, 4])
 @Benchmark.parametrize("seq_len", [512, 2048, 8192, 32768])
 @Benchmark.parametrize("hidden_dim", [1024, 2048, 4096])
-def bench_rmsnorm_bwd(hidden_dim, seq_len, batch, page_size):
+def bench_rmsnorm_bwd(hidden_dim, seq_len, batch):
     """Setup RMSNorm backward benchmark functions."""
     torch.manual_seed(42)
     M = batch * seq_len
     D = hidden_dim
     x = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(D, dtype=torch.bfloat16, device="cuda")
-
+    dout = torch.randn(M, D, dtype=torch.bfloat16, device="cuda")
     funcs = {}
+
+    # PyTorch backward
+    funcs["pytorch"] = lambda: rmsnorm_backward_pytorch(dout, x, weight)
+
+    # Triton backward
+    if HAS_TRITON:
+        rmsnorm_backward_triton(dout, x, weight)
+        torch.cuda.synchronize()
+        funcs["triton"] = lambda: rmsnorm_backward_triton(dout, x, weight)
 
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         x_3d = x.view(batch, seq_len, D)
-        dout_3d = torch.randn(batch, seq_len, D, dtype=torch.bfloat16, device="cuda")
+        dout_3d = dout.view(batch, seq_len, D)
         try:
             dx_3d = torch.empty_like(x_3d)
             bwd_ops = RMSNormBwdOp.schedule(
-                dout=dout_3d, x=x_3d, weight=weight, dx=dx_3d, page_size=page_size)
+                dout=dout_3d, x=x_3d, weight=weight, dx=dx_3d)
             bwd_config = RMSNormBwdOp.kernel_config(bwd_ops)
             bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -184,8 +178,9 @@ def bench_rmsnorm_bwd(hidden_dim, seq_len, batch, page_size):
         try:
             dx_so_3d = torch.empty_like(x_3d)
             so_bwd_ops = RMSNormBwdOp.schedule(
-                dout=dout_3d, x=x_3d, weight=weight, dx=dx_so_3d, page_size=page_size)
-            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+                dout=dout_3d, x=x_3d, weight=weight, dx=dx_so_3d)
+            so_bwd_config = RMSNormBwdOp.kernel_config(so_bwd_ops)
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops, config=so_bwd_config)
             with contextlib.redirect_stdout(io.StringIO()):
                 so_bwd_kernel.run()
             torch.cuda.synchronize()
@@ -218,7 +213,7 @@ if __name__ == "__main__":
 
     bench_rmsnorm._benchmark.run(
         mode="kernel",
-        bytes_fn=rmsnorm_bytes,
+        bytes_fn=rmsnorm_bytes_fwd,
         warmup=10,
         rep=50,
     )
@@ -231,7 +226,7 @@ if __name__ == "__main__":
 
     bench_rmsnorm_bwd._benchmark.run(
         mode="kernel",
-        bytes_fn=rmsnorm_bwd_bytes,
+        bytes_fn=rmsnorm_bytes_bwd,
         warmup=10,
         rep=50,
     )

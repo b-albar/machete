@@ -78,17 +78,28 @@ class SingleOpKernel:
 
         self._total_tiles = sum(op.total_tiles for op in ops)
 
-        # Smem: [work_mbar(8B) compute_done_mbar(8B) pad→128B] [page]
-        self._work_mbar_offset = 0
-        self._compute_done_offset = 8
-        self._page_offset = 128
-        self._aligned_page_size = _align_up(config.page_size, 128)
-        self._smem_size = self._page_offset + self._aligned_page_size
-
         # Registries (same as Megakernel)
         self._tensor_registry = TensorRegistry.from_ops(ops)
         validate_op_compatibility(ops, self._tensor_registry)
         self._tma_registry = TMARegistry.from_ops(ops, self._tensor_registry)
+
+        # Direct mode: no TMA → skip warp specialization, use all threads
+        self._is_direct = not self._tma_registry.has_tma
+
+        if self._is_direct:
+            # No mbarrier header, minimal smem (just scratch for compute)
+            self._work_mbar_offset = 0
+            self._compute_done_offset = 0
+            self._page_offset = 0
+            self._aligned_page_size = _align_up(config.page_size, 128)
+            self._smem_size = self._aligned_page_size
+        else:
+            # TMA mode: [work_mbar(8B) compute_done_mbar(8B) pad→128B] [page]
+            self._work_mbar_offset = 0
+            self._compute_done_offset = 8
+            self._page_offset = 128
+            self._aligned_page_size = _align_up(config.page_size, 128)
+            self._smem_size = self._page_offset + self._aligned_page_size
 
         self._op_configs_tensor = None
         self._cute_tensors = None
@@ -258,7 +269,10 @@ class SingleOpKernel:
         all_tma_canonical = tma_registry.all_canonical_names
 
         threads_per_block = self.config.threads_per_block
-        num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32
+        if self._is_direct:
+            num_compute_threads = threads_per_block  # All threads are compute
+        else:
+            num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32
 
         load_fns, compute_fns, store_fns = [], [], []
         inner_iters_list = []
@@ -366,7 +380,118 @@ class SingleOpKernel:
     # =========================================================================
 
     def _create_kernel(self):
-        """Build the grid kernel with warp specialization."""
+        """Build the grid kernel (warp-specialized or direct)."""
+        if self._is_direct:
+            return self._create_direct_kernel()
+        return self._create_warp_specialized_kernel()
+
+    def _create_direct_kernel(self):
+        """Build grid kernel for direct mode (no TMA, no warp specialization).
+
+        All threads are compute threads. No mbarriers, no load/store phases.
+        Global memory is accessed directly via vectorized loads/stores.
+        """
+        import machete.megakernel.compile as cm
+
+        cfg = self.config
+        threads_per_block = cfg.threads_per_block
+        total_tiles = self._total_tiles
+        smem_size = self._smem_size
+
+        # Build only compute dispatch (load/store are no-ops in direct mode)
+        (_, dispatch_compute, _, _) = self._build_dispatch_fns()
+        decompose_block_id = self._build_decompose_fn()
+
+        # Tensor param strings for signature
+        all_canonical = self._tensor_registry.canonical_names
+        tensor_params = ", ".join(all_canonical)
+        tensor_sig = f", {tensor_params}" if tensor_params else ""
+
+        # Simple kernel body: decompose → compute (no warp specialization)
+        def _kernel_body(
+            op_configs_ptr: Int64,
+            tidx: Int32,
+            block_id: Int32,
+            smem_base: Int32,
+        ) -> None:
+            op_idx, tile_0, tile_1, tile_2, tile_3, tile_4 = (
+                decompose_block_id(block_id)
+            )
+            op_config = ld_global_i64(op_configs_ptr, op_idx)
+            dispatch_compute(
+                op_idx, smem_base,
+                tile_0, tile_1, tile_2, tile_3, tile_4,
+                op_config,
+            )
+
+        # Source-transform: add tensor params to dispatch call
+        body = _extract_body(_kernel_body)
+        if tensor_params:
+            body = re.sub(
+                r"(dispatch_compute)\(([^)]*)\)",
+                lambda m: (
+                    f"{m.group(1)}("
+                    f"{m.group(2).rstrip().rstrip(',')}, {tensor_params})"
+                ),
+                body,
+            )
+
+        kb_src = (
+            "@cute.jit\n"
+            "def _kernel_body("
+            f"op_configs_ptr, tidx, block_id, smem_base{tensor_sig}"
+            "):\n"
+            + textwrap.indent(body, "    ")
+            + "\n"
+        )
+        kb_globals = {
+            "cute": cute,
+            "Int32": Int32,
+            "Int64": Int64,
+            "dispatch_compute": dispatch_compute,
+            "decompose_block_id": decompose_block_id,
+            "ld_global_i64": ld_global_i64,
+        }
+        kernel_body = self._exec_jit(
+            kb_src, "_kernel_body", cm, extra_globals=kb_globals
+        )
+
+        # GridKernel class (no TMA descriptors)
+        gk_src = (
+            "class GridKernel:\n"
+            "    def __init__(self):\n"
+            f"        self.total_tiles = {total_tiles}\n"
+            f"        self.threads_per_block = {threads_per_block}\n"
+            f"        self.smem_size = {smem_size}\n"
+            "\n"
+            "    @cute.jit\n"
+            f"    def __call__(self, op_configs_ptr{tensor_sig}, stream):\n"
+            f"        self.kernel(op_configs_ptr{tensor_sig}).launch(\n"
+            f"            grid=[self.total_tiles, 1, 1],\n"
+            f"            block=[self.threads_per_block, 1, 1],\n"
+            f"            smem=self.smem_size, stream=stream)\n"
+            "\n"
+            "    @cute.kernel\n"
+            f"    def kernel(self, op_configs_ptr{tensor_sig}):\n"
+            "        tidx = cute.arch.thread_idx()[0]\n"
+            "        block_id = cute.arch.block_idx()[0]\n"
+            "        smem_base = get_smem_base_ptr()\n"
+            f"        _kernel_body(op_configs_ptr, tidx, block_id, smem_base"
+            f"{tensor_sig})\n"
+        )
+
+        gk_globals = {
+            "cute": cute,
+            "get_smem_base_ptr": get_smem_base_ptr,
+            "_kernel_body": kernel_body,
+        }
+
+        GridKernel = self._exec_jit(
+            gk_src, "GridKernel", cm, extra_globals=gk_globals
+        )
+        return GridKernel()
+
+    def _create_warp_specialized_kernel(self):
         import machete.megakernel.compile as cm
 
         cfg = self.config
@@ -723,9 +848,15 @@ class SingleOpKernel:
 
         set_tracing_enabled(False)
 
-        tma_str = " [TMA]" if self._tma_registry.has_tma else ""
+        mode_str = " [direct]" if self._is_direct else (
+            " [TMA]" if self._tma_registry.has_tma else ""
+        )
         print(
-            f"Compiling grid kernel{tma_str} for {len(self.ops)} ops, "
+            f"Compiling grid kernel{mode_str} for {len(self.ops)} ops, "
+            f"{self._total_tiles} tiles, "
+            f"{self._smem_size}B smem..."
+            if self._is_direct else
+            f"Compiling grid kernel{mode_str} for {len(self.ops)} ops, "
             f"{self._total_tiles} tiles, "
             f"{self._smem_size // 1024}KB smem..."
         )

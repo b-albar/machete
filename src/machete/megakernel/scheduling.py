@@ -66,7 +66,7 @@ class BarrierFormula:
         padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
         result = self.base
         for i in range(MAX_TILE_DIMS):
-            result += (self.coeffs[i] * padded[i]) // self.divs[i]
+            result += self.coeffs[i] * (padded[i] // self.divs[i])
         return result
 
     def is_guarded(self, tiles: Tuple[int, ...]) -> bool:

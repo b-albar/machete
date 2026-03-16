@@ -783,14 +783,15 @@ class GemmOp(Op):
         """Compute largest (tile_S, tile_N, tile_K) that fit in page_size.
 
         Constraints:
-          - 2 * (a_factor*tile_S + tile_N) * tile_K * elem <= page_size  (double buf)
+          - 2 * (a_factor*tile_S + tile_N) * tile_K * elem + mbar <= page_size  (double buf + mbarriers)
           - tile_S * tile_N * elem <= page_size  (C epilogue)
           - tile_K must be a multiple of 16
         """
         a_factor = 2 if has_a_scale else 1
         tile_K = 32
+        mbar_bytes = 32  # 4 op-managed mbarriers × 8 bytes
         for tile_S, tile_N in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
-            ab = 2 * (a_factor * tile_S + tile_N) * tile_K * elem_bytes
+            ab = 2 * (a_factor * tile_S + tile_N) * tile_K * elem_bytes + mbar_bytes
             c = tile_S * tile_N * elem_bytes
             if ab <= page_size and c <= page_size:
                 return tile_S, tile_N, tile_K
