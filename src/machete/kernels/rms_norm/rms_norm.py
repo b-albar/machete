@@ -61,21 +61,22 @@ _DIRECT_PAGE_SIZE = 128  # Aligned; actual scratch usage <= SCRATCH_BYTES
 
 
 def _direct_kernel_config(ops):
-    """Return config for direct-mode RMSNorm (no DMA warps).
+    """Return config for direct-mode RMSNorm.
 
-    Targets ~8 elements per thread, matching Triton's strategy:
-    D=1024 → 128 threads (4 warps), D≥2048 → 256 threads (8 warps).
+    threads_per_block includes DMA warps (framework always reserves them).
+    Cap at 4 compute warps (128 threads) — RMSNorm is memory-bound,
+    more warps don't improve throughput and >5 MMA warps can hang.
     """
     from machete.megakernel import MegakernelConfig
+    from machete.megakernel.megakernel import NUM_DMA_WARPS
     D = ops[0].static_dims.get('D', 4096)
-    target = min(256, max(128, D // 8))
-    compute_threads = 128
-    for ct in [target, 256, 128, 64]:
+    compute_threads = 64
+    for ct in [128, 64]:
         if D % ct == 0:
             compute_threads = ct
             break
     return MegakernelConfig(
-        threads_per_block=compute_threads,
+        threads_per_block=compute_threads + NUM_DMA_WARPS * 32,
         page_size=_DIRECT_PAGE_SIZE,
     )
 

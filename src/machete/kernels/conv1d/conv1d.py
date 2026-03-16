@@ -348,4 +348,278 @@ class Conv1dOp(Op):
             cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
-__all__ = ["Conv1dOp"]
+class Conv1dBwdOp(Op):
+    """Causal depthwise Conv1d backward (dx gradient) for the megakernel.
+
+    Computes dx[b,l,d] = sum_{j=0}^{K-1} w[K-1-j,d] * dy[b, l+j, d]
+    where dy[b, l+j, d] = 0 when l+j >= L.
+
+    Same structure as Conv1dOp forward but with **future halo**: positions
+    l+j beyond the tile end are read from global memory, while in-tile
+    positions are read from smem (TMA-loaded dy).
+
+    Smem layout within a page:
+        [0, dy_tile_bytes)              — dy input (TMA loaded)
+        [dy_tile_bytes, 2*dy_tile_bytes) — dx output (compute writes, TMA stored)
+    """
+
+    reads = {
+        "dy": (None, ("B", "S", "D")),
+        "w":  (None, ("K", "D")),
+    }
+    writes = {
+        "dx": (None, ("B", "S", "D")),
+    }
+    tile = ("B", "S", "D")
+
+    tma_loads = {"dy"}
+    tma_stores = {"dx"}
+    peer_stores = {"dx"}
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
+
+        if self.dy_dtype == cutlass.Float32:
+            self.elem_bytes = 4
+        elif self.dy_dtype in (cutlass.Float16, cutlass.BFloat16):
+            self.elem_bytes = 2
+        else:
+            self.elem_bytes = 4
+
+        self.dy_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
+        self.dx_smem_offset = self.dy_tile_bytes
+        self.total_smem = 2 * self.dy_tile_bytes
+
+        assert self.total_smem <= self.page_size, (
+            f"Conv1dBwdOp: tile smem ({self.total_smem}B) exceeds "
+            f"page_size ({self.page_size}B). Reduce tile_size_S={self.tile_size_S}."
+        )
+
+        self.num_warps = self.threads_per_row // 32
+
+    # =========================================================================
+    # Scheduling
+    # =========================================================================
+
+    @classmethod
+    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+                         **tensors):
+        """Schedule causal conv1d backward (dx).
+
+        Args:
+            tile_sizes: optional {"S": int} override.
+            page_size: shared memory page size in bytes.
+            **tensors: dy (B,S,D) required, w (D,K) required,
+                       dx (B,S,D) optional (allocated if omitted).
+        """
+        tile_sizes = dict(tile_sizes or {})
+
+        # Transpose w from user layout (D, K) to internal layout (K, D)
+        w = tensors.get('w')
+        if w is not None and w.ndim == 2:
+            D, K = w.shape
+            tensors['w'] = w.t().contiguous()  # (K, D)
+
+        dy = tensors.get('dy')
+        if dy is not None:
+            D = dy.shape[2]
+            elem_bytes = dy.element_size()
+            if "S" not in tile_sizes:
+                tile_sizes["S"] = max(1, page_size // (2 * D * elem_bytes))
+            tile_sizes.setdefault("B", 1)
+            tile_sizes["D"] = D
+
+        if 'dx' not in tensors:
+            tensors['dx'] = torch.empty_like(dy)
+
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims['page_size'] = page_size
+        return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for Conv1dBwdOp."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
+        return MegakernelConfig(page_size=page_size)
+
+    # =========================================================================
+    # Backward Load (TMA G->S for dy)
+    # =========================================================================
+
+    @cute.jit
+    def load(self, page_ptr, tile_B, tile_S, tile_D, dy_tma, dy_tma_gmem,
+             work_mbar):
+        """TMA load of dy tile from global to shared memory."""
+        sDY = cute.make_tensor(
+            cute.make_ptr(self.dy_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
+        )
+        gDY = cute.local_tile(
+            dy_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
+        )
+        tDYsDY, tDYgDY = cute.nvgpu.cpasync.tma_partition(
+            dy_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDY, 0, 3),
+            cute.group_modes(gDY, 0, 3),
+        )
+
+        nbytes = Int32(self.dy_tile_bytes)
+        mbar_ptr = cute.make_ptr(
+            cutlass.Int64, work_mbar, cute.AddressSpace.smem
+        )
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        cute.copy(dy_tma, tDYgDY[(None, tile_D, tile_S, tile_B)], tDYsDY,
+                  tma_bar_ptr=mbar_ptr)
+
+    # =========================================================================
+    # Backward Compute
+    # =========================================================================
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, dy, w, dx):
+        """Backward conv1d: read dy from smem/global, write dx to smem.
+
+        For each output position l in [tile_start, tile_start + tile_S):
+            dx[b, l, d] = sum(w[K-1-j, d] * dy[b, l+j, d] for j in 0..K-1)
+
+        dy is read from smem for in-tile positions (src_l in [l_start, l_start+tile_S)).
+        For future halo positions (src_l >= l_start + tile_S), dy is read from global.
+        For src_l >= S, zero (boundary condition).
+        dx is written to smem at dx_smem_offset for TMA store.
+        """
+        dy_smem = cute.make_ptr(self.dy_dtype, page_ptr, cute.AddressSpace.smem)
+        dx_smem = cute.make_ptr(
+            self.dy_dtype, page_ptr + self.dx_smem_offset, cute.AddressSpace.smem
+        )
+
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        thr_layout = cute.make_layout(32)
+
+        b = tile_B
+        l_start = tile_S * self.tile_size_S
+
+        # Pre-load weight taps into registers: w_regs[j] = w[K-1-j, :]
+        w_regs = []
+        for j in cutlass.range_constexpr(self.K):
+            w_row = cute.make_tensor(
+                w.iterator + (self.K - 1 - j) * self.D,
+                cute.make_layout(self.D),
+            )
+            w_part = cute.local_partition(w_row, thr_layout, lane_idx)
+            w_reg = cute.make_fragment_like(w_part)
+            cute.autovec_copy(w_part, w_reg)
+            w_regs.append(w_reg)
+
+        # Each warp processes different L positions in round-robin
+        for local_l in range(warp_idx, self.tile_size_S, num_warps):
+            l_idx = l_start + local_l
+
+            if l_idx < self.S:
+                # Output row in dx smem region
+                out_row = cute.make_tensor(
+                    dx_smem + local_l * self.D,
+                    cute.make_layout(self.D),
+                )
+                out_part = cute.local_partition(out_row, thr_layout, lane_idx)
+
+                # Float32 accumulator
+                acc_reg = cute.make_fragment_like(out_part, Float32)
+                for i in range(cute.size(acc_reg)):
+                    acc_reg[i] = Float32(0.0)
+
+                # Convolve: accumulate K taps (future halo)
+                for j in cutlass.range_constexpr(self.K):
+                    src_l = l_idx + j
+                    src_local = local_l + j
+
+                    # Case 1: in-tile position — read dy from smem
+                    if src_local < Int32(self.tile_size_S):
+                        dys_row = cute.make_tensor(
+                            dy_smem + src_local * self.D,
+                            cute.make_layout(self.D),
+                        )
+                        dys_part = cute.local_partition(dys_row, thr_layout, lane_idx)
+                        dys_reg = cute.make_fragment_like(dys_part)
+                        cute.autovec_copy(dys_part, dys_reg)
+
+                        for i in range(cute.size(acc_reg)):
+                            acc_reg[i] = acc_reg[i] + w_regs[j][i].to(Float32) * dys_reg[i].to(Float32)
+
+                    # Case 2: future halo — read dy from global
+                    if src_local >= Int32(self.tile_size_S):
+                        if src_l < Int32(self.S):
+                            dyg_row = cute.make_tensor(
+                                dy.iterator + b * self.S * self.D + src_l * self.D,
+                                cute.make_layout(self.D),
+                            )
+                            dyg_part = cute.local_partition(dyg_row, thr_layout, lane_idx)
+                            dyg_reg = cute.make_fragment_like(dyg_part)
+                            cute.autovec_copy(dyg_part, dyg_reg)
+
+                            for i in range(cute.size(acc_reg)):
+                                acc_reg[i] = acc_reg[i] + w_regs[j][i].to(Float32) * dyg_reg[i].to(Float32)
+
+                # Cast back to dtype and write to dx smem region
+                out_reg = cute.make_fragment_like(out_part)
+                for i in range(cute.size(out_reg)):
+                    out_reg[i] = acc_reg[i].to(self.dy_dtype)
+                cute.autovec_copy(out_reg, out_part)
+
+    # =========================================================================
+    # Backward Store (3D TMA S->G)
+    # =========================================================================
+
+    @cute.jit
+    def store(self, page_ptr, tile_B, tile_S, tile_D, dx_tma, dx_tma_gmem):
+        """TMA store of dx result from shared to global memory."""
+        sDX = cute.make_tensor(
+            cute.make_ptr(
+                self.dy_dtype, page_ptr + self.dx_smem_offset,
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
+        )
+        gDX = cute.local_tile(
+            dx_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
+        )
+        tDXsDX, tDXgDX = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDX, 0, 3),
+            cute.group_modes(gDX, 0, 3),
+        )
+        with cute.arch.elect_one():
+            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
+
+    # =========================================================================
+    # Communicate (TMA S->G to peer GPU)
+    # =========================================================================
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_B, tile_S, tile_D,
+                    dx_p0_tma, dx_p0_tma_gmem):
+        """Send dx tile to peer GPU 0 via TMA S2G."""
+        sDX = cute.make_tensor(
+            cute.make_ptr(
+                self.dy_dtype, page_ptr + self.dx_smem_offset,
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.D, self.tile_size_S, 1)),
+        )
+        gDX = cute.local_tile(
+            dx_p0_tma_gmem, (self.D, self.tile_size_S, 1), (None, None, None),
+        )
+        tDXsDX, tDXgDX = cute.nvgpu.cpasync.tma_partition(
+            dx_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDX, 0, 3),
+            cute.group_modes(gDX, 0, 3),
+        )
+        with cute.arch.elect_one():
+            cute.copy(dx_p0_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
+
+
+__all__ = ["Conv1dOp", "Conv1dBwdOp"]

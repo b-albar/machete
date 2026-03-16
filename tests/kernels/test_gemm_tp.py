@@ -4,7 +4,7 @@
 Tests:
 1. Single-GPU: GemmColumnParallelOp and GemmRowParallelOp with same-device peer.
 2. Multi-GPU column-parallel: broadcast C shard to peer via TMA S2G.
-3. Multi-GPU row-parallel: broadcast partial C to peer via TMA S2G.
+3. Multi-GPU row-parallel: all-reduce partial C to all buffers via TMA S2G atomic add.
 """
 
 import contextlib
@@ -112,7 +112,10 @@ class TestGemmTPSingleGPU:
 
     @requires_gpu
     def test_row_parallel_smoke(self):
-        """GemmRowParallelOp broadcasts C to same-device peer buffer."""
+        """GemmRowParallelOp atomic-adds C to local and peer buffers.
+
+        With zeroed buffers: 0 + C_partial = C_partial (same as broadcast).
+        """
         from machete.megakernel import Megakernel, MegakernelConfig
         from machete.kernels.gemm import GemmRowParallelOp
 
@@ -141,6 +144,46 @@ class TestGemmTPSingleGPU:
 
         ref = _gemm_ref(a.squeeze(0), b)
         torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(peer_c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
+
+    @requires_gpu
+    def test_row_parallel_accumulates(self):
+        """GemmRowParallelOp atomic add accumulates onto pre-existing values.
+
+        Pre-fill local buffer with 1.0, run kernel → result = 1.0 + C_partial.
+        Verifies that TMA reduce S2G (atomic add) works correctly.
+        """
+        from machete.megakernel import Megakernel, MegakernelConfig
+        from machete.kernels.gemm import GemmRowParallelOp
+
+        M, K, N = 64, 64, 32
+        torch.manual_seed(42)
+        a = torch.randn(1, M, K, dtype=torch.float16, device="cuda")
+        b = torch.randn(N, K, dtype=torch.float16, device="cuda")
+        c = torch.ones(1, M, N, dtype=torch.float16, device="cuda")
+        peer_c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
+
+        ops = GemmRowParallelOp.schedule(a=a, b=b, c=c)
+        base_config = GemmRowParallelOp.kernel_config(ops)
+        config = MegakernelConfig(
+            threads_per_block=base_config.threads_per_block,
+            page_size=base_config.page_size,
+            peer_buffers={"c": [peer_c]},
+            peer_barriers=_alloc_peer_barriers(ops),
+            device_idx=0,
+            num_devices=2,
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel = Megakernel(ops, config=config)
+            kernel.run()
+        torch.cuda.synchronize()
+
+        ref = _gemm_ref(a.squeeze(0), b)
+        # Local: pre-filled 1.0 + atomic add C_partial = 1.0 + ref
+        expected_local = 1.0 + ref
+        torch.testing.assert_close(c.squeeze(0), expected_local, atol=1e-1, rtol=1e-2)
+        # Peer: zeroed + atomic add C_partial = ref
         torch.testing.assert_close(peer_c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
 
     @requires_gpu
@@ -261,19 +304,16 @@ class TestGemmTPColumnParallel:
 @requires_gpu
 @requires_multi_gpu
 class TestGemmTPRowParallel:
-    """Row-parallel TP: broadcast partial C to peer.
+    """Row-parallel TP: all-reduce partial C via TMA S2G atomic add.
 
-    Each GPU computes C_partial from its K-shard and broadcasts
-    the partial result to peer buffers via TMA S2G copy.
-
-    NOTE: True all-reduce (atomic add) requires CopyReduceBulkTensorTileS2GOp,
-    which has a 2x output bug in the CUTLASS DSL. As a workaround,
-    GemmRowParallelOp uses regular broadcast. The caller must handle
-    reduction externally (e.g., NCCL all-reduce).
+    Each GPU computes C_partial from its K-shard and atomic-adds
+    the result to both its local buffer and all peer buffers.
+    After all GPUs complete, each buffer contains C_full = sum(C_partial_i).
+    All output buffers must be zeroed before kernel launch.
     """
 
-    def test_broadcast_partial(self):
-        """GPU 0 computes partial C and broadcasts to GPU 1."""
+    def test_reduce_partial(self):
+        """GPU 0 computes partial C and atomic-adds to local + GPU 1."""
         _enable_peer_access(0, 1)
         _enable_peer_access(1, 0)
 

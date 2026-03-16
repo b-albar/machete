@@ -992,17 +992,76 @@ class GemmColumnParallelOp(GemmOp):
 
 
 class GemmRowParallelOp(GemmOp):
-    """GemmOp with TMA S2G broadcast for row-parallel TP.
+    """GemmOp with TMA S2G atomic add for row-parallel TP (all-reduce).
 
     Each GPU computes C_partial[M, N] = A_shard[M, K/P] @ W[N, K/P]^T
-    and writes the partial result to both the local output buffer and
-    all peer output buffers via regular TMA S2G copy.
+    and atomic-adds the result to both the local and all peer output buffers.
+    After kernel completion, each buffer contains C_full = sum(C_partial_i).
 
-    NOTE: True all-reduce (atomic add to all buffers) requires
-    CopyReduceBulkTensorTileS2GOp, which currently has a 2x output bug
-    in the CUTLASS DSL. As a workaround, this uses regular broadcast
-    (same as column-parallel). The caller must handle reduction
-    externally (e.g., via NCCL all-reduce after kernel completion).
+    IMPORTANT: All output buffers must be zeroed before kernel launch.
+
+    TMA reduce S2G (CopyReduceBulkTensorTileS2GOp) is warp-collective:
+    all threads in the warp must execute the instruction, producing exactly
+    one atomic add per warp. Therefore store() and communicate() must NOT
+    use elect_one() — doing so causes non-elected threads to skip the
+    warp-collective instruction, resulting in a hang.
     """
 
-    peer_stores = {"c"}  # Broadcast partial result to peers
+    tma_stores = set()          # Override parent: no regular S2G for c
+    tma_reduce_stores = {"c"}   # Local store via atomic add
+    peer_reduce_stores = {"c"}  # Peer stores via atomic add
+
+    @cute.jit
+    def store(self, page_ptr, tile_B, tile_S, tile_N, c_tma, c_tma_gmem):
+        """TMA reduce store of C (atomic add) — warp-collective, no elect_one."""
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
+        )
+
+        gC = cute.local_tile(
+            c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+
+        # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
+        cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_B, tile_S, tile_N,
+                    c_p0_tma, c_p0_tma_gmem):
+        """TMA reduce store to peer (atomic add) — warp-collective, no elect_one."""
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
+        )
+
+        gC = cute.local_tile(
+            c_p0_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+
+        # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
+        cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])

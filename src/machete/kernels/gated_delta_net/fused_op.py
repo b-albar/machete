@@ -532,17 +532,14 @@ class GDNFusedOp(Op):
             chunk_idx = Int32(0)
             while chunk_idx < Int32(self.NT_val):
 
-                # Load g_cumsum while cpasync is in flight
-                gG_tile = cute.local_tile(gG_head, (self.BT,), (chunk_idx,))
-                if tidx < Int32(self.BT):
-                    g_buf[tidx] = gG_tile[tidx]
-
                 # Wait for u cpasync (chunk 0: Q already in smem from TMA,
                 # chunk 1+: Q from prev chunk's pipeline cpasync)
                 cute.arch.cp_async_wait_group(0)
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 # Q smem → registers (from plain Q views, stride K per row)
+                # MUST happen before g_buf load — g_buf overlaps s_primary
+                # (Q region) when smem is tight.
                 tCrQ_full_parts = []
                 for qi in cutlass.range_constexpr(self.NK):
                     tCsQ_part = thr_mma.partition_A(s_q_plain_bufs[qi])
@@ -550,6 +547,13 @@ class GDNFusedOp(Op):
                     for qkb in cutlass.range_constexpr(self.BK // 16):
                         cute.autovec_copy(tCsQ_part[None, None, qkb], tCrQ_part[None, None, qkb])
                     tCrQ_full_parts.append(tCrQ_part)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+                # Load g_cumsum into g_buf (safe: Q already in registers,
+                # g_buf may overlap s_primary region)
+                gG_tile = cute.local_tile(gG_head, (self.BT,), (chunk_idx,))
+                if tidx < Int32(self.BT):
+                    g_buf[tidx] = gG_tile[tidx]
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 # u stays in smem (read via partition_C)
@@ -1107,21 +1111,23 @@ class GDNFusedBwdOp(Op):
             chunk_idx = Int32(self.NT_val - 1)
             while chunk_idx >= Int32(0):
 
-                # Load g_cumsum for this chunk
-                gG_tile = cute.local_tile(gG_head, (self.BT,), (chunk_idx,))
-                if tidx < Int32(self.BT):
-                    g_buf[tidx] = gG_tile[tidx]
-
                 # Wait for do (chunk NT-1: TMA loaded, others: cpasync pipelined)
                 cute.arch.cp_async_wait_group(0)
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-                # do smem → registers
+                # do smem → registers (MUST happen before g_buf load —
+                # g_buf may overlap s_primary/do region when smem is tight)
                 tCsDO = thr_mma.partition_C(s_do)
                 do_regs = cute.make_fragment(
                     tiled_mma.partition_shape_C((self.BT, self.BV)), Float32)
                 for ci in cutlass.range_constexpr(cute.size(do_regs)):
                     do_regs[ci] = tCsDO[ci].to(Float32)
+
+                # Load g_cumsum into g_buf (safe: do already in registers)
+                gG_tile = cute.local_tile(gG_head, (self.BT,), (chunk_idx,))
+                if tidx < Int32(self.BT):
+                    g_buf[tidx] = gG_tile[tidx]
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 g_last = g_buf[Int32(self.BT - 1)]
 

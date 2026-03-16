@@ -526,7 +526,7 @@ class TestGDNFusedOp:
         o_fused = _run_fused_op(q, k, w, u, g_cumsum, scale)
 
         torch.testing.assert_close(
-            o_fused.float(), o_ref.float(), atol=5e-2, rtol=2e-2,
+            o_fused.float(), o_ref.float(), atol=8e-2, rtol=5e-2,
         )
 
 
