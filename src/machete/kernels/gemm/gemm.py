@@ -245,8 +245,8 @@ class GemmOp(Op):
         if inner_iter_idx == Int32(0):
             # === ITER 0 (load warp): init mbarriers + TMA first 2 K-blocks ===
             with cute.arch.elect_one():
-                mbarrier_init(_bf_0, Int32(1))
-                mbarrier_init(_bf_1, Int32(1))
+                mbarrier_init(_bf_0, Int32(self.num_mma_warps))
+                mbarrier_init(_bf_1, Int32(self.num_mma_warps))
                 mbarrier_init(_kr_0, Int32(1))
                 mbarrier_init(_kr_1, Int32(1))
             mbarrier_init_fence()
@@ -575,9 +575,8 @@ class GemmOp(Op):
                       tCrA[None, None, k_block],
                       tCrB[None, None, k_block], acc)
 
-        # Sync all MMA warps, then one thread signals buf 0 is free
-        named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-        if tidx == Int32(0):
+        # Per-warp signal: buf 0 read complete (no cross-warp sync needed)
+        if tidx % Int32(32) == Int32(0):
             mbarrier_arrive(_bf_0)
 
         # =====================================================================
@@ -602,9 +601,8 @@ class GemmOp(Op):
                           tCrA[None, None, k_block],
                           tCrB[None, None, k_block], acc)
 
-            # Sync all MMA warps, then one thread signals buf 1 is free
-            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-            if tidx == Int32(0):
+            # Per-warp signal: buf 1 read complete
+            if tidx % Int32(32) == Int32(0):
                 mbarrier_arrive(_bf_1)
 
         # =====================================================================
@@ -660,9 +658,8 @@ class GemmOp(Op):
                               tCrA[None, None, k_block],
                               tCrB[None, None, k_block], acc)
 
-            # Sync all MMA warps, then one thread signals buffer is free
-            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-            if tidx == Int32(0):
+            # Per-warp signal: buffer read complete
+            if tidx % Int32(32) == Int32(0):
                 if k_idx % Int32(2) == Int32(0):
                     mbarrier_arrive(_bf_0)
                 if k_idx % Int32(2) == Int32(1):
@@ -780,20 +777,31 @@ class GemmOp(Op):
 
     @classmethod
     def _auto_tiles(cls, page_size, elem_bytes=2, has_a_scale=False):
-        """Compute largest (tile_S, tile_N, tile_K) that fit in page_size.
+        """Compute best (tile_S, tile_N, tile_K) that fit in page_size.
 
         Constraints:
           - 2 * (a_factor*tile_S + tile_N) * tile_K * elem + mbar <= page_size  (double buf + mbarriers)
           - tile_S * tile_N * elem <= page_size  (C epilogue)
           - tile_K must be a multiple of 16
+
+        Prefers 128×64 (best TMA/compute balance) over 128×128.
+        After selecting spatial tiles, maximizes tile_K within budget.
         """
         a_factor = 2 if has_a_scale else 1
-        tile_K = 32
         mbar_bytes = 32  # 4 op-managed mbarriers × 8 bytes
-        for tile_S, tile_N in [(128, 128), (128, 64), (64, 64), (64, 32), (32, 32)]:
+        # Prefer 128×64: best TMA/compute balance (NCU-verified).
+        for tile_S, tile_N in [(128, 64), (128, 128), (64, 64), (64, 32), (32, 32)]:
+            tile_K = 32
             ab = 2 * (a_factor * tile_S + tile_N) * tile_K * elem_bytes + mbar_bytes
             c = tile_S * tile_N * elem_bytes
             if ab <= page_size and c <= page_size:
+                # Try larger tile_K when page headroom allows.
+                # Must be power-of-2 for valid TMA box sizes.
+                for try_K in [64]:
+                    ab_k = 2 * (a_factor * tile_S + tile_N) * try_K * elem_bytes + mbar_bytes
+                    if ab_k <= page_size:
+                        tile_K = try_K
+                        break
                 return tile_S, tile_N, tile_K
         return 32, 32, 16
 
