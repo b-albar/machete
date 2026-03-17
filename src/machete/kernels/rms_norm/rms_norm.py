@@ -593,27 +593,7 @@ class RMSNormBwdOp(Op):
                     x_reg = cute.make_fragment_like(x_part)
                     cute.autovec_copy(x_part, x_reg)
 
-                    # Pass 1: sum_sq via cross-warp reduction
-                    partial_sq = Float32(0.0)
-                    for i in range(cute.size(x_reg)):
-                        val = x_reg[i].to(Float32)
-                        partial_sq = partial_sq + val * val
-
-                    warp_sum = cute.arch.warp_reduction(partial_sq, operator.add)
-                    buf_off = Int32(0)
-                    if lane_idx == 0:
-                        scratch[buf_off + warp_idx] = warp_sum
-                    named_barrier_sync(Int32(2), Int32(self.effective_threads))
-
-                    sum_sq = Float32(0.0)
-                    for wi in range(self.effective_warps):
-                        sum_sq = sum_sq + scratch[buf_off + wi]
-
-                    rstd = cute.math.rsqrt(
-                        sum_sq / self.D + RMSNORM_EPS, fastmath=True
-                    )
-
-                    # Load dout from global
+                    # Load dout from global (before reduction to fuse passes)
                     dout_row = cute.make_tensor(
                         dout.iterator + global_offset, cute.make_layout(self.D),
                     )
@@ -632,31 +612,43 @@ class RMSNormBwdOp(Op):
                         gate_part = cute.local_partition(gate_row, thr_layout, tidx)
                         cute.autovec_copy(gate_part, gate_reg)
 
-                    # Pass 2: sum_grad via cross-warp reduction
+                    # Fused reduction: compute both sum_sq and sum_grad
+                    # in a single pass with one barrier sync
+                    partial_sq = Float32(0.0)
                     partial_grad = Float32(0.0)
                     buf2_off = Int32(self.effective_warps)
 
                     if const_expr(self.has_gate):
                         for i in range(cute.size(x_reg)):
+                            val = x_reg[i].to(Float32)
+                            partial_sq = partial_sq + val * val
                             g = gate_reg[i].to(Float32)
                             sig = Float32(1.0) / (Float32(1.0) + cute.math.exp(-g, fastmath=True))
                             silu_g = g * sig
                             dy_norm = dout_reg[i].to(Float32) * silu_g
-                            partial_grad = partial_grad + dy_norm * w_reg[i].to(Float32) * x_reg[i].to(Float32)
+                            partial_grad = partial_grad + dy_norm * w_reg[i].to(Float32) * val
                     else:
                         for i in range(cute.size(x_reg)):
-                            d = dout_reg[i].to(Float32)
-                            partial_grad = partial_grad + d * w_reg[i].to(Float32) * x_reg[i].to(Float32)
+                            val = x_reg[i].to(Float32)
+                            partial_sq = partial_sq + val * val
+                            partial_grad = partial_grad + dout_reg[i].to(Float32) * w_reg[i].to(Float32) * val
 
+                    warp_sum = cute.arch.warp_reduction(partial_sq, operator.add)
                     warp_grad = cute.arch.warp_reduction(partial_grad, operator.add)
                     if lane_idx == 0:
+                        scratch[warp_idx] = warp_sum
                         scratch[buf2_off + warp_idx] = warp_grad
                     named_barrier_sync(Int32(2), Int32(self.effective_threads))
 
+                    sum_sq = Float32(0.0)
                     sum_grad = Float32(0.0)
                     for wi in range(self.effective_warps):
+                        sum_sq = sum_sq + scratch[wi]
                         sum_grad = sum_grad + scratch[buf2_off + wi]
 
+                    rstd = cute.math.rsqrt(
+                        sum_sq / self.D + RMSNORM_EPS, fastmath=True
+                    )
                     mean_grad = sum_grad / self.D
 
                     # Pass 3: dx [and dgate]
