@@ -45,12 +45,20 @@ def _run_conv1d(x, w, activation=None, tile_s=None, page_size=None):
     from machete.kernels.conv1d import Conv1dOp
 
     D = x.shape[2]
+    K = w.shape[1] if w.ndim == 2 and w.shape[0] != w.shape[1] else w.shape[0]
+    # After transpose, w is (K, D); before transpose, w is (D, K).
+    # Detect: if w.shape == (D, K) with D == x.shape[2], K is w.shape[1].
+    if w.shape[0] == D and w.ndim == 2:
+        K = w.shape[1]
+    else:
+        K = w.shape[0]
     elem_bytes = 2 if x.dtype in (torch.float16, torch.bfloat16) else 4
     if page_size is None:
         page_size = 49152  # 48KB
     if tile_s is None:
-        # 2x smem: x tile (TMA loaded) + y tile (compute output)
-        tile_s = max(1, page_size // (2 * D * elem_bytes))
+        # Smem reuse: halo (K-1 rows) + x tile (tile_s rows), y overwrites
+        total_rows = page_size // (D * elem_bytes)
+        tile_s = max(1, total_rows - (K - 1))
 
     y = torch.empty_like(x)
     ops = Conv1dOp.schedule(
@@ -170,11 +178,17 @@ def _run_conv1d_bwd(dy, w, tile_s=None, page_size=None):
     from machete.kernels.conv1d import Conv1dBwdOp
 
     D = dy.shape[2]
+    if w.shape[0] == D and w.ndim == 2:
+        K = w.shape[1]
+    else:
+        K = w.shape[0]
     elem_bytes = 2 if dy.dtype in (torch.float16, torch.bfloat16) else 4
     if page_size is None:
         page_size = 49152  # 48KB
     if tile_s is None:
-        tile_s = max(1, page_size // (2 * D * elem_bytes))
+        # Smem reuse: dy tile (tile_s rows) + halo (K-1 rows), dx overwrites
+        total_rows = page_size // (D * elem_bytes)
+        tile_s = max(1, total_rows - (K - 1))
 
     dx = torch.empty_like(dy)
     ops = Conv1dBwdOp.schedule(
