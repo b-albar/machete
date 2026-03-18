@@ -174,7 +174,9 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
         # Pack pointers
         for i, (name, dtype, dims) in enumerate(unique_tensors):
             t = tensors[name]
-            assert t.is_contiguous(), f"{name} must be contiguous"
+            assert t.is_contiguous() or t.stride(-1) == 1, (
+                f"{name} must be contiguous or have unit innermost stride"
+            )
             lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
             config[2 * i] = lo
             config[2 * i + 1] = hi
@@ -692,6 +694,7 @@ class ScheduledOp:
     tensor_refs: Dict[str, Any] = field(default_factory=dict)  # {name: torch.Tensor} for tensor param mode
     tensor_metas: Dict[str, TensorMeta] = field(default_factory=dict)  # Per-tensor metadata (shape, strides, ndim)
     tensor_strides: Dict[str, Tuple[int, ...]] = field(default_factory=dict)  # {name: strides} for stride init source
+    dim_aliases: Dict[str, str] = field(default_factory=dict)  # Maps dim name → canonical for barrier matching
 
     def __post_init__(self):
         if self.dim_names is None:

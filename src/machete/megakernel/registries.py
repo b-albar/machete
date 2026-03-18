@@ -329,6 +329,7 @@ class TMADescriptorInfo:
     smem_layout_shape: Tuple[int, ...]
     dtype: Any
     tensor_shape: Tuple[int, ...] = ()  # original tensor shape from the op
+    original_tensor: Any = None  # actual tensor from op.tensor_refs (for strided TMA)
     smem_layout_src: Optional[str] = None
 
 
@@ -403,11 +404,13 @@ class TMARegistry:
                             tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
                         )
 
-                    # Store the original tensor shape from the op so
-                    # _prepare_tma_tensors can reshape correctly when the
-                    # registry tensor has different ndim (e.g., 2D GEMM
-                    # output vs 4D GDN input sharing the same data_ptr).
-                    tensor_shape = tuple(op.tensor_refs[tensor_name].shape)
+                    # Store the original tensor shape and reference from the op so
+                    # _prepare_tma_tensors can use the correct tensor layout.
+                    # The original_tensor is needed when the op's tensor is a
+                    # strided view (e.g., as_strided FA tensors sharing data_ptr
+                    # with GEMM outputs) — reshape would give wrong strides.
+                    original_ref = op.tensor_refs[tensor_name]
+                    tensor_shape = tuple(original_ref.shape)
 
                     descriptors.append(
                         TMADescriptorInfo(
@@ -419,6 +422,7 @@ class TMARegistry:
                             smem_layout_shape=tma_tile_shape,
                             dtype=dtype,
                             tensor_shape=tensor_shape,
+                            original_tensor=original_ref,
                             smem_layout_src=smem_layout_src,
                         )
                     )

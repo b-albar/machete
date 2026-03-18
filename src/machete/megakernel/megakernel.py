@@ -356,38 +356,44 @@ class Megakernel:
             if key in seen:
                 continue
             seen.add(key)
-            # Find the torch.Tensor from tensor registry
-            for canonical_name, tensor, dtype in self._tensor_registry.tensors:
-                if canonical_name == desc.tensor_canonical:
-                    t = tensor.detach()
-                    # The registry deduplicates by data_ptr, so t may have
-                    # different ndim than this descriptor's op expects (e.g.,
-                    # 2D GEMM output vs 4D GDN input). Reshape to the
-                    # descriptor's original tensor shape first.
-                    if desc.tensor_shape and tuple(t.shape) != desc.tensor_shape:
-                        t = t.reshape(desc.tensor_shape)
-                    # Match tensor ndim to TMA tile dimensionality.
-                    # from_dlpack can merge contiguous modes unpredictably
-                    # (e.g., 4D (B,T,H,K) → 3D after T*B merge). Reshape
-                    # leading PyTorch dims (trailing CuTe dims) before
-                    # permute to guarantee mode count matches tile_shape.
-                    target_ndim = ndim
-                    if t.ndim > target_ndim:
-                        keep = target_ndim - 1
-                        if keep > 0:
-                            t = t.reshape(-1, *t.shape[-keep:])
-                        else:
-                            t = t.reshape(-1)
-                    # TMA requires CuTe mode 0 to be contiguous (stride 1).
-                    # PyTorch row-major tensors have mode 0 = rows (stride N),
-                    # so we reverse dims to get mode 0 = last dim (stride 1).
-                    # For 2D (M,D) → (D,M); for 3D (BH,M,D) → (D,M,BH).
-                    if t.ndim >= 2:
-                        t = t.permute(*reversed(range(t.ndim)))
-                    cute_t = from_dlpack(t, assumed_align=16)
-                    self._tma_cute_tensors.append(
-                        (f"{desc.tensor_canonical}_{ndim}d", cute_t))
-                    break
+
+            # Get the tensor for this TMA descriptor. Prefer the original
+            # tensor from the op's tensor_refs — this preserves correct
+            # strides for strided views (e.g., as_strided FA tensors
+            # sharing data_ptr with GEMM outputs). Fall back to
+            # TensorRegistry lookup + reshape for backward compat.
+            if desc.original_tensor is not None:
+                t = desc.original_tensor.detach()
+            else:
+                for canonical_name, tensor, dtype in self._tensor_registry.tensors:
+                    if canonical_name == desc.tensor_canonical:
+                        t = tensor.detach()
+                        if desc.tensor_shape and tuple(t.shape) != desc.tensor_shape:
+                            t = t.reshape(desc.tensor_shape)
+                        break
+
+            # Match tensor ndim to TMA tile dimensionality.
+            # from_dlpack can merge contiguous modes unpredictably
+            # (e.g., 4D (B,T,H,K) → 3D after T*B merge). Reshape
+            # leading PyTorch dims (trailing CuTe dims) before
+            # permute to guarantee mode count matches tile_shape.
+            target_ndim = ndim
+            if t.ndim > target_ndim:
+                keep = target_ndim - 1
+                if keep > 0:
+                    t = t.reshape(-1, *t.shape[-keep:])
+                else:
+                    t = t.reshape(-1)
+            # TMA requires CuTe mode 0 to be contiguous (stride 1).
+            # PyTorch row-major tensors have mode 0 = rows (stride N),
+            # so we reverse dims to get mode 0 = last dim (stride 1).
+            # For 2D (M,D) → (D,M); for 3D (BH,M,D) → (D,M,BH).
+            if t.ndim >= 2:
+                t = t.permute(*reversed(range(t.ndim)))
+            cute_t = from_dlpack(t, assumed_align=16)
+            self._tma_cute_tensors.append(
+                (f"{desc.tensor_canonical}_{ndim}d", cute_t))
+
 
     def _prepare_peer_tma_tensors(self) -> None:
         """Prepare CuTe tensors with static layout for peer TMA descriptor creation.

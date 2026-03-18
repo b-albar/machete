@@ -802,31 +802,59 @@ class InstructionStreamBuilder:
 
                 p_op = producer.op
                 c_op = consumer.op
-                p_dims = set(p_op.dim_names.keys())
-                c_dims = set(c_op.dim_names.keys())
-                shared_dims = p_dims & c_dims
-                producer_only = p_dims - c_dims
+
+                # Build canonical → original dim mappings (applying dim_aliases)
+                # E.g., if consumer has dims {"M","H"} with alias {"M":"S"},
+                # then canonical "S" maps to consumer's "M", matching producer's "S".
+                p_canon_to_orig = {}
+                for d in p_op.dim_names:
+                    canon = p_op.dim_aliases.get(d, d)
+                    p_canon_to_orig[canon] = d
+                c_canon_to_orig = {}
+                for d in c_op.dim_names:
+                    canon = c_op.dim_aliases.get(d, d)
+                    c_canon_to_orig[canon] = d
+
+                shared_canonical = set(p_canon_to_orig.keys()) & set(c_canon_to_orig.keys())
+                producer_only_canonical = set(p_canon_to_orig.keys()) - shared_canonical
+
+                # Build shared_pairs: [(canonical, p_orig, c_orig), ...]
+                shared_pairs = [
+                    (canon, p_canon_to_orig[canon], c_canon_to_orig[canon])
+                    for canon in shared_canonical
+                ]
+                producer_only_dims = [p_canon_to_orig[c] for c in producer_only_canonical]
 
                 # Validate tile sizes on shared dims are divisible.
-                # Non-divisible tile sizes (e.g., producer S=4, consumer S=3)
-                # cannot be expressed by BarrierFormula integer division.
-                # All ops sharing a dependency MUST have compatible tile sizes.
-                for dim in shared_dims:
-                    p_ts = p_op.tile_sizes.get(dim, 1)
-                    c_ts = c_op.tile_sizes.get(dim, 1)
+                # Non-divisible tile sizes cannot be expressed by BarrierFormula
+                # integer division. Move incompatible dims to producer_only
+                # for conservative many-to-one barriers.
+                incompatible = []
+                compatible_pairs = []
+                for canon, p_dim, c_dim in shared_pairs:
+                    p_ts = p_op.tile_sizes.get(p_dim, 1)
+                    c_ts = c_op.tile_sizes.get(c_dim, 1)
+                    p_axis = p_op.dim_names[p_dim]
+                    c_axis = c_op.dim_names[c_dim]
+                    p_tiles = p_op.tiles_for_axis(p_axis)
+                    c_tiles = c_op.tiles_for_axis(c_axis)
                     if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        raise ValueError(
-                            f"Incompatible tile sizes on shared dim '{dim}': "
-                            f"producer {p_op.op_cls.__name__} has tile_size={p_ts}, "
-                            f"consumer {c_op.op_cls.__name__} has tile_size={c_ts}. "
-                            f"Tile sizes on shared dims must be equal or "
-                            f"one must divide the other."
-                        )
+                        # Incompatible tile sizes
+                        incompatible.append(p_dim)
+                    elif p_tiles != c_tiles and p_ts == c_ts:
+                        # Same tile size but different extents → different
+                        # semantics. E.g., GEMM_Q N=2048 vs GEMM_O N=1024
+                        # both with tile_N=64. Consumer likely reads
+                        # globally along this dim (reduction), so per-tile
+                        # barriers are unsafe. Fall back to many-to-one.
+                        incompatible.append(p_dim)
+                    else:
+                        compatible_pairs.append((canon, p_dim, c_dim))
+                shared_pairs = compatible_pairs
+                producer_only_dims.extend(incompatible)
 
                 # When named ops share no dimensions, all tiles map to the
                 # same barrier (all-or-nothing). This is correct but suboptimal.
-                # TODO: Once all ops use standardized dims (B, S, ...), add
-                # an error here to enforce tile-level barriers.
 
                 # Determine target side and compute barrier count / expected
                 # Also compute divisors for tile size ratio handling
@@ -835,11 +863,11 @@ class InstructionStreamBuilder:
                 expected = 1
 
                 # Handle tile size ratios on shared dims
-                for dim in shared_dims:
-                    p_axis = p_op.dim_names[dim]
-                    c_axis = c_op.dim_names[dim]
-                    p_ts = p_op.tile_sizes.get(dim, 1)
-                    c_ts = c_op.tile_sizes.get(dim, 1)
+                for canon, p_dim, c_dim in shared_pairs:
+                    p_axis = p_op.dim_names[p_dim]
+                    c_axis = c_op.dim_names[c_dim]
+                    p_ts = p_op.tile_sizes.get(p_dim, 1)
+                    c_ts = c_op.tile_sizes.get(c_dim, 1)
                     if p_ts > c_ts:
                         ratio = p_ts // c_ts
                         c_divs[c_axis] = ratio
@@ -850,48 +878,48 @@ class InstructionStreamBuilder:
 
                 # Barrier count: product of min tile counts on shared dims
                 num_barriers = 1
-                for dim in shared_dims:
-                    p_axis = p_op.dim_names[dim]
-                    c_axis = c_op.dim_names[dim]
+                for canon, p_dim, c_dim in shared_pairs:
+                    p_axis = p_op.dim_names[p_dim]
+                    c_axis = c_op.dim_names[c_dim]
                     num_barriers *= min(
                         p_op.tiles_for_axis(p_axis),
                         c_op.tiles_for_axis(c_axis),
                     )
 
-                if producer_only:
+                if producer_only_dims:
                     # Many-to-one (or both-sides-extra): collapse
                     # producer-only dims — all producer tiles on those dims
                     # signal the same barrier, so consumer expects them all.
                     collapsed = 1
-                    for dim in producer_only:
+                    for dim in producer_only_dims:
                         axis = p_op.dim_names[dim]
                         collapsed *= p_op.tiles_for_axis(axis)
                     expected *= collapsed
 
                 # Compute coefficients using dense shared strides.
                 # Extra dims (producer-only / consumer-only) get coefficient 0
-                # since they don't appear in shared_dims. This correctly
+                # since they don't appear in shared_pairs. This correctly
                 # handles different axis orderings and tile size differences.
-                shared_dims_sorted = sorted(shared_dims)
+                shared_pairs_sorted = sorted(shared_pairs, key=lambda t: t[0])
                 shared_strides: Dict[str, int] = {}
                 stride = 1
-                for dim in reversed(shared_dims_sorted):
-                    shared_strides[dim] = stride
-                    p_axis = p_op.dim_names[dim]
-                    c_axis = c_op.dim_names[dim]
+                for canon, p_dim, c_dim in reversed(shared_pairs_sorted):
+                    shared_strides[canon] = stride
+                    p_axis = p_op.dim_names[p_dim]
+                    c_axis = c_op.dim_names[c_dim]
                     stride *= min(
                         p_op.tiles_for_axis(p_axis),
                         c_op.tiles_for_axis(c_axis),
                     )
 
                 p_coeffs_list = [0] * MAX_TILE_DIMS
-                for dim in shared_dims:
-                    p_coeffs_list[p_op.dim_names[dim]] = shared_strides[dim]
+                for canon, p_dim, c_dim in shared_pairs:
+                    p_coeffs_list[p_op.dim_names[p_dim]] = shared_strides[canon]
                 p_coeffs = tuple(p_coeffs_list)
 
                 c_coeffs_list = [0] * MAX_TILE_DIMS
-                for dim in shared_dims:
-                    c_coeffs_list[c_op.dim_names[dim]] = shared_strides[dim]
+                for canon, p_dim, c_dim in shared_pairs:
+                    c_coeffs_list[c_op.dim_names[c_dim]] = shared_strides[canon]
                 c_coeffs = tuple(c_coeffs_list)
 
                 # Producer signal formula

@@ -43,6 +43,7 @@ from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
     mbarrier_init_fence,
+    mbarrier_inval,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -669,6 +670,16 @@ class GemmOp(Op):
 
         # --- Epilogue: R->S (write final C to swizzled smem for TMA store) ---
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+        # Invalidate op-managed mbarriers before the page is reused.
+        # Without this, a subsequent op's TMA load (e.g. GLU with large tiles)
+        # can overwrite these addresses with regular data, corrupting the
+        # mbarrier hardware state and causing undefined behavior on SM_120+.
+        if tidx == Int32(0):
+            mbarrier_inval(_bf_0)
+            mbarrier_inval(_bf_1)
+            mbarrier_inval(_kr_0)
+            mbarrier_inval(_kr_1)
 
         swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(

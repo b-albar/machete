@@ -232,6 +232,37 @@ def global_barrier_signal_gpu(
     )
 
 
+@dsl_user_op
+def atomic_add_acq_rel_gpu_i32(
+    base_ptr: Int64,
+    idx: Int32,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Atomic increment (add 1) with acquire-release semantics, GPU scope.
+
+    Computes address as base_ptr + idx * 4, then atomically adds 1.
+    Returns the OLD value before the increment. Used for cross-block
+    coordination: release ensures this block's prior writes are visible,
+    acquire ensures the caller sees other blocks' released writes.
+    """
+    return llvm.inline_asm(
+        Int32.mlir_type,
+        [base_ptr.ir_value(loc=loc, ip=ip), idx.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $2, 4, $1;
+            atom.add.acq_rel.gpu.global.u32 $0, [%addr], 1;
+        }
+        """,
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 # =============================================================================
 # Instruction Stream Access
 # =============================================================================
@@ -609,6 +640,36 @@ def mbarrier_try_wait(
 
 
 @dsl_user_op
+def mbarrier_inval(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Invalidate an mbarrier object, releasing it for regular smem reuse.
+
+    After invalidation, the shared memory locations occupied by the mbarrier
+    can be safely overwritten with regular data (e.g., by TMA loads for a
+    different op reusing the same page).
+
+    Must only be called when no thread has pending arrive/wait operations
+    on this mbarrier.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier (8-byte aligned)
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "mbarrier.inval.shared.b64 [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def nanosleep(
     duration: Int32,
     *,
@@ -756,6 +817,7 @@ __all__ = [
     # mbarrier primitives
     "mbarrier_init",
     "mbarrier_init_fence",
+    "mbarrier_inval",
     "mbarrier_arrive",
     "mbarrier_arrive_expect_tx",
     "mbarrier_wait",
