@@ -112,9 +112,7 @@ class Conv1dOp(Op):
         self.halo_size = self.K - 1
         self.halo_bytes = self.halo_size * self.D * self.elem_bytes
         self.x_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
-        # Smem reuse: y overwrites input region at offset 0 after barrier
-        self.y_smem_offset = 0
-        self.total_smem = self.halo_bytes + self.x_tile_bytes  # No separate y
+        self.total_smem = self.halo_bytes + self.x_tile_bytes
 
         assert self.total_smem <= self.page_size, (
             f"Conv1dOp: tile smem ({self.total_smem}B) exceeds "
@@ -131,7 +129,7 @@ class Conv1dOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation=None,
+    def schedule(cls, tile_sizes=None, activation=None,
                          page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule causal conv1d forward.
 
@@ -434,10 +432,7 @@ class Conv1dBwdOp(Op):
         self.halo_bytes = self.halo_size * self.D * self.elem_bytes
         self.dy_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
         self.dy_full_bytes = self.dy_tile_bytes + self.halo_bytes
-        # Smem reuse: dx overwrites input region at offset 0 after barrier
-        self.dx_smem_offset = 0
-        self.dx_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
-        self.total_smem = self.dy_full_bytes  # No separate dx region
+        self.total_smem = self.dy_full_bytes
 
         assert self.total_smem <= self.page_size, (
             f"Conv1dBwdOp: tile smem ({self.total_smem}B) exceeds "
@@ -454,7 +449,7 @@ class Conv1dBwdOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          **tensors):
         """Schedule causal conv1d backward (dx).
 

@@ -15,7 +15,7 @@ Usage:
     from machete.kernels.gated_delta_net.wu_op import GDNWUOp
     from machete.megakernel import Megakernel
 
-    ops = GDNWUOp.schedule_forward(
+    ops = GDNWUOp.schedule(
         a_solved=a_solved, k=k, v=v,
         g_cumsum=g_cumsum, beta=beta,
         w=w, u=u,
@@ -233,7 +233,7 @@ class GDNWUOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         """Schedule GDN WU Op."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)

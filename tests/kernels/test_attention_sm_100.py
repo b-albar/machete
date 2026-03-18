@@ -48,9 +48,9 @@ def _run_attention_forward(q, k, v, tile_m=None, causal=False, kv_group_size=1):
     tile_sizes = {}
     if tile_m is not None:
         tile_sizes["M"] = tile_m
-    # For fp16/bf16, let schedule_forward compute optimal tile_M
+    # For fp16/bf16, let schedule compute optimal tile_M
     o = torch.zeros_like(q)
-    ops = FlashAttentionSm100Op.schedule_forward(
+    ops = FlashAttentionSm100Op.schedule(
         q=q, k=k, v=v, o=o,
         tile_sizes=tile_sizes,
         causal=causal,
@@ -175,7 +175,7 @@ class TestFlashAttentionMMA:
 
 
 class TestFlashAttentionMultiWarp:
-    """Multi-warp MMA tests — let schedule_forward pick optimal tile_M."""
+    """Multi-warp MMA tests — let schedule pick optimal tile_M."""
 
     @requires_gpu
     @pytest.mark.parametrize("BH,M,N,D", [

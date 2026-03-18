@@ -329,7 +329,7 @@ def _run_gemm_fused_act(a, b_t, activation, tile_m=64, tile_n=32, tile_k=32):
     N = b_t.shape[0]
     c = torch.zeros(1, M, N, dtype=a.dtype, device=a.device)
 
-    ops = GemmOp.schedule_forward(
+    ops = GemmOp.schedule(
         a=a.unsqueeze(0), b=b_t, c=c, activation=activation,
         tile_sizes={"S": tile_m, "N": tile_n, "K": tile_k},
     )

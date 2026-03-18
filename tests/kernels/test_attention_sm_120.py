@@ -175,7 +175,7 @@ class TestFlashAttentionCoopMMA:
 
 
 class TestFlashAttentionCoopMultiWarp:
-    """Multi-warp MMA tests — let schedule_forward pick optimal tile_M."""
+    """Multi-warp MMA tests — let schedule pick optimal tile_M."""
 
     @requires_gpu
     @pytest.mark.parametrize("BH,M,N,D", [
@@ -340,7 +340,7 @@ def _run_attention_coop_forward_with_lse(q, k, v, causal=False,
 
     o = torch.zeros_like(q)
     lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
-    ops = FlashAttentionSm120Op.schedule_forward(
+    ops = FlashAttentionSm120Op.schedule(
         q=q, k=k, v=v, o=o, lse=lse, causal=causal,
         kv_group_size=kv_group_size,
     )

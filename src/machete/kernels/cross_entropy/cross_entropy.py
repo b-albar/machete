@@ -138,7 +138,7 @@ class CrossEntropyOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, page_size=None, ignore_index=-100,
+    def schedule(cls, page_size=None, ignore_index=-100,
                          tile_sizes=None, **tensors):
         """Schedule cross-entropy Op."""
         if page_size is None:

@@ -7,9 +7,9 @@ uses only 1 CTA per head, leaving most SMs idle. FlashDecoding splits the KV
 sequence across multiple CTAs (splits), each producing partial O and LSE in
 fp32. A combine kernel reduces the partials into the final output.
 
-Two-op architecture:
-    FlashDecodingSplitOp:   tile=(BH, SPLIT) — each CTA handles a KV range
-    FlashDecodingCombineOp: tile=(BH,) — reduces partials per head
+Architecture:
+    FlashDecodingSplitOp: tile=(BH, SPLIT) — each CTA handles a KV range.
+    Combine is fused into the store warp epilogue (no separate op needed).
 
 Usage:
     from machete.kernels.attention.flash_decoding import flash_decoding_schedule
@@ -98,7 +98,6 @@ class FlashDecodingSplitOp(Op):
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D ** 0.5)
-        self.kv_row_bytes = self.D * self.elem_bytes
         self.q_tile_bytes = self.M * self.D * self.elem_bytes
 
         # Raw pointer for atomic counter (set via static_dims)
@@ -185,7 +184,7 @@ class FlashDecodingSplitOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False,
+    def schedule(cls, tile_sizes=None, causal=False,
                          page_size=DEFAULT_PAGE_SIZE, kv_group_size=1,
                          num_splits=0, **tensors):
         """Schedule split-KV forward pass with fused combine.
@@ -204,7 +203,7 @@ class FlashDecodingSplitOp(Op):
         N = k.shape[1]
 
         assert q.element_size() == 2
-        assert "o" in tensors, "FlashDecodingSplitOp.schedule_forward requires 'o' tensor"
+        assert "o" in tensors, "FlashDecodingSplitOp.schedule requires 'o' tensor"
 
         # Auto num_splits
         if num_splits <= 0:
@@ -753,114 +752,6 @@ class FlashDecodingSplitOp(Op):
                 elem_idx = elem_idx + Int32(32)
 
 
-class FlashDecodingCombineOp(Op):
-    """Combine partial O and LSE across splits into final output.
-
-    For each row: compute max LSE across splits, scale each partial O
-    by exp(lse - lse_max), normalize, and sum.
-
-    This is a simple per-row reduction — no MMA needed.
-    """
-
-    reads = {
-        "o_partial": (cutlass.Float32, ("BH", "SPLIT", "M", "D")),
-        "lse_partial": (cutlass.Float32, ("BH", "SPLIT", "M")),
-    }
-    writes = {
-        "o": (None, ("BH", "M", "D")),
-        "lse": (cutlass.Float32, ("BH", "M")),
-    }
-    tile = ("BH",)
-
-    tma_loads = set()
-    tma_stores = set()  # Write O directly to global from compute
-
-    def __init__(self, **config):
-        super().__init__(**config)
-        self.num_splits = self.SPLIT
-        self.elem_bytes = 2  # output dtype
-
-    @classmethod
-    def schedule_forward(cls, tile_sizes=None, **tensors):
-        """Schedule combine op."""
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes["BH"] = 1
-        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
-        return ops
-
-    @cute.jit
-    def compute(self, page_ptr, tile_BH, o_partial, lse_partial, o, lse):
-        """Reduce partial O and LSE across splits.
-
-        Each thread handles a subset of (M, D) elements. The reduction
-        over splits is sequential (num_splits is typically 16-70).
-        """
-        tidx = cute.arch.thread_idx()[0]
-        num_threads = Int32(self.threads_per_row)
-
-        # Create CuTe tensors for global memory access
-        # o_partial: (BH, SPLIT, M, D) — contiguous fp32
-        g_op = cute.make_tensor(
-            o_partial.iterator + tile_BH * Int32(self.num_splits * self.M * self.D),
-            cute.make_layout((self.num_splits, self.M, self.D),
-                             stride=(self.M * self.D, self.D, 1)),
-        )
-        # lse_partial: (BH, SPLIT, M) — contiguous fp32
-        g_lp = cute.make_tensor(
-            lse_partial.iterator + tile_BH * Int32(self.num_splits * self.M),
-            cute.make_layout((self.num_splits, self.M),
-                             stride=(self.M, 1)),
-        )
-        # o: (BH, M, D) — output
-        g_o = cute.make_tensor(
-            o.iterator + tile_BH * Int32(self.M * self.D),
-            cute.make_layout((self.M, self.D), stride=(self.D, 1)),
-        )
-        # lse: (BH, M) — output
-        g_lse = cute.make_tensor(
-            lse.iterator + tile_BH * Int32(self.M),
-            cute.make_layout(self.M),
-        )
-
-        # Each thread handles elements in a strided pattern over M*D
-        total_elems = Int32(self.M * self.D)
-        elem_idx = tidx
-        while elem_idx < total_elems:
-            row = elem_idx // Int32(self.D)
-            col = elem_idx % Int32(self.D)
-
-            # Find max LSE across splits for this row
-            lse_max = Float32(-1e30)
-            si = Int32(0)
-            while si < Int32(self.num_splits):
-                lse_val = g_lp[si, row]
-                lse_max = cute.arch.fmax(lse_max, lse_val)
-                si = si + Int32(1)
-
-            # Accumulate scaled O and total scale
-            acc = Float32(0.0)
-            scale_sum = Float32(0.0)
-            si = Int32(0)
-            while si < Int32(self.num_splits):
-                lse_val = g_lp[si, row]
-                scale = cute.math.exp(lse_val - lse_max)
-                o_val = g_op[si, row, col]
-                acc = acc + scale * o_val
-                scale_sum = scale_sum + scale
-                si = si + Int32(1)
-
-            # Normalize and write
-            inv_scale_sum = cute.arch.rcp_approx(scale_sum)
-            result = acc * inv_scale_sum
-            g_o[row, col] = result.to(self.o_dtype)
-
-            # Write LSE (only once per row, from the thread handling col=0)
-            if col == Int32(0):
-                g_lse[row] = lse_max + cute.math.log(scale_sum)
-
-            elem_idx = elem_idx + num_threads
-
-
 # =============================================================================
 # Public API
 # =============================================================================
@@ -883,7 +774,7 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     lse = torch.empty(BH, M, dtype=torch.float32, device=q.device)
 
     # Schedule split ops with fused combine
-    split_ops = FlashDecodingSplitOp.schedule_forward(
+    split_ops = FlashDecodingSplitOp.schedule(
         q=q, k=k, v=v, o=o, lse=lse,
         num_splits=num_splits,
         page_size=page_size, causal=causal, kv_group_size=kv_group_size,
@@ -893,4 +784,4 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     return split_ops, config
 
 
-__all__ = ["FlashDecodingSplitOp", "FlashDecodingCombineOp", "flash_decoding_schedule"]
+__all__ = ["FlashDecodingSplitOp", "flash_decoding_schedule"]

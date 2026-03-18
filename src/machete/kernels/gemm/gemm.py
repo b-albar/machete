@@ -145,13 +145,10 @@ class GemmOp(Op):
         # Swizzle parameters for bank-conflict-free LdMatrix reads.
         if self.tile_K % 64 == 0 and self.tile_K >= 64:
             self.swz_B_ab = 3   # SW128
-            self.atom_K = 64
         elif self.tile_K % 32 == 0:
             self.swz_B_ab = 2   # SW64
-            self.atom_K = 32
         else:
             self.swz_B_ab = 1   # SW32
-            self.atom_K = 16
 
         # 4 op-managed mbarriers after double-buffer data (32 bytes):
         #   buf_free[0,1]:     compute → store warp (buffer read, safe to overwrite)
@@ -817,7 +814,7 @@ class GemmOp(Op):
         return 32, 32, 16
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          activation=None, has_a_scale=0, **tensors):
         """Schedule forward GEMM.
 
@@ -929,17 +926,17 @@ class GemmOp(Op):
                     "N": ts.get("K", 32),
                     "K": ts.get("N", 32),
                 }
-            # else: let schedule_forward auto-compute via _auto_tiles
+            # else: let schedule auto-compute via _auto_tiles
             if act_grad is not None:
                 fwd_kwargs["a_scale"] = act_grad
-            ops.extend(cls.schedule_forward(**fwd_kwargs, page_size=page_size))
+            ops.extend(cls.schedule(**fwd_kwargs, page_size=page_size))
 
         if db is not None:
             # dB[N,K] = dout^T[N,B*S] @ A[B*S,K]  — flatten B*S, transpose
             BS = dout.shape[0] * dout.shape[1]
             dout_flat = dout.reshape(BS, dout.shape[2])
             a_flat = a.reshape(BS, a.shape[2])
-            # a operand: (1, N, BS) — 3D for schedule_forward
+            # a operand: (1, N, BS) — 3D for schedule
             dout_t = dout_flat.t().contiguous().unsqueeze(0)
             # b weight: (K, BS) — stays 2D
             a_t = a_flat.t().contiguous()
@@ -953,11 +950,11 @@ class GemmOp(Op):
                     "N": ts.get("K", 32),
                     "K": ts.get("S", 64),
                 }
-            # else: let schedule_forward auto-compute via _auto_tiles
+            # else: let schedule auto-compute via _auto_tiles
             if act_grad is not None:
                 act_flat = act_grad.reshape(BS, act_grad.shape[2])
                 fwd_kwargs["a_scale"] = act_flat.t().contiguous().unsqueeze(0)
-            ops.extend(cls.schedule_forward(**fwd_kwargs, page_size=page_size))
+            ops.extend(cls.schedule(**fwd_kwargs, page_size=page_size))
 
         return ops
 
@@ -966,13 +963,13 @@ class GemmOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward_tp(cls, tp_mode='column', **kwargs):
+    def schedule_tp(cls, tp_mode='column', **kwargs):
         """Schedule forward GEMM with tensor parallelism.
 
         Args:
             tp_mode: 'column' for column-parallel (broadcast output shard),
                      'row' for row-parallel (all-reduce via atomic add).
-            **kwargs: Forwarded to schedule_forward().
+            **kwargs: Forwarded to schedule().
 
         Returns:
             List of ScheduledOps using the appropriate TP subclass.
@@ -985,9 +982,9 @@ class GemmOp(Op):
                 All output buffers must be zeroed before kernel launch.
         """
         if tp_mode == 'column':
-            return GemmColumnParallelOp.schedule_forward(**kwargs)
+            return GemmColumnParallelOp.schedule(**kwargs)
         elif tp_mode == 'row':
-            return GemmRowParallelOp.schedule_forward(**kwargs)
+            return GemmRowParallelOp.schedule(**kwargs)
         else:
             raise ValueError(f"Unknown tp_mode: {tp_mode!r}. Use 'column' or 'row'.")
 

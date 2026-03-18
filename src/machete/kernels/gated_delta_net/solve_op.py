@@ -15,7 +15,7 @@ Usage:
     from machete.kernels.gated_delta_net.solve_op import GDNSolveOp
     from machete.megakernel import Megakernel
 
-    ops = GDNSolveOp.schedule_forward(
+    ops = GDNSolveOp.schedule(
         k=k, g=g, beta=beta,
         g_cumsum=g_cumsum, a_solved=a_solved,
     )
@@ -163,7 +163,7 @@ class GDNSolveOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         """Schedule GDN solve Op."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)

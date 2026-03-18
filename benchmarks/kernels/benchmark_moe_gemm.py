@@ -135,7 +135,7 @@ def bench_moe_gemm(num_tokens, num_experts, topk, K, N, dtype, page_size):
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         try:
             c = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
-            ops = MoeGemmOp.schedule_forward(
+            ops = MoeGemmOp.schedule(
                 sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c, page_size=page_size,
             )
             config = MoeGemmOp.kernel_config(ops)
@@ -152,7 +152,7 @@ def bench_moe_gemm(num_tokens, num_experts, topk, K, N, dtype, page_size):
 
         try:
             c_so = torch.zeros(total_padded, N, dtype=torch_dtype, device=device)
-            so_ops = MoeGemmOp.schedule_forward(
+            so_ops = MoeGemmOp.schedule(
                 sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c_so, page_size=page_size,
             )
             so_kernel = SingleOpKernel(so_ops)

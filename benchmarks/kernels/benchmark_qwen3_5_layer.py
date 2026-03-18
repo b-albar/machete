@@ -210,37 +210,37 @@ def megakernel_forward_build(B, S, x, residual,
     out = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
 
     # --- Schedule all ops ---
-    rmsnorm1_ops = RMSNormOp.schedule_forward(
+    rmsnorm1_ops = RMSNormOp.schedule(
         x=x, weight=w_attn_norm, y=h,
         residual_in=residual, residual_out=residual_out,
         tile_sizes={"S": 16}, page_size=page_size,
     )
-    gemm_q_ops = GemmOp.schedule_forward(a=h, b=W_q, c=q_3d, page_size=page_size)
-    gemm_k_ops = GemmOp.schedule_forward(a=h, b=W_k, c=k_3d, page_size=page_size)
-    gemm_v_ops = GemmOp.schedule_forward(a=h, b=W_v, c=v_3d, page_size=page_size)
-    qknorm_q_ops = QKNormRopeOp.schedule_forward(
+    gemm_q_ops = GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=page_size)
+    gemm_k_ops = GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=page_size)
+    gemm_v_ops = GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=page_size)
+    qknorm_q_ops = QKNormRopeOp.schedule(
         q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
-    qknorm_k_ops = QKNormRopeOp.schedule_forward(
+    qknorm_k_ops = QKNormRopeOp.schedule(
         q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
 
-    fa_ops = FlashAttentionOp.schedule_forward(
+    fa_ops = FlashAttentionOp.schedule(
         q=q_fa, k=k_fa, v=v_fa, o=o_fa, lse=lse,
         causal=True, kv_group_size=KV_GROUP_SIZE, page_size=page_size,
     )
 
-    gemm_o_ops = GemmOp.schedule_forward(
+    gemm_o_ops = GemmOp.schedule(
         a=attn_out_3d, b=W_o, c=proj, page_size=page_size)
-    rmsnorm2_ops = RMSNormOp.schedule_forward(
+    rmsnorm2_ops = RMSNormOp.schedule(
         x=proj, weight=w_mlp_norm, y=h2,
         residual_in=residual_out, residual_out=residual_out2,
         tile_sizes={"S": 16}, page_size=page_size,
     )
-    gemm_gu_ops = GemmOp.schedule_forward(
+    gemm_gu_ops = GemmOp.schedule(
         a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
-    glu_ops = GLUOp.schedule_forward(
+    glu_ops = GLUOp.schedule(
         x=gate_up, y=mlp_h, activation='silu',
         tile_sizes={"S": 2}, page_size=page_size)
-    gemm_down_ops = GemmOp.schedule_forward(
+    gemm_down_ops = GemmOp.schedule(
         a=mlp_h, b=W_down, c=out, page_size=page_size)
 
     all_ops = (rmsnorm1_ops + gemm_q_ops + gemm_k_ops + gemm_v_ops
@@ -475,24 +475,24 @@ def bench_qwen35_no_attn(seq_len, batch):
             out = torch.empty_like(x)
 
             all_ops = (
-                RMSNormOp.schedule_forward(
+                RMSNormOp.schedule(
                     x=x, weight=w_attn_norm, y=h,
                     residual_in=residual, residual_out=res_out,
                     tile_sizes={"S": 16}, page_size=page_size)
-                + GemmOp.schedule_forward(a=h, b=W_q, c=q_3d, page_size=page_size)
-                + GemmOp.schedule_forward(a=h, b=W_k, c=k_3d, page_size=page_size)
-                + GemmOp.schedule_forward(a=h, b=W_v, c=v_3d, page_size=page_size)
-                + QKNormRopeOp.schedule_forward(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
-                + QKNormRopeOp.schedule_forward(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
-                + GemmOp.schedule_forward(a=attn_out, b=W_o, c=proj, page_size=page_size)
-                + RMSNormOp.schedule_forward(
+                + GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=page_size)
+                + GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=page_size)
+                + GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=page_size)
+                + QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
+                + QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
+                + GemmOp.schedule(a=attn_out, b=W_o, c=proj, page_size=page_size)
+                + RMSNormOp.schedule(
                     x=proj, weight=w_mlp_norm, y=h2,
                     residual_in=res_out, residual_out=res_out2,
                     tile_sizes={"S": 16}, page_size=page_size)
-                + GemmOp.schedule_forward(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
-                + GLUOp.schedule_forward(x=gate_up, y=mlp_h, activation='silu',
+                + GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
+                + GLUOp.schedule(x=gate_up, y=mlp_h, activation='silu',
                                          tile_sizes={"S": 2}, page_size=page_size)
-                + GemmOp.schedule_forward(a=mlp_h, b=W_down, c=out, page_size=page_size)
+                + GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size)
             )
             config = GemmOp.kernel_config(all_ops)
             kernel = Megakernel(all_ops, config=config)

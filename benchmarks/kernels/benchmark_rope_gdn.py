@@ -84,11 +84,11 @@ def _schedule_gdn_ops(q, k, v, g, beta, scale, page_size):
         from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
         from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
 
-        prep_ops = GDNPrepOp.schedule_forward(
+        prep_ops = GDNPrepOp.schedule(
             k=k, v=v, g=g, beta=beta,
             g_cumsum=gc, w=w, u=u, page_size=page_size,
         )
-        fused_ops = GDNFusedOp.schedule_forward(
+        fused_ops = GDNFusedOp.schedule(
             q=q, k=k, w=w, u=u,
             g_cumsum=gc, o=o, scale=scale, page_size=page_size,
         )
@@ -111,23 +111,23 @@ def _schedule_gdn_ops(q, k, v, g, beta, scale, page_size):
     v_new = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
     h_states = torch.zeros(B, NT, H, K, V, device=q.device, dtype=dtype)
 
-    solve_ops = GDNSolveOp.schedule_forward(
+    solve_ops = GDNSolveOp.schedule(
         k=k, g=g, beta=beta,
         g_cumsum=gc, a_solved=a_solved, page_size=page_size,
     )
-    wu_ops = GDNWUOp.schedule_forward(
+    wu_ops = GDNWUOp.schedule(
         a_solved=a_solved, k=k, v=v,
         g_cumsum=gc, beta=beta, w=w, u=u, page_size=page_size,
     )
-    state_ops = GDNStateRecurrenceOp.schedule_forward(
+    state_ops = GDNStateRecurrenceOp.schedule(
         k=k, w=w, u=u, g_cumsum=gc,
         h_states=h_states, page_size=page_size,
     )
-    vnew_ops = GDNVNewOp.schedule_forward(
+    vnew_ops = GDNVNewOp.schedule(
         w=w, u=u, h_states=h_states,
         v_new=v_new, page_size=page_size,
     )
-    output_ops = GDNOutputOp.schedule_forward(
+    output_ops = GDNOutputOp.schedule(
         q=q, k=k, v_new=v_new, h_states=h_states,
         g_cumsum=gc, o=o, scale=scale, page_size=page_size,
     )
@@ -142,8 +142,8 @@ def _build_rope_megakernel(q, k, cos, sin, page_size):
     from machete.megakernel import Megakernel
     from machete.kernels.rope import RopeOp
 
-    rope_q_ops = RopeOp.schedule_forward(q=q, cos=cos, sin=sin, page_size=page_size)
-    rope_k_ops = RopeOp.schedule_forward(q=k, cos=cos, sin=sin, page_size=page_size)
+    rope_q_ops = RopeOp.schedule(q=q, cos=cos, sin=sin, page_size=page_size)
+    rope_k_ops = RopeOp.schedule(q=k, cos=cos, sin=sin, page_size=page_size)
     all_ops = rope_q_ops + rope_k_ops
     config = RopeOp.kernel_config(all_ops)
     kernel = Megakernel(all_ops, config=config)
@@ -171,8 +171,8 @@ def _build_fused_megakernel(q, k, v, g, beta, cos, sin, scale, page_size):
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.rope import RopeOp
 
-    rope_q_ops = RopeOp.schedule_forward(q=q, cos=cos, sin=sin, page_size=page_size)
-    rope_k_ops = RopeOp.schedule_forward(q=k, cos=cos, sin=sin, page_size=page_size)
+    rope_q_ops = RopeOp.schedule(q=q, cos=cos, sin=sin, page_size=page_size)
+    rope_k_ops = RopeOp.schedule(q=k, cos=cos, sin=sin, page_size=page_size)
 
     gdn_ops, gdn_config, bufs = _schedule_gdn_ops(
         q, k, v, g, beta, scale, page_size)

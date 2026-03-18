@@ -89,7 +89,7 @@ def benchmark_cross_entropy(BT, V, page_size):
     try:
         loss_buf = torch.zeros(BT, dtype=torch.float32, device="cuda")
         grad_buf = torch.zeros_like(logits)
-        ops = CrossEntropyOp.schedule_forward(
+        ops = CrossEntropyOp.schedule(
             logits=logits,
             targets=targets.int(),
             loss=loss_buf,
@@ -108,7 +108,7 @@ def benchmark_cross_entropy(BT, V, page_size):
     try:
         loss_so = torch.zeros(BT, dtype=torch.float32, device="cuda")
         grad_so = torch.zeros_like(logits)
-        so_ops = CrossEntropyOp.schedule_forward(
+        so_ops = CrossEntropyOp.schedule(
             logits=logits,
             targets=targets.int(),
             loss=loss_so,

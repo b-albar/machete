@@ -162,7 +162,7 @@ class GDNVNewOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, page_size=DEFAULT_PAGE_SIZE,
                          tile_sizes=None, **tensors):
         """Schedule GDN VNew Op."""
         tile_sizes = dict(tile_sizes or {})

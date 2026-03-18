@@ -86,8 +86,8 @@ def bench_gemm_rmsnorm(M, D):
         h_f = torch.zeros(B, M, D, dtype=dtype, device="cuda")  # GEMM output
         y_f = torch.zeros(B, M, D, dtype=dtype, device="cuda")  # RMSNorm output
 
-        gemm_ops = GemmOp.schedule_forward(a=x_f, b=W, c=h_f, page_size=PAGE_SIZE)
-        rms_ops = RMSNormOp.schedule_forward(x=h_f, weight=rms_weight, y=y_f)
+        gemm_ops = GemmOp.schedule(a=x_f, b=W, c=h_f, page_size=PAGE_SIZE)
+        rms_ops = RMSNormOp.schedule(x=h_f, weight=rms_weight, y=y_f)
 
         all_ops = gemm_ops + rms_ops
         config = _merged_config(
@@ -114,10 +114,10 @@ def bench_gemm_rmsnorm(M, D):
         h_sd = torch.zeros(B, M, D, dtype=dtype, device="cuda")
         y_sd = torch.zeros(B, M, D, dtype=dtype, device="cuda")
 
-        gemm_ops_sd = GemmOp.schedule_forward(a=x_sd, b=W, c=h_sd, page_size=PAGE_SIZE)
+        gemm_ops_sd = GemmOp.schedule(a=x_sd, b=W, c=h_sd, page_size=PAGE_SIZE)
         gemm_kern_d = _build_and_run(gemm_ops_sd, GemmOp.kernel_config(gemm_ops_sd))
 
-        dir_ops = RMSNormOp.schedule_forward(x=h_sd, weight=rms_weight, y=y_sd)
+        dir_ops = RMSNormOp.schedule(x=h_sd, weight=rms_weight, y=y_sd)
         dir_config = RMSNormOp.kernel_config(dir_ops)
         dir_kern = SingleOpKernel(dir_ops, config=dir_config)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -186,7 +186,7 @@ def bench_rmsnorm_standalone(M, D):
     # SingleOp
     try:
         y_dir = torch.empty_like(x)
-        dir_ops = RMSNormOp.schedule_forward(x=x, weight=weight, y=y_dir)
+        dir_ops = RMSNormOp.schedule(x=x, weight=weight, y=y_dir)
         dir_config = RMSNormOp.kernel_config(dir_ops)
         dir_kern = SingleOpKernel(dir_ops, config=dir_config)
         with contextlib.redirect_stdout(io.StringIO()):

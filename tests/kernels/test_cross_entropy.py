@@ -43,7 +43,7 @@ def _run_cross_entropy(logits, targets, ignore_index=-100):
     loss = torch.zeros(BT, dtype=torch.float32, device=logits.device)
     grad_logits = torch.zeros_like(logits)
 
-    ops = CrossEntropyOp.schedule_forward(
+    ops = CrossEntropyOp.schedule(
         logits=logits,
         targets=targets.int(),
         loss=loss,

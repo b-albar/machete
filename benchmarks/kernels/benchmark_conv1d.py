@@ -93,7 +93,7 @@ def bench_conv1d_fwd(kernel_size, hidden_dim, seq_len, batch):
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             y = torch.empty_like(x)
-            ops = Conv1dOp.schedule_forward(x=x, w=w, y=y)
+            ops = Conv1dOp.schedule(x=x, w=w, y=y)
             config = Conv1dOp.kernel_config(ops)
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel = Megakernel(ops, config=config)
@@ -105,7 +105,7 @@ def bench_conv1d_fwd(kernel_size, hidden_dim, seq_len, batch):
 
         try:
             y_so = torch.empty_like(x)
-            so_ops = Conv1dOp.schedule_forward(x=x, w=w, y=y_so)
+            so_ops = Conv1dOp.schedule(x=x, w=w, y=y_so)
             so_config = Conv1dOp.kernel_config(so_ops)
             so_kernel = SingleOpKernel(so_ops, config=so_config)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -148,7 +148,7 @@ def bench_conv1d_bwd(kernel_size, hidden_dim, seq_len, batch):
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             dx = torch.empty_like(dy)
-            ops = Conv1dBwdOp.schedule_forward(dy=dy, w=w, dx=dx)
+            ops = Conv1dBwdOp.schedule(dy=dy, w=w, dx=dx)
             config = Conv1dBwdOp.kernel_config(ops)
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel = Megakernel(ops, config=config)
@@ -161,7 +161,7 @@ def bench_conv1d_bwd(kernel_size, hidden_dim, seq_len, batch):
 
         try:
             dx_so = torch.empty_like(dy)
-            so_ops = Conv1dBwdOp.schedule_forward(dy=dy, w=w, dx=dx_so)
+            so_ops = Conv1dBwdOp.schedule(dy=dy, w=w, dx=dx_so)
             so_config = Conv1dBwdOp.kernel_config(so_ops)
             so_kernel = SingleOpKernel(so_ops, config=so_config)
             with contextlib.redirect_stdout(io.StringIO()):

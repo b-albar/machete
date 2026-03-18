@@ -188,7 +188,7 @@ class TestGemmTPSingleGPU:
 
     @requires_gpu
     def test_schedule_forward_tp_column(self):
-        """schedule_forward_tp with tp_mode='column'."""
+        """schedule_tp with tp_mode='column'."""
         from machete.kernels.gemm import GemmOp, GemmColumnParallelOp
 
         M, K, N = 64, 64, 32
@@ -196,12 +196,12 @@ class TestGemmTPSingleGPU:
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
         c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
-        ops = GemmOp.schedule_forward_tp(tp_mode='column', a=a, b=b, c=c)
+        ops = GemmOp.schedule_tp(tp_mode='column', a=a, b=b, c=c)
         assert ops[0].op_cls is GemmColumnParallelOp
 
     @requires_gpu
     def test_schedule_forward_tp_row(self):
-        """schedule_forward_tp with tp_mode='row'."""
+        """schedule_tp with tp_mode='row'."""
         from machete.kernels.gemm import GemmOp, GemmRowParallelOp
 
         M, K, N = 64, 64, 32
@@ -209,7 +209,7 @@ class TestGemmTPSingleGPU:
         b = torch.randn(N, K, dtype=torch.float16, device="cuda")
         c = torch.zeros(1, M, N, dtype=torch.float16, device="cuda")
 
-        ops = GemmOp.schedule_forward_tp(tp_mode='row', a=a, b=b, c=c)
+        ops = GemmOp.schedule_tp(tp_mode='row', a=a, b=b, c=c)
         assert ops[0].op_cls is GemmRowParallelOp
 
 

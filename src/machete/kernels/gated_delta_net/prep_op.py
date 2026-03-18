@@ -15,7 +15,7 @@ Usage:
     from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
     from machete.megakernel import Megakernel
 
-    ops = GDNPrepOp.schedule_forward(
+    ops = GDNPrepOp.schedule(
         k=k, v=v, g=g, beta=beta,
         g_cumsum=g_cumsum, w=w, u=u,
     )
@@ -103,7 +103,7 @@ class GDNPrepOp(Op):
         )
         self.elem_bytes = 2
 
-        # Block sizes (auto-sized from page_size via schedule_forward)
+        # Block sizes (auto-sized from page_size via schedule)
         self.BT = _BT
         self.BK = getattr(self, "BK", _BK)
         self.BV = getattr(self, "BV", _BV)
@@ -197,7 +197,7 @@ class GDNPrepOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule(cls, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         """Schedule GDN prep Op."""
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)

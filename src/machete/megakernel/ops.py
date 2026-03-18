@@ -421,20 +421,7 @@ def _process_op_declarations(cls):
 
     cls._schedule_single = _schedule_single
 
-    # Add schedule() classmethod (public dispatcher — returns list of ScheduledOps)
-    @classmethod
-    def schedule(cls, tile_sizes=None, **tensors):
-        """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
-
-        Checks for schedule_forward override on the subclass. If found,
-        delegates to it. Otherwise wraps a single _schedule_single() call
-        in a list.
-        """
-        if hasattr(cls, "schedule_forward"):
-            return cls.schedule_forward(tile_sizes=tile_sizes, **tensors)
-        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
-
-    cls.schedule = schedule
+    # Default schedule() is on Op base class. Subclasses override directly.
 
     # Add gen_tensor_param_names classmethod
     @classmethod
@@ -553,6 +540,19 @@ class Op:
         super().__init_subclass__(**kwargs)
         if hasattr(cls, "reads") and hasattr(cls, "writes"):
             _process_op_declarations(cls)
+
+    # =========================================================================
+    # Scheduling
+    # =========================================================================
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
+
+        Subclasses override this for custom scheduling (auto-tiling, etc.).
+        Default: wraps a single _schedule_single() call in a list.
+        """
+        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
 
     # =========================================================================
     # Pipelined Execution Interface

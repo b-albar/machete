@@ -114,7 +114,6 @@ class FlashAttentionSm120Op(Op):
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D**0.5)
-        self.kv_row_bytes = self.D * self.elem_bytes
         self.q_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
 
         # Stride overrides for strided K/V (e.g., as_strided FA views of GEMM output).
@@ -231,7 +230,7 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, causal=False, page_size=DEFAULT_PAGE_SIZE,
                          kv_group_size=1, **tensors):
         """Schedule cooperative flash attention forward.
 
@@ -265,8 +264,6 @@ class FlashAttentionSm120Op(Op):
                 tile_sizes["M"] = tile_M
         # Auto-allocate lse output if not provided
         if "lse" not in tensors and q is not None:
-            import torch
-
             tensors["lse"] = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size

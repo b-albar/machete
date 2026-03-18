@@ -93,7 +93,7 @@ def bench_glu_fwd(hidden_dim, seq_len, batch):
 
         try:
             y_3d = torch.empty(batch, seq_len, D, dtype=x.dtype, device="cuda")
-            ops = GLUOp.schedule_forward(x=x_3d, y=y_3d)
+            ops = GLUOp.schedule(x=x_3d, y=y_3d)
             config = GLUOp.kernel_config(ops)
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel = Megakernel(ops, config=config)
@@ -105,7 +105,7 @@ def bench_glu_fwd(hidden_dim, seq_len, batch):
 
         try:
             y_so = torch.empty(batch, seq_len, D, dtype=x.dtype, device="cuda")
-            so_ops = GLUOp.schedule_forward(x=x_3d, y=y_so)
+            so_ops = GLUOp.schedule(x=x_3d, y=y_so)
             so_config = GLUOp.kernel_config(so_ops)
             so_kernel = SingleOpKernel(so_ops, config=so_config)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -159,7 +159,7 @@ def bench_glu_bwd(hidden_dim, seq_len, batch):
 
         try:
             dx_3d = torch.empty_like(x_3d)
-            ops = GLUBwdOp.schedule_forward(
+            ops = GLUBwdOp.schedule(
                 dy=dy_3d, x=x_3d, dx=dx_3d)
             config = GLUBwdOp.kernel_config(ops)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -173,7 +173,7 @@ def bench_glu_bwd(hidden_dim, seq_len, batch):
 
         try:
             dx_so = torch.empty_like(x_3d)
-            so_ops = GLUBwdOp.schedule_forward(
+            so_ops = GLUBwdOp.schedule(
                 dy=dy_3d, x=x_3d, dx=dx_so)
             so_config = GLUBwdOp.kernel_config(so_ops)
             so_kernel = SingleOpKernel(so_ops, config=so_config)

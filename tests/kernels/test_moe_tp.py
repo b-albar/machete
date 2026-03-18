@@ -106,7 +106,7 @@ class TestMoeTPSingleGPU:
         c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
         peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda")
 
-        ops = MoeGemmOp.schedule_forward(
+        ops = MoeGemmOp.schedule(
             sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
             tile_sizes={"M": tile_M, "N": N, "K": 32},
         )
@@ -159,7 +159,7 @@ class TestMoeTPMultiGPU:
         c = torch.zeros(M, N, dtype=torch.float16, device="cuda:0")
         peer_c = torch.zeros(M, N, dtype=torch.float16, device="cuda:1")
 
-        ops = MoeGemmOp.schedule_forward(
+        ops = MoeGemmOp.schedule(
             sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
             tile_sizes={"M": tile_M, "N": N, "K": 32},
         )

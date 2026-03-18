@@ -87,7 +87,7 @@ def _build_prep_megakernel(k, v, g, beta):
     w = torch.zeros(B, T, H, K_, device=k.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-    ops = GDNPrepOp.schedule_forward(
+    ops = GDNPrepOp.schedule(
         k=k, v=v, g=g, beta=beta,
         g_cumsum=gc, w=w, u=u,
     )
@@ -119,7 +119,7 @@ def _build_fused_megakernel(q, k, w, u, g_cumsum, scale):
     g_cumsum = g_cumsum.contiguous()
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    ops = GDNFusedOp.schedule_forward(
+    ops = GDNFusedOp.schedule(
         q=q, k=k, w=w, u=u, g_cumsum=g_cumsum, o=o,
         scale=scale,
     )
@@ -171,7 +171,7 @@ def bench_prep(B, T, H, K, V, page_size):
             w_mk = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
             u_mk = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
 
-            mk_ops = GDNPrepOp.schedule_forward(
+            mk_ops = GDNPrepOp.schedule(
                 k=k.contiguous(), v=v.contiguous(),
                 g=g.contiguous(), beta=beta.contiguous(),
                 g_cumsum=gc_mk, w=w_mk, u=u_mk, page_size=page_size,
@@ -194,7 +194,7 @@ def bench_prep(B, T, H, K, V, page_size):
             w_so = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
             u_so = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
 
-            so_ops = GDNPrepOp.schedule_forward(
+            so_ops = GDNPrepOp.schedule(
                 k=k.contiguous(), v=v.contiguous(),
                 g=g.contiguous(), beta=beta.contiguous(),
                 g_cumsum=gc_so, w=w_so, u=u_so, page_size=page_size,
@@ -255,7 +255,7 @@ def bench_fused(B, T, H, K, V, page_size):
 
             try:
                 o_mk = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
-                mk_ops = GDNFusedOp.schedule_forward(
+                mk_ops = GDNFusedOp.schedule(
                     q=q.contiguous(), k=k.contiguous(),
                     w=w.contiguous(), u=u.contiguous(),
                     g_cumsum=g_cumsum.contiguous(), o=o_mk,
@@ -276,7 +276,7 @@ def bench_fused(B, T, H, K, V, page_size):
 
             try:
                 o_so = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
-                so_ops = GDNFusedOp.schedule_forward(
+                so_ops = GDNFusedOp.schedule(
                     q=q.contiguous(), k=k.contiguous(),
                     w=w.contiguous(), u=u.contiguous(),
                     g_cumsum=g_cumsum.contiguous(), o=o_so,
@@ -350,11 +350,11 @@ def bench_pipeline(B, T, H, K, V, page_size):
             u_ps = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
             o_ps = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-            prep_ops = GDNPrepOp.schedule_forward(
+            prep_ops = GDNPrepOp.schedule(
                 k=k_c, v=v_c, g=g_c, beta=beta_c,
                 g_cumsum=gc_ps, w=w_ps, u=u_ps, page_size=page_size,
             )
-            fused_ops = GDNFusedOp.schedule_forward(
+            fused_ops = GDNFusedOp.schedule(
                 q=q_c, k=k_c, w=w_ps, u=u_ps,
                 g_cumsum=gc_ps, o=o_ps, scale=scale, page_size=page_size,
             )
@@ -421,23 +421,23 @@ def _build_5op_kernel(q_c, k_c, v_c, g_c, beta_c, scale, page_size):
     h_states = torch.zeros(B, NT, H, K, V, device=q_c.device, dtype=dtype)
     o = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
 
-    solve_ops = GDNSolveOp.schedule_forward(
+    solve_ops = GDNSolveOp.schedule(
         k=k_c, g=g_c, beta=beta_c,
         g_cumsum=gc, a_solved=a_solved, page_size=page_size,
     )
-    wu_ops = GDNWUOp.schedule_forward(
+    wu_ops = GDNWUOp.schedule(
         a_solved=a_solved, k=k_c, v=v_c,
         g_cumsum=gc, beta=beta_c, w=w, u=u, page_size=page_size,
     )
-    state_ops = GDNStateRecurrenceOp.schedule_forward(
+    state_ops = GDNStateRecurrenceOp.schedule(
         k=k_c, w=w, u=u, g_cumsum=gc,
         h_states=h_states, page_size=page_size,
     )
-    vnew_ops = GDNVNewOp.schedule_forward(
+    vnew_ops = GDNVNewOp.schedule(
         w=w, u=u, h_states=h_states,
         v_new=v_new, page_size=page_size,
     )
-    output_ops = GDNOutputOp.schedule_forward(
+    output_ops = GDNOutputOp.schedule(
         q=q_c, k=k_c, v_new=v_new, h_states=h_states,
         g_cumsum=gc, o=o, scale=scale, page_size=page_size,
     )

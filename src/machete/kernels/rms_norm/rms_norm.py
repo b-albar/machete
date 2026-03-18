@@ -72,15 +72,15 @@ def _tma_kernel_config(ops):
     """Return config for TMA-mode RMSNorm.
 
     threads_per_block includes DMA warps (framework always reserves them).
-    Cap at 4 compute warps (128 threads) — RMSNorm is memory-bound,
-    more warps don't improve throughput and >5 MMA warps can hang.
+    Picks the largest compute thread count (multiple of 32) that divides D,
+    up to 256 (8 warps).
     """
     from machete.megakernel import MegakernelConfig
     from machete.megakernel.megakernel import NUM_DMA_WARPS
     D = ops[0].static_dims.get('D', 4096)
     page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
     compute_threads = 64
-    for ct in [128, 64]:
+    for ct in [256, 128, 64]:
         if D % ct == 0:
             compute_threads = ct
             break
@@ -131,7 +131,6 @@ class RMSNormOp(Op):
         self.has_residual = getattr(self, 'has_residual', 0)
         self.has_gate = getattr(self, 'has_gate', 0)
         self.per_row_weight = getattr(self, 'per_row_weight', 0)
-        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
         if self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
             self.elem_bytes = 2
         else:
@@ -168,7 +167,7 @@ class RMSNormOp(Op):
         return has_residual, has_gate
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, residual=False, gemma=False,
+    def schedule(cls, tile_sizes=None, residual=False, gemma=False,
                          per_row_weight=False, page_size=DEFAULT_PAGE_SIZE,
                          **tensors):
         tensors = dict(tensors)
@@ -430,7 +429,6 @@ class RMSNormBwdOp(Op):
         self.has_residual = getattr(self, 'has_residual', 0)
         self.has_gate = getattr(self, 'has_gate', 0)
         self.per_row_weight = getattr(self, 'per_row_weight', 0)
-        self.page_size = getattr(self, 'page_size', DEFAULT_PAGE_SIZE)
         if self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
             self.elem_bytes = 2
         else:
@@ -466,7 +464,7 @@ class RMSNormBwdOp(Op):
         return has_residual, has_gate
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, residual=False, gemma=False,
+    def schedule(cls, tile_sizes=None, residual=False, gemma=False,
                          per_row_weight=False, page_size=DEFAULT_PAGE_SIZE,
                          **tensors):
         tensors = dict(tensors)

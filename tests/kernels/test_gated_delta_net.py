@@ -390,7 +390,7 @@ def _run_prep_op(k, v, g, beta):
     w = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-    ops = GDNPrepOp.schedule_forward(
+    ops = GDNPrepOp.schedule(
         k=k.contiguous(), v=v.contiguous(),
         g=g.contiguous(), beta=beta.contiguous(),
         g_cumsum=gc, w=w, u=u,
@@ -487,7 +487,7 @@ def _run_fused_op(q, k, w, u, g_cumsum, scale):
 
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    ops = GDNFusedOp.schedule_forward(
+    ops = GDNFusedOp.schedule(
         q=q.contiguous(), k=k.contiguous(),
         w=w.contiguous(), u=u.contiguous(),
         g_cumsum=g_cumsum.contiguous(), o=o,
@@ -546,7 +546,7 @@ def _run_solve_op(k, g, beta, page_size=49152):
     gc = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
     a_solved = torch.zeros(B, T, H, 64, device=k.device, dtype=dtype)
 
-    ops = GDNSolveOp.schedule_forward(
+    ops = GDNSolveOp.schedule(
         k=k.contiguous(), g=g.contiguous(), beta=beta.contiguous(),
         g_cumsum=gc, a_solved=a_solved,
         page_size=page_size,
@@ -572,7 +572,7 @@ def _run_wu_op(a_solved, k, v, g_cumsum, beta, page_size=49152):
     w = torch.zeros(B, T, H, K, device=k.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=k.device, dtype=dtype)
 
-    ops = GDNWUOp.schedule_forward(
+    ops = GDNWUOp.schedule(
         a_solved=a_solved.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g_cumsum=g_cumsum.contiguous(),
         beta=beta.contiguous(), w=w, u=u,
@@ -598,7 +598,7 @@ def _run_output_op(q, k, v_new, h_states, g_cumsum, scale, page_size=49152):
 
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    ops = GDNOutputOp.schedule_forward(
+    ops = GDNOutputOp.schedule(
         q=q.contiguous(), k=k.contiguous(),
         v_new=v_new.contiguous(), h_states=h_states.contiguous(),
         g_cumsum=g_cumsum.contiguous(), o=o, scale=scale,
@@ -706,7 +706,7 @@ def _run_state_recurrence_op(k, w, u, g_cumsum, page_size=49152):
 
     h_states = torch.zeros(B, NT, H, K, V, device=k.device, dtype=dtype)
 
-    ops = GDNStateRecurrenceOp.schedule_forward(
+    ops = GDNStateRecurrenceOp.schedule(
         k=k.contiguous(), w=w.contiguous(), u=u.contiguous(),
         g_cumsum=g_cumsum.contiguous(),
         h_states=h_states,
@@ -732,7 +732,7 @@ def _run_vnew_op(w, u, h_states, page_size=49152):
 
     v_new = torch.zeros(B, T, H, V, device=w.device, dtype=dtype)
 
-    ops = GDNVNewOp.schedule_forward(
+    ops = GDNVNewOp.schedule(
         w=w.contiguous(), u=u.contiguous(),
         h_states=h_states.contiguous(),
         v_new=v_new,

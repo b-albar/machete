@@ -120,7 +120,7 @@ class QKNormRopeOp(Op):
         return tiles
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          eps=1e-6, **tensors):
         """Schedule fused QKNorm+RoPE forward with auto-computed tile sizes."""
         tile_sizes = dict(tile_sizes or {})

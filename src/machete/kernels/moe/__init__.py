@@ -16,7 +16,7 @@ Usage:
     sorted_x = x[sorted_token_ids.clamp(max=x.shape[0]-1)]
 
     # Schedule and run grouped GEMM
-    ops = MoeGemmOp.schedule_forward(sorted_x=sorted_x, w=w,
+    ops = MoeGemmOp.schedule(sorted_x=sorted_x, w=w,
                                       expert_ids=expert_ids, c=c)
     config = MoeGemmOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)

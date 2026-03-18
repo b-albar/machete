@@ -59,7 +59,7 @@ def _run_moe_gemm(sorted_x, w, expert_ids, c,
     from machete.megakernel import Megakernel
     from machete.kernels.moe import MoeGemmOp
 
-    ops = MoeGemmOp.schedule_forward(
+    ops = MoeGemmOp.schedule(
         sorted_x=sorted_x, w=w, expert_ids=expert_ids, c=c,
         tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
     )

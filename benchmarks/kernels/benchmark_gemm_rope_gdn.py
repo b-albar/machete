@@ -123,11 +123,11 @@ def _schedule_gdn_ops(q, k, v, g, beta, scale, page_size):
         from machete.kernels.gated_delta_net.prep_op import GDNPrepOp
         from machete.kernels.gated_delta_net.fused_op import GDNFusedOp
 
-        prep_ops = GDNPrepOp.schedule_forward(
+        prep_ops = GDNPrepOp.schedule(
             k=k, v=v, g=g, beta=beta,
             g_cumsum=gc, w=w, u=u, page_size=page_size,
         )
-        fused_ops = GDNFusedOp.schedule_forward(
+        fused_ops = GDNFusedOp.schedule(
             q=q, k=k, w=w, u=u,
             g_cumsum=gc, o=o, scale=scale, page_size=page_size,
         )
@@ -150,23 +150,23 @@ def _schedule_gdn_ops(q, k, v, g, beta, scale, page_size):
     v_new = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
     h_states = torch.zeros(B, NT, H, K, V, device=q.device, dtype=dtype)
 
-    solve_ops = GDNSolveOp.schedule_forward(
+    solve_ops = GDNSolveOp.schedule(
         k=k, g=g, beta=beta,
         g_cumsum=gc, a_solved=a_solved, page_size=page_size,
     )
-    wu_ops = GDNWUOp.schedule_forward(
+    wu_ops = GDNWUOp.schedule(
         a_solved=a_solved, k=k, v=v,
         g_cumsum=gc, beta=beta, w=w, u=u, page_size=page_size,
     )
-    state_ops = GDNStateRecurrenceOp.schedule_forward(
+    state_ops = GDNStateRecurrenceOp.schedule(
         k=k, w=w, u=u, g_cumsum=gc,
         h_states=h_states, page_size=page_size,
     )
-    vnew_ops = GDNVNewOp.schedule_forward(
+    vnew_ops = GDNVNewOp.schedule(
         w=w, u=u, h_states=h_states,
         v_new=v_new, page_size=page_size,
     )
-    output_ops = GDNOutputOp.schedule_forward(
+    output_ops = GDNOutputOp.schedule(
         q=q, k=k, v_new=v_new, h_states=h_states,
         g_cumsum=gc, o=o, scale=scale, page_size=page_size,
     )
@@ -215,15 +215,15 @@ def bench_gemm_rope(B, T, H, K, V, page_size):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
         k_s4 = k_s.view(B, T, H, K)
-        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin, page_size=page_size)
-                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin, page_size=page_size))
+        rope_ops = (RopeOp.schedule(q=q_s4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule(q=k_s4, cos=cos, sin=sin, page_size=page_size))
         rope_kern = _build_and_run(rope_ops, RopeOp.kernel_config(rope_ops))
 
         s_stream = torch.cuda.Stream()
@@ -252,11 +252,11 @@ def bench_gemm_rope(B, T, H, K, V, page_size):
         q_f4 = q_f.view(B, T, H, K)
         k_f4 = k_f.view(B, T, H, K)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
-        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin, page_size=page_size)
-                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wv, c=v_f, page_size=page_size))
+        rope_ops = (RopeOp.schedule(q=q_f4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule(q=k_f4, cos=cos, sin=sin, page_size=page_size))
 
         all_ops = gemm_ops + rope_ops
         config = GemmOp.kernel_config(all_ops)
@@ -309,9 +309,9 @@ def bench_gemm_gdn(B, T, H, K, V, page_size):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
@@ -350,9 +350,9 @@ def bench_gemm_gdn(B, T, H, K, V, page_size):
         k_f4 = k_f.view(B, T, H, K)
         v_f4 = v_f.view(B, T, H, V)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wv, c=v_f, page_size=page_size))
 
         gdn_ops, gdn_config, gdn_bufs_f = _schedule_gdn_ops(
             q_f4, k_f4, v_f4, g, beta, scale, page_size)
@@ -410,15 +410,15 @@ def bench_gemm_rope_gdn(B, T, H, K, V, page_size):
         k_s = torch.zeros_like(k_3d)
         v_s = torch.zeros_like(v_3d)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_s, b=wq, c=q_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wk, c=k_s, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_s, b=wv, c=v_s, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_s, b=wq, c=q_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wk, c=k_s, page_size=page_size)
+                     + GemmOp.schedule(a=x_s, b=wv, c=v_s, page_size=page_size))
         gemm_kern = _build_and_run(gemm_ops, GemmOp.kernel_config(gemm_ops))
 
         q_s4 = q_s.view(B, T, H, K)
         k_s4 = k_s.view(B, T, H, K)
-        rope_ops = (RopeOp.schedule_forward(q=q_s4, cos=cos, sin=sin, page_size=page_size)
-                     + RopeOp.schedule_forward(q=k_s4, cos=cos, sin=sin, page_size=page_size))
+        rope_ops = (RopeOp.schedule(q=q_s4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule(q=k_s4, cos=cos, sin=sin, page_size=page_size))
         rope_kern = _build_and_run(rope_ops, RopeOp.kernel_config(rope_ops))
 
         v_s4 = v_s.view(B, T, H, V)
@@ -457,11 +457,11 @@ def bench_gemm_rope_gdn(B, T, H, K, V, page_size):
         k_f4 = k_f.view(B, T, H, K)
         v_f4 = v_f.view(B, T, H, V)
 
-        gemm_ops = (GemmOp.schedule_forward(a=x_f, b=wq, c=q_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wk, c=k_f, page_size=page_size)
-                     + GemmOp.schedule_forward(a=x_f, b=wv, c=v_f, page_size=page_size))
-        rope_ops = (RopeOp.schedule_forward(q=q_f4, cos=cos, sin=sin, page_size=page_size)
-                     + RopeOp.schedule_forward(q=k_f4, cos=cos, sin=sin, page_size=page_size))
+        gemm_ops = (GemmOp.schedule(a=x_f, b=wq, c=q_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wk, c=k_f, page_size=page_size)
+                     + GemmOp.schedule(a=x_f, b=wv, c=v_f, page_size=page_size))
+        rope_ops = (RopeOp.schedule(q=q_f4, cos=cos, sin=sin, page_size=page_size)
+                     + RopeOp.schedule(q=k_f4, cos=cos, sin=sin, page_size=page_size))
 
         gdn_ops, gdn_config, gdn_bufs_f = _schedule_gdn_ops(
             q_f4, k_f4, v_f4, g, beta, scale, page_size)

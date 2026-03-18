@@ -109,7 +109,7 @@ class GLUOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='silu',
+    def schedule(cls, tile_sizes=None, activation='silu',
                          page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule GLU forward.
 
@@ -233,7 +233,7 @@ class GLUOp(Op):
                         g = gate_reg[i].to(Float32)
                         u = up_reg[i].to(Float32)
 
-                        act_val = g
+                        act_val = g  # CuTe DSL: must init before dynamic if
                         if self.activation == ACT_IDENTITY:
                             act_val = g
                         elif self.activation == ACT_RELU:
@@ -345,7 +345,7 @@ class GLUBwdOp(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='silu',
+    def schedule(cls, tile_sizes=None, activation='silu',
                          page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule GLU backward.
 

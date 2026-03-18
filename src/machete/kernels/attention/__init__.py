@@ -4,7 +4,7 @@
 from .sm_100 import FlashAttentionSm100Op
 from .sm_120 import FlashAttentionSm120Op
 from .sm_120_bwd import FlashAttentionSm120BwdOp
-from .flash_decoding import FlashDecodingSplitOp, FlashDecodingCombineOp, flash_decoding_schedule
+from .flash_decoding import FlashDecodingSplitOp, flash_decoding_schedule
 from machete.megakernel.ops import DEFAULT_PAGE_SIZE
 
 import torch
@@ -68,13 +68,13 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
         tensors["lse"] = lse
 
     if use_fd:
-        ops = FlashDecodingSplitOp.schedule_forward(
+        ops = FlashDecodingSplitOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,
             **tensors,
         )
         config = FlashDecodingSplitOp.kernel_config(ops)
     else:
-        ops = FlashAttentionOp.schedule_forward(
+        ops = FlashAttentionOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,
             **tensors,
         )
@@ -85,6 +85,6 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
 
 __all__ = [
     "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120BwdOp",
-    "FlashDecodingSplitOp", "FlashDecodingCombineOp", "flash_decoding_schedule",
+    "FlashDecodingSplitOp", "flash_decoding_schedule",
     "flash_attention_schedule",
 ]

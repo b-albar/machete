@@ -125,7 +125,6 @@ class FlashAttentionSm100Op(Op):
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D ** 0.5)
-        self.kv_row_bytes = self.D * self.elem_bytes
         self.q_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
 
         self._init_mma()
@@ -181,7 +180,6 @@ class FlashAttentionSm100Op(Op):
         #   smem_consumed[0,1]: compute → store warp (buffer read done)
         #   kblock_ready[0,1]:  TMA hw → compute (new K/V data arrived)
         self.mbar_offset = 2 * self.kv_tile_bytes
-        self.mbar_bytes = 32  # 4 × 8B
 
         total_smem = 2 * self.kv_tile_bytes + self.mbar_bytes
         assert total_smem <= self.page_size, (
@@ -208,7 +206,7 @@ class FlashAttentionSm100Op(Op):
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, causal=False,
+    def schedule(cls, tile_sizes=None, causal=False,
                          kv_group_size=1,
                          page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule flash attention forward, optionally with causal masking."""

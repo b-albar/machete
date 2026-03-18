@@ -128,14 +128,14 @@ def _run_gemm_rope_megakernel(x, wq, wk, wv, cos, sin, B, T, H, K, V):
     k_4d = k_3d.view(B, T, H, K)
 
     # GEMM ops
-    gemm_q_ops = GemmOp.schedule_forward(a=x_3d, b=wq, c=q_3d)
-    gemm_k_ops = GemmOp.schedule_forward(a=x_3d, b=wk, c=k_3d)
-    gemm_v_ops = GemmOp.schedule_forward(a=x_3d, b=wv, c=v_3d)
+    gemm_q_ops = GemmOp.schedule(a=x_3d, b=wq, c=q_3d)
+    gemm_k_ops = GemmOp.schedule(a=x_3d, b=wk, c=k_3d)
+    gemm_v_ops = GemmOp.schedule(a=x_3d, b=wv, c=v_3d)
 
     # RoPE ops — q_4d/k_4d share data_ptr with q_3d/k_3d,
     # so framework auto-detects dependency (GEMM → RoPE)
-    rope_q_ops = RopeOp.schedule_forward(q=q_4d, cos=cos, sin=sin)
-    rope_k_ops = RopeOp.schedule_forward(q=k_4d, cos=cos, sin=sin)
+    rope_q_ops = RopeOp.schedule(q=q_4d, cos=cos, sin=sin)
+    rope_k_ops = RopeOp.schedule(q=k_4d, cos=cos, sin=sin)
 
     all_ops = gemm_q_ops + gemm_k_ops + gemm_v_ops + rope_q_ops + rope_k_ops
     config = GemmOp.kernel_config(all_ops)
@@ -162,12 +162,12 @@ def _run_gdn_megakernel(q_4d, k_4d, v_4d, g, beta, scale):
     u = torch.zeros(B, T, H, V, device=q_4d.device, dtype=dtype)
     o = torch.zeros(B, T, H, V, device=q_4d.device, dtype=dtype)
 
-    prep_ops = GDNPrepOp.schedule_forward(
+    prep_ops = GDNPrepOp.schedule(
         k=k_4d.contiguous(), v=v_4d.contiguous(),
         g=g.contiguous(), beta=beta.contiguous(),
         g_cumsum=gc, w=w, u=u,
     )
-    fused_ops = GDNFusedOp.schedule_forward(
+    fused_ops = GDNFusedOp.schedule(
         q=q_4d.contiguous(), k=k_4d.contiguous(), w=w, u=u,
         g_cumsum=gc, o=o, scale=scale,
     )
@@ -222,18 +222,18 @@ def _run_fully_fused_megakernel(x, wq, wk, wv, g, beta, cos, sin,
     o = torch.zeros(B, T, H, V, device=x.device, dtype=dtype)
 
     # Schedule all ops
-    gemm_q_ops = GemmOp.schedule_forward(a=x_3d, b=wq, c=q_3d)
-    gemm_k_ops = GemmOp.schedule_forward(a=x_3d, b=wk, c=k_3d)
-    gemm_v_ops = GemmOp.schedule_forward(a=x_3d, b=wv, c=v_3d)
+    gemm_q_ops = GemmOp.schedule(a=x_3d, b=wq, c=q_3d)
+    gemm_k_ops = GemmOp.schedule(a=x_3d, b=wk, c=k_3d)
+    gemm_v_ops = GemmOp.schedule(a=x_3d, b=wv, c=v_3d)
 
-    rope_q_ops = RopeOp.schedule_forward(q=q_4d, cos=cos, sin=sin)
-    rope_k_ops = RopeOp.schedule_forward(q=k_4d, cos=cos, sin=sin)
+    rope_q_ops = RopeOp.schedule(q=q_4d, cos=cos, sin=sin)
+    rope_k_ops = RopeOp.schedule(q=k_4d, cos=cos, sin=sin)
 
-    prep_ops = GDNPrepOp.schedule_forward(
+    prep_ops = GDNPrepOp.schedule(
         k=k_4d, v=v_4d, g=g.contiguous(), beta=beta.contiguous(),
         g_cumsum=gc, w=w, u=u,
     )
-    fused_ops = GDNFusedOp.schedule_forward(
+    fused_ops = GDNFusedOp.schedule(
         q=q_4d, k=k_4d, w=w, u=u,
         g_cumsum=gc, o=o, scale=scale,
     )
@@ -277,9 +277,9 @@ def _run_sequential_megakernels(x, wq, wk, wv, g, beta, cos, sin,
     k_3d = torch.zeros(B, T, D_in, dtype=dtype, device=x.device)
     v_3d = torch.zeros(B, T, D_v, dtype=dtype, device=x.device)
 
-    gemm_ops = (GemmOp.schedule_forward(a=x_3d, b=wq, c=q_3d)
-                + GemmOp.schedule_forward(a=x_3d, b=wk, c=k_3d)
-                + GemmOp.schedule_forward(a=x_3d, b=wv, c=v_3d))
+    gemm_ops = (GemmOp.schedule(a=x_3d, b=wq, c=q_3d)
+                + GemmOp.schedule(a=x_3d, b=wk, c=k_3d)
+                + GemmOp.schedule(a=x_3d, b=wv, c=v_3d))
     gemm_kernel = Megakernel(gemm_ops, config=GemmOp.kernel_config(gemm_ops))
     with contextlib.redirect_stdout(io.StringIO()):
         gemm_kernel.run()
@@ -289,8 +289,8 @@ def _run_sequential_megakernels(x, wq, wk, wv, g, beta, cos, sin,
     q_4d = q_3d.view(B, T, H, K)
     k_4d = k_3d.view(B, T, H, K)
 
-    rope_ops = (RopeOp.schedule_forward(q=q_4d, cos=cos, sin=sin)
-                + RopeOp.schedule_forward(q=k_4d, cos=cos, sin=sin))
+    rope_ops = (RopeOp.schedule(q=q_4d, cos=cos, sin=sin)
+                + RopeOp.schedule(q=k_4d, cos=cos, sin=sin))
     rope_kernel = Megakernel(rope_ops, config=RopeOp.kernel_config(rope_ops))
     with contextlib.redirect_stdout(io.StringIO()):
         rope_kernel.run()
@@ -306,11 +306,11 @@ def _run_sequential_megakernels(x, wq, wk, wv, g, beta, cos, sin,
     u = torch.zeros(B, T, H, V, device=x.device, dtype=dtype)
     o = torch.zeros(B, T, H, V, device=x.device, dtype=dtype)
 
-    gdn_ops = GDNPrepOp.schedule_forward(
+    gdn_ops = GDNPrepOp.schedule(
         k=k_4d, v=v_4d, g=g, beta=beta,
         g_cumsum=gc, w=w, u=u,
     )
-    gdn_ops += GDNFusedOp.schedule_forward(
+    gdn_ops += GDNFusedOp.schedule(
         q=q_4d, k=k_4d, w=w, u=u,
         g_cumsum=gc, o=o, scale=scale,
     )

@@ -145,7 +145,7 @@ class GDNOutputOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE,
                          tile_sizes=None, **tensors):
         """Schedule GDN output Op."""
         tile_sizes = dict(tile_sizes or {})

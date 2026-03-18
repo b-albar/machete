@@ -140,7 +140,7 @@ class GDNStateRecurrenceOp(Op):
         )
 
     @classmethod
-    def schedule_forward(cls, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, page_size=DEFAULT_PAGE_SIZE,
                          num_stages=2, tile_sizes=None, **tensors):
         """Schedule GDN state recurrence Op."""
         tile_sizes = dict(tile_sizes or {})

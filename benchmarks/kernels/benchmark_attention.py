@@ -390,7 +390,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
             # Run forward to get lse
             o_mk = torch.zeros_like(q)
             lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
-            fwd_ops = FlashAttentionSm120Op.schedule_forward(
+            fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_mk, lse=lse, page_size=page_size,
             )
             fwd_config = FlashAttentionSm120Op.kernel_config(fwd_ops)
@@ -426,7 +426,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
             # Run forward to get lse
             o_so = torch.zeros_like(q)
             lse_so = torch.empty(BH, M, dtype=torch.float32, device="cuda")
-            so_fwd_ops = FlashAttentionSm120Op.schedule_forward(
+            so_fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_so, lse=lse_so, page_size=page_size,
             )
             so_fwd_kernel = SingleOpKernel(so_fwd_ops)
@@ -508,7 +508,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
             # Run forward to get lse
             o_mk = torch.zeros_like(q)
             lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
-            fwd_ops = FlashAttentionSm120Op.schedule_forward(
+            fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_mk, lse=lse, causal=True, page_size=page_size,
             )
             fwd_config = FlashAttentionSm120Op.kernel_config(fwd_ops)
@@ -544,7 +544,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
             # Run forward to get lse
             o_so = torch.zeros_like(q)
             lse_so = torch.empty(BH, M, dtype=torch.float32, device="cuda")
-            so_fwd_ops = FlashAttentionSm120Op.schedule_forward(
+            so_fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_so, lse=lse_so, causal=True, page_size=page_size,
             )
             so_fwd_kernel = SingleOpKernel(so_fwd_ops)

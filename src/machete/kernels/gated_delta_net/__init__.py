@@ -79,11 +79,11 @@ def _run_fused_megakernel(q, k, v, g, beta, scale):
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
     # Schedule PrepOp + FusedOp — dependencies resolved via shared tensors
-    prep_ops = GDNPrepOp.schedule_forward(
+    prep_ops = GDNPrepOp.schedule(
         k=k, v=v, g=g, beta=beta,
         g_cumsum=g_cumsum, w=w, u=u,
     )
-    fused_ops = GDNFusedOp.schedule_forward(
+    fused_ops = GDNFusedOp.schedule(
         q=q, k=k, w=w, u=u,
         g_cumsum=g_cumsum, o=o, scale=scale,
     )
@@ -115,7 +115,7 @@ def _run_fused_bwd_megakernel(q, k, w, g_cumsum, do, scale):
 
     dv = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
-    ops = GDNFusedBwdOp.schedule_forward(
+    ops = GDNFusedBwdOp.schedule(
         q=q, k=k, w=w, g_cumsum=g_cumsum, do=do, dv=dv, scale=scale,
     )
     config = GDNFusedBwdOp.kernel_config(ops)
@@ -157,28 +157,28 @@ def _run_5op_megakernel(q, k, v, g, beta, scale, page_size=None):
     o = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
 
     # Schedule all 5 ops
-    solve_ops = GDNSolveOp.schedule_forward(
+    solve_ops = GDNSolveOp.schedule(
         k=k, g=g, beta=beta,
         g_cumsum=g_cumsum, a_solved=a_solved,
         page_size=page_size,
     )
-    wu_ops = GDNWUOp.schedule_forward(
+    wu_ops = GDNWUOp.schedule(
         a_solved=a_solved, k=k, v=v,
         g_cumsum=g_cumsum, beta=beta,
         w=w, u=u,
         page_size=page_size,
     )
-    state_ops = GDNStateRecurrenceOp.schedule_forward(
+    state_ops = GDNStateRecurrenceOp.schedule(
         k=k, w=w, u=u, g_cumsum=g_cumsum,
         h_states=h_states,
         page_size=page_size,
     )
-    vnew_ops = GDNVNewOp.schedule_forward(
+    vnew_ops = GDNVNewOp.schedule(
         w=w, u=u, h_states=h_states,
         v_new=v_new,
         page_size=page_size,
     )
-    output_ops = GDNOutputOp.schedule_forward(
+    output_ops = GDNOutputOp.schedule(
         q=q, k=k, v_new=v_new, h_states=h_states,
         g_cumsum=g_cumsum, o=o, scale=scale,
         page_size=page_size,

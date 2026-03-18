@@ -236,7 +236,7 @@ class GDNFusedOp(Op):
         self.compute = self.compute_mma
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "u")
 
     kernel_config = staticmethod(_kernel_config)
@@ -845,7 +845,7 @@ class GDNFusedBwdOp(Op):
         self.compute = self.compute_mma
 
     @classmethod
-    def schedule_forward(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
+    def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "do")
 
     kernel_config = staticmethod(_kernel_config)

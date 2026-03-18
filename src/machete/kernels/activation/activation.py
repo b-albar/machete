@@ -86,14 +86,12 @@ class ActivationOp(Op):
             f"Reduce tile_size_S={self.tile_size_S}."
         )
 
-        self.num_warps = self.threads_per_row // 32
-
     # =========================================================================
     # Scheduling
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='relu', page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule(cls, tile_sizes=None, activation='relu', page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule activation forward.
 
         Args:

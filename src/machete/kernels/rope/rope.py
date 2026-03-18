@@ -141,7 +141,7 @@ class RopeOp(Op):
         return tiles
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule RoPE forward with auto-computed tile sizes.
 
         q must be 4D (B, S, NH, HD).
@@ -418,7 +418,7 @@ class RopeBwdOp(Op):
     store = RopeOp.store
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule RoPE backward with auto-computed tile sizes.
 
         q must be 4D (B, S, NH, HD).

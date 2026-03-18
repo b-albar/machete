@@ -606,7 +606,7 @@ class MoeGemmOp(Op):
         return 32, 32, 16
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          **tensors):
         """Schedule forward MoE grouped GEMM.
 
