@@ -497,6 +497,12 @@ class FlashDecodingSplitOp(Op):
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
             # =============================================================
+            # Preload Q into registers (once, before KV loop)
+            # =============================================================
+            for _qkb in cutlass.range_constexpr(self.D // 16):
+                cute.copy(smem_tiled_copy_Q, tQsQ[None, None, _qkb], tQrQ_view[None, None, _qkb])
+
+            # =============================================================
             # KV loop over [kv_start_block, kv_end_block)
             # =============================================================
 
@@ -522,13 +528,11 @@ class FlashDecodingSplitOp(Op):
                     cute.copy(gmem_tiled_copy, tVgV[None, None, ci], tVsV_cp[None, None, ci])
                 cute.arch.cp_async_commit_group()
 
-                # S GEMM
+                # S GEMM (Q already in registers)
                 acc_S.fill(0.0)
-                cute.copy(smem_tiled_copy_Q, tQsQ[None, None, 0], tQrQ_view[None, None, 0])
                 cute.copy(smem_tiled_copy_K, tKsK[None, None, 0], tKrK_view[None, None, 0])
                 for kb in cutlass.range_constexpr(self.D // 16):
                     kb_next = (kb + 1) % (self.D // 16)
-                    cute.copy(smem_tiled_copy_Q, tQsQ[None, None, kb_next], tQrQ_view[None, None, kb_next])
                     cute.copy(smem_tiled_copy_K, tKsK[None, None, kb_next], tKrK_view[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_S, tCrQ[None, None, kb], tCrK[None, None, kb], acc_S)
 
