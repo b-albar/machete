@@ -294,9 +294,11 @@ class Megakernel:
     def _prepare_cute_tensors(self) -> None:
         """Prepare tensor objects for kernel parameters.
 
-        Passes torch.Tensor objects directly — CuTe DSL's TensorAdapter
-        (registered for torch.Tensor) auto-converts via from_dlpack +
-        mark_layout_dynamic, preserving N-D shape with dynamic layout.
+        Pre-converts all tensors to CuTe _Tensor objects via from_dlpack +
+        mark_layout_dynamic. This avoids the expensive TensorAdapter
+        conversion (from_dlpack) on every kernel launch — the CuTe _Tensor
+        objects have a cached __c_pointers__() that costs ~0.03us per tensor
+        vs ~3us per tensor for TensorAdapter re-creation.
 
         Tensors are threaded as runtime parameters through:
         PersistentKernel -> kernel_loop -> dispatch -> phase_fn.
@@ -304,26 +306,16 @@ class Megakernel:
         if self._cute_tensors is not None:
             return
 
+        from cutlass.cute.runtime import from_dlpack
+
         self._cute_tensors = []
         for canonical_name, tensor, dtype in self._tensor_registry.tensors:
             # detach() for gradient-tracking tensors, contiguous() for layout.
-            # Pass N-D torch.Tensor directly — TensorAdapter auto-converts
-            # via from_dlpack + mark_layout_dynamic, preserving shape for TMA.
-            # Ops that need flat 1D access get a flat alias in init source.
             t = tensor.detach().contiguous()
-            # Fix ambiguous strides: CuTe's mark_layout_dynamic() can't deduce
-            # the leading dim when multiple dims have stride 1 (happens with
-            # size-1 dims since from_dlpack normalizes their strides to 1).
-            # Convert these tensors to CuTe manually with explicit leading_dim.
-            strides = t.stride()
-            unit_dims = [i for i in range(t.ndim) if strides[i] == 1]
-            if len(unit_dims) > 1:
-                from cutlass.cute.runtime import from_dlpack
-
-                cute_t = from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-                self._cute_tensors.append(cute_t)
-            else:
-                self._cute_tensors.append(t)
+            # Convert all tensors to CuTe _Tensor objects with explicit
+            # leading_dim to handle ambiguous strides (size-1 dims).
+            cute_t = from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            self._cute_tensors.append(cute_t)
 
     def _prepare_tma_tensors(self) -> None:
         """Prepare CuTe tensors with static layout for TMA descriptor creation.
@@ -490,12 +482,14 @@ class Megakernel:
         store_fns = []
         communicate_fns = []
         inner_iters_list = []  # Per-op inner iteration count
+        per_op_warps = []  # Per-op num_mma_warps for setmaxnreg transitions
         op_tensor_args = []  # Per-op list of canonical tensor arg names
         op_tma_args = {"load": [], "compute": [], "store": [], "communicate": []}
 
         # Warp-specialized mode: DMA warps are last warps, compute threads = rest
         threads_per_block = self.config.threads_per_block
         num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32  # Exclude load + store warps
+        num_mma_warps = num_compute_threads // 32
 
         for i, op in enumerate(ops):
             # Get canonical names in declaration order for this op
@@ -525,6 +519,7 @@ class Megakernel:
             config = build_op_config(op, kernel_config=kernel_config)
             instance = op.op_cls(**config)
             inner_iters_list.append(getattr(instance, "inner_iters", 1))
+            per_op_warps.append(getattr(instance, "num_mma_warps", num_mma_warps))
 
             load_fns.append(
                 compile_phase(
@@ -592,6 +587,7 @@ class Megakernel:
             dispatch_communicate,
             inner_iters_list,
             has_communicate,
+            per_op_warps,
         )
 
     def _build_exec_dispatch_fn(
@@ -1194,9 +1190,15 @@ class Megakernel:
                 setmaxregister_decrease = _setmaxregister_noop
 
         # Build pipelined dispatch functions (with barrier replacement for compute)
-        (dispatch_load, dispatch_compute, dispatch_store, dispatch_communicate, inner_iters_list, has_communicate) = (
-            self._build_pipelined_dispatch_fns()
-        )
+        (
+            dispatch_load, dispatch_compute, dispatch_store,
+            dispatch_communicate, inner_iters_list, has_communicate,
+            per_op_warps,
+        ) = self._build_pipelined_dispatch_fns()
+
+        # Per-op warp transition: enable if any op uses fewer warps than total
+        needs_warp_transition = any(w < num_mma_warps for w in per_op_warps)
+        MIN_IDLE_REGS = 24  # PTX minimum for setmaxnreg
 
         # Build barrier functions
         signal_barriers = self._build_signal_barriers()
@@ -1693,6 +1695,26 @@ class Megakernel:
                             _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
                             _cached_op_idx = op_idx
 
+                            # Per-op register transition: idle warps
+                            # release registers, active warps reclaim them.
+                            if const_expr(needs_warp_transition):
+                                # Phase 1: warps idle for this op decrease
+                                for _ow in range_constexpr(num_ops):
+                                    if op_idx == Int32(_ow):
+                                        if warp_id >= Int32(per_op_warps[_ow]):
+                                            setmaxregister_decrease(
+                                                MIN_IDLE_REGS)
+                                # Sync: frees must complete before claims
+                                named_barrier_sync(
+                                    Int32(1), Int32(num_compute_threads))
+                                # Phase 2: active warps increase (no-op if
+                                # already at mma_reg_count)
+                                for _ow in range_constexpr(num_ops):
+                                    if op_idx == Int32(_ow):
+                                        if warp_id < Int32(per_op_warps[_ow]):
+                                            setmaxregister_increase(
+                                                mma_reg_count)
+
                         if const_expr(tracing):
                             _tc = trace_start()
 
@@ -1773,6 +1795,11 @@ class Megakernel:
                 "has_communicate": has_communicate,
                 "signal_peer_barriers": signal_peer_barriers,
                 "_peer_barriers_data_ptr": peer_barriers_data_ptr,
+                # Per-op warp register transitions
+                "needs_warp_transition": needs_warp_transition,
+                "per_op_warps": per_op_warps,
+                "MIN_IDLE_REGS": MIN_IDLE_REGS,
+                "num_ops": len(self.ops),
                 **trace_exec_globals,
             },
         )
@@ -1963,27 +1990,66 @@ class Megakernel:
                         f"since schedule() (was {meta.shape}, now {tuple(ref.shape)})."
                     )
 
-    def run(self, stream=None, sync: bool = True) -> None:
+    def _cache_launch_args(self) -> None:
+        """Cache stable launch arguments to avoid per-run Python overhead.
+
+        Int64() construction costs ~0.6us each, CUstream ~2us.
+        These values are stable after compile() — cache them once.
+        """
+        if hasattr(self, "_cached_launch_args"):
+            return
+        import cuda.bindings.driver as cuda
+
+        self._cached_launch_args = {
+            "instructions_ptr": Int64(self._instructions_tensor.data_ptr()),
+            "barriers_ptr": Int64(self._barriers_tensor.data_ptr()),
+            "op_configs_ptr": Int64(self._op_configs_tensor.data_ptr()),
+            "wait_info_ptr": Int64(self._wait_info.data_ptr()),
+            "trace_buffer_ptr": Int64(0),
+            "tma_tensor_args": [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else [],
+            "peer_tma_tensor_args": (
+                [ct for _, _, ct in self._peer_tma_cute_tensors]
+                if self._peer_tma_cute_tensors else []
+            ),
+        }
+        # Cache CUstream for the default stream
+        torch_stream = torch.cuda.current_stream()
+        self._cached_cu_stream = cuda.CUstream(torch_stream.cuda_stream)
+        self._cached_torch_stream_id = torch_stream.cuda_stream
+
+    def run(self, stream=None, sync: bool = True, validate: bool = True) -> None:
         """Run the persistent megakernel.
 
         Args:
             stream: CUDA stream (optional). If None, uses current stream.
             sync: If True (default), synchronize after launch. Set to False
                 for benchmarking or when managing synchronization externally.
+            validate: If True (default), validate tensors haven't been
+                reallocated since schedule(). Set to False for production
+                inner loops where tensors are known to be stable.
         """
         # Validate tensors haven't changed since schedule()
-        self._validate_tensors()
+        if validate:
+            self._validate_tensors()
 
         # Compile on first call (no-op if already compiled).
         # Always call compile() to ensure tensors are prepared, even when
         # _compiled_kernel was injected externally (e.g., autograd cache).
         self.compile()
 
+        # Cache stable launch args on first run
+        self._cache_launch_args()
+        cached = self._cached_launch_args
+
         if stream is None:
+            # Reuse cached CUstream if on same torch stream
             import cuda.bindings.driver as cuda
 
-            torch_stream = torch.cuda.current_stream()
-            stream = cuda.CUstream(torch_stream.cuda_stream)
+            torch_stream_id = torch.cuda.current_stream().cuda_stream
+            if torch_stream_id == self._cached_torch_stream_id:
+                stream = self._cached_cu_stream
+            else:
+                stream = cuda.CUstream(torch_stream_id)
 
         # Reset barriers for this run
         self._barriers_tensor.zero_()
@@ -1994,23 +2060,18 @@ class Megakernel:
             self._tracing_state.builder.reset()
             trace_buffer_ptr = Int64(self._tracing_state.builder._buffer.data_ptr())
         else:
-            trace_buffer_ptr = Int64(0)
+            trace_buffer_ptr = cached["trace_buffer_ptr"]
 
-        # Build TMA tensor args for __call__ (static-layout CuTe tensors)
-        tma_tensor_args = [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else []
-        peer_tma_tensor_args = [ct for _, _, ct in self._peer_tma_cute_tensors] if self._peer_tma_cute_tensors else []
-
-        wait_info_ptr = Int64(self._wait_info.data_ptr())
         self._compiled_kernel(
-            Int64(self._instructions_tensor.data_ptr()),
-            Int64(self._barriers_tensor.data_ptr()),
-            Int64(self._op_configs_tensor.data_ptr()),
+            cached["instructions_ptr"],
+            cached["barriers_ptr"],
+            cached["op_configs_ptr"],
             trace_buffer_ptr,
-            wait_info_ptr,
+            cached["wait_info_ptr"],
             self._num_instructions_i32,
             *self._cute_tensors,
-            *tma_tensor_args,
-            *peer_tma_tensor_args,
+            *cached["tma_tensor_args"],
+            *cached["peer_tma_tensor_args"],
             stream,
         )
 
@@ -2058,17 +2119,22 @@ class Megakernel:
 
         # Capture references to internal state (stable after compile)
         compiled_kernel = self._compiled_kernel
-        instructions_tensor = self._instructions_tensor
         barriers_tensor = self._barriers_tensor
-        op_configs_tensor = self._op_configs_tensor
-        wait_info = self._wait_info
         num_instructions_i32 = self._num_instructions_i32
 
         cute_tensors = list(self._cute_tensors) if self._cute_tensors else []
         tma_tensor_args = [ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else []
-        peer_tma_tensor_args = [ct for _, _, ct in self._peer_tma_cute_tensors] if self._peer_tma_cute_tensors else []
+        peer_tma_tensor_args = (
+            [ct for _, _, ct in self._peer_tma_cute_tensors]
+            if self._peer_tma_cute_tensors else []
+        )
 
-        wait_info_ptr_val = Int64(wait_info.data_ptr())
+        # Pre-cache Int64 pointers (stable after compile)
+        instructions_ptr = Int64(self._instructions_tensor.data_ptr())
+        barriers_ptr = Int64(barriers_tensor.data_ptr())
+        op_configs_ptr = Int64(self._op_configs_tensor.data_ptr())
+        wait_info_ptr = Int64(self._wait_info.data_ptr())
+        trace_ptr = Int64(0)
 
         def _setup():
             if setup_fn is not None:
@@ -2077,11 +2143,11 @@ class Megakernel:
 
         def _launch():
             compiled_kernel(
-                Int64(instructions_tensor.data_ptr()),
-                Int64(barriers_tensor.data_ptr()),
-                Int64(op_configs_tensor.data_ptr()),
-                Int64(0),  # trace_buffer_ptr (tracing disabled for benchmarks)
-                wait_info_ptr_val,
+                instructions_ptr,
+                barriers_ptr,
+                op_configs_ptr,
+                trace_ptr,
+                wait_info_ptr,
                 num_instructions_i32,
                 *cute_tensors,
                 *tma_tensor_args,

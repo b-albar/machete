@@ -36,7 +36,7 @@ from machete.megakernel.interpreter import (
 )
 
 
-def _compute_block_v(page_size, elem_bytes, V=None, num_warps=16):
+def _compute_block_v(page_size, elem_bytes, V=None, num_warps=8):
     """Compute BLOCK_V from page_size and element size.
 
     BLOCK_V is capped at 4096 elements to keep compilation fast,
@@ -103,8 +103,8 @@ class CrossEntropyOp(Op):
         else:
             self.elem_bytes = 4
 
-        # Thread config: 16 compute warps = 512 threads
-        self.num_mma_warps = 16
+        # Thread config: 8 compute warps = 256 threads
+        self.num_mma_warps = 8
         self.num_mma_threads = self.num_mma_warps * 32
         self.effective_threads = self.num_mma_threads
         self.effective_warps = self.num_mma_warps
@@ -167,7 +167,7 @@ class CrossEntropyOp(Op):
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        compute_threads = 512  # 16 warps
+        compute_threads = 256  # 8 warps
         threads_per_block = compute_threads + NUM_DMA_WARPS * 32
         page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
