@@ -134,16 +134,21 @@ class FlashDecodingSplitOp(Op):
             f"FlashDecodingSplitOp: Q tile ({self.q_tile_bytes}B) > page_size ({self.page_size}B)."
         )
 
-        # n_block: Q persists + KV double-buffer
+        # KV smem padding: same technique as Sm120Op — distributes LdMatrix
+        # accesses across banks with zero register overhead. Free for decode
+        # because n_block rounds to the same power-of-2 (plenty of kv_budget).
+        self.kv_pad = 8
+
+        # n_block: Q persists + KV double-buffer (with padding)
         kv_budget = self.page_size - self.q_tile_bytes
         assert kv_budget > 0
-        max_n_block = kv_budget // (2 * self.D * self.elem_bytes)
+        max_n_block = kv_budget // (2 * (self.D + self.kv_pad) * self.elem_bytes)
         self.n_block = 1 << int(math.log2(max(16, max_n_block)))
         if self.N < self.n_block:
             self.n_block = max(16, (self.N // 16) * 16)
         self.num_kv_blocks = (self.N + self.n_block - 1) // self.n_block
 
-        self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
+        self.kv_tile_bytes = self.n_block * (self.D + self.kv_pad) * self.elem_bytes
 
         # Compute KV blocks per split
         self.blocks_per_split = (self.num_kv_blocks + self.num_splits - 1) // self.num_splits
@@ -160,11 +165,6 @@ class FlashDecodingSplitOp(Op):
             self.swizzle_B = 1
         self.swizzle_M = 4
         self.swizzle_S = 3
-
-        # KV swizzle (cpasync, not TMA-constrained)
-        self.swizzle_KV_B = 4
-        self.swizzle_KV_M = 4
-        self.swizzle_KV_S = int(math.log2(self.D * self.elem_bytes)) - 4
 
         # cpasync thread layout
         self.async_copy_elems = 128 // (self.elem_bytes * 8)
@@ -212,14 +212,19 @@ class FlashDecodingSplitOp(Op):
             # Estimate n_block
             q_tile_bytes = M * D * elem
             kv_budget = page_size - q_tile_bytes
-            max_n_block = kv_budget // (2 * D * elem)
+            max_n_block = kv_budget // (2 * (D + 8) * elem)  # +8 = kv_pad
             n_block = 1 << int(math.log2(max(16, max_n_block)))
             if N < n_block:
                 n_block = max(16, (N // 16) * 16)
             num_n_blocks = (N + n_block - 1) // n_block
 
             total_mblocks = BH  # 1 M-tile per head for decode
-            num_splits = min(num_SMs // max(total_mblocks, 1), num_n_blocks)
+            # Cap splits so each has >= MIN_BLOCKS_PER_SPLIT KV blocks.
+            # This enables cpasync K/V pipelining within each split and
+            # reduces combine overhead (fewer fp32 partials to reduce).
+            min_blocks_per_split = 4
+            max_splits = max(1, num_n_blocks // min_blocks_per_split)
+            num_splits = min(num_SMs // max(total_mblocks, 1), max_splits)
             num_splits = max(num_splits, 1)
 
         # Allocate intermediate buffers
@@ -407,31 +412,27 @@ class FlashDecodingSplitOp(Op):
             smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
             smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
 
-            # === KV buffer base (after persistent Q) ===
+            # === KV buffer base (after persistent Q, padded rows) ===
             _kv_base = page_ptr + Int32(self.q_tile_bytes)
-            swz_kv = cute.make_swizzle(self.swizzle_KV_B, self.swizzle_KV_M, self.swizzle_KV_S)
+            _kv_ptr = cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128)
+            _kv_stride = self.D + self.kv_pad  # padded row stride (elements)
 
-            # K smem (buf0)
+            # K smem (buf0, padded stride)
             _sK = cute.make_tensor(
-                cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz_kv, dtype=self.q_dtype,
-                ),
-                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+                _kv_ptr,
+                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
             )
             _tCsK = thr_mma.partition_B(_sK)
             tCrK = tiled_mma.make_fragment_B(_tCsK)
             tKrK_view = smem_thr_copy_K.retile(tCrK)
             tKsK = smem_thr_copy_K.partition_S(_sK)
 
-            # V smem (buf1)
+            # V smem (buf1, padded stride)
             _buf1_base = _kv_base + Int32(self.kv_tile_bytes)
+            _buf1_ptr = cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128)
             _sVt = cute.make_tensor(
-                cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz_kv, dtype=self.q_dtype,
-                ),
-                cute.make_layout((self.D, self.n_block), stride=(1, self.D)),
+                _buf1_ptr,
+                cute.make_layout((self.D, self.n_block), stride=(1, _kv_stride)),
             )
             _tBsVt = thr_mma.partition_B(_sVt)
             tBrVt = tiled_mma.make_fragment_B(_tBsVt)
@@ -446,18 +447,12 @@ class FlashDecodingSplitOp(Op):
             thr_copy = gmem_tiled_copy.get_slice(tidx)
 
             sK_cp = cute.make_tensor(
-                cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz_kv, dtype=self.q_dtype,
-                ),
-                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+                _kv_ptr,
+                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
             )
             sV_cp = cute.make_tensor(
-                cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
-                    swz_kv, dtype=self.q_dtype,
-                ),
-                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+                _buf1_ptr,
+                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
             )
             tKsK_cp = thr_copy.partition_D(sK_cp)
             tVsV_cp = thr_copy.partition_D(sV_cp)
