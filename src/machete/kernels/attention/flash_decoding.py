@@ -5,16 +5,17 @@ FlashDecoding: Split-KV Attention for decode workloads.
 For small BH (batch×heads) and small M (query length), the standard FA kernel
 uses only 1 CTA per head, leaving most SMs idle. FlashDecoding splits the KV
 sequence across multiple CTAs (splits), each producing partial O and LSE in
-fp32. A combine kernel reduces the partials into the final output.
+fp32. A separate CombineOp reduces the partials into the final output.
 
-Architecture (Compute-driven TMA):
-    DMA warp: TMA Q load (single shot) + init mbarriers.
-    MMA warps: Warp 0 issues TMA K/V loads. All warps do MMA compute.
-    Store warp: Fused combine epilogue (atomic counter, reduce partials).
+Architecture:
+    FlashDecodingSplitOp (BH × num_splits tiles):
+        DMA warp: TMA Q load (single shot) + init mbarriers.
+        MMA warps: Warp 0 issues TMA K/V loads. All warps do MMA compute.
+        Writes fp32 partials (o_partial, lse_partial) to global.
 
-    Overlap:
-        V[i] loads during S GEMM (Q × K[i]^T).
-        K[i+1] loads during softmax + O GEMM (P × V[i]).
+    FlashDecodingCombineOp (BH tiles):
+        All MMA warps reduce partials into final O (bf16) and LSE (fp32).
+        Framework guarantees all SplitOp tiles complete before CombineOp starts.
 
 Usage:
     from machete.kernels.attention.flash_decoding import flash_decoding_schedule
@@ -29,7 +30,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32
+from cutlass import Int32, Float32
 from cutlass.cute.nvgpu import warp
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
@@ -39,7 +40,6 @@ from machete.megakernel.interpreter import (
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
     named_barrier_sync,
-    atomic_add_acq_rel_gpu_i32,
 )
 
 # Op-managed mbarriers: kblock_ready_K + kblock_ready_V = 2 × 8B
@@ -71,9 +71,6 @@ class FlashDecodingSplitOp(Op):
     writes = {
         "o_partial": (cutlass.Float32, ("BH", "SPLIT", "M", "D")),
         "lse_partial": (cutlass.Float32, ("BH", "SPLIT", "M")),
-        "o": (None, ("BH", "M", "D")),
-        "lse": (cutlass.Float32, ("BH", "M")),
-        "split_counter": (cutlass.Int32, ("BH",)),
     }
     tile = ("BH", "SPLIT")
 
@@ -119,9 +116,6 @@ class FlashDecodingSplitOp(Op):
 
         self.scale_val = 1.0 / (self.D ** 0.5)
         self.q_tile_bytes = self.M * self.D * self.elem_bytes
-
-        # Raw pointer for atomic counter (set via static_dims)
-        self.split_counter_ptr = getattr(self, "split_counter_ptr", 0)
 
         # num_splits stored as SPLIT dim extent
         self.num_splits = self.SPLIT
@@ -192,7 +186,7 @@ class FlashDecodingSplitOp(Op):
     def schedule(cls, tile_sizes=None, causal=False,
                          page_size=DEFAULT_PAGE_SIZE, kv_group_size=1,
                          num_splits=0, **tensors):
-        """Schedule split-KV forward pass with fused combine."""
+        """Schedule split-KV forward pass (partials only, no combine)."""
         import torch
 
         q = tensors["q"]
@@ -201,7 +195,6 @@ class FlashDecodingSplitOp(Op):
         N = k.shape[1]
 
         assert q.element_size() == 2
-        assert "o" in tensors, "FlashDecodingSplitOp.schedule requires 'o' tensor"
 
         # Bump page_size to accommodate op-managed mbarriers
         effective_page_size = page_size + _MBAR_BYTES
@@ -227,10 +220,6 @@ class FlashDecodingSplitOp(Op):
         # Allocate intermediate buffers
         o_partial = torch.empty(BH, num_splits, M, D, dtype=torch.float32, device=q.device)
         lse_partial = torch.empty(BH, num_splits, M, dtype=torch.float32, device=q.device)
-        split_counter = torch.zeros(BH, dtype=torch.int32, device=q.device)
-
-        if "lse" not in tensors:
-            tensors["lse"] = torch.empty(BH, M, dtype=torch.float32, device=q.device)
 
         tile_sizes = dict(tile_sizes or {})
         tile_sizes["BH"] = 1
@@ -238,7 +227,6 @@ class FlashDecodingSplitOp(Op):
 
         tensors["o_partial"] = o_partial
         tensors["lse_partial"] = lse_partial
-        tensors["split_counter"] = split_counter
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
 
@@ -260,35 +248,7 @@ class FlashDecodingSplitOp(Op):
         if kv_group_size > 1:
             ops[0].static_dims["kv_group_size"] = kv_group_size
 
-        # Raw pointer for atomic counter
-        ops[0].static_dims["split_counter_ptr"] = split_counter.data_ptr()
-
-        return ops
-
-    @classmethod
-    def kernel_config(cls, ops):
-        """Return recommended MegakernelConfig for split ops."""
-        from machete.megakernel import MegakernelConfig
-        from machete.megakernel.megakernel import NUM_DMA_WARPS
-
-        M = ops[0].static_dims["M"]
-        num_mma_warps = M // 16
-        threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
-        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
-
-        # Limit grid to actual tiles for standalone decode attention
-        total_tiles = sum(op.total_tiles for op in ops)
-        import torch
-        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-        num_sms = min(num_sms, total_tiles)
-
-        return MegakernelConfig(
-            threads_per_block=threads_per_block,
-            page_size=page_size,
-            noinline=True,
-            num_pages=2,
-            num_sms=num_sms,
-        )
+        return ops, o_partial, lse_partial
 
     # =========================================================================
     # Load (TMA Q + init mbarriers)
@@ -363,7 +323,7 @@ class FlashDecodingSplitOp(Op):
 
     @cute.jit
     def compute_mma(self, page_ptr, tile_BH, tile_SPLIT,
-                    q, k, v, o_partial, lse_partial, o, lse, split_counter,
+                    q, k, v, o_partial, lse_partial,
                     k_tma, k_tma_gmem, v_tma, v_tma_gmem):
         """Compute-driven TMA split-KV flash attention.
 
@@ -683,36 +643,61 @@ class FlashDecodingSplitOp(Op):
                         g_lse[Int32(row_idx)] = lse_val
 
 
-    # =========================================================================
-    # Store — fused combine epilogue
-    # =========================================================================
+# =============================================================================
+# CombineOp — parallel reduction of split partials
+# =============================================================================
+
+
+class FlashDecodingCombineOp(Op):
+    """Combine partial O and LSE from split-KV attention into final output.
+
+    All MMA warps participate in the reduction — 8x more parallelism than
+    the previous 32-thread store warp approach.
+
+    Framework guarantees all SplitOp tiles complete before CombineOp starts
+    (automatic dependency detection via shared o_partial tensor pointer).
+    """
+
+    reads = {
+        "o_partial": (cutlass.Float32, ("BH", "SPLIT", "M", "D")),
+        "lse_partial": (cutlass.Float32, ("BH", "SPLIT", "M")),
+    }
+    writes = {
+        "o": (None, ("BH", "M", "D")),
+        "lse": (cutlass.Float32, ("BH", "M")),
+    }
+    tile = ("BH",)
+    tma_loads = set()
+    tma_stores = set()
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.num_splits = self.SPLIT
+        self.num_mma_threads = self.threads_per_row
+        self.inner_iters = 1
+        self.inner_depth = 1
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        """Schedule combine op — one tile per head."""
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("BH", 1)
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        return ops
 
     @cute.jit
-    def store(self, page_ptr, tile_BH, tile_SPLIT,
-              q, k, v, o_partial, lse_partial, o, lse, split_counter):
-        """Fused combine epilogue in the store warp.
+    def compute(self, page_ptr, tile_BH, o_partial, lse_partial, o, lse):
+        """Reduce num_splits partial O/LSE into final output.
 
-        After compute writes partials to global, the store warp atomically
-        increments a per-head counter. The LAST split's store warp detects
-        this and performs the combine reduction across all splits.
-
-        All 32 threads of the store warp participate.
+        All MMA warps participate. Each thread handles a strided subset
+        of M×D output elements, reading all splits per element.
         """
-        lane_id = cute.arch.thread_idx()[0] % Int32(32)
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.warp_idx()
+        num_mma_warps = Int32(self.num_mma_threads // 32)
 
-        # Atomic increment — thread 0 does the atomic, broadcasts result
-        old_count = Int32(0)
-        if lane_id == Int32(0):
-            # Use raw pointer (Int64) from static_dims for atomic
-            counter_base = Int64(self.split_counter_ptr)
-            old_count = atomic_add_acq_rel_gpu_i32(counter_base, tile_BH)
-        old_count = cute.arch.shuffle_sync(old_count, offset=0, mask=-1, mask_and_clamp=31)
-
-        if (old_count + Int32(1)) % Int32(self.num_splits) == Int32(0):
-            # Last split: combine all partials into final O and LSE
-            # All 32 threads participate in the reduction
-
-            # Create CuTe tensors for global memory access
+        if warp_idx < num_mma_warps:
+            # Global memory tensors for this head
             # o_partial: (BH, SPLIT, M, D) fp32
             g_op = cute.make_tensor(
                 o_partial.iterator + tile_BH * Int32(self.num_splits * self.M * self.D),
@@ -738,7 +723,7 @@ class FlashDecodingSplitOp(Op):
 
             # Each thread handles elements in a strided pattern over M*D
             total_elems = Int32(self.M * self.D)
-            elem_idx = lane_id
+            elem_idx = tidx
             while elem_idx < total_elems:
                 row = elem_idx // Int32(self.D)
                 col = elem_idx % Int32(self.D)
@@ -766,13 +751,13 @@ class FlashDecodingSplitOp(Op):
                 # Normalize and write output
                 inv_scale_sum = cute.arch.rcp_approx(scale_sum)
                 result = acc * inv_scale_sum
-                g_o[row, col] = result.to(self.q_dtype)
+                g_o[row, col] = result.to(self.o_dtype)
 
                 # Write LSE (only once per row, from the thread handling col=0)
                 if col == Int32(0):
                     g_lse[row] = lse_max + cute.math.log(scale_sum)
 
-                elem_idx = elem_idx + Int32(32)
+                elem_idx = elem_idx + Int32(self.num_mma_threads)
 
 
 # =============================================================================
@@ -780,13 +765,34 @@ class FlashDecodingSplitOp(Op):
 # =============================================================================
 
 
+def flash_decoding_kernel_config(ops):
+    """Return recommended MegakernelConfig for flash decoding ops."""
+    from machete.megakernel import MegakernelConfig
+    from machete.megakernel.megakernel import NUM_DMA_WARPS
+    import torch
+
+    # Use 8 MMA warps: SplitOp uses M//16 (typically 1), CombineOp uses all 8
+    num_mma_warps = 8
+    threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
+    page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+
+    total_tiles = sum(op.total_tiles for op in ops)
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_sms = min(num_sms, total_tiles)
+
+    return MegakernelConfig(
+        threads_per_block=threads_per_block,
+        page_size=page_size,
+        noinline=True,
+        num_pages=2,
+        num_sms=num_sms,
+    )
+
+
 def flash_decoding_schedule(q, k, v, o, num_splits=0,
                             page_size=DEFAULT_PAGE_SIZE,
                             causal=False, kv_group_size=1):
-    """Schedule FlashDecoding split-KV with fused combine.
-
-    The combine is fused into the store warp epilogue of the split op,
-    eliminating the need for a separate CombineOp.
+    """Schedule FlashDecoding split-KV with separate CombineOp.
 
     Returns:
         (ops, config): List of ScheduledOps and MegakernelConfig.
@@ -796,15 +802,25 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     BH, M, D = q.shape
     lse = torch.empty(BH, M, dtype=torch.float32, device=q.device)
 
-    # Schedule split ops with fused combine
-    split_ops = FlashDecodingSplitOp.schedule(
-        q=q, k=k, v=v, o=o, lse=lse,
+    # Schedule split ops (writes fp32 partials)
+    split_ops, o_partial, lse_partial = FlashDecodingSplitOp.schedule(
+        q=q, k=k, v=v,
         num_splits=num_splits,
         page_size=page_size, causal=causal, kv_group_size=kv_group_size,
     )
 
-    config = FlashDecodingSplitOp.kernel_config(split_ops)
-    return split_ops, config
+    # Schedule combine op (reduces partials → final output)
+    combine_ops = FlashDecodingCombineOp.schedule(
+        o_partial=o_partial, lse_partial=lse_partial, o=o, lse=lse,
+    )
+
+    ops = split_ops + combine_ops
+    config = flash_decoding_kernel_config(ops)
+    return ops, config
 
 
-__all__ = ["FlashDecodingSplitOp", "flash_decoding_schedule"]
+__all__ = [
+    "FlashDecodingSplitOp",
+    "FlashDecodingCombineOp",
+    "flash_decoding_schedule",
+]
