@@ -7,9 +7,14 @@ uses only 1 CTA per head, leaving most SMs idle. FlashDecoding splits the KV
 sequence across multiple CTAs (splits), each producing partial O and LSE in
 fp32. A combine kernel reduces the partials into the final output.
 
-Architecture:
-    FlashDecodingSplitOp: tile=(BH, SPLIT) — each CTA handles a KV range.
-    Combine is fused into the store warp epilogue (no separate op needed).
+Architecture (Compute-driven TMA):
+    DMA warp: TMA Q load (single shot) + init mbarriers.
+    MMA warps: Warp 0 issues TMA K/V loads. All warps do MMA compute.
+    Store warp: Fused combine epilogue (atomic counter, reduce partials).
+
+    Overlap:
+        V[i] loads during S GEMM (Q × K[i]^T).
+        K[i+1] loads during softmax + O GEMM (P × V[i]).
 
 Usage:
     from machete.kernels.attention.flash_decoding import flash_decoding_schedule
@@ -28,11 +33,21 @@ from cutlass import Int32, Int64, Float32
 from cutlass.cute.nvgpu import warp
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
-from machete.megakernel.interpreter import named_barrier_sync, atomic_add_acq_rel_gpu_i32
+from machete.megakernel.interpreter import (
+    mbarrier_init,
+    mbarrier_init_fence,
+    mbarrier_arrive_expect_tx,
+    mbarrier_wait,
+    named_barrier_sync,
+    atomic_add_acq_rel_gpu_i32,
+)
+
+# Op-managed mbarriers: kblock_ready_K + kblock_ready_V = 2 × 8B
+_MBAR_BYTES = 16
 
 
 class FlashDecodingSplitOp(Op):
-    """Split-KV attention: each tile processes a subset of KV blocks.
+    """Split-KV attention with compute-driven TMA K/V loads.
 
     Tensors:
         q: (BH, M, D) — query (fp16/bf16)
@@ -62,29 +77,34 @@ class FlashDecodingSplitOp(Op):
     }
     tile = ("BH", "SPLIT")
 
-    # Q via TMA (DMA warp loads once), K/V via cpasync in compute
-    tma_loads = {"q"}
+    # Q/K/V via TMA: Q loaded by DMA warp, K/V by compute warp 0
+    tma_loads = {"q", "k", "v"}
     tma_stores = set()  # Partials written to global from compute
 
     @classmethod
+    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
+        """Custom TMA tile shapes for K/V (n_block sub-tiling).
+
+        Returns shape in CuTe mode order (D, n_block, BH).
+        The framework permutes PyTorch (BH, N, D) → CuTe (D, N, BH),
+        so tile_shape[0] maps to D (contiguous), tile_shape[1] to N.
+        """
+        if tensor_name in ("k", "v"):
+            n_block = static_dims["n_block"]
+            D = static_dims["D"]
+            return (1, n_block, D)
+        return None  # Q uses defaults
+
+    @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
-        """Swizzled smem layout for Q TMA load descriptor."""
-        if tensor_name != "q":
-            return None
-        D = static_dims["D"]
-        if D >= 64:
-            B = 3
-        elif D >= 32:
-            B = 2
-        else:
-            B = 1
-        dim0, dim1, dim2 = tma_tile_shape
-        return (
-            f"cute.make_composed_layout("
-            f"cute.make_swizzle({B}, 4, 3), 0, "
-            f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
-            f"stride=(1, {dim0}, {dim0 * dim1})))"
-        )
+        """Plain smem layout for TMA — no swizzle for multi-row TMA boxes.
+
+        Without swizzle, TMA can use full-width boxes (256B for D=128 bf16)
+        × all n_block rows in a single cp.async.bulk.tensor.2d, reducing
+        128 TMA ops per K/V load to just 1.
+        """
+        # Return None → framework uses default plain layout
+        return None
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -103,19 +123,13 @@ class FlashDecodingSplitOp(Op):
         # Raw pointer for atomic counter (set via static_dims)
         self.split_counter_ptr = getattr(self, "split_counter_ptr", 0)
 
-        # Stride overrides for strided K/V
-        self.k_bh_stride = getattr(self, "k_bh_stride", self.N * self.D)
-        self.k_n_stride = getattr(self, "k_n_stride", self.D)
-        self.v_bh_stride = getattr(self, "v_bh_stride", self.N * self.D)
-        self.v_n_stride = getattr(self, "v_n_stride", self.D)
-
         # num_splits stored as SPLIT dim extent
         self.num_splits = self.SPLIT
 
         self._init_mma()
 
     def _init_mma(self):
-        """Init MMA path — tile_M = M (full query, since M is small for decode)."""
+        """Init compute-driven TMA MMA path."""
         self.tile_size_M = self.M  # Full M per tile (decode: M is small)
         assert self.tile_size_M % 16 == 0 and self.tile_size_M >= 16, (
             f"FlashDecodingSplitOp: M={self.M} must be a positive multiple of 16."
@@ -134,43 +148,34 @@ class FlashDecodingSplitOp(Op):
             f"FlashDecodingSplitOp: Q tile ({self.q_tile_bytes}B) > page_size ({self.page_size}B)."
         )
 
-        # KV smem padding: same technique as Sm120Op — distributes LdMatrix
-        # accesses across banks with zero register overhead. Free for decode
-        # because n_block rounds to the same power-of-2 (plenty of kv_budget).
-        self.kv_pad = 8
+        # Op-managed mbarriers: kblock_ready_K, kblock_ready_V (2 × 8B = 16B)
+        self.mbar_bytes = _MBAR_BYTES
 
-        # n_block: Q persists + KV double-buffer (with padding)
-        kv_budget = self.page_size - self.q_tile_bytes
-        assert kv_budget > 0
-        max_n_block = kv_budget // (2 * (self.D + self.kv_pad) * self.elem_bytes)
+        # n_block: page = Q + 2×KV + mbarriers
+        kv_budget = self.page_size - self.q_tile_bytes - self.mbar_bytes
+        assert kv_budget > 0, (
+            f"FlashDecodingSplitOp: page_size ({self.page_size}B) must be > "
+            f"Q tile + mbarriers ({self.q_tile_bytes + self.mbar_bytes}B)."
+        )
+        max_n_block = kv_budget // (2 * self.D * self.elem_bytes)
         self.n_block = 1 << int(math.log2(max(16, max_n_block)))
         if self.N < self.n_block:
             self.n_block = max(16, (self.N // 16) * 16)
         self.num_kv_blocks = (self.N + self.n_block - 1) // self.n_block
 
-        self.kv_tile_bytes = self.n_block * (self.D + self.kv_pad) * self.elem_bytes
+        self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
+        self.mbar_offset = self.q_tile_bytes + 2 * self.kv_tile_bytes
+
+        total_smem = self.q_tile_bytes + 2 * self.kv_tile_bytes + self.mbar_bytes
+        assert total_smem <= self.page_size, (
+            f"FlashDecodingSplitOp: Q + KV + mbar ({total_smem}B) > page_size ({self.page_size}B)."
+        )
 
         # Compute KV blocks per split
         self.blocks_per_split = (self.num_kv_blocks + self.num_splits - 1) // self.num_splits
 
         self.inner_iters = 1
         self.inner_depth = 1
-
-        # Swizzle for Q (TMA-constrained: S=3)
-        if self.D >= 64:
-            self.swizzle_B = 3
-        elif self.D >= 32:
-            self.swizzle_B = 2
-        else:
-            self.swizzle_B = 1
-        self.swizzle_M = 4
-        self.swizzle_S = 3
-
-        # cpasync thread layout
-        self.async_copy_elems = 128 // (self.elem_bytes * 8)
-        self.copy_dim1 = self.D // self.async_copy_elems
-        self.copy_dim0 = self.num_mma_threads // self.copy_dim1
-        assert self.n_block % self.copy_dim0 == 0
 
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
@@ -187,14 +192,7 @@ class FlashDecodingSplitOp(Op):
     def schedule(cls, tile_sizes=None, causal=False,
                          page_size=DEFAULT_PAGE_SIZE, kv_group_size=1,
                          num_splits=0, **tensors):
-        """Schedule split-KV forward pass with fused combine.
-
-        Allocates intermediate buffers (o_partial, lse_partial, split_counter)
-        and schedules split ops. The combine is fused into the store warp
-        epilogue — no separate CombineOp needed.
-
-        Requires 'o' and 'lse' in tensors for the fused combine output.
-        """
+        """Schedule split-KV forward pass with fused combine."""
         import torch
 
         q = tensors["q"]
@@ -205,24 +203,23 @@ class FlashDecodingSplitOp(Op):
         assert q.element_size() == 2
         assert "o" in tensors, "FlashDecodingSplitOp.schedule requires 'o' tensor"
 
+        # Bump page_size to accommodate op-managed mbarriers
+        effective_page_size = page_size + _MBAR_BYTES
+
         # Auto num_splits
         if num_splits <= 0:
             num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
             elem = q.element_size()
-            # Estimate n_block
             q_tile_bytes = M * D * elem
-            kv_budget = page_size - q_tile_bytes
-            max_n_block = kv_budget // (2 * (D + 8) * elem)  # +8 = kv_pad
+            kv_budget = effective_page_size - q_tile_bytes - _MBAR_BYTES
+            max_n_block = kv_budget // (2 * D * elem)
             n_block = 1 << int(math.log2(max(16, max_n_block)))
             if N < n_block:
                 n_block = max(16, (N // 16) * 16)
             num_n_blocks = (N + n_block - 1) // n_block
 
             total_mblocks = BH  # 1 M-tile per head for decode
-            # Cap splits so each has >= MIN_BLOCKS_PER_SPLIT KV blocks.
-            # This enables cpasync K/V pipelining within each split and
-            # reduces combine overhead (fewer fp32 partials to reduce).
-            min_blocks_per_split = 4
+            min_blocks_per_split = 2
             max_splits = max(1, num_n_blocks // min_blocks_per_split)
             num_splits = min(num_SMs // max(total_mblocks, 1), max_splits)
             num_splits = max(num_splits, 1)
@@ -230,11 +227,8 @@ class FlashDecodingSplitOp(Op):
         # Allocate intermediate buffers
         o_partial = torch.empty(BH, num_splits, M, D, dtype=torch.float32, device=q.device)
         lse_partial = torch.empty(BH, num_splits, M, dtype=torch.float32, device=q.device)
-
-        # Allocate split counter for fused combine (atomic, one per head)
         split_counter = torch.zeros(BH, dtype=torch.int32, device=q.device)
 
-        # Allocate LSE output if not provided
         if "lse" not in tensors:
             tensors["lse"] = torch.empty(BH, M, dtype=torch.float32, device=q.device)
 
@@ -247,7 +241,19 @@ class FlashDecodingSplitOp(Op):
         tensors["split_counter"] = split_counter
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
-        ops[0].static_dims["page_size"] = page_size
+
+        # Compute n_block for static_dims (must match _init_mma)
+        elem = q.element_size()
+        _q_tile = M * D * elem
+        _kv_budget = effective_page_size - _q_tile - _MBAR_BYTES
+        if _kv_budget > 0:
+            _max_n = _kv_budget // (2 * D * elem)
+            _n_block = 1 << int(math.log2(max(16, _max_n)))
+            if N < _n_block:
+                _n_block = max(16, (N // 16) * 16)
+            ops[0].static_dims["n_block"] = _n_block
+
+        ops[0].static_dims["page_size"] = effective_page_size
         ops[0].static_dims["num_splits"] = num_splits
         if causal:
             ops[0].static_dims["causal"] = 1
@@ -256,15 +262,6 @@ class FlashDecodingSplitOp(Op):
 
         # Raw pointer for atomic counter
         ops[0].static_dims["split_counter_ptr"] = split_counter.data_ptr()
-
-        # Strided K/V support
-        if not k.is_contiguous():
-            ops[0].static_dims["k_bh_stride"] = k.stride(0)
-            ops[0].static_dims["k_n_stride"] = k.stride(1)
-        v = tensors.get("v")
-        if v is not None and not v.is_contiguous():
-            ops[0].static_dims["v_bh_stride"] = v.stride(0)
-            ops[0].static_dims["v_n_stride"] = v.stride(1)
 
         return ops
 
@@ -278,30 +275,45 @@ class FlashDecodingSplitOp(Op):
         num_mma_warps = M // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
-        return MegakernelConfig(threads_per_block=threads_per_block, page_size=page_size)
+
+        # Limit grid to actual tiles for standalone decode attention
+        total_tiles = sum(op.total_tiles for op in ops)
+        import torch
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        num_sms = min(num_sms, total_tiles)
+
+        return MegakernelConfig(
+            threads_per_block=threads_per_block,
+            page_size=page_size,
+            noinline=True,
+            num_pages=2,
+            num_sms=num_sms,
+        )
 
     # =========================================================================
-    # Load (TMA Q only — same as FlashAttentionSm120Op)
+    # Load (TMA Q + init mbarriers)
     # =========================================================================
 
     @cute.jit
     def load(self, page_ptr, tile_BH, tile_SPLIT, q_tma, q_tma_gmem, work_mbar):
-        """TMA Q load into page (single shot, swizzled for LdMatrix reads).
+        """TMA Q load + init op-managed mbarriers for compute-driven K/V TMA.
 
-        Note: tile_SPLIT is unused here — Q is the same for all splits of a head.
-        The TMA coord uses tile_BH to select the head.
+        Mbarriers (initialized here, used by compute warp 0):
+          kblock_ready_K (offset +0): signals K data arrived in smem
+          kblock_ready_V (offset +8): signals V data arrived in smem
         """
-        from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
+        # Init mbarriers for compute-driven K/V TMA
+        _kr_K = page_ptr + Int32(self.mbar_offset)
+        _kr_V = page_ptr + Int32(self.mbar_offset + 8)
+        with cute.arch.elect_one():
+            mbarrier_init(_kr_K, Int32(1))
+            mbarrier_init(_kr_V, Int32(1))
+        mbarrier_init_fence()
 
+        # TMA Q → page start (plain layout, no swizzle for multi-row TMA)
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-
-        _q_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
         sQ = cute.make_tensor(
-            cute.recast_ptr(
-                cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
-                _q_swz,
-                dtype=self.q_dtype,
-            ),
+            cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
             cute.make_layout((self.D, self.tile_size_M, 1)),
         )
         gQ = cute.local_tile(
@@ -310,20 +322,17 @@ class FlashDecodingSplitOp(Op):
             (None, None, None),
         )
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
-            q_tma,
-            Int32(0),
-            cute.make_layout(1),
+            q_tma, Int32(0), cute.make_layout(1),
             cute.group_modes(sQ, 0, 3),
             cute.group_modes(gQ, 0, 3),
         )
         nbytes = Int32(self.q_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        # Q tile indices: D and M are full-extent (not tile dims), so tile index = 0
         cute.copy(q_tma, tQgQ[(None, Int32(0), Int32(0), tile_BH)], tQsQ, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
-    # MMA Helpers (same as Sm120Op)
+    # MMA Helpers
     # =========================================================================
 
     def _make_acc_tensor_mn_view(self, acc):
@@ -349,21 +358,66 @@ class FlashDecodingSplitOp(Op):
         return self._threadquad_reduce(val, lambda x, y: x + y)
 
     # =========================================================================
-    # Compute — split-KV variant of FlashAttentionSm120Op.compute_mma
+    # Compute — compute-driven TMA split-KV flash attention
     # =========================================================================
 
     @cute.jit
     def compute_mma(self, page_ptr, tile_BH, tile_SPLIT,
-                    q, k, v, o_partial, lse_partial, o, lse, split_counter):
-        """Split-KV flash attention: process KV blocks [kv_start, kv_end).
+                    q, k, v, o_partial, lse_partial, o, lse, split_counter,
+                    k_tma, k_tma_gmem, v_tma, v_tma_gmem):
+        """Compute-driven TMA split-KV flash attention.
 
-        Same MMA pipeline as FlashAttentionSm120Op but:
-        - Only processes a subset of KV blocks (determined by tile_SPLIT)
-        - Writes fp32 partial O and LSE to global memory (no smem O write)
-        - No TMA store (store warp is a no-op)
+        Same pipeline as FlashAttentionSm120Op but processes only KV blocks
+        [kv_start, kv_end) and writes fp32 partials to global memory.
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
+
+        # GQA: map Q head index to KV head index
+        kv_bh = tile_BH // Int32(self.kv_group_size)
+
+        # === TMA partition setup (must be at function top level — ===
+        # === TMA atoms cannot cross MLIR SCF region boundaries)  ===
+
+        _k_base = page_ptr + Int32(self.q_tile_bytes)
+        _v_base = page_ptr + Int32(self.q_tile_bytes + self.kv_tile_bytes)
+
+        sK_tma = cute.make_tensor(
+            cute.make_ptr(self.q_dtype, _k_base, cute.AddressSpace.smem),
+            cute.make_layout(
+                (self.D, self.n_block, 1),
+                stride=(1, self.D, self.D * self.n_block)),
+        )
+        gK_tma = cute.local_tile(
+            k_tma_gmem, (self.D, self.n_block, 1), (None, None, None),
+        )
+        tKsK_tma, tKgK_tma = cute.nvgpu.cpasync.tma_partition(
+            k_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sK_tma, 0, 3),
+            cute.group_modes(gK_tma, 0, 3),
+        )
+
+        sV_tma = cute.make_tensor(
+            cute.make_ptr(self.q_dtype, _v_base, cute.AddressSpace.smem),
+            cute.make_layout(
+                (self.D, self.n_block, 1),
+                stride=(1, self.D, self.D * self.n_block)),
+        )
+        gV_tma = cute.local_tile(
+            v_tma_gmem, (self.D, self.n_block, 1), (None, None, None),
+        )
+        tVsV_tma, tVgV_tma = cute.nvgpu.cpasync.tma_partition(
+            v_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sV_tma, 0, 3),
+            cute.group_modes(gV_tma, 0, 3),
+        )
+
+        # Op-managed mbarrier pointers
+        _kr_K = page_ptr + Int32(self.mbar_offset)
+        _kr_V = page_ptr + Int32(self.mbar_offset + 8)
+        _kr_K_ptr = cute.make_ptr(cutlass.Int64, _kr_K, cute.AddressSpace.smem)
+        _kr_V_ptr = cute.make_ptr(cutlass.Int64, _kr_V, cute.AddressSpace.smem)
+        nbytes_kv = Int32(self.kv_tile_bytes)
 
         if warp_idx < Int32(self.num_mma_warps):
             # === Determine KV range for this split ===
@@ -381,13 +435,9 @@ class FlashDecodingSplitOp(Op):
             )
             thr_mma = tiled_mma.get_slice(tidx)
 
-            # === Swizzle + LdMatrix setup ===
-            swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
+            # === Q smem tensor (persistent, plain layout) ===
             sQ = cute.make_tensor(
-                cute.recast_ptr(
-                    cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
-                    swz, dtype=self.q_dtype,
-                ),
+                cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
                 cute.make_layout((self.tile_size_M, self.D), stride=(self.D, 1)),
             )
             _tCsQ = thr_mma.partition_A(sQ)
@@ -412,59 +462,27 @@ class FlashDecodingSplitOp(Op):
             smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
             smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
 
-            # === KV buffer base (after persistent Q, padded rows) ===
-            _kv_base = page_ptr + Int32(self.q_tile_bytes)
-            _kv_ptr = cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128)
-            _kv_stride = self.D + self.kv_pad  # padded row stride (elements)
-
-            # K smem (buf0, padded stride)
+            # === K smem tensor + LdMatrix fragments (plain layout) ===
             _sK = cute.make_tensor(
-                _kv_ptr,
-                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
+                cute.make_ptr(self.q_dtype, _k_base, cute.AddressSpace.smem, assumed_align=128),
+                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
             )
             _tCsK = thr_mma.partition_B(_sK)
             tCrK = tiled_mma.make_fragment_B(_tCsK)
             tKrK_view = smem_thr_copy_K.retile(tCrK)
             tKsK = smem_thr_copy_K.partition_S(_sK)
 
-            # V smem (buf1, padded stride)
-            _buf1_base = _kv_base + Int32(self.kv_tile_bytes)
-            _buf1_ptr = cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128)
+            # === V smem tensor + LdMatrix fragments (plain layout, transposed) ===
             _sVt = cute.make_tensor(
-                _buf1_ptr,
-                cute.make_layout((self.D, self.n_block), stride=(1, _kv_stride)),
+                cute.make_ptr(self.q_dtype, _v_base, cute.AddressSpace.smem, assumed_align=128),
+                cute.make_layout((self.D, self.n_block), stride=(1, self.D)),
             )
             _tBsVt = thr_mma.partition_B(_sVt)
             tBrVt = tiled_mma.make_fragment_B(_tBsVt)
             tVrVt_view = smem_thr_copy_Vt.retile(tBrVt)
             tVsVt = smem_thr_copy_Vt.partition_S(_sVt)
 
-            # === cpasync tiled copy setup ===
-            async_copy_atom = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), self.q_dtype, num_bits_per_copy=128)
-            copy_thread_layout = cute.make_layout((self.copy_dim0, self.copy_dim1), stride=(self.copy_dim1, 1))
-            copy_value_layout = cute.make_layout((1, self.async_copy_elems))
-            gmem_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, copy_thread_layout, copy_value_layout)
-            thr_copy = gmem_tiled_copy.get_slice(tidx)
-
-            sK_cp = cute.make_tensor(
-                _kv_ptr,
-                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
-            )
-            sV_cp = cute.make_tensor(
-                _buf1_ptr,
-                cute.make_layout((self.n_block, self.D), stride=(_kv_stride, 1)),
-            )
-            tKsK_cp = thr_copy.partition_D(sK_cp)
-            tVsV_cp = thr_copy.partition_D(sV_cp)
-
-            # Global K/V sources
-            kv_bh = tile_BH // Int32(self.kv_group_size)
-            k_head_ptr = (k.iterator + kv_bh * Int32(self.k_bh_stride)).align(16)
-            v_head_ptr = (v.iterator + kv_bh * Int32(self.v_bh_stride)).align(16)
-            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((self.N, self.D), stride=(self.k_n_stride, 1)))
-            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((self.N, self.D), stride=(self.v_n_stride, 1)))
-
-            # P register fragment
+            # P register fragment + MMA view
             acc_S = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.n_block)), Float32)
             rP = cute.make_fragment_like(acc_S, self.q_dtype)
             rP_ld = cute.logical_divide(rP.layout, (None, None, 2))
@@ -492,38 +510,40 @@ class FlashDecodingSplitOp(Op):
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
             # =============================================================
-            # Preload Q into registers (once, before KV loop)
+            # Preload Q into registers
             # =============================================================
             for _qkb in cutlass.range_constexpr(self.D // 16):
                 cute.copy(smem_tiled_copy_Q, tQsQ[None, None, _qkb], tQrQ_view[None, None, _qkb])
 
             # =============================================================
-            # KV loop over [kv_start_block, kv_end_block)
+            # Pipelined KV loop with compute-driven TMA
             # =============================================================
 
-            # Prologue: cpasync K[kv_start_block]
-            gK_block0 = cute.local_tile(gK_head, (self.n_block, self.D), (kv_start_block, Int32(0)))
-            tKgK0 = thr_copy.partition_S(gK_block0)
-            for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
-                cute.copy(gmem_tiled_copy, tKgK0[None, None, ci], tKsK_cp[None, None, ci])
-            cute.arch.cp_async_commit_group()
-
+            # Prologue: issue TMA K[kv_start_block] from warp 0
             kv_idx = kv_start_block
+            kv_phase = Int32(0)
+            if warp_idx == Int32(0):
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(_kr_K, nbytes_kv)
+                cute.copy(k_tma,
+                          tKgK_tma[(None, Int32(0), kv_idx, kv_bh)],
+                          tKsK_tma, tma_bar_ptr=_kr_K_ptr)
+
             while kv_idx < kv_end_block:
                 kv_start = kv_idx * Int32(self.n_block)
 
-                # Wait for K[i]
-                cute.arch.cp_async_wait_group(0)
-                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+                # --- Wait for K[i] (TMA from warp 0) ---
+                mbarrier_wait(_kr_K, kv_phase)
 
-                # Start V[i] cpasync
-                gV_block = cute.local_tile(gV_head, (self.n_block, self.D), (kv_idx, Int32(0)))
-                tVgV = thr_copy.partition_S(gV_block)
-                for ci in cutlass.range_constexpr(cute.size(tVsV_cp.shape[2])):
-                    cute.copy(gmem_tiled_copy, tVgV[None, None, ci], tVsV_cp[None, None, ci])
-                cute.arch.cp_async_commit_group()
+                # --- Issue TMA V[i] from warp 0 (overlap with S GEMM) ---
+                if warp_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(_kr_V, nbytes_kv)
+                    cute.copy(v_tma,
+                              tVgV_tma[(None, Int32(0), kv_idx, kv_bh)],
+                              tVsV_tma, tma_bar_ptr=_kr_V_ptr)
 
-                # S GEMM (Q already in registers)
+                # --- S GEMM: Q_regs × K_smem ---
                 acc_S.fill(0.0)
                 cute.copy(smem_tiled_copy_K, tKsK[None, None, 0], tKrK_view[None, None, 0])
                 for kb in cutlass.range_constexpr(self.D // 16):
@@ -531,19 +551,22 @@ class FlashDecodingSplitOp(Op):
                     cute.copy(smem_tiled_copy_K, tKsK[None, None, kb_next], tKrK_view[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_S, tCrQ[None, None, kb], tCrK[None, None, kb], acc_S)
 
-                # Wait for V[i]
-                cute.arch.cp_async_wait_group(0)
+                # --- Sync: all warps done reading K, buffer safe for reuse ---
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-                # Start K[i+1] cpasync (if not last)
+                # --- Issue TMA K[i+1] from warp 0 (overlap with V processing) ---
                 if kv_idx + Int32(1) < kv_end_block:
-                    gK_next = cute.local_tile(gK_head, (self.n_block, self.D), (kv_idx + Int32(1), Int32(0)))
-                    tKgK_next = thr_copy.partition_S(gK_next)
-                    for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
-                        cute.copy(gmem_tiled_copy, tKgK_next[None, None, ci], tKsK_cp[None, None, ci])
-                    cute.arch.cp_async_commit_group()
+                    if warp_idx == Int32(0):
+                        with cute.arch.elect_one():
+                            mbarrier_arrive_expect_tx(_kr_K, nbytes_kv)
+                        cute.copy(k_tma,
+                                  tKgK_tma[(None, Int32(0), kv_idx + Int32(1), kv_bh)],
+                                  tKsK_tma, tma_bar_ptr=_kr_K_ptr)
 
-                # Masking
+                # --- Wait for V[i] (TMA from warp 0) ---
+                mbarrier_wait(_kr_V, kv_phase)
+
+                # --- Masking ---
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
                 acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
 
@@ -559,8 +582,7 @@ class FlashDecodingSplitOp(Op):
                 # Causal mask
                 if self.causal:
                     last_blk_col = kv_start + Int32(self.n_block - 1)
-                    # tile_M=0 always for decode (M is full extent, single tile)
-                    first_row = Int32(0)
+                    first_row = Int32(0)  # tile_M=0 always for decode
                     if last_blk_col > first_row + Int32(self.N - self.M):
                         for r in cutlass.range_constexpr(num_rows):
                             row_idx = tScS_mn[r, 0][0]
@@ -571,7 +593,7 @@ class FlashDecodingSplitOp(Op):
                                 if global_col > global_row + Int32(self.N - self.M):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
-                # Online softmax
+                # --- Online softmax ---
                 _any_correction = Int32(0)
                 corrections = cute.make_fragment(cute.make_layout(num_rows), Float32)
                 for r in cutlass.range_constexpr(num_rows):
@@ -606,7 +628,7 @@ class FlashDecodingSplitOp(Op):
                     for r in cutlass.range_constexpr(num_rows):
                         acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
 
-                # P conversion + O GEMM
+                # --- P conversion + O GEMM ---
                 rP.store(acc_S.load().to(self.q_dtype))
                 cute.copy(smem_tiled_copy_Vt, tVsVt[None, None, 0], tVrVt_view[None, None, 0])
                 for kb in cutlass.range_constexpr(self.n_block // 16):
@@ -614,7 +636,11 @@ class FlashDecodingSplitOp(Op):
                     cute.copy(smem_tiled_copy_Vt, tVsVt[None, None, kb_next], tVrVt_view[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_O, tOrS[None, None, kb], tBrVt[None, None, kb], acc_O)
 
+                # --- Sync: all warps done reading V, buffer safe for reuse ---
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
                 kv_idx = kv_idx + Int32(1)
+                kv_phase = Int32(1) - kv_phase
 
             # =============================================================
             # Write partial O (fp32) and LSE (fp32) to global memory
@@ -628,7 +654,6 @@ class FlashDecodingSplitOp(Op):
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
 
             # Write partial O to global: o_partial[BH, SPLIT, M, D]
-            # Each thread writes its owned elements
             lane_in_quad = tidx % Int32(4)
             o_partial_base = (
                 o_partial.iterator
@@ -644,7 +669,6 @@ class FlashDecodingSplitOp(Op):
                 tCgO[i] = acc_O[i]
 
             # Write LSE to global: lse_partial[BH, SPLIT, M]
-            # LSE = row_max * scale_val + log(row_sum)
             lse_base = (
                 lse_partial.iterator
                 + tile_BH * Int32(self.num_splits * self.M)
