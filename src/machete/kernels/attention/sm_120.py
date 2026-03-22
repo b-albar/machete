@@ -130,7 +130,9 @@ class FlashAttentionSm120Op(Op):
         assert self.tile_size_M % 16 == 0 and self.tile_size_M >= 16, (
             f"FlashAttentionSm120Op: tile_size_M={self.tile_size_M} must be a positive multiple of 16."
         )
-        self.num_mma_warps = self.tile_size_M // 16
+
+        # num_mma_warps from schedule (supports m_reps > 1 where tile_M > warps*16)
+        self.num_mma_warps = getattr(self, "num_mma_warps", self.tile_size_M // 16)
         max_warps = self.threads_per_row // 32
         assert self.num_mma_warps <= max_warps, (
             f"FlashAttentionSm120Op: tile_size_M={self.tile_size_M} requires "
@@ -138,25 +140,33 @@ class FlashAttentionSm120Op(Op):
         )
         self.num_mma_threads = self.num_mma_warps * 32
 
+        # M-repetitions per warp: tile_M / (warps * 16)
+        self.mma_tile_M = self.num_mma_warps * 16
+        self.m_reps = self.tile_size_M // self.mma_tile_M
+        assert self.tile_size_M == self.mma_tile_M * self.m_reps, (
+            f"tile_size_M={self.tile_size_M} must be exact multiple of "
+            f"mma_tile_M={self.mma_tile_M} (num_mma_warps={self.num_mma_warps})"
+        )
+
+        # Q-in-smem mode: when m_reps > 1, Q stays in smem, KV uses remaining space.
+        # Q-preload mode: when m_reps == 1, Q preloaded to regs, full page for KV.
+        self.q_in_smem = (self.m_reps > 1)
+
         assert self.D >= 16 and self.D % 16 == 0, f"FlashAttentionSm120Op: D={self.D} must be >= 16 and x16."
 
         assert self.q_tile_bytes <= self.page_size, (
             f"FlashAttentionSm120Op: Q tile ({self.q_tile_bytes}B) > page_size ({self.page_size}B). Reduce tile_size_M."
         )
 
-        # --- n_block: Q persists in smem + KV double-buffer ---
-        # Q stays in smem for LdMatrix reload per S GEMM k-block.
-        # q_tile_bytes + 2 × n_block × D × elem_bytes <= page_size
-        kv_budget = self.page_size - self.q_tile_bytes
-        assert kv_budget > 0, (
-            f"FlashAttentionSm120Op: page_size ({self.page_size}B) must be > "
-            f"Q tile ({self.q_tile_bytes}B) for Q-in-smem layout."
-        )
-        max_n_block = kv_budget // (2 * self.D * self.elem_bytes)
-        # Round n_block to power of 2 so common N values (powers of 2)
-        # divide evenly. OOB cpasync reads can produce NaN in V → 0*NaN=NaN
-        # in O GEMM (IEEE 754), so avoiding OOB is critical.
         import math
+
+        if self.q_in_smem:
+            # Q stays in smem: KV uses remaining page space
+            kv_budget = self.page_size - self.q_tile_bytes
+            max_n_block = kv_budget // (2 * self.D * self.elem_bytes)
+        else:
+            # Q preloaded to registers: full page available for KV
+            max_n_block = self.page_size // (2 * self.D * self.elem_bytes)
 
         self.n_block = 1 << int(math.log2(max(16, max_n_block)))
         if self.N < self.n_block:
@@ -166,9 +176,15 @@ class FlashAttentionSm120Op(Op):
 
         self.kv_tile_bytes = self.n_block * self.D * self.elem_bytes
         total_kv_smem = 2 * self.kv_tile_bytes
-        assert total_kv_smem <= kv_budget, (
-            f"FlashAttentionSm120Op: KV double-buffer ({total_kv_smem}B) > kv_budget ({kv_budget}B)."
-        )
+        if self.q_in_smem:
+            assert self.q_tile_bytes + total_kv_smem <= self.page_size, (
+                f"FlashAttentionSm120Op: Q({self.q_tile_bytes}B) + KV({total_kv_smem}B) "
+                f"> page_size ({self.page_size}B)."
+            )
+        else:
+            assert total_kv_smem <= self.page_size, (
+                f"FlashAttentionSm120Op: KV double-buffer ({total_kv_smem}B) > page_size ({self.page_size}B)."
+            )
 
         # DMA loads Q once, then compute handles everything
         self.inner_iters = 1
@@ -205,25 +221,20 @@ class FlashAttentionSm120Op(Op):
         self.swizzle_KV_M = 4
         self.swizzle_KV_S = int(math.log2(self.D * self.elem_bytes)) - 4
 
-        # cpasync thread layout for K/V loading
+        # cpasync thread layout for K/V loading (using reclaimed n_block)
         # 128-bit copies = 8 fp16 elements per thread per copy
         self.async_copy_elems = 128 // (self.elem_bytes * 8)  # 8 for fp16
         self.copy_dim1 = self.D // self.async_copy_elems
         self.copy_dim0 = self.num_mma_threads // self.copy_dim1
         assert self.n_block % self.copy_dim0 == 0, (
             f"n_block={self.n_block} must be divisible by copy_dim0={self.copy_dim0} "
-            f"(num_mma_warps={self.num_mma_warps}). Use power-of-2 num_mma_warps."
+            f"(num_mma_warps={self.num_mma_warps}). Use power-of-2 n_block and num_mma_warps."
         )
 
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
-        # Rescale threshold (log2-space): skip O rescale when correction factor
-        # >= 2^(-threshold), i.e. row max changed insignificantly.
-        # 8.0 matches flash_fwd_sm100 for fp16/bf16 (2^-8 = 1/256 worst-case).
-        self.rescale_threshold = 8.0
-
-        # Override compute method
-        self.compute = self.compute_mma
+        # Override compute method (select Q-in-smem vs Q-preload path)
+        self.compute = self.compute_mma_q_smem if self.q_in_smem else self.compute_mma
 
     # =========================================================================
     # Scheduling
@@ -234,14 +245,18 @@ class FlashAttentionSm120Op(Op):
                          kv_group_size=1, **tensors):
         """Schedule cooperative flash attention forward.
 
-        Q persists in smem alongside KV double-buffer, so tile_M is auto-sized
-        to fit Q + KV within page_size.
+        Two modes depending on page_size:
+        - Q-in-smem: Q persists in smem alongside KV. tile_M can be 2x warps
+          (m_reps=2) for better KV reuse. Used when page fits Q(128)+KV.
+        - Q-preload: Q preloaded to registers, smem reclaimed for KV.
+          tile_M = warps * 16. Used for smaller page_size.
         """
         import torch
 
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("BH", 1)
         q = tensors.get("q")
+        nw = None
         if q is not None:
             assert q.element_size() == 2, (
                 f"FlashAttentionSm120Op requires fp16/bf16, got element_size={q.element_size()}"
@@ -251,22 +266,30 @@ class FlashAttentionSm120Op(Op):
             elem = q.element_size()
 
             if "M" not in tile_sizes:
-                # Q persists in smem alongside KV double-buffer.
-                # Reserve at least half the page for KV (min n_block=16).
                 min_kv_bytes = 2 * 16 * D * elem  # 2 buffers × 16 rows
-                max_tile_M_page = (page_size - min_kv_bytes) // (D * elem)
-                max_nw = min(8, max_tile_M_page // 16, M // 16)
-                # Round to power-of-2 warps so cpasync copy_dim0 divides n_block
+
+                # Target 4 MMA warps (matches SDPA, optimal barrier overhead)
+                max_nw = min(4, M // 16)
                 nw = 1
                 while nw * 2 <= max_nw:
                     nw *= 2
-                tile_M = max(16, nw * 16)
+
+                # Try m_reps=2 (tile_M = nw*32) if page fits Q + min KV
+                tile_M_2x = nw * 32
+                q_bytes_2x = tile_M_2x * D * elem
+                if (page_size >= q_bytes_2x + min_kv_bytes
+                        and M >= tile_M_2x):
+                    tile_M = tile_M_2x  # e.g., 128 for nw=4
+                else:
+                    tile_M = max(16, nw * 16)  # e.g., 64 for nw=4
                 tile_sizes["M"] = tile_M
         # Auto-allocate lse output if not provided
         if "lse" not in tensors and q is not None:
             tensors["lse"] = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        if nw is not None:
+            ops[0].static_dims["num_mma_warps"] = nw
         if causal:
             ops[0].static_dims["causal"] = 1
         if kv_group_size > 1:
@@ -289,11 +312,10 @@ class FlashAttentionSm120Op(Op):
     def kernel_config(cls, ops):
         """Return recommended MegakernelConfig for the given scheduled ops."""
         from machete.megakernel import MegakernelConfig
-
-        tile_m = ops[0].tile_sizes["M"]
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        num_mma_warps = tile_m // 16
+        tile_m = ops[0].tile_sizes["M"]
+        num_mma_warps = ops[0].static_dims.get("num_mma_warps", tile_m // 16)
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
         return MegakernelConfig(
@@ -380,15 +402,13 @@ class FlashAttentionSm120Op(Op):
     def compute_mma(self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, lse):
         """Cooperative flash attention: MMA warps do both cpasync loads and MMA.
 
-        Q stays in smem persistently (TMA-loaded with swizzle). Each S GEMM
-        k-block reloads Q via LdMatrix — trades smem bandwidth for register
-        savings (~28 regs/thread).
+        Smem layout phases:
+          Phase 0: [Q: tile_M×D×2B]  (TMA-loaded, preloaded to registers)
+          Phase 1: [K buf: n_block×D×2B] [V buf: n_block×D×2B]  (Q reclaimed)
+          Phase 2: [O: tile_M×D×2B]  (overwrites KV, for TMA store)
 
-        Smem layout: [Q: tile_M×D×2B] [K buf: n_block×D×2B] [V buf: n_block×D×2B]
-
-        Phase 1: Pipelined KV loop with cpasync K/V + MMA + Q LdMatrix reload.
-        Phase 2: Write O to smem for TMA store (overwrites Q, safe since Q no
-                 longer needed).
+        Q preload to registers frees the full page for KV double-buffering,
+        doubling n_block vs the Q-persistent layout.
 
         Note: q and o are unused here (loaded/stored by TMA) but must be in
         the signature because the framework passes all tensors when
@@ -447,13 +467,29 @@ class FlashAttentionSm120Op(Op):
             smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
             smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
 
-            # === KV buffer base (after persistent Q) ===
-            _kv_base = page_ptr + Int32(self.q_tile_bytes)
+            # =============================================================
+            # Phase 0: Preload Q from TMA smem → registers, then reclaim
+            # =============================================================
 
-            # === KV swizzle (cpasync-loaded, not TMA-constrained) ===
+            # Preload ALL Q k-blocks into registers. After this, Q smem
+            # at page_ptr is free for KV double-buffering (2x n_block).
+            for _qkb in cutlass.range_constexpr(self.D // 16):
+                cute.copy(smem_tiled_copy_Q, tQsQ[None, None, _qkb], tQrQ_view[None, None, _qkb])
+
+            # Barrier: all warps must finish Q reads before K overwrites smem
+            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+            # =============================================================
+            # Phase 1: Setup KV at page_ptr (reclaimed Q space)
+            # =============================================================
+
+            # KV buffer base: reclaim Q smem → full page for KV
+            _kv_base = page_ptr
+
+            # KV swizzle (cpasync-loaded, not TMA-constrained)
             swz_kv = cute.make_swizzle(self.swizzle_KV_B, self.swizzle_KV_M, self.swizzle_KV_S)
 
-            # === K smem tensor + LdMatrix fragments (buf0, KV swizzle) ===
+            # K smem tensor + LdMatrix fragments (buf0, KV swizzle)
             _sK = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
@@ -467,7 +503,7 @@ class FlashAttentionSm120Op(Op):
             tKrK_view = smem_thr_copy_K.retile(tCrK)
             tKsK = smem_thr_copy_K.partition_S(_sK)
 
-            # === V smem tensor + LdMatrix fragments (buf1, KV swizzle) ===
+            # V smem tensor + LdMatrix fragments (buf1, KV swizzle)
             _buf1_base = _kv_base + Int32(self.kv_tile_bytes)
             _sVt = cute.make_tensor(
                 cute.recast_ptr(
@@ -482,14 +518,14 @@ class FlashAttentionSm120Op(Op):
             tVrVt_view = smem_thr_copy_Vt.retile(tBrVt)
             tVsVt = smem_thr_copy_Vt.partition_S(_sVt)
 
-            # === cpasync tiled copy setup ===
+            # cpasync tiled copy setup
             async_copy_atom = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), self.q_dtype, num_bits_per_copy=128)
             copy_thread_layout = cute.make_layout((self.copy_dim0, self.copy_dim1), stride=(self.copy_dim1, 1))
             copy_value_layout = cute.make_layout((1, self.async_copy_elems))
             gmem_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, copy_thread_layout, copy_value_layout)
             thr_copy = gmem_tiled_copy.get_slice(tidx)
 
-            # cpasync smem destinations (buf0=K, buf1=V, KV swizzle, after Q)
+            # cpasync smem destinations (buf0=K at page_ptr, buf1=V)
             sK_cp = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
@@ -510,10 +546,6 @@ class FlashAttentionSm120Op(Op):
             tVsV_cp = thr_copy.partition_D(sV_cp)
 
             # cpasync global sources: K and V for current head
-            # k, v are CuTe tensors from framework (base pointer only used).
-            # Stride attributes handle both contiguous (BH,N,D) and strided
-            # layouts (e.g., as_strided views of GEMM output).
-            # .align(16) annotates 16-byte alignment for 128-bit cpasync.
             kv_bh = tile_BH // Int32(self.kv_group_size)
             k_head_ptr = (k.iterator + kv_bh * Int32(self.k_bh_stride)).align(16)
             v_head_ptr = (v.iterator + kv_bh * Int32(self.v_bh_stride)).align(16)
@@ -530,7 +562,7 @@ class FlashAttentionSm120Op(Op):
             )
             tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
 
-            # === Accumulators ===
+            # Accumulators
             acc_O = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.D)), Float32)
             acc_O.fill(0.0)
 
@@ -549,14 +581,8 @@ class FlashAttentionSm120Op(Op):
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
             # =============================================================
-            # Phase 1: Pipelined KV loop with cpasync (Q preloaded in regs)
+            # Phase 2: Pipelined KV loop
             # =============================================================
-
-            # Preload ALL Q k-blocks into registers once. This eliminates
-            # D/16 LdMatrix Q reloads per KV block (the main smem bandwidth
-            # bottleneck — NCU showed 33% L1 throughput vs 14% for SDPA).
-            for _qkb in cutlass.range_constexpr(self.D // 16):
-                cute.copy(smem_tiled_copy_Q, tQsQ[None, None, _qkb], tQrQ_view[None, None, _qkb])
 
             # Causal block skipping: compute effective number of KV blocks
             # for this M-tile. Row i can attend to columns 0..(i + N - M),
@@ -639,7 +665,6 @@ class FlashAttentionSm120Op(Op):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---
-                _any_correction = Int32(0)
                 corrections = cute.make_fragment(cute.make_layout(num_rows), Float32)
                 for r in cutlass.range_constexpr(num_rows):
                     acc_S_row = acc_S_mn[r, None].load()
@@ -653,13 +678,8 @@ class FlashAttentionSm120Op(Op):
                     # Clamp to PTX ex2.approx valid range [-126, 128] to avoid
                     # NaN on first iteration (m_old=-1e30 → acc_scale_≈-1e30).
                     correction = cute.math.exp2(cute.arch.fmax(acc_scale_, Float32(-126.0)), fastmath=True)
-                    if acc_scale_ >= Float32(-self.rescale_threshold):
-                        m_new = m_old
-                        correction = Float32(1.0)
                     row_sum[r] = row_sum[r] * correction
                     corrections[r] = correction
-                    if m_new > m_old:
-                        _any_correction = Int32(1)
 
                     acc_S_row_exp = cute.math.exp2(
                         acc_S_row * Float32(self.scale_log2e) - m_new * Float32(self.scale_log2e), fastmath=True
@@ -669,11 +689,10 @@ class FlashAttentionSm120Op(Op):
                     row_max[r] = m_new
                     acc_S_mn[r, None] = acc_S_row_exp
 
-                # Deferred O rescale: skip if max unchanged across all rows/threads
-                _skip_rescale = cute.arch.vote_all_sync(_any_correction == Int32(0))
-                if not _skip_rescale:
-                    for r in cutlass.range_constexpr(num_rows):
-                        acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
+                # O rescale (unconditional — CuTe DSL dynamic-if executes both
+                # branches anyway, so vote_all_sync + conditional was pure overhead)
+                for r in cutlass.range_constexpr(num_rows):
+                    acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
 
                 # --- P conversion + O GEMM with register pipeline ---
                 rP.store(acc_S.load().to(self.q_dtype))
@@ -728,7 +747,8 @@ class FlashAttentionSm120Op(Op):
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
 
             # Write O to smem (at page_ptr, swizzled layout)
-            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+            # No barrier needed: each warp writes to disjoint M rows.
+            # DMA store warp waits on framework's compute_done barrier.
             _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
             sO = cute.make_tensor(
                 cute.recast_ptr(
@@ -741,6 +761,332 @@ class FlashAttentionSm120Op(Op):
             for i in cutlass.range_constexpr(cute.size(acc_O)):
                 tCrO_q[i] = acc_O[i].to(self.q_dtype)
             # Retile register fragment for copy atom, partition smem
+            tOrO = smem_thr_copy_O.retile(tCrO_q)
+            tOsO = smem_thr_copy_O.partition_D(sO)
+            cute.copy(smem_tiled_copy_O, tOrO, tOsO)
+
+    # =========================================================================
+    # Forward Compute -- Q-in-smem mode (m_reps > 1)
+    # =========================================================================
+
+    @cute.jit
+    def compute_mma_q_smem(self, page_ptr, tile_BH, tile_M, tile_D, q, k, v, o, lse):
+        """Cooperative flash attention with Q persistent in smem (m_reps > 1).
+
+        Smem layout (persistent throughout compute):
+          [Q: tile_M×D×2B]  (TMA-loaded, read per k-block via LdMatrix)
+          [K buf: n_block×D×2B]  (cpasync double-buffer slot 0)
+          [V buf: n_block×D×2B]  (cpasync double-buffer slot 1)
+
+        Q stays in smem for the entire KV loop. Each S GEMM k-block reloads Q
+        via LdMatrix, trading smem bandwidth for ~28 fewer registers/thread.
+        With m_reps=2 (tile_M=128, 4 warps), this halves total tile count
+        vs Q-preload mode, reducing total KV bandwidth by 2x.
+        """
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.warp_idx()
+
+        if warp_idx < Int32(self.num_mma_warps):
+            # === MMA setup (multi-warp, m_reps > 1) ===
+            mma_op = warp.MmaF16BF16Op(self.q_dtype, Float32, (16, 8, 16))
+            tiled_mma = cute.make_tiled_mma(
+                mma_op,
+                cute.make_layout((self.num_mma_warps, 1, 1)),
+                permutation_mnk=(self.tile_size_M, 16, 16),
+            )
+            thr_mma = tiled_mma.get_slice(tidx)
+
+            # === Swizzle + LdMatrix setup ===
+            swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
+
+            # === Q smem tensor (persistent, swizzled for LdMatrix) ===
+            sQ = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
+                    swz,
+                    dtype=self.q_dtype,
+                ),
+                cute.make_layout((self.tile_size_M, self.D), stride=(self.D, 1)),
+            )
+            _tCsQ = thr_mma.partition_A(sQ)
+            tCrQ = tiled_mma.make_fragment_A(_tCsQ)
+
+            # LdMatrix copy atoms
+            smem_copy_atom_Q = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.q_dtype
+            )
+            smem_copy_atom_K = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.q_dtype
+            )
+            smem_copy_atom_Vt = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.q_dtype
+            )
+            smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
+            smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_K, tiled_mma)
+            smem_tiled_copy_Vt = cute.make_tiled_copy_B(smem_copy_atom_Vt, tiled_mma)
+            smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
+            smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
+            smem_thr_copy_Vt = smem_tiled_copy_Vt.get_slice(tidx)
+
+            tQrQ_view = smem_thr_copy_Q.retile(tCrQ)
+            tQsQ = smem_thr_copy_Q.partition_S(sQ)
+
+            # CopyUniversal for O write to swizzled smem
+            smem_copy_atom_O = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.q_dtype)
+            smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
+            smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
+
+            # =============================================================
+            # KV smem setup (after Q, persistent)
+            # =============================================================
+
+            _kv_base = page_ptr + Int32(self.q_tile_bytes)
+
+            swz_kv = cute.make_swizzle(self.swizzle_KV_B, self.swizzle_KV_M, self.swizzle_KV_S)
+
+            # K smem tensor + LdMatrix fragments (buf0)
+            _sK = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
+                    swz_kv,
+                    dtype=self.q_dtype,
+                ),
+                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+            )
+            _tCsK = thr_mma.partition_B(_sK)
+            tCrK = tiled_mma.make_fragment_B(_tCsK)
+            tKrK_view = smem_thr_copy_K.retile(tCrK)
+            tKsK = smem_thr_copy_K.partition_S(_sK)
+
+            # V smem tensor + LdMatrix fragments (buf1)
+            _buf1_base = _kv_base + Int32(self.kv_tile_bytes)
+            _sVt = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
+                    swz_kv,
+                    dtype=self.q_dtype,
+                ),
+                cute.make_layout((self.D, self.n_block), stride=(1, self.D)),
+            )
+            _tBsVt = thr_mma.partition_B(_sVt)
+            tBrVt = tiled_mma.make_fragment_B(_tBsVt)
+            tVrVt_view = smem_thr_copy_Vt.retile(tBrVt)
+            tVsVt = smem_thr_copy_Vt.partition_S(_sVt)
+
+            # cpasync tiled copy setup
+            async_copy_atom = cute.make_copy_atom(cute.nvgpu.cpasync.CopyG2SOp(), self.q_dtype, num_bits_per_copy=128)
+            copy_thread_layout = cute.make_layout((self.copy_dim0, self.copy_dim1), stride=(self.copy_dim1, 1))
+            copy_value_layout = cute.make_layout((1, self.async_copy_elems))
+            gmem_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, copy_thread_layout, copy_value_layout)
+            thr_copy = gmem_tiled_copy.get_slice(tidx)
+
+            # cpasync smem destinations
+            sK_cp = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, _kv_base, cute.AddressSpace.smem, assumed_align=128),
+                    swz_kv,
+                    dtype=self.q_dtype,
+                ),
+                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+            )
+            sV_cp = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, _buf1_base, cute.AddressSpace.smem, assumed_align=128),
+                    swz_kv,
+                    dtype=self.q_dtype,
+                ),
+                cute.make_layout((self.n_block, self.D), stride=(self.D, 1)),
+            )
+            tKsK_cp = thr_copy.partition_D(sK_cp)
+            tVsV_cp = thr_copy.partition_D(sV_cp)
+
+            # cpasync global sources
+            kv_bh = tile_BH // Int32(self.kv_group_size)
+            k_head_ptr = (k.iterator + kv_bh * Int32(self.k_bh_stride)).align(16)
+            v_head_ptr = (v.iterator + kv_bh * Int32(self.v_bh_stride)).align(16)
+            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((self.N, self.D), stride=(self.k_n_stride, 1)))
+            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((self.N, self.D), stride=(self.v_n_stride, 1)))
+
+            # P register fragment + MMA view
+            acc_S = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.n_block)), Float32)
+            rP = cute.make_fragment_like(acc_S, self.q_dtype)
+            rP_ld = cute.logical_divide(rP.layout, (None, None, 2))
+            rP_mma_view = cute.make_layout(
+                ((rP_ld.shape[0], rP_ld.shape[2][0]), rP_ld.shape[1], rP_ld.shape[2][1]),
+                stride=((rP_ld.stride[0], rP_ld.stride[2][0]), rP_ld.stride[1], rP_ld.stride[2][1]),
+            )
+            tOrS = cute.make_tensor(rP.iterator, rP_mma_view)
+
+            # Accumulators
+            acc_O = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.D)), Float32)
+            acc_O.fill(0.0)
+
+            # Softmax state
+            acc_O_shape = tiled_mma.partition_shape_C((self.tile_size_M, self.D))
+            num_rows = acc_O_shape[0][1] * acc_O_shape[1]
+            row_max = cute.make_fragment(cute.make_layout(num_rows), Float32)
+            row_sum = cute.make_fragment(cute.make_layout(num_rows), Float32)
+            for r in cutlass.range_constexpr(num_rows):
+                row_max[r] = Float32(-1e30)
+                row_sum[r] = Float32(0.0)
+
+            # Identity tensor for masking
+            mcS = cute.make_identity_tensor((self.tile_size_M, self.n_block))
+            tScS = thr_mma.partition_C(mcS)
+            tScS_mn = self._make_acc_tensor_mn_view(tScS)
+
+            # =============================================================
+            # Pipelined KV loop (Q read from smem each k-block)
+            # =============================================================
+
+            num_kv_blocks_eff = Int32(self.num_kv_blocks)
+            if self.causal:
+                _last_row = tile_M * Int32(self.tile_size_M) + Int32(self.tile_size_M - 1)
+                _max_col = _last_row + Int32(self.N - self.M)
+                num_kv_blocks_eff = (_max_col + Int32(self.n_block)) // Int32(self.n_block)
+                if num_kv_blocks_eff > Int32(self.num_kv_blocks):
+                    num_kv_blocks_eff = Int32(self.num_kv_blocks)
+
+            # Prologue: cpasync K[0] → buf0
+            gK_block0 = cute.local_tile(gK_head, (self.n_block, self.D), (Int32(0), Int32(0)))
+            tKgK0 = thr_copy.partition_S(gK_block0)
+            for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
+                cute.copy(gmem_tiled_copy, tKgK0[None, None, ci], tKsK_cp[None, None, ci])
+            cute.arch.cp_async_commit_group()
+
+            kv_idx = Int32(0)
+            while kv_idx < num_kv_blocks_eff:
+                kv_start = kv_idx * Int32(self.n_block)
+
+                # --- Wait for K[i] in buf0 ---
+                cute.arch.cp_async_wait_group(0)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+                # --- Start V[i] cpasync → buf1 ---
+                gV_block = cute.local_tile(gV_head, (self.n_block, self.D), (kv_idx, Int32(0)))
+                tVgV = thr_copy.partition_S(gV_block)
+                for ci in cutlass.range_constexpr(cute.size(tVsV_cp.shape[2])):
+                    cute.copy(gmem_tiled_copy, tVgV[None, None, ci], tVsV_cp[None, None, ci])
+                cute.arch.cp_async_commit_group()
+
+                # --- S GEMM: Q from smem + K from smem, pipelined LdMatrix ---
+                acc_S.fill(0.0)
+                cute.copy(smem_tiled_copy_Q, tQsQ[None, None, 0], tQrQ_view[None, None, 0])
+                cute.copy(smem_tiled_copy_K, tKsK[None, None, 0], tKrK_view[None, None, 0])
+                for kb in cutlass.range_constexpr(self.D // 16):
+                    kb_next = (kb + 1) % (self.D // 16)
+                    cute.copy(smem_tiled_copy_Q, tQsQ[None, None, kb_next], tQrQ_view[None, None, kb_next])
+                    cute.copy(smem_tiled_copy_K, tKsK[None, None, kb_next], tKrK_view[None, None, kb_next])
+                    cute.gemm(tiled_mma, acc_S, tCrQ[None, None, kb], tCrK[None, None, kb], acc_S)
+
+                # --- Wait for V[i] in buf1 ---
+                cute.arch.cp_async_wait_group(0)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+                # --- Start K[i+1] cpasync → buf0 (if not last) ---
+                if kv_idx + Int32(1) < num_kv_blocks_eff:
+                    gK_next = cute.local_tile(gK_head, (self.n_block, self.D), (kv_idx + Int32(1), Int32(0)))
+                    tKgK_next = thr_copy.partition_S(gK_next)
+                    for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
+                        cute.copy(gmem_tiled_copy, tKgK_next[None, None, ci], tKsK_cp[None, None, ci])
+                    cute.arch.cp_async_commit_group()
+
+                # --- Masking ---
+                acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
+                acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+
+                if kv_start + Int32(self.n_block) > Int32(self.N):
+                    for r in cutlass.range_constexpr(num_rows):
+                        for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                            col_idx = tScS_mn[0, c][1]
+                            global_col = kv_start + Int32(col_idx)
+                            if global_col >= Int32(self.N):
+                                acc_S_mn[r, c] = Float32(-1e30)
+
+                if self.causal:
+                    last_blk_col = kv_start + Int32(self.n_block - 1)
+                    first_row = tile_M * Int32(self.tile_size_M)
+                    if last_blk_col > first_row + Int32(self.N - self.M):
+                        for r in cutlass.range_constexpr(num_rows):
+                            row_idx = tScS_mn[r, 0][0]
+                            global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
+                            for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                                col_idx = tScS_mn[0, c][1]
+                                global_col = kv_start + Int32(col_idx)
+                                if global_col > global_row + Int32(self.N - self.M):
+                                    acc_S_mn[r, c] = Float32(-1e30)
+
+                # --- Online softmax ---
+                corrections = cute.make_fragment(cute.make_layout(num_rows), Float32)
+                for r in cutlass.range_constexpr(num_rows):
+                    acc_S_row = acc_S_mn[r, None].load()
+                    row_max_cur = acc_S_row.reduce(cute.ReductionOp.MAX, Float32(-1e30), 0)
+                    row_max_cur = self._threadquad_reduce_max(row_max_cur)
+
+                    m_old = row_max[r]
+                    m_new = cute.arch.fmax(m_old, row_max_cur)
+
+                    acc_scale_ = (m_old - m_new) * Float32(self.scale_log2e)
+                    correction = cute.math.exp2(cute.arch.fmax(acc_scale_, Float32(-126.0)), fastmath=True)
+                    row_sum[r] = row_sum[r] * correction
+                    corrections[r] = correction
+
+                    acc_S_row_exp = cute.math.exp2(
+                        acc_S_row * Float32(self.scale_log2e) - m_new * Float32(self.scale_log2e), fastmath=True
+                    )
+                    acc_S_row_sum = acc_S_row_exp.reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
+                    row_sum[r] = row_sum[r] + acc_S_row_sum
+                    row_max[r] = m_new
+                    acc_S_mn[r, None] = acc_S_row_exp
+
+                # O rescale
+                for r in cutlass.range_constexpr(num_rows):
+                    acc_O_mn[r, None] = acc_O_mn[r, None].load() * corrections[r]
+
+                # --- P conversion + O GEMM ---
+                rP.store(acc_S.load().to(self.q_dtype))
+
+                cute.copy(smem_tiled_copy_Vt, tVsVt[None, None, 0], tVrVt_view[None, None, 0])
+                for kb in cutlass.range_constexpr(self.n_block // 16):
+                    kb_next = (kb + 1) % (self.n_block // 16)
+                    cute.copy(smem_tiled_copy_Vt, tVsVt[None, None, kb_next], tVrVt_view[None, None, kb_next])
+                    cute.gemm(tiled_mma, acc_O, tOrS[None, None, kb], tBrVt[None, None, kb], acc_O)
+
+                kv_idx = kv_idx + Int32(1)
+
+            # =============================================================
+            # Normalize O and write to smem for TMA store
+            # =============================================================
+            acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+            for r in cutlass.range_constexpr(num_rows):
+                row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
+
+            lse_head_ptr = lse.iterator + tile_BH * Int32(self.M)
+            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
+            lane_in_quad = tidx % Int32(4)
+            for r in cutlass.range_constexpr(num_rows):
+                if lane_in_quad == Int32(0):
+                    row_idx = tScS_mn[r, 0][0]
+                    global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
+                    if global_row < Int32(self.M):
+                        lse_val = row_max[r] * Float32(self.scale_val) + cute.math.log(row_sum[r])
+                        g_lse[global_row] = lse_val
+
+            for r in cutlass.range_constexpr(num_rows):
+                inv_sum = cute.arch.rcp_approx(row_sum[r])
+                acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
+
+            # Write O to smem (overwrites Q, which is no longer needed)
+            _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
+            sO = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.q_dtype
+                ),
+                cute.make_layout((self.tile_size_M, self.D), stride=(self.D, 1)),
+            )
+            tCrO_q = cute.make_fragment_like(acc_O, self.q_dtype)
+            for i in cutlass.range_constexpr(cute.size(acc_O)):
+                tCrO_q[i] = acc_O[i].to(self.q_dtype)
             tOrO = smem_thr_copy_O.retile(tCrO_q)
             tOsO = smem_thr_copy_O.partition_D(sO)
             cute.copy(smem_tiled_copy_O, tOrO, tOsO)

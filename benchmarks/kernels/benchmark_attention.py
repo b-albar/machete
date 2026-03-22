@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # Copyright (c) 2025, Machete Authors
-"""Benchmark Flash Attention: Megakernel vs PyTorch vs torch SDPA vs CuTe DSL FA2.
+"""Benchmark Flash Attention: Megakernel vs SDPA vs CuTe DSL FA2.
 
 Compares GPU kernel execution time of:
-  - PyTorch manual attention (bmm + softmax + bmm) [bf16]
   - torch.nn.functional.scaled_dot_product_attention [bf16]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
   - Megakernel FlashAttentionSm120Op (cooperative cpasync + MMA) [bf16]
@@ -24,7 +23,6 @@ import torch.nn.functional as F
 
 from machete.megakernel import Megakernel
 from machete.kernels.attention import FlashAttentionSm120Op, FlashAttentionSm120BwdOp
-from machete.kernels.attention.ref import flash_attention_pytorch
 from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
@@ -36,7 +34,7 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
-PAGE_SIZES = [16384, 32768, 49152]
+PAGE_SIZES = [16384, 32768, 49152, 65536]
 BH_SIZES = [1, 4, 16]
 
 # CuTe DSL Flash Attention v2 (Ampere tensor core implementation)
@@ -92,26 +90,13 @@ _fa2_cache = {}
 # =============================================================================
 
 _BASE_FWD_CONFIGS = [
-    # (M, N, D) — realistic LLM attention shapes (D=128 typical)
-    #
-    # Decode (autoregressive, M=16 minimum MMA tile)
-    (16, 2048, 128),
-    (16, 4096, 128),
-    (16, 8192, 128),
-    (16, 16384, 128),
-    (16, 32768, 128),
-    (16, 65536, 128),
-    (16, 131072, 128),
-    # Prefill (M=N, processing prompt tokens)
+    # (M, N, D) — prefill shapes (M=N, D=128 typical)
+    (512, 512, 128),
     (1024, 1024, 128),
     (2048, 2048, 128),
     (4096, 4096, 128),
     (8192, 8192, 128),
-    # Chunked prefill (M < N, typical chunk sizes)
-    (256, 4096, 128),
-    (256, 16384, 128),
-    (512, 8192, 128),
-    (512, 32768, 128),
+    (16384, 16384, 128),
 ]
 
 FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
@@ -128,9 +113,6 @@ def bench_attention(BH, M, N, D, page_size):
     v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
-
-    # PyTorch manual
-    funcs["pytorch"] = lambda: flash_attention_pytorch(q, k, v)
 
     # torch SDPA (4D input so flash attention backend is used)
     q4d = q.unsqueeze(0)  # (1, BH, M, D) → (batch, heads, seq, head_dim)
@@ -241,25 +223,13 @@ def bench_attention(BH, M, N, D, page_size):
 # =============================================================================
 
 _BASE_CAUSAL_FWD_CONFIGS = [
-    # (M, N, D) — causal masking only makes sense when M <= N
-    # Decode (causal, M=16 minimum MMA tile)
-    (16, 2048, 128),
-    (16, 4096, 128),
-    (16, 8192, 128),
-    (16, 16384, 128),
-    (16, 32768, 128),
-    (16, 65536, 128),
-    (16, 131072, 128),
-    # Prefill (M=N, causal mask is triangular)
+    # (M, N, D) — causal prefill shapes (M=N)
+    (512, 512, 128),
     (1024, 1024, 128),
     (2048, 2048, 128),
     (4096, 4096, 128),
     (8192, 8192, 128),
-    # Chunked prefill (M < N)
-    (256, 4096, 128),
-    (256, 16384, 128),
-    (512, 8192, 128),
-    (512, 32768, 128),
+    (16384, 16384, 128),
 ]
 
 CAUSAL_FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_CAUSAL_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
@@ -276,9 +246,6 @@ def bench_attention_causal(BH, M, N, D, page_size):
     v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
-
-    # PyTorch manual (causal)
-    funcs["pytorch"] = lambda: flash_attention_pytorch(q, k, v, causal=True)
 
     # torch SDPA (causal)
     q4d = q.unsqueeze(0)
@@ -329,19 +296,12 @@ def bench_attention_causal(BH, M, N, D, page_size):
 # =============================================================================
 
 _BASE_BWD_CONFIGS = [
-    # (M, N, D) — subset of forward configs for backward
-    # Decode
-    (16, 2048, 128),
-    (16, 4096, 128),
-    (16, 8192, 128),
-    (16, 16384, 128),
-    # Prefill
+    # (M, N, D) — prefill shapes (M=N)
+    (512, 512, 128),
     (1024, 1024, 128),
     (2048, 2048, 128),
     (4096, 4096, 128),
-    # Chunked prefill
-    (256, 4096, 128),
-    (512, 8192, 128),
+    (8192, 8192, 128),
 ]
 
 BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
@@ -359,17 +319,6 @@ def bench_attention_bwd(BH, M, N, D, page_size):
     dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
-
-    # PyTorch autograd backward
-    def pytorch_bwd():
-        q_ = q.detach().requires_grad_(True)
-        k_ = k.detach().requires_grad_(True)
-        v_ = v.detach().requires_grad_(True)
-        o = flash_attention_pytorch(q_, k_, v_)
-        o.backward(dout)
-        return q_.grad, k_.grad, v_.grad
-
-    funcs["pytorch"] = pytorch_bwd
 
     # torch SDPA backward
     dout4d = dout.unsqueeze(0)
@@ -478,17 +427,6 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
 
     funcs = {}
 
-    # PyTorch autograd backward (causal)
-    def pytorch_bwd():
-        q_ = q.detach().requires_grad_(True)
-        k_ = k.detach().requires_grad_(True)
-        v_ = v.detach().requires_grad_(True)
-        o = flash_attention_pytorch(q_, k_, v_, causal=True)
-        o.backward(dout)
-        return q_.grad, k_.grad, v_.grad
-
-    funcs["pytorch"] = pytorch_bwd
-
     # torch SDPA backward (causal)
     dout4d = dout.unsqueeze(0)
 
@@ -583,7 +521,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
 
 if __name__ == "__main__":
     print("=" * 100)
-    print("Flash Attention Benchmark: Megakernel vs PyTorch vs SDPA vs CuTe DSL FA2")
+    print("Flash Attention Benchmark: Megakernel vs SDPA vs CuTe DSL FA2")
     print("=" * 100)
 
     if torch.cuda.is_available():
@@ -604,7 +542,7 @@ if __name__ == "__main__":
 
     print()
     print("=" * 100)
-    print("Flash Attention Backward Benchmark: Megakernel vs PyTorch vs SDPA")
+    print("Flash Attention Backward Benchmark: Megakernel vs SDPA")
     print("=" * 100)
     print()
 
@@ -616,7 +554,7 @@ if __name__ == "__main__":
 
     print()
     print("=" * 100)
-    print("Flash Attention Causal Forward Benchmark: Megakernel vs PyTorch vs SDPA")
+    print("Flash Attention Causal Forward Benchmark: Megakernel vs SDPA")
     print("=" * 100)
     print()
 
@@ -628,7 +566,7 @@ if __name__ == "__main__":
 
     print()
     print("=" * 100)
-    print("Flash Attention Causal Backward Benchmark: Megakernel vs PyTorch vs SDPA")
+    print("Flash Attention Causal Backward Benchmark: Megakernel vs SDPA")
     print("=" * 100)
     print()
 
