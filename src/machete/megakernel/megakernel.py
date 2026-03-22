@@ -1316,7 +1316,7 @@ class Megakernel:
             # Controller warp (split) or load warp (non-split) is always
             # warp num_mma_warps — same ID in both modes.
             if warp_id == Int32(num_mma_warps):
-                if lane_id == Int32(0):
+                with cute.arch.elect_one():
                     st_shared_i32(flags_ptr + FLAG_DISPATCH_LOAD, Int32(-1))
                     st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
                     st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
@@ -1472,7 +1472,7 @@ class Megakernel:
                                     )
                         # Signal controller: dispatch consumed (release ensures
                         # TMA dispatch is ordered before flag reset)
-                        if lane_id == Int32(0):
+                        with cute.arch.elect_one():
                             st_shared_release_cta_i32(_ldr_dispatch_ptr, Int32(-1))
 
                     if _dl_slot == Int32(-1):
@@ -1607,8 +1607,8 @@ class Megakernel:
                                         _ds_op,
                                     )
 
-                        # Thread 0: signal barriers + update store_idx
-                        if lane_id == Int32(0):
+                        # Elect one thread: signal barriers + update store_idx
+                        with cute.arch.elect_one():
                             signal_barriers(
                                 _ds_op,
                                 _ds_0,
@@ -1745,7 +1745,7 @@ class Megakernel:
                                     )
 
                         # Signal compute_done for this slot
-                        if lane_id == Int32(0):
+                        with cute.arch.elect_one():
                             mbarrier_arrive(_compute_done_mbar(smem_base, slot))
 
                         consume_ptr = consume_ptr + Int32(1)
