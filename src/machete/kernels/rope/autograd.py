@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 import torch
 
 from machete.megakernel.autograd_op import AutogradOp, TensorSpec
-from .rope import RopeOp
+from .rope import RopeOp, RopeBwdOp
 
 
 class RopeAutogradOp(AutogradOp):
@@ -34,6 +34,7 @@ class RopeAutogradOp(AutogradOp):
     """
 
     op_cls = RopeOp
+    bwd_op_cls = RopeBwdOp
 
     def tensor_specs(self) -> List[TensorSpec]:
         return [
@@ -48,12 +49,12 @@ class RopeAutogradOp(AutogradOp):
 
     def prepare_tensors(self, q, cos, sin, **kw) -> Dict[str, torch.Tensor]:
         b, s, h, d = q.shape
-        # Pick largest tile_size_H <= 8 that divides H
+        # Pick largest tile_size_NH <= 8 that divides NH
         tile_h = min(h, 8)
         while h % tile_h != 0:
             tile_h -= 1
-        self._tile_sizes = {"M": 2, "H": tile_h}
-        return {"q": q.view(b * s, h, d).contiguous(), "cos": cos, "sin": sin}
+        self._tile_sizes = {"S": 2, "NH": tile_h, "B": 1}
+        return {"q": q.contiguous(), "cos": cos, "sin": sin}
 
 
 __all__ = ["RopeAutogradOp"]

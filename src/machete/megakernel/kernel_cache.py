@@ -9,20 +9,20 @@ tensors are rebuilt per call (cheap CPU work).
 The cache key captures everything that affects the compiled MLIR/PTX:
 - Op class types and their execution modes
 - Tile counts (barrier formulas bake tile_counts into coefficients)
-- num_sms, threads_per_block, page_size, num_pages, backward flag
+- num_sms, threads_per_block, page_size, num_pages
 
 Usage:
     cache = KernelCache.get()
-    compiled = cache.lookup(scheduled_ops, mk_config, backward=False)
+    compiled = cache.lookup(scheduled_ops, mk_config)
     if compiled is None:
         # compile, then store
-        cache.store(scheduled_ops, mk_config, backward=False, compiled_kernel=kernel)
+        cache.store(scheduled_ops, mk_config, compiled_kernel=kernel)
 """
 
 import threading
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple
 
-from .ops import ScheduledOp, Op
+from .ops import ScheduledOp
 from .megakernel import MegakernelConfig
 
 
@@ -58,7 +58,6 @@ class KernelCache:
     def make_key(
         ops: List[ScheduledOp],
         config: MegakernelConfig,
-        backward: bool,
     ) -> CacheKey:
         """Build a cache key from op structure and config.
 
@@ -77,7 +76,6 @@ class KernelCache:
         return (
             op_structure,
             config.num_sms,
-            backward,
             config.threads_per_block,
             config.page_size,
             config.num_pages,
@@ -87,21 +85,19 @@ class KernelCache:
         self,
         ops: List[ScheduledOp],
         config: MegakernelConfig,
-        backward: bool,
     ) -> object:
         """Look up a cached compiled kernel. Returns None on miss."""
-        key = self.make_key(ops, config, backward)
+        key = self.make_key(ops, config)
         return self._cache.get(key)
 
     def store(
         self,
         ops: List[ScheduledOp],
         config: MegakernelConfig,
-        backward: bool,
         compiled_kernel: object,
     ) -> None:
         """Store a compiled kernel in the cache."""
-        key = self.make_key(ops, config, backward)
+        key = self.make_key(ops, config)
         with self._lock:
             self._cache[key] = compiled_kernel
 

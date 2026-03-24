@@ -10,7 +10,7 @@ Usage:
     from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    ops = RMSNormOp.schedule(x=x, weight=w, y=y, tile_sizes={"M": 4})
+    ops = RMSNormOp.schedule(x=x, weight=w, y=y)
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -20,14 +20,20 @@ from .ops import (
     Op,
     ScheduledOp,
     TensorMeta,
+    build_op_config,
+)
+
+from .registries import (
+    PeerBufferRegistry,
+    PeerTMARegistry,
+    validate_op_compatibility,
+)
+
+from .scheduling import (
     BarrierFormula,
     INSTRUCTION_WORDS,
     TileInstruction,
     InstructionStreamBuilder,
-    PeerBufferRegistry,
-    PeerTMARegistry,
-    validate_op_compatibility,
-    build_op_config,
 )
 
 from .compile import (
@@ -52,6 +58,7 @@ from .autograd_op import AutogradOp, TensorSpec
 from .autograd import MegakernelFunction
 from .kernel_cache import KernelCache
 from .functional import megakernel_apply, MegakernelModule
+from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
 
 __all__ = [
     # Operation Protocol
@@ -89,4 +96,9 @@ __all__ = [
     "KernelCache",
     "megakernel_apply",
     "MegakernelModule",
+    # Debug utilities
+    "dump_ptx",
+    "dump_sass",
+    "dump_cubin",
+    "extract_cubin",
 ]

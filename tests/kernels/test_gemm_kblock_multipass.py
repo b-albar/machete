@@ -52,6 +52,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1,
               page_size=None):
     """Run GemmOp and return output tensor C.
 
+    Inputs are 2D (M, K)/(N, K), auto-wrapped to 3D (1, M, K) for GemmOp.
     Uses num_sms=1 by default to force multi-pass execution.
     """
     from machete.megakernel import Megakernel, MegakernelConfig
@@ -59,15 +60,15 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1,
 
     M, K = a.shape
     N = b_t.shape[0]
-    c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
+    c = torch.zeros(1, M, N, dtype=a.dtype, device=a.device)
 
     kw = {}
     if page_size is not None:
         kw["page_size"] = page_size
 
     ops = GemmOp.schedule(
-        a=a, b=b_t, c=c,
-        tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        a=a.unsqueeze(0), b=b_t, c=c,
+        tile_sizes={"S": tile_m, "N": tile_n, "K": tile_k},
         **kw,
     )
     config = GemmOp.kernel_config(ops)
@@ -81,7 +82,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32, num_sms=1,
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
-    return c
+    return c.squeeze(0)
 
 
 def _gemm_case(M, K, N, dtype, tile_m=64, tile_n=32, tile_k=32,

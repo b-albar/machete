@@ -40,7 +40,7 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _run_attention_forward(q, k, v, tile_m=None, causal=False):
+def _run_attention_forward(q, k, v, tile_m=None, causal=False, kv_group_size=1):
     """Run FlashAttentionSm100Op forward and return output tensor."""
     from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm100Op
@@ -48,12 +48,13 @@ def _run_attention_forward(q, k, v, tile_m=None, causal=False):
     tile_sizes = {}
     if tile_m is not None:
         tile_sizes["M"] = tile_m
-    # For fp16/bf16, let schedule_forward compute optimal tile_M
+    # For fp16/bf16, let schedule compute optimal tile_M
     o = torch.zeros_like(q)
     ops = FlashAttentionSm100Op.schedule(
         q=q, k=k, v=v, o=o,
         tile_sizes=tile_sizes,
         causal=causal,
+        kv_group_size=kv_group_size,
     )
     config = FlashAttentionSm100Op.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -174,7 +175,7 @@ class TestFlashAttentionMMA:
 
 
 class TestFlashAttentionMultiWarp:
-    """Multi-warp MMA tests — let schedule_forward pick optimal tile_M."""
+    """Multi-warp MMA tests — let schedule pick optimal tile_M."""
 
     @requires_gpu
     @pytest.mark.parametrize("BH,M,N,D", [
@@ -371,3 +372,39 @@ class TestFlashAttentionReference:
         o = flash_attention_pytorch(q, k, v)
         # Row 0 should be close to V[0]
         torch.testing.assert_close(o[0, 0], v[0, 0].float(), atol=1e-3, rtol=1e-3)
+
+
+# =============================================================================
+# GQA Tests (Grouped Query Attention)
+# =============================================================================
+
+
+class TestFlashAttentionGQA:
+    """GQA tests: multiple Q heads share K/V heads."""
+
+    @requires_gpu
+    @pytest.mark.parametrize("BH_q,BH_kv,M,N,D,causal", [
+        (4, 2, 32, 32, 64, False),    # kv_group_size=2, D=64
+        (8, 2, 32, 32, 128, False),   # kv_group_size=4, D=128
+        (8, 4, 64, 64, 128, False),   # kv_group_size=2, larger
+        (4, 2, 32, 32, 64, True),     # kv_group_size=2, causal
+        (8, 2, 64, 64, 128, True),    # kv_group_size=4, causal
+    ], ids=[
+        "gqa2_d64", "gqa4_d128", "gqa2_d128_large",
+        "gqa2_d64_causal", "gqa4_d128_causal",
+    ])
+    def test_gqa_forward(self, BH_q, BH_kv, M, N, D, causal):
+        """GQA forward matches PyTorch reference with repeat_interleave."""
+        kv_group_size = BH_q // BH_kv
+        torch.manual_seed(42)
+        q = torch.randn(BH_q, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+
+        o_mk = _run_attention_forward(
+            q, k, v, causal=causal, kv_group_size=kv_group_size)
+        o_ref = flash_attention_pytorch(
+            q.float(), k.float(), v.float(),
+            causal=causal, kv_group_size=kv_group_size).half()
+
+        torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)

@@ -40,21 +40,32 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _tile_size_M(D, elem_bytes=2):
-    """Compute largest tile_size_M that fits in a 16KB page."""
-    return min(4, max(1, 16384 // (D * elem_bytes)))
+def _tile_size_S(N, elem_bytes=2):
+    """Compute largest tile_size_S that fits in a 16KB page."""
+    return min(4, max(1, 16384 // (N * elem_bytes)))
+
+
+def _to_3d(t):
+    """Wrap 2D (M, N) tensor to 3D (1, M, N) for ActivationOp."""
+    if t.ndim == 2:
+        return t.unsqueeze(0)
+    return t
 
 
 def _run_activation(x_2d, activation='relu'):
-    """Run ActivationOp and return output tensor (in-place on x_2d)."""
+    """Run ActivationOp and return output tensor (in-place on x_2d).
+
+    Wraps 2D input to 3D for ActivationOp, which now uses (B, S, N) dims.
+    """
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.activation import ActivationOp
 
-    D = x_2d.shape[1]
-    elem_bytes = 2 if x_2d.dtype in (torch.float16, torch.bfloat16) else 4
-    tile_m = _tile_size_M(D, elem_bytes)
+    x = _to_3d(x_2d)
+    N = x.shape[2]
+    elem_bytes = 2 if x.dtype in (torch.float16, torch.bfloat16) else 4
+    tile_s = _tile_size_S(N, elem_bytes)
     ops = ActivationOp.schedule(
-        x=x_2d, activation=activation, tile_sizes={"M": tile_m},
+        x=x, activation=activation, tile_sizes={"S": tile_s},
     )
     kernel = Megakernel(ops, config=MegakernelConfig())
 
@@ -62,28 +73,32 @@ def _run_activation(x_2d, activation='relu'):
         kernel.run()
 
     torch.cuda.synchronize()
-    return x_2d
+    return x_2d  # in-place: x_2d shares storage with x
 
 
 def _run_gemm_activation(a, b_t, activation='relu', tile_m=64, tile_n=32, tile_k=32):
-    """Run fused GEMM + Activation and return output tensor C."""
+    """Run fused GEMM + Activation and return output tensor C.
+
+    Inputs are 2D (M, K)/(N, K), auto-wrapped to 3D (1, M, K) for GemmOp.
+    ActivationOp now uses (B, S, N) dims — receives 3D c directly.
+    """
     from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
     from machete.kernels.activation import ActivationOp
 
     M, K = a.shape
     N = b_t.shape[0]
-    c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
+    c = torch.zeros(1, M, N, dtype=a.dtype, device=a.device)
 
     elem_bytes = 2 if a.dtype in (torch.float16, torch.bfloat16) else 4
-    act_tile_m = _tile_size_M(N, elem_bytes)
+    act_tile_s = _tile_size_S(N, elem_bytes)
 
     ops = GemmOp.schedule(
-        a=a, b=b_t, c=c,
-        tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        a=a.unsqueeze(0), b=b_t, c=c,
+        tile_sizes={"S": tile_m, "N": tile_n, "K": tile_k},
     )
     ops += ActivationOp.schedule(
-        x=c, activation=activation, tile_sizes={"M": act_tile_m},
+        x=c, activation=activation, tile_sizes={"S": act_tile_s},
     )
 
     config = GemmOp.kernel_config(ops)
@@ -92,7 +107,7 @@ def _run_gemm_activation(a, b_t, activation='relu', tile_m=64, tile_n=32, tile_k
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
-    return c
+    return c.squeeze(0)
 
 
 # =============================================================================

@@ -7,11 +7,11 @@ Compiles an Op's pipelined phase methods (load, compute, store) into
 method, mapping positional tile indices to named parameters.
 
 Usage:
-    from machete.megakernel.compile import compile_compute
+    from machete.megakernel.compile import compile_phase
 
     config = build_op_config(scheduled_op, kernel_config=kernel_config)
     instance = MyOp(**config)
-    tile_fn = compile_compute(instance, tensor_param_names=['t0', 't1'])
+    tile_fn = compile_phase(instance, "compute", tensor_param_names=['t0', 't1'])
 
     # Returns @cute.jit function with signature:
     #   fn(page_ptr: Int32, tile_0..tile_4: Int32,
@@ -109,8 +109,9 @@ def _build_phase_wrapper(
 
     op_cls = instance.__class__
     method = getattr(instance, phase_name)
-    method_params = set(inspect.signature(method).parameters.keys())
-    method_params_ordered = list(inspect.signature(method).parameters.keys())
+    sig_params = inspect.signature(method).parameters
+    method_params = set(sig_params.keys())
+    method_params_ordered = list(sig_params.keys())
 
     # Build instance method call arguments:
     # page_ptr, then tile indices (mapped to positional tile_i), then tensors,
@@ -139,13 +140,15 @@ def _build_phase_wrapper(
     # page_ptr, tile_*, op_config_ptr, work_mbar, and TMA params)
     if tensor_param_names:
         known_special = {
-            "page_ptr", "op_config_ptr", "work_mbar", "inner_iter_idx",
+            "page_ptr",
+            "op_config_ptr",
+            "work_mbar",
+            "inner_iter_idx",
         }
         tma_local_names = set(tma_reverse.keys())
         expects_tensors = any(
             p not in known_special
             and not p.startswith("tile_")
-            and not p.startswith("prev_tile_")
             and p not in tma_local_names
             for p in method_params
         )
@@ -167,23 +170,9 @@ def _build_phase_wrapper(
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
 
-    is_load_phase = phase_name in ("load", "backward_load")
+    is_load_phase = phase_name == "load"
 
-    # Map prev_tile params for load phases: prev_tile_M, prev_tile_D, etc.
-    # Framework passes -1 when the previous tile was a different op.
-    # Load methods can accept these to skip redundant TMA loads when
-    # consecutive tiles share coordinates.
     if is_load_phase:
-        if hasattr(op_cls, "_TILE_DIM_NAMES_ORDERED"):
-            for dim_name in op_cls._TILE_DIM_NAMES_ORDERED:
-                if f"prev_tile_{dim_name}" in method_params:
-                    axis = op_cls.DIM_NAMES[dim_name]
-                    call_args.append(f"prev_{axis}")
-        else:
-            for i in range(5):
-                if f"prev_tile_{i}" in method_params:
-                    call_args.append(f"prev_{i}")
-
         # inner_iter_idx: store warp passes iteration index for K-block loading
         if "inner_iter_idx" in method_params:
             call_args.append("inner_iter_idx")
@@ -196,12 +185,10 @@ def _build_phase_wrapper(
     if extra_params:
         extra_str = ", " + ", ".join(extra_params)
 
-    # For load phases: add prev_0..prev_4 and inner_iter_idx to signature
-    # Values are -1 when previous tile was a different op (or first tile).
-    prev_tile_str = ""
+    # For load phases: add inner_iter_idx to signature
+    load_extra_str = ""
     if is_load_phase:
-        prev_params = ", ".join(f"prev_{i}" for i in range(5))
-        prev_tile_str = f", {prev_params}, inner_iter_idx"
+        load_extra_str = ", inner_iter_idx"
 
     tensor_str = ""
     if tensor_param_names:
@@ -219,8 +206,9 @@ def _build_phase_wrapper(
     # Non-TMA ops must be wrapped in elect_one() so only one thread executes.
     # TMA ops handle thread selection internally (elect_one for mbarrier,
     # cute.copy outside for warp-convergent TMA copy).
-    is_store_phase = phase_name in ("store", "backward_store")
     has_tma = bool(tma_local_mapping)
+    is_compute = phase_name == "compute"
+    is_store = phase_name in ("store", "communicate")
     if is_load_phase and not has_tma:
         # Non-TMA loads: elect_one so only one thread issues the G2S copy.
         body = f"    with cute.arch.elect_one():\n"
@@ -232,23 +220,46 @@ def _build_phase_wrapper(
         if append_mbar:
             body += "    mbarrier_arrive(work_mbar)\n"
 
+    # Prevent LLVM DCE of noinline compute/store wrappers with empty bodies.
+    # When an op's method is a no-op (pass), the wrapper generates no code.
+    # LLVM marks the function as readnone and eliminates the call, which can
+    # corrupt control flow in the MMA/store warp loops.  A zero-cost
+    # nanosleep.u32 0 acts as a compiler barrier with no runtime overhead.
+    needs_fence = is_compute or is_store
+    if needs_fence:
+        body += "    _compiler_fence()\n"
+
     fn_source = (
         "@cute.jit\n"
         f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
-        f"{extra_str}{prev_tile_str}{tensor_str}{tma_str}):\n"
+        f"{extra_str}{load_extra_str}{tensor_str}{tma_str}):\n"
         f"{body}"
     )
 
     exec_globals = {
-        "cute": cute, "Int32": Int32, "Int64": Int64,
+        "cute": cute,
+        "Int32": Int32,
+        "Int64": Int64,
         "_instance": instance,
     }
     if append_mbar:
         from .interpreter import mbarrier_arrive
+
         exec_globals["mbarrier_arrive"] = mbarrier_arrive
+    if needs_fence:
+        from .interpreter import nanosleep
+
+        @cute.jit
+        def _compiler_fence():
+            nanosleep(Int32(0))
+
+        exec_globals["_compiler_fence"] = _compiler_fence
 
     linecache.cache[unique_filename] = (
-        len(fn_source), None, fn_source.splitlines(True), unique_filename,
+        len(fn_source),
+        None,
+        fn_source.splitlines(True),
+        unique_filename,
     )
     _linecache_entries.append(unique_filename)
 
@@ -257,117 +268,48 @@ def _build_phase_wrapper(
     return exec_globals["phase_fn"]
 
 
-def compile_load(instance, tensor_param_names=None,
-                 tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's load method.
+def compile_phase(instance, phase_name, tensor_param_names=None,
+                  tma_param_names=None, tma_local_mapping=None,
+                  noinline=False):
+    """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
-    Detects async vs sync load from method signature.
-    Always includes work_mbar in wrapper signature.
+    For load phases, detects async vs sync from method
+    signature. Async loads manage their own mbarrier; sync loads get an
+    automatic mbarrier_arrive appended. All load wrappers include work_mbar
+    in their signature.
+
+    All other phases (compute, store, communicate, backward_*) are compiled
+    directly with no extra parameters.
     """
-    method = getattr(instance, "load")
-    is_async = "work_mbar" in inspect.signature(method).parameters
+    is_load = phase_name == "load"
 
-    if is_async:
-        return _build_phase_wrapper(
-            instance, "load", tensor_param_names,
+    if is_load:
+        method = getattr(instance, phase_name)
+        is_async = "work_mbar" in inspect.signature(method).parameters
+        fn = _build_phase_wrapper(
+            instance,
+            phase_name,
+            tensor_param_names,
             extra_params=["work_mbar"],
-            filename="<compile_load>",
+            append_mbar=not is_async,
+            filename=f"<compile_{phase_name}>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
         )
     else:
-        return _build_phase_wrapper(
-            instance, "load", tensor_param_names,
-            extra_params=["work_mbar"],
-            append_mbar=True,
-            filename="<compile_load>",
+        fn = _build_phase_wrapper(
+            instance,
+            phase_name,
+            tensor_param_names,
+            filename=f"<compile_{phase_name}>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
         )
 
+    if noinline and hasattr(fn, "__wrapped__"):
+        fn.__wrapped__._noinline = True
 
-def compile_compute(instance, tensor_param_names=None,
-                    tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's compute method."""
-    return _build_phase_wrapper(
-        instance, "compute", tensor_param_names,
-        filename="<compile_compute>",
-        tma_param_names=tma_param_names,
-        tma_local_mapping=tma_local_mapping,
-    )
-
-
-def compile_store(instance, tensor_param_names=None,
-                  tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's store method."""
-    return _build_phase_wrapper(
-        instance, "store", tensor_param_names,
-        filename="<compile_store>",
-        tma_param_names=tma_param_names,
-        tma_local_mapping=tma_local_mapping,
-    )
-
-
-def compile_backward_load(instance, tensor_param_names=None,
-                          tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's backward_load method."""
-    method = getattr(instance, "backward_load")
-    is_async = "work_mbar" in inspect.signature(method).parameters
-
-    if is_async:
-        return _build_phase_wrapper(
-            instance, "backward_load", tensor_param_names,
-            extra_params=["work_mbar"],
-            filename="<compile_backward_load>",
-            tma_param_names=tma_param_names,
-            tma_local_mapping=tma_local_mapping,
-        )
-    else:
-        return _build_phase_wrapper(
-            instance, "backward_load", tensor_param_names,
-            extra_params=["work_mbar"],
-            append_mbar=True,
-            filename="<compile_backward_load>",
-            tma_param_names=tma_param_names,
-            tma_local_mapping=tma_local_mapping,
-        )
-
-
-def compile_backward_compute(instance, tensor_param_names=None,
-                             tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's backward_compute method."""
-    return _build_phase_wrapper(
-        instance, "backward_compute", tensor_param_names,
-        filename="<compile_backward_compute>",
-        tma_param_names=tma_param_names,
-        tma_local_mapping=tma_local_mapping,
-    )
-
-
-def compile_backward_store(instance, tensor_param_names=None,
-                           tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's backward_store method."""
-    return _build_phase_wrapper(
-        instance, "backward_store", tensor_param_names,
-        filename="<compile_backward_store>",
-        tma_param_names=tma_param_names,
-        tma_local_mapping=tma_local_mapping,
-    )
-
-
-def compile_communicate(instance, tensor_param_names=None,
-                         tma_param_names=None, tma_local_mapping=None):
-    """Compile Op's communicate method for peer GPU stores.
-
-    Same pattern as compile_store — called by store warp after local store.
-    TMA params here are peer TMA descriptors (S2G to peer memory).
-    """
-    return _build_phase_wrapper(
-        instance, "communicate", tensor_param_names,
-        filename="<compile_communicate>",
-        tma_param_names=tma_param_names,
-        tma_local_mapping=tma_local_mapping,
-    )
+    return fn
 
 
 # =============================================================================
@@ -390,13 +332,7 @@ def cleanup_linecache() -> int:
 
 
 __all__ = [
-    "compile_load",
-    "compile_compute",
-    "compile_store",
-    "compile_communicate",
-    "compile_backward_load",
-    "compile_backward_compute",
-    "compile_backward_store",
+    "compile_phase",
     "cleanup_linecache",
     # Internals
     "_extract_body",

@@ -23,9 +23,9 @@ Usage:
     from machete.kernels.gemm import GemmOp
     from machete.megakernel import Megakernel
 
-    c = torch.zeros(M, N, dtype=dtype, device="cuda")
-    ops = GemmOp.schedule(a=a, b=b, c=c, tile_sizes={"M": 64, "N": 32, "K": 32})
-    ops += ActivationOp.schedule(x=c, activation='relu', tile_sizes={"M": 4})
+    c = torch.zeros(1, M, N, dtype=dtype, device="cuda")
+    ops = GemmOp.schedule(a=a, b=b, c=c, tile_sizes={"S": 64, "N": 32, "K": 32})
+    ops += ActivationOp.schedule(x=c, activation='relu', tile_sizes={"S": 4})
     kernel = Megakernel(ops)
     kernel.run()
 """
@@ -52,17 +52,17 @@ class ActivationOp(Op):
     In-place: schedule with y=x (default when y is omitted).
 
     Tensor declarations:
-        x: (M, D) -- input tensor
-        y: (M, D) -- output tensor (typically same as x)
+        x: (B, S, N) -- input tensor
+        y: (B, S, N) -- output tensor (typically same as x)
 
     Tiling:
-        tile_M indexes row groups. D is full-extent (1 tile).
-        tile_size_M * D * elem_bytes <= page_size.
+        tile_B=1, tile_S indexes row groups. N is full-extent (1 tile).
+        tile_size_S * N * elem_bytes <= page_size.
     """
 
-    reads = {"x": (None, ("M", "D"))}
-    writes = {"y": (None, ("M", "D"))}
-    tile = ("M", "D")
+    reads = {"x": (None, ("B", "S", "N"))}
+    writes = {"y": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -79,35 +79,34 @@ class ActivationOp(Op):
         else:
             self.elem_bytes = 4
 
-        self.x_tile_bytes = self.tile_size_M * self.D * self.elem_bytes
+        self.x_tile_bytes = self.tile_size_S * self.N * self.elem_bytes
 
         assert self.x_tile_bytes <= self.page_size, (
             f"ActivationOp: tile smem ({self.x_tile_bytes}B) exceeds page_size ({self.page_size}B). "
-            f"Reduce tile_size_M={self.tile_size_M}."
+            f"Reduce tile_size_S={self.tile_size_S}."
         )
-
-        self.num_warps = self.threads_per_row // 32
 
     # =========================================================================
     # Scheduling
     # =========================================================================
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, activation='relu', page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule(cls, tile_sizes=None, activation='relu', page_size=DEFAULT_PAGE_SIZE, **tensors):
         """Schedule activation forward.
 
         Args:
             activation: 'relu' or 'silu'
             page_size: Shared memory page size in bytes.
-            **tensors: x required, y optional (defaults to x for in-place)
+            **tensors: x (B,S,N) required, y optional (defaults to x for in-place)
         """
         tile_sizes = dict(tile_sizes or {})
-        if "M" not in tile_sizes:
+        if "S" not in tile_sizes:
             x = tensors.get('x')
             if x is not None:
-                D = x.shape[1]
+                N = x.shape[2]
                 elem_bytes = x.element_size()
-                tile_sizes["M"] = max(1, page_size // (D * elem_bytes))
+                tile_sizes["S"] = max(1, page_size // (N * elem_bytes))
+        tile_sizes.setdefault("B", 1)
         if 'y' not in tensors:
             tensors['y'] = tensors['x']
         act_id = ACT_MAP.get(activation, ACT_RELU)
@@ -128,19 +127,19 @@ class ActivationOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_D, x_tma, x_tma_gmem, work_mbar):
+    def load(self, page_ptr, tile_B, tile_S, tile_N, x_tma, x_tma_gmem, work_mbar):
         """TMA load of x tile from global to shared memory."""
         sX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M)),
+            cute.make_layout((self.N, self.tile_size_S, 1)),
         )
         gX = cute.local_tile(
-            x_tma_gmem, (self.D, self.tile_size_M), (None, None),
+            x_tma_gmem, (self.N, self.tile_size_S, 1), (None, None, None),
         )
         tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
             x_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sX, 0, 2),
-            cute.group_modes(gX, 0, 2),
+            cute.group_modes(sX, 0, 3),
+            cute.group_modes(gX, 0, 3),
         )
 
         nbytes = Int32(self.x_tile_bytes)
@@ -149,7 +148,7 @@ class ActivationOp(Op):
         )
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(x_tma, tXgX[(None, tile_D, tile_M)], tXsX,
+        cute.copy(x_tma, tXgX[(None, tile_N, tile_S, tile_B)], tXsX,
                   tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -157,7 +156,7 @@ class ActivationOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_D):
+    def compute(self, page_ptr, tile_B, tile_S, tile_N):
         """Apply activation element-wise: read from smem, activate, write back."""
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
 
@@ -166,15 +165,15 @@ class ActivationOp(Op):
         num_warps = self.threads_per_row // 32
         thr_layout = cute.make_layout(32)
 
-        row_start = tile_M * self.tile_size_M
+        row_start = tile_S * self.tile_size_S
 
-        for local_row in range(warp_idx, self.tile_size_M, num_warps):
+        for local_row in range(warp_idx, self.tile_size_S, num_warps):
             row_idx = row_start + local_row
 
-            if row_idx < self.M:
+            if row_idx < self.S:
                 x_row = cute.make_tensor(
-                    x_smem + local_row * self.D,
-                    cute.make_layout(self.D),
+                    x_smem + local_row * self.N,
+                    cute.make_layout(self.N),
                 )
                 x_part = cute.local_partition(x_row, thr_layout, lane_idx)
                 x_reg = cute.make_fragment_like(x_part)
@@ -195,8 +194,8 @@ class ActivationOp(Op):
                         y_reg[i] = act_val.to(self.x_dtype)
 
                 y_row = cute.make_tensor(
-                    x_smem + local_row * self.D,
-                    cute.make_layout(self.D),
+                    x_smem + local_row * self.N,
+                    cute.make_layout(self.N),
                 )
                 y_part = cute.local_partition(y_row, thr_layout, lane_idx)
                 cute.autovec_copy(y_reg, y_part)
@@ -206,22 +205,22 @@ class ActivationOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_D, y_tma, y_tma_gmem):
+    def store(self, page_ptr, tile_B, tile_S, tile_N, y_tma, y_tma_gmem):
         """TMA store of activated result from shared to global memory."""
         sY = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M)),
+            cute.make_layout((self.N, self.tile_size_S, 1)),
         )
         gY = cute.local_tile(
-            y_tma_gmem, (self.D, self.tile_size_M), (None, None),
+            y_tma_gmem, (self.N, self.tile_size_S, 1), (None, None, None),
         )
         tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
             y_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sY, 0, 2),
-            cute.group_modes(gY, 0, 2),
+            cute.group_modes(sY, 0, 3),
+            cute.group_modes(gY, 0, 3),
         )
         with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_M)])
+            cute.copy(y_tma, tYsY, tYgY[(None, tile_N, tile_S, tile_B)])
 
 
 __all__ = ["ActivationOp"]

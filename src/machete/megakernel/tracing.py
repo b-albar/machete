@@ -4,9 +4,10 @@
 Provides cutedsl-trace integration for visualizing per-SM tile timelines
 (load, compute, store, and wait events).
 
-Two lanes per CTA:
-    lane 0 = DMA warp (load, store, dep_wait)
+Three lanes per CTA:
+    lane 0 = Load warp (load, dep_wait)
     lane 1 = MMA warp 0 (compute, data_wait)
+    lane 2 = Store warp (store, compute_wait)
 """
 
 import math
@@ -26,6 +27,7 @@ class TracingState:
     store_fmts: List[int] = field(default_factory=list)
     dep_wait_fmt: int = 0
     data_wait_fmt: int = 0
+    compute_wait_fmt: int = 0
 
 
 def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
@@ -66,7 +68,7 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
         state.store_fmts.append(seen_classes[cls_name]["store"].id)
 
     # Wait event types
-    for wait_name in ("dep_wait", "data_wait"):
+    for wait_name in ("dep_wait", "data_wait", "compute_wait"):
         tt = TraceType(
             name=wait_name,
             label_string=wait_name.replace("_", " "),
@@ -77,6 +79,7 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
         state.trace_types[wait_name] = tt
     state.dep_wait_fmt = state.trace_types["dep_wait"].id
     state.data_wait_fmt = state.trace_types["data_wait"].id
+    state.compute_wait_fmt = state.trace_types["compute_wait"].id
 
     state.block_type = BlockType(
         name="CTA",
@@ -84,33 +87,39 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
         tooltip_string="CTA {blockLinear} on SM {smId}",
     )
 
-    dma_track = TrackType(
-        name="DMA",
-        label_string="SM {lane} DMA",
-        tooltip_string="DMA warp on SM {lane}",
+    load_track = TrackType(
+        name="Load",
+        label_string="SM {lane} Load",
+        tooltip_string="Load warp on SM {lane}",
     )
     mma_track = TrackType(
         name="MMA",
         label_string="SM {lane} MMA",
         tooltip_string="MMA warp 0 on SM {lane}",
     )
+    store_track = TrackType(
+        name="Store",
+        label_string="SM {lane} Store",
+        tooltip_string="Store warp on SM {lane}",
+    )
 
-    # 2 lanes; enough events for load+store+compute+waits per tile
+    # 3 lanes: load, MMA, store; enough events per tile
     tiles_per_sm = math.ceil(total_tiles / num_sms)
     max_events = tiles_per_sm * 3 + 16
     state.builder = DynamicTraceBuilder(
-        num_lanes=2,
+        num_lanes=3,
         max_events_per_lane=max_events,
         grid_dims=(num_sms, 1, 1),
     )
-    state.builder.set_track_type(dma_track, lane=0)
+    state.builder.set_track_type(load_track, lane=0)
     state.builder.set_track_type(mma_track, lane=1)
+    state.builder.set_track_type(store_track, lane=2)
 
     return state
 
 
-def write_trace(state: TracingState, filename: str) -> None:
-    """Write trace to .nanotrace file. Only valid after run() with tracing=True."""
+def _make_writer(state: TracingState):
+    """Create a TraceWriter from tracing state."""
     if state is None or state.builder is None:
         raise RuntimeError("Tracing not enabled. Set MegakernelConfig(tracing=True).")
     from cutedsl_trace import TraceWriter
@@ -121,7 +130,17 @@ def write_trace(state: TracingState, filename: str) -> None:
     writer.add_tensor(state.builder)
     for tt in state.trace_types.values():
         writer.register_trace_type(tt)
-    writer.write(filename)
+    return writer
+
+
+def write_trace(state: TracingState, filename: str) -> None:
+    """Write trace to .nanotrace file. Only valid after run() with tracing=True."""
+    _make_writer(state).write(filename)
+
+
+def write_trace_perfetto(state: TracingState, filename: str) -> None:
+    """Write trace as Perfetto JSON. Only valid after run() with tracing=True."""
+    _make_writer(state).write_perfetto(filename)
 
 
 def resolve_tracing_blocks(source: str, tracing: bool) -> str:
@@ -207,6 +226,7 @@ def get_trace_exec_globals(state: TracingState) -> dict:
             "trace_store_fmts": state.store_fmts,
             "trace_dep_wait_fmt": state.dep_wait_fmt,
             "trace_data_wait_fmt": state.data_wait_fmt,
+            "trace_compute_wait_fmt": state.compute_wait_fmt,
         }
     else:
         # Trace code is stripped from the source by resolve_tracing_blocks,

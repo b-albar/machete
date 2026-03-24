@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # Copyright (c) 2025, Machete Authors
-"""Benchmark Flash Attention: Megakernel vs PyTorch vs torch SDPA vs CuTe DSL FA2.
+"""Benchmark Flash Attention: Megakernel vs SDPA vs CuTe DSL FA2.
 
 Compares GPU kernel execution time of:
-  - PyTorch manual attention (bmm + softmax + bmm) [bf16]
   - torch.nn.functional.scaled_dot_product_attention [bf16]
   - CuTe DSL FlashAttentionForwardAmpere (tensor core MMA) [fp16]
   - Megakernel FlashAttentionSm120Op (cooperative cpasync + MMA) [bf16]
@@ -23,8 +22,8 @@ import torch
 import torch.nn.functional as F
 
 from machete.megakernel import Megakernel
-from machete.kernels.attention import FlashAttentionSm120Op
-from machete.kernels.attention.ref import flash_attention_pytorch
+from machete.kernels.attention import FlashAttentionSm120Op, FlashAttentionSm120BwdOp
+from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -34,6 +33,9 @@ try:
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
+
+PAGE_SIZES = [16384, 32768, 49152, 65536]
+BH_SIZES = [1, 4, 16]
 
 # CuTe DSL Flash Attention v2 (Ampere tensor core implementation)
 CUTE_FA2_AVAILABLE = False
@@ -87,32 +89,21 @@ _fa2_cache = {}
 # Benchmark configs
 # =============================================================================
 
-CONFIGS = [
-    # (BH, M, N, D) — realistic LLM attention shapes (D=128 typical)
-    #
-    # Decode (autoregressive, M=16 minimum MMA tile)
-    (32, 16, 2048, 128),
-    (32, 16, 4096, 128),
-    (32, 16, 8192, 128),
-    (32, 16, 16384, 128),
-    (32, 16, 32768, 128),
-    (32, 16, 65536, 128),
-    (32, 16, 131072, 128),
-    # Prefill (M=N, processing prompt tokens)
-    (32, 1024, 1024, 128),
-    (32, 2048, 2048, 128),
-    (32, 4096, 4096, 128),
-    (32, 8192, 8192, 128),
-    # Chunked prefill (M < N, typical chunk sizes)
-    (32, 256, 4096, 128),
-    (32, 256, 16384, 128),
-    (32, 512, 8192, 128),
-    (32, 512, 32768, 128),
+_BASE_FWD_CONFIGS = [
+    # (M, N, D) — prefill shapes (M=N, D=128 typical)
+    (512, 512, 128),
+    (1024, 1024, 128),
+    (2048, 2048, 128),
+    (4096, 4096, 128),
+    (8192, 8192, 128),
+    (16384, 16384, 128),
 ]
 
+FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
 
-@Benchmark.configs(["BH", "M", "N", "D"], CONFIGS)
-def bench_attention(BH, M, N, D):
+
+@Benchmark.configs(["BH", "M", "N", "D", "page_size"], FWD_CONFIGS)
+def bench_attention(BH, M, N, D, page_size):
     """Setup attention benchmark functions for each implementation."""
     torch_dtype = torch.bfloat16
 
@@ -122,9 +113,6 @@ def bench_attention(BH, M, N, D):
     v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
-
-    # PyTorch manual
-    funcs["pytorch"] = lambda: flash_attention_pytorch(q, k, v)
 
     # torch SDPA (4D input so flash attention backend is used)
     q4d = q.unsqueeze(0)  # (1, BH, M, D) → (batch, heads, seq, head_dim)
@@ -189,28 +177,339 @@ def bench_attention(BH, M, N, D):
                     f(q, k, v, o, s, stream)
 
                 funcs["cute_fa2"] = _run_fa2
-        except Exception as e:
-            print(f"  CuTe FA2 error: {e}")
+        except Exception:
+            pass
 
-    # Megakernel bf16 (cooperative cpasync + MMA)
+    # Megakernel + SingleOp bf16
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             o_mk = torch.zeros_like(q)
             ops_mk = FlashAttentionSm120Op.schedule(
-                q=q, k=k, v=v, o=o_mk,
+                q=q, k=k, v=v, o=o_mk, page_size=page_size,
             )
             config_mk = FlashAttentionSm120Op.kernel_config(ops_mk)
             kernel_mk = Megakernel(ops_mk, config=config_mk)
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel_mk.run()
             torch.cuda.synchronize()
-
             funcs["megakernel"] = kernel_mk.bench_spec(
-                setup_fn=lambda: o_mk.zero_(),
+                setup_fn=lambda o_mk=o_mk: o_mk.zero_(),
                 keep_alive=[q, k, v, o_mk],
             )
-        except Exception as e:
-            print(f"  megakernel error: {e}")
+        except Exception:
+            pass
+
+        try:
+            o_so = torch.zeros_like(q)
+            so_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_so, page_size=page_size,
+            )
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda o_so=o_so: o_so.zero_(),
+                keep_alive=[q, k, v, o_so],
+            )
+        except Exception:
+            pass
+
+    return funcs
+
+
+# =============================================================================
+# Causal Forward Benchmark
+# =============================================================================
+
+_BASE_CAUSAL_FWD_CONFIGS = [
+    # (M, N, D) — causal prefill shapes (M=N)
+    (512, 512, 128),
+    (1024, 1024, 128),
+    (2048, 2048, 128),
+    (4096, 4096, 128),
+    (8192, 8192, 128),
+    (16384, 16384, 128),
+]
+
+CAUSAL_FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_CAUSAL_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+
+
+@Benchmark.configs(["BH", "M", "N", "D", "page_size"], CAUSAL_FWD_CONFIGS)
+def bench_attention_causal(BH, M, N, D, page_size):
+    """Setup causal attention benchmark functions for each implementation."""
+    torch_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+
+    funcs = {}
+
+    # torch SDPA (causal)
+    q4d = q.unsqueeze(0)
+    k4d = k.unsqueeze(0)
+    v4d = v.unsqueeze(0)
+    funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q4d, k4d, v4d, is_causal=True)
+
+    # Megakernel + SingleOp bf16 (causal)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            o_mk = torch.zeros_like(q)
+            ops_mk = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_mk, causal=True, page_size=page_size,
+            )
+            config_mk = FlashAttentionSm120Op.kernel_config(ops_mk)
+            kernel_mk = Megakernel(ops_mk, config=config_mk)
+            with contextlib.redirect_stdout(io.StringIO()):
+                kernel_mk.run()
+            torch.cuda.synchronize()
+            funcs["megakernel"] = kernel_mk.bench_spec(
+                setup_fn=lambda o_mk=o_mk: o_mk.zero_(),
+                keep_alive=[q, k, v, o_mk],
+            )
+        except Exception:
+            pass
+
+        try:
+            o_so = torch.zeros_like(q)
+            so_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_so, causal=True, page_size=page_size,
+            )
+            so_kernel = SingleOpKernel(so_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_kernel.run()
+            torch.cuda.synchronize()
+            funcs["single_op"] = so_kernel.bench_spec(
+                setup_fn=lambda o_so=o_so: o_so.zero_(),
+                keep_alive=[q, k, v, o_so],
+            )
+        except Exception:
+            pass
+
+    return funcs
+
+
+# =============================================================================
+# Backward Benchmark
+# =============================================================================
+
+_BASE_BWD_CONFIGS = [
+    # (M, N, D) — prefill shapes (M=N)
+    (512, 512, 128),
+    (1024, 1024, 128),
+    (2048, 2048, 128),
+    (4096, 4096, 128),
+    (8192, 8192, 128),
+]
+
+BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+
+
+@Benchmark.configs(["BH", "M", "N", "D", "page_size"], BWD_CONFIGS)
+def bench_attention_bwd(BH, M, N, D, page_size):
+    """Setup attention backward benchmark."""
+    torch_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+
+    funcs = {}
+
+    # torch SDPA backward
+    dout4d = dout.unsqueeze(0)
+
+    def sdpa_bwd():
+        q_ = q.unsqueeze(0).detach().requires_grad_(True)
+        k_ = k.unsqueeze(0).detach().requires_grad_(True)
+        v_ = v.unsqueeze(0).detach().requires_grad_(True)
+        o = F.scaled_dot_product_attention(q_, k_, v_)
+        o.backward(dout4d)
+        return q_.grad, k_.grad, v_.grad
+
+    funcs["sdpa"] = sdpa_bwd
+
+    # Megakernel + SingleOp backward
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            # Run forward to get lse
+            o_mk = torch.zeros_like(q)
+            lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            fwd_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_mk, lse=lse, page_size=page_size,
+            )
+            fwd_config = FlashAttentionSm120Op.kernel_config(fwd_ops)
+            fwd_kernel = Megakernel(fwd_ops, config=fwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            # Setup backward
+            dpsum = (dout.float() * o_mk.float()).sum(dim=-1).contiguous()
+            dq_accum = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk = torch.zeros_like(k)
+            dv = torch.zeros_like(v)
+
+            bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
+                dq=dq_accum, dk=dk, dv=dv, page_size=page_size,
+            )
+            bwd_config = FlashAttentionSm120BwdOp.kernel_config(bwd_ops)
+            bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["megakernel"] = bwd_kernel.bench_spec(
+                setup_fn=lambda dq=dq_accum, dk=dk, dv=dv: (dq.zero_(), dk.zero_(), dv.zero_()),
+                keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
+            )
+        except Exception:
+            pass
+
+        try:
+            # Run forward to get lse
+            o_so = torch.zeros_like(q)
+            lse_so = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            so_fwd_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_so, lse=lse_so, page_size=page_size,
+            )
+            so_fwd_kernel = SingleOpKernel(so_fwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            dpsum_so = (dout.float() * o_so.float()).sum(dim=-1).contiguous()
+            dq_so = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk_so = torch.zeros_like(k)
+            dv_so = torch.zeros_like(v)
+
+            so_bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse_so, dpsum=dpsum_so,
+                dq=dq_so, dk=dk_so, dv=dv_so, page_size=page_size,
+            )
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                setup_fn=lambda dq=dq_so, dk=dk_so, dv=dv_so: (dq.zero_(), dk.zero_(), dv.zero_()),
+                keep_alive=[q, k, v, dout, lse_so, dpsum_so, dq_so, dk_so, dv_so],
+            )
+        except Exception:
+            pass
+
+    return funcs
+
+
+# =============================================================================
+# Causal Backward Benchmark
+# =============================================================================
+
+CAUSAL_BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+
+
+@Benchmark.configs(["BH", "M", "N", "D", "page_size"], CAUSAL_BWD_CONFIGS)
+def bench_attention_causal_bwd(BH, M, N, D, page_size):
+    """Setup causal attention backward benchmark."""
+    torch_dtype = torch.bfloat16
+
+    torch.manual_seed(42)
+    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+
+    funcs = {}
+
+    # torch SDPA backward (causal)
+    dout4d = dout.unsqueeze(0)
+
+    def sdpa_bwd():
+        q_ = q.unsqueeze(0).detach().requires_grad_(True)
+        k_ = k.unsqueeze(0).detach().requires_grad_(True)
+        v_ = v.unsqueeze(0).detach().requires_grad_(True)
+        o = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
+        o.backward(dout4d)
+        return q_.grad, k_.grad, v_.grad
+
+    funcs["sdpa"] = sdpa_bwd
+
+    # Megakernel + SingleOp backward (causal)
+    if is_hopper_or_newer() and CUTLASS_AVAILABLE:
+        try:
+            # Run forward to get lse
+            o_mk = torch.zeros_like(q)
+            lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            fwd_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_mk, lse=lse, causal=True, page_size=page_size,
+            )
+            fwd_config = FlashAttentionSm120Op.kernel_config(fwd_ops)
+            fwd_kernel = Megakernel(fwd_ops, config=fwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            # Setup backward
+            dpsum = (dout.float() * o_mk.float()).sum(dim=-1).contiguous()
+            dq_accum = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk = torch.zeros_like(k)
+            dv = torch.zeros_like(v)
+
+            bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
+                dq=dq_accum, dk=dk, dv=dv, causal=True, page_size=page_size,
+            )
+            bwd_config = FlashAttentionSm120BwdOp.kernel_config(bwd_ops)
+            bwd_kernel = Megakernel(bwd_ops, config=bwd_config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["megakernel"] = bwd_kernel.bench_spec(
+                setup_fn=lambda dq=dq_accum, dk=dk, dv=dv: (dq.zero_(), dk.zero_(), dv.zero_()),
+                keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
+            )
+        except Exception:
+            pass
+
+        try:
+            # Run forward to get lse
+            o_so = torch.zeros_like(q)
+            lse_so = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            so_fwd_ops = FlashAttentionSm120Op.schedule(
+                q=q, k=k, v=v, o=o_so, lse=lse_so, causal=True, page_size=page_size,
+            )
+            so_fwd_kernel = SingleOpKernel(so_fwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_fwd_kernel.run()
+            torch.cuda.synchronize()
+
+            dpsum_so = (dout.float() * o_so.float()).sum(dim=-1).contiguous()
+            dq_so = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dk_so = torch.zeros_like(k)
+            dv_so = torch.zeros_like(v)
+
+            so_bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+                k=k, v=v, q=q, dout=dout, lse=lse_so, dpsum=dpsum_so,
+                dq=dq_so, dk=dk_so, dv=dv_so, causal=True, page_size=page_size,
+            )
+            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
+            with contextlib.redirect_stdout(io.StringIO()):
+                so_bwd_kernel.run()
+            torch.cuda.synchronize()
+
+            funcs["single_op"] = so_bwd_kernel.bench_spec(
+                setup_fn=lambda dq=dq_so, dk=dk_so, dv=dv_so: (dq.zero_(), dk.zero_(), dv.zero_()),
+                keep_alive=[q, k, v, dout, lse_so, dpsum_so, dq_so, dk_so, dv_so],
+            )
+        except Exception:
+            pass
 
     return funcs
 
@@ -222,7 +521,7 @@ def bench_attention(BH, M, N, D):
 
 if __name__ == "__main__":
     print("=" * 100)
-    print("Flash Attention Benchmark: Megakernel vs PyTorch vs SDPA vs CuTe DSL FA2")
+    print("Flash Attention Benchmark: Megakernel vs SDPA vs CuTe DSL FA2")
     print("=" * 100)
 
     if torch.cuda.is_available():
@@ -236,6 +535,42 @@ if __name__ == "__main__":
     print()
 
     bench_attention._benchmark.run(
+        mode="kernel",
+        warmup=25,
+        rep=100,
+    )
+
+    print()
+    print("=" * 100)
+    print("Flash Attention Backward Benchmark: Megakernel vs SDPA")
+    print("=" * 100)
+    print()
+
+    bench_attention_bwd._benchmark.run(
+        mode="kernel",
+        warmup=25,
+        rep=100,
+    )
+
+    print()
+    print("=" * 100)
+    print("Flash Attention Causal Forward Benchmark: Megakernel vs SDPA")
+    print("=" * 100)
+    print()
+
+    bench_attention_causal._benchmark.run(
+        mode="kernel",
+        warmup=25,
+        rep=100,
+    )
+
+    print()
+    print("=" * 100)
+    print("Flash Attention Causal Backward Benchmark: Megakernel vs SDPA")
+    print("=" * 100)
+    print()
+
+    bench_attention_causal_bwd._benchmark.run(
         mode="kernel",
         warmup=25,
         rep=100,

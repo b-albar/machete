@@ -2,9 +2,14 @@
 """
 GEMM Op for the Megakernel.
 
-Computes C[M,N] = A[M,K] @ B[N,K]^T  (i.e., standard matmul with B pre-transposed).
+Computes C[B,S,N] = A[B,S,K] @ B_w[N,K]^T  (standard matmul with B pre-transposed).
 
-Note: B is expected in (N, K) layout (K contiguous). If you have B in standard
+Tensor shapes follow LLM conventions:
+    A: (B, S, K) — batch, sequence, input dim
+    B: (N, K)    — weight matrix (N = output dim, K contiguous)
+    C: (B, S, N) — output
+
+Note: B_w is expected in (N, K) layout (K contiguous). If you have B in standard
 PyTorch (K, N) layout, pass b.t().contiguous() when scheduling.
 
 Architecture (SM_90+ / Hopper+):
@@ -21,11 +26,11 @@ Pipelined phases:
     compute: Process K-blocks 0-1 (TMA-loaded by DMA), then TMA double-buffered
              loop for K-blocks 2+ (elected MMA thread). LdMatrix + MMA per K-block.
              Epilogue: R->S.
-    store:   TMA store S->G of C[tile_M, tile_N]
+    store:   TMA store S->G of C[tile_S, tile_N]
 
 Page layout (2-stage double buffer):
     [buf0: A_tile + B_tile] [buf1: A_tile + B_tile] [mbar0: 8B] [mbar1: 8B]
-    Epilogue: [C: tile_M x tile_N]  (reuses page from offset 0)
+    Epilogue: [C: tile_S x tile_N]  (reuses page from offset 0)
 
 No output pre-zeroing needed — fp32 accumulator handles full K reduction.
 """
@@ -38,6 +43,7 @@ from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
     mbarrier_init_fence,
+    mbarrier_inval,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -48,8 +54,11 @@ from machete.megakernel.interpreter import (
 class GemmOp(Op):
     """GEMM operation for the megakernel framework.
 
-    Computes C[M,N] = A[M,K] @ B[N,K]^T using tensor core MMA.
-    B must be in (N, K) layout with K contiguous.
+    Computes C[B,S,N] = A[B,S,K] @ B_w[N,K]^T using tensor core MMA.
+    B_w must be in (N, K) layout with K contiguous.
+
+    Tile dimensions: (B, S, N) with tile_B=1 always.
+    B and S are shared with downstream ops (RoPE, GDN) for tile-level barriers.
 
     K is handled via double-buffered TMA pipelining: the DMA warp TMA-loads
     the first 2 K-blocks, then an elected MMA thread issues TMA loads for
@@ -57,12 +66,12 @@ class GemmOp(Op):
     """
 
     reads = {
-        "a": (None, ("M", "K")),
-        "a_scale": (None, ("M", "K")),  # element-wise A scaling (for activation backward)
+        "a": (None, ("B", "S", "K")),
+        "a_scale": (None, ("B", "S", "K")),  # element-wise A scaling (for activation backward)
         "b": (None, ("N", "K")),
     }
-    writes = {"c": (None, ("M", "N"))}
-    tile = ("M", "N")
+    writes = {"c": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
 
     tma_loads = {"a", "a_scale", "b"}
     tma_stores = {"c"}
@@ -71,16 +80,16 @@ class GemmOp(Op):
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
         """Custom TMA tile shapes for inner K-block sub-tiling.
 
-        A and B use tile_K (inner block size) instead of full K extent.
-        C uses the standard tile_M x tile_N.
+        A and C are 3D (B, S, K/N) with tile_B=1.
+        B (weight) stays 2D (N, K).
         """
         tile_K = static_dims.get("tile_K", 32)
         if tensor_name in ("a", "a_scale"):
-            return (tile_sizes["M"], tile_K)
+            return (1, tile_sizes["S"], tile_K)
         elif tensor_name == "b":
             return (tile_sizes["N"], tile_K)
         else:  # "c"
-            return (tile_sizes["M"], tile_sizes["N"])
+            return (1, tile_sizes["S"], tile_sizes["N"])
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -95,9 +104,17 @@ class GemmOp(Op):
         self.activation = getattr(self, 'activation', 0)  # 0=none, 1=relu, 2=silu
         self.has_a_scale = getattr(self, 'has_a_scale', 0)  # 1=scale A by a_scale
 
-        self.a_tile_bytes = self.tile_size_M * self.tile_K * self.elem_bytes
+        self.a_tile_bytes = self.tile_size_S * self.tile_K * self.elem_bytes
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
-        self.c_tile_bytes = self.tile_size_M * self.tile_size_N * self.elem_bytes
+        self.c_tile_bytes = self.tile_size_S * self.tile_size_N * self.elem_bytes
+
+        # Swizzle for C epilogue (R→S) to avoid smem bank conflicts.
+        if self.tile_size_N % 64 == 0 and self.tile_size_N >= 64:
+            self.swz_B_c = 3   # SW128
+        elif self.tile_size_N % 32 == 0:
+            self.swz_B_c = 2   # SW64
+        else:
+            self.swz_B_c = 1   # SW32
         # Per-buffer layout: [A | (a_scale) | B]
         # a_scale only allocated when has_a_scale=1 (compile-time constant)
         if self.has_a_scale:
@@ -128,13 +145,10 @@ class GemmOp(Op):
         # Swizzle parameters for bank-conflict-free LdMatrix reads.
         if self.tile_K % 64 == 0 and self.tile_K >= 64:
             self.swz_B_ab = 3   # SW128
-            self.atom_K = 64
         elif self.tile_K % 32 == 0:
             self.swz_B_ab = 2   # SW64
-            self.atom_K = 32
         else:
             self.swz_B_ab = 1   # SW32
-            self.atom_K = 16
 
         # 4 op-managed mbarriers after double-buffer data (32 bytes):
         #   buf_free[0,1]:     compute → store warp (buffer read, safe to overwrite)
@@ -148,17 +162,48 @@ class GemmOp(Op):
         total_smem = max(ab_bytes + self.mbar_bytes, self.c_tile_bytes)
         assert total_smem <= self.page_size, (
             f"GemmOp: smem {total_smem}B exceeds page_size ({self.page_size}B). "
-            f"tile_M={self.tile_size_M}, tile_N={self.tile_size_N}, "
+            f"tile_S={self.tile_size_S}, tile_N={self.tile_size_N}, "
             f"tile_K={self.tile_K}"
         )
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
                                 tile_sizes, static_dims):
-        """Return swizzled smem layout code for TMA descriptor creation."""
+        """Return swizzled smem layout code for TMA descriptor creation.
+
+        A and C are 3D (B=1 trivial outer dim), B (weight) is 2D.
+        Swizzle operates on the inner 2D part; B=1 adds a trivial mode.
+        """
         tile_K = static_dims.get("tile_K", 32)
+
+        def _layout_str(swz_B, dims):
+            """Build composed layout string for 2D or 3D dims."""
+            if len(dims) == 2:
+                d0, d1 = dims
+                return (
+                    f"cute.make_composed_layout("
+                    f"cute.make_swizzle({swz_B}, 4, 3), 0, "
+                    f"cute.make_layout(({d0}, {d1}), stride=(1, {d0})))")
+            else:  # 3D: (inner0, inner1, 1) — B=1 trivial outer
+                d0, d1, d2 = dims
+                return (
+                    f"cute.make_composed_layout("
+                    f"cute.make_swizzle({swz_B}, 4, 3), 0, "
+                    f"cute.make_layout(({d0}, {d1}, {d2}), "
+                    f"stride=(1, {d0}, {d0 * d1})))")
+
+        if tensor_name == "c":
+            tile_N = tile_sizes.get("N", 64)
+            if tile_N % 64 == 0 and tile_N >= 64:
+                B_c = 3   # SW128
+            elif tile_N % 32 == 0:
+                B_c = 2   # SW64
+            else:
+                B_c = 1   # SW32
+            return _layout_str(B_c, tma_tile_shape)
+
         if tensor_name not in ("a", "a_scale", "b"):
-            return None  # No swizzle for C
+            return None
 
         if tile_K % 64 == 0 and tile_K >= 64:
             B = 3   # SW128
@@ -166,24 +211,21 @@ class GemmOp(Op):
             B = 2   # SW64
         else:
             B = 1   # SW32
-
-        dim0, dim1 = tma_tile_shape  # (tile_K, tile_M/N) in TMA convention
-        return (
-            f"cute.make_composed_layout("
-            f"cute.make_swizzle({B}, 4, 3), 0, "
-            f"cute.make_layout(({dim0}, {dim1}), stride=(1, {dim0})))"
-        )
+        return _layout_str(B, tma_tile_shape)
 
     # =========================================================================
     # Forward Load: TMA G->S (called by load warp and store warp)
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_M, tile_N,
+    def load(self, page_ptr, tile_B, tile_S, tile_N,
              a_tma, a_tma_gmem, a_scale_tma, a_scale_tma_gmem,
              b_tma, b_tma_gmem,
              work_mbar, inner_iter_idx):
         """TMA load of A and B K-blocks.
+
+        A/a_scale are 3D (B, S, K) — TMA coords include tile_B.
+        B (weight) is 2D (N, K) — TMA coords use tile_N only.
 
         iter 0 (load warp):  Init mbarriers, TMA K0+K1 → buf0+buf1,
                               signal work_mbar.
@@ -201,8 +243,8 @@ class GemmOp(Op):
         if inner_iter_idx == Int32(0):
             # === ITER 0 (load warp): init mbarriers + TMA first 2 K-blocks ===
             with cute.arch.elect_one():
-                mbarrier_init(_bf_0, Int32(1))
-                mbarrier_init(_bf_1, Int32(1))
+                mbarrier_init(_bf_0, Int32(self.num_mma_warps))
+                mbarrier_init(_bf_1, Int32(self.num_mma_warps))
                 mbarrier_init(_kr_0, Int32(1))
                 mbarrier_init(_kr_1, Int32(1))
             mbarrier_init_fence()
@@ -215,23 +257,26 @@ class GemmOp(Op):
 
             for _k in cutlass.range_constexpr(self.tma_k_blocks):
                 _buf_base = page_ptr + Int32(_k * self.buf_stride)
+
+                # A: 3D TMA (K, S, B) in CuTe convention
                 sA_ptr = cute.recast_ptr(
                     cute.make_ptr(self.a_dtype, _buf_base,
                                   cute.AddressSpace.smem),
                     swz, dtype=self.a_dtype)
                 sA = cute.make_tensor(
                     sA_ptr,
-                    cute.make_layout((self.tile_K, self.tile_size_M),
-                                     stride=(1, self.tile_K)))
+                    cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                     stride=(1, self.tile_K,
+                                             self.tile_K * self.tile_size_S)))
                 gA = cute.local_tile(
-                    a_tma_gmem, (self.tile_K, self.tile_size_M), (None, None))
+                    a_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                    (None, None, None))
                 tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
                     a_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sA, 0, 2),
-                    cute.group_modes(gA, 0, 2))
+                    cute.group_modes(sA, 0, 3),
+                    cute.group_modes(gA, 0, 3))
 
-                # a_scale partition (always created; a_scale_offset=0 when
-                # has_a_scale=0 so it harmlessly overlaps with A)
+                # a_scale: 3D TMA (same layout as A)
                 sScale_ptr = cute.recast_ptr(
                     cute.make_ptr(self.a_scale_dtype,
                                   _buf_base + Int32(self.a_scale_offset),
@@ -239,16 +284,18 @@ class GemmOp(Op):
                     swz, dtype=self.a_scale_dtype)
                 sScale = cute.make_tensor(
                     sScale_ptr,
-                    cute.make_layout((self.tile_K, self.tile_size_M),
-                                     stride=(1, self.tile_K)))
+                    cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                     stride=(1, self.tile_K,
+                                             self.tile_K * self.tile_size_S)))
                 gScale = cute.local_tile(
-                    a_scale_tma_gmem, (self.tile_K, self.tile_size_M),
-                    (None, None))
+                    a_scale_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                    (None, None, None))
                 tScaleS, tScaleG = cute.nvgpu.cpasync.tma_partition(
                     a_scale_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sScale, 0, 2),
-                    cute.group_modes(gScale, 0, 2))
+                    cute.group_modes(sScale, 0, 3),
+                    cute.group_modes(gScale, 0, 3))
 
+                # B (weight): 2D TMA (K, N) — unchanged
                 sB_ptr = cute.recast_ptr(
                     cute.make_ptr(self.b_dtype,
                                   _buf_base + Int32(self.b_offset),
@@ -265,12 +312,14 @@ class GemmOp(Op):
                     cute.group_modes(sB, 0, 2),
                     cute.group_modes(gB, 0, 2))
 
-                cute.copy(a_tma, tAgA[(None, Int32(_k), tile_M)], tAsA,
-                          tma_bar_ptr=mbar_ptr)
+                # A: (None, k_block, S_tile, B_tile)
+                cute.copy(a_tma, tAgA[(None, Int32(_k), tile_S, tile_B)],
+                          tAsA, tma_bar_ptr=mbar_ptr)
                 if self.has_a_scale:
                     cute.copy(a_scale_tma,
-                              tScaleG[(None, Int32(_k), tile_M)],
+                              tScaleG[(None, Int32(_k), tile_S, tile_B)],
                               tScaleS, tma_bar_ptr=mbar_ptr)
+                # B: (None, k_block, N_tile)
                 cute.copy(b_tma, tBgB[(None, Int32(_k), tile_N)], tBsB,
                           tma_bar_ptr=mbar_ptr)
 
@@ -301,23 +350,25 @@ class GemmOp(Op):
                     mbarrier_arrive_expect_tx(
                         _kr_1, Int32(self.ab_tma_bytes))
 
-            # TMA A tile
+            # A: 3D TMA
             sA_ptr = cute.recast_ptr(
                 cute.make_ptr(self.a_dtype, _buf_base,
                               cute.AddressSpace.smem),
                 swz, dtype=self.a_dtype)
             sA = cute.make_tensor(
                 sA_ptr,
-                cute.make_layout((self.tile_K, self.tile_size_M),
-                                 stride=(1, self.tile_K)))
+                cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                 stride=(1, self.tile_K,
+                                         self.tile_K * self.tile_size_S)))
             gA = cute.local_tile(
-                a_tma_gmem, (self.tile_K, self.tile_size_M), (None, None))
+                a_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                (None, None, None))
             tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
                 a_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sA, 0, 2),
-                cute.group_modes(gA, 0, 2))
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(gA, 0, 3))
 
-            # a_scale partition (always created; harmless overlap when unused)
+            # a_scale: 3D TMA
             sScale_ptr = cute.recast_ptr(
                 cute.make_ptr(self.a_scale_dtype,
                               _buf_base + Int32(self.a_scale_offset),
@@ -325,17 +376,18 @@ class GemmOp(Op):
                 swz, dtype=self.a_scale_dtype)
             sScale = cute.make_tensor(
                 sScale_ptr,
-                cute.make_layout((self.tile_K, self.tile_size_M),
-                                 stride=(1, self.tile_K)))
+                cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                 stride=(1, self.tile_K,
+                                         self.tile_K * self.tile_size_S)))
             gScale = cute.local_tile(
-                a_scale_tma_gmem, (self.tile_K, self.tile_size_M),
-                (None, None))
+                a_scale_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                (None, None, None))
             tScaleS, tScaleG = cute.nvgpu.cpasync.tma_partition(
                 a_scale_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sScale, 0, 2),
-                cute.group_modes(gScale, 0, 2))
+                cute.group_modes(sScale, 0, 3),
+                cute.group_modes(gScale, 0, 3))
 
-            # TMA B tile
+            # B (weight): 2D TMA
             sB_ptr = cute.recast_ptr(
                 cute.make_ptr(self.b_dtype,
                               _buf_base + Int32(self.b_offset),
@@ -352,10 +404,11 @@ class GemmOp(Op):
                 cute.group_modes(sB, 0, 2),
                 cute.group_modes(gB, 0, 2))
 
-            cute.copy(a_tma, tAgA[(None, _k_block, tile_M)], tAsA,
-                      tma_bar_ptr=_kr_ptr)
+            cute.copy(a_tma, tAgA[(None, _k_block, tile_S, tile_B)],
+                      tAsA, tma_bar_ptr=_kr_ptr)
             if self.has_a_scale:
-                cute.copy(a_scale_tma, tScaleG[(None, _k_block, tile_M)],
+                cute.copy(a_scale_tma,
+                          tScaleG[(None, _k_block, tile_S, tile_B)],
                           tScaleS, tma_bar_ptr=_kr_ptr)
             cute.copy(b_tma, tBgB[(None, _k_block, tile_N)], tBsB,
                       tma_bar_ptr=_kr_ptr)
@@ -365,7 +418,7 @@ class GemmOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_N):
+    def compute(self, page_ptr, tile_B, tile_S, tile_N):
         """GEMM compute with double-buffered K-block processing.
 
         K-blocks 0-1: TMA-loaded by load warp (in buf 0 and buf 1).
@@ -412,7 +465,7 @@ class GemmOp(Op):
                 cute.make_ptr(self.a_dtype, page_ptr,
                               cute.AddressSpace.smem, assumed_align=128),
                 swz, dtype=self.a_dtype),
-            cute.make_layout((self.tile_size_M, self.tile_K),
+            cute.make_layout((self.tile_size_S, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
         # a_scale smem tensors (always created; a_scale_offset=0 when
@@ -423,7 +476,7 @@ class GemmOp(Op):
                               page_ptr + Int32(self.a_scale_offset),
                               cute.AddressSpace.smem, assumed_align=128),
                 swz, dtype=self.a_scale_dtype),
-            cute.make_layout((self.tile_size_M, self.tile_K),
+            cute.make_layout((self.tile_size_S, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
         sB_0 = cute.make_tensor(
@@ -441,7 +494,7 @@ class GemmOp(Op):
                               page_ptr + Int32(self.buf_stride),
                               cute.AddressSpace.smem, assumed_align=128),
                 swz, dtype=self.a_dtype),
-            cute.make_layout((self.tile_size_M, self.tile_K),
+            cute.make_layout((self.tile_size_S, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
         sScale_1 = cute.make_tensor(
@@ -450,7 +503,7 @@ class GemmOp(Op):
                               page_ptr + Int32(self.buf_stride + self.a_scale_offset),
                               cute.AddressSpace.smem, assumed_align=128),
                 swz, dtype=self.a_scale_dtype),
-            cute.make_layout((self.tile_size_M, self.tile_K),
+            cute.make_layout((self.tile_size_S, self.tile_K),
                              stride=(self.tile_K, 1)),
         )
         sB_1 = cute.make_tensor(
@@ -494,7 +547,7 @@ class GemmOp(Op):
 
         # --- Init fp32 accumulator ---
         acc = cute.make_fragment(
-            tiled_mma.partition_shape_C((self.tile_size_M, self.tile_size_N)),
+            tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N)),
             Float32,
         )
         acc.fill(0.0)
@@ -520,9 +573,8 @@ class GemmOp(Op):
                       tCrA[None, None, k_block],
                       tCrB[None, None, k_block], acc)
 
-        # Sync all MMA warps, then one thread signals buf 0 is free
-        named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-        if tidx == Int32(0):
+        # Per-warp signal: buf 0 read complete (no cross-warp sync needed)
+        if tidx % Int32(32) == Int32(0):
             mbarrier_arrive(_bf_0)
 
         # =====================================================================
@@ -547,9 +599,8 @@ class GemmOp(Op):
                           tCrA[None, None, k_block],
                           tCrB[None, None, k_block], acc)
 
-            # Sync all MMA warps, then one thread signals buf 1 is free
-            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-            if tidx == Int32(0):
+            # Per-warp signal: buf 1 read complete
+            if tidx % Int32(32) == Int32(0):
                 mbarrier_arrive(_bf_1)
 
         # =====================================================================
@@ -605,9 +656,8 @@ class GemmOp(Op):
                               tCrA[None, None, k_block],
                               tCrB[None, None, k_block], acc)
 
-            # Sync all MMA warps, then one thread signals buffer is free
-            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-            if tidx == Int32(0):
+            # Per-warp signal: buffer read complete
+            if tidx % Int32(32) == Int32(0):
                 if k_idx % Int32(2) == Int32(0):
                     mbarrier_arrive(_bf_0)
                 if k_idx % Int32(2) == Int32(1):
@@ -615,14 +665,31 @@ class GemmOp(Op):
 
             k_idx = k_idx + Int32(1)
 
-        # --- Epilogue: R->S (write final C to smem for TMA store) ---
+        # --- Epilogue: R->S (write final C to swizzled smem for TMA store) ---
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+        # Invalidate op-managed mbarriers before the page is reused.
+        # Without this, a subsequent op's TMA load (e.g. GLU with large tiles)
+        # can overwrite these addresses with regular data, corrupting the
+        # mbarrier hardware state and causing undefined behavior on SM_120+.
+        if tidx == Int32(0):
+            mbarrier_inval(_bf_0)
+            mbarrier_inval(_bf_1)
+            mbarrier_inval(_kr_0)
+            mbarrier_inval(_kr_1)
+
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(
-            cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.tile_size_M, self.tile_size_N),
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_S, self.tile_size_N),
                              stride=(self.tile_size_N, 1)),
         )
-        tCsC = thr_mma.partition_C(sC)
+
+        # Apply activation + convert FP32 acc to output dtype in registers
+        acc_out = cute.make_fragment_like(acc, self.c_dtype)
         for ci in cutlass.range_constexpr(cute.size(acc)):
             val = acc[ci]
             if self.activation == 1:  # ReLU
@@ -631,31 +698,86 @@ class GemmOp(Op):
                 neg_val = Float32(0.0) - val
                 exp_neg = cute.math.exp(neg_val, fastmath=True)
                 val = val / (Float32(1.0) + exp_neg)
-            tCsC[ci] = val.to(self.c_dtype)
+            acc_out[ci] = val.to(self.c_dtype)
+
+        # Use tiled copy C to write to swizzled smem (bank-conflict-free)
+        r2s_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.c_dtype)
+        r2s_copy = cute.make_tiled_copy_C(r2s_atom, tiled_mma)
+        r2s_thr = r2s_copy.get_slice(tidx)
+        tCrC = r2s_thr.retile(acc_out)
+        tCsC = r2s_thr.partition_D(sC)
+        cute.copy(r2s_copy, tCrC, tCsC)
 
     # =========================================================================
     # Forward Store (S->G): Regular TMA store of C
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_N, c_tma, c_tma_gmem):
-        """TMA store of C from shared to global memory."""
+    def store(self, page_ptr, tile_B, tile_S, tile_N, c_tma, c_tma_gmem):
+        """TMA store of C from swizzled shared to global memory.
+
+        C is 3D (B, S, N) — TMA coord includes tile_B.
+        """
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(
-            cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.tile_size_N, self.tile_size_M)),
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
         )
 
         gC = cute.local_tile(
-            c_tma_gmem, (self.tile_size_N, self.tile_size_M), (None, None),
+            c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
         )
         tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
             c_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sC, 0, 2),
-            cute.group_modes(gC, 0, 2),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
         )
 
         with cute.arch.elect_one():
-            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+    # =========================================================================
+    # Communicate (TMA S->G to peer GPU)
+    # =========================================================================
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_B, tile_S, tile_N,
+                    c_p0_tma, c_p0_tma_gmem):
+        """Send C tile to peer GPU 0 via TMA S2G.
+
+        The TMA atom determines the semantics: regular copy for broadcast
+        (column-parallel), atomic add for reduce (row-parallel all-reduce).
+        """
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
+        )
+
+        gC = cute.local_tile(
+            c_p0_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+
+        with cute.arch.elect_one():
+            cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
 
     # =========================================================================
     # Scheduling
@@ -663,28 +785,42 @@ class GemmOp(Op):
 
     @classmethod
     def _auto_tiles(cls, page_size, elem_bytes=2, has_a_scale=False):
-        """Compute largest (tile_M, tile_N, tile_K) that fit in page_size.
+        """Compute best (tile_S, tile_N, tile_K) that fit in page_size.
 
         Constraints:
-          - 2 * (a_factor*tile_M + tile_N) * tile_K * elem <= page_size  (double buf)
-          - tile_M * tile_N * elem <= page_size  (C epilogue)
+          - 2 * (a_factor*tile_S + tile_N) * tile_K * elem + mbar <= page_size  (double buf + mbarriers)
+          - tile_S * tile_N * elem <= page_size  (C epilogue)
           - tile_K must be a multiple of 16
+
+        Prefers 128×64 (best TMA/compute balance) over 128×128.
+        After selecting spatial tiles, maximizes tile_K within budget.
         """
         a_factor = 2 if has_a_scale else 1
-        tile_K = 32
-        for tile_M, tile_N in [(128, 64), (64, 64), (64, 32), (32, 32)]:
-            ab = 2 * (a_factor * tile_M + tile_N) * tile_K * elem_bytes
-            c = tile_M * tile_N * elem_bytes
+        mbar_bytes = 32  # 4 op-managed mbarriers × 8 bytes
+        # Prefer 128×64: best TMA/compute balance (NCU-verified).
+        for tile_S, tile_N in [(128, 64), (128, 128), (64, 64), (64, 32), (32, 32)]:
+            tile_K = 32
+            ab = 2 * (a_factor * tile_S + tile_N) * tile_K * elem_bytes + mbar_bytes
+            c = tile_S * tile_N * elem_bytes
             if ab <= page_size and c <= page_size:
-                return tile_M, tile_N, tile_K
+                # Try larger tile_K when page headroom allows.
+                # Must be power-of-2 for valid TMA box sizes.
+                for try_K in [64]:
+                    ab_k = 2 * (a_factor * tile_S + tile_N) * try_K * elem_bytes + mbar_bytes
+                    if ab_k <= page_size:
+                        tile_K = try_K
+                        break
+                return tile_S, tile_N, tile_K
         return 32, 32, 16
 
     @classmethod
-    def schedule_forward(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          activation=None, has_a_scale=0, **tensors):
         """Schedule forward GEMM.
 
-        Accepts tile_sizes with M, N, K keys. K is the inner K-block size
+        Tensors must be 3D: A (B, S, K), C (B, S, N). B_w stays 2D (N, K).
+
+        Accepts tile_sizes with S, N, K keys. K is the inner K-block size
         (not a framework tile dimension). Auto-computed from page_size when
         not specified.
 
@@ -698,12 +834,13 @@ class GemmOp(Op):
             tensors["a_scale"] = tensors["a"]
 
         ts = dict(tile_sizes or {})
-        if "M" not in ts or "N" not in ts:
+        ts.setdefault("B", 1)
+        if "S" not in ts or "N" not in ts:
             a = tensors.get('a')
             elem_bytes = a.element_size() if a is not None else 2
-            auto_M, auto_N, auto_K = cls._auto_tiles(
+            auto_S, auto_N, auto_K = cls._auto_tiles(
                 page_size, elem_bytes, has_a_scale=bool(has_a_scale))
-            ts.setdefault("M", auto_M)
+            ts.setdefault("S", auto_S)
             ts.setdefault("N", auto_N)
             ts.setdefault("K", auto_K)
         tile_K = ts.pop("K", 32)
@@ -721,8 +858,9 @@ class GemmOp(Op):
         """Return recommended MegakernelConfig for scheduled GemmOps."""
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
-        page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
-        tile_m = ops[0].tile_sizes.get('M', 64)
+        page_size = max(op.static_dims.get('page_size', DEFAULT_PAGE_SIZE)
+                        for op in ops)
+        tile_m = max(op.tile_sizes.get('S', 64) for op in ops)
         num_mma_warps = tile_m // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         return MegakernelConfig(threads_per_block=threads_per_block,
@@ -730,14 +868,17 @@ class GemmOp(Op):
 
     @classmethod
     def schedule_backward(cls, tile_sizes=None, activation=None,
-                          c=None, pre_act=None, **tensors):
+                          c=None, pre_act=None, page_size=DEFAULT_PAGE_SIZE,
+                          **tensors):
         """Schedule GEMM backward as forward-equivalent ops.
 
-        dA[M,K] = dout[M,N] @ B[N,K]  (contracts over N)
-        dB[N,K] = dout^T[N,M] @ A[M,K]  (contracts over M)
+        dA[B,S,K] = dout[B,S,N] @ B[N,K]  (contracts over N)
+        dB[N,K] = dout^T[N,B*S] @ A[B*S,K]  (contracts over S, flattened)
 
         Each gradient is a standard forward GEMM with transposed inputs.
         No output zeroing needed (regular TMA store, not atomic add).
+
+        All tensors must be 3D (B,S,K).
 
         When activation is set, the activation gradient is fused into the
         GEMM via A-operand scaling: dout is element-wise multiplied by
@@ -753,10 +894,6 @@ class GemmOp(Op):
 
         dout, a, b = tensors['dout'], tensors['a'], tensors['b']
         da, db = tensors.get('da'), tensors.get('db')
-        ts = tile_sizes or {}
-        tile_m = ts.get("M", 64)
-        tile_n = ts.get("N", 32)
-        tile_k = ts.get("K", 32)
 
         # Compute activation gradient tensor if needed
         act_grad = None
@@ -781,21 +918,158 @@ class GemmOp(Op):
             b_t = b.t().contiguous()
             fwd_kwargs = dict(
                 a=dout, b=b_t, c=da, has_a_scale=use_scale,
-                tile_sizes={"M": tile_m, "N": tile_k, "K": tile_n},
             )
+            if tile_sizes is not None:
+                ts = tile_sizes
+                fwd_kwargs["tile_sizes"] = {
+                    "S": ts.get("S", 64),
+                    "N": ts.get("K", 32),
+                    "K": ts.get("N", 32),
+                }
+            # else: let schedule auto-compute via _auto_tiles
             if act_grad is not None:
                 fwd_kwargs["a_scale"] = act_grad
-            ops.extend(cls.schedule_forward(**fwd_kwargs))
+            ops.extend(cls.schedule(**fwd_kwargs, page_size=page_size))
 
         if db is not None:
-            dout_t = dout.t().contiguous()
-            a_t = a.t().contiguous()
+            # dB[N,K] = dout^T[N,B*S] @ A[B*S,K]  — flatten B*S, transpose
+            BS = dout.shape[0] * dout.shape[1]
+            dout_flat = dout.reshape(BS, dout.shape[2])
+            a_flat = a.reshape(BS, a.shape[2])
+            # a operand: (1, N, BS) — 3D for schedule
+            dout_t = dout_flat.t().contiguous().unsqueeze(0)
+            # b weight: (K, BS) — stays 2D
+            a_t = a_flat.t().contiguous()
             fwd_kwargs = dict(
                 a=dout_t, b=a_t, c=db, has_a_scale=use_scale,
-                tile_sizes={"M": tile_n, "N": tile_k, "K": tile_m},
             )
+            if tile_sizes is not None:
+                ts = tile_sizes
+                fwd_kwargs["tile_sizes"] = {
+                    "S": ts.get("N", 32),
+                    "N": ts.get("K", 32),
+                    "K": ts.get("S", 64),
+                }
+            # else: let schedule auto-compute via _auto_tiles
             if act_grad is not None:
-                fwd_kwargs["a_scale"] = act_grad.t().contiguous()
-            ops.extend(cls.schedule_forward(**fwd_kwargs))
+                act_flat = act_grad.reshape(BS, act_grad.shape[2])
+                fwd_kwargs["a_scale"] = act_flat.t().contiguous().unsqueeze(0)
+            ops.extend(cls.schedule(**fwd_kwargs, page_size=page_size))
 
         return ops
+
+    # =========================================================================
+    # Tensor Parallelism Factory
+    # =========================================================================
+
+    @classmethod
+    def schedule_tp(cls, tp_mode='column', **kwargs):
+        """Schedule forward GEMM with tensor parallelism.
+
+        Args:
+            tp_mode: 'column' for column-parallel (broadcast output shard),
+                     'row' for row-parallel (all-reduce via atomic add).
+            **kwargs: Forwarded to schedule().
+
+        Returns:
+            List of ScheduledOps using the appropriate TP subclass.
+
+        Notes:
+            Column-parallel: each GPU has W_shard[N/P, K], computes
+                C_shard = A @ W_shard^T, broadcasts to peers.
+            Row-parallel: each GPU has W[N, K/P], computes
+                C_partial = A_shard @ W^T, atomic-adds to all outputs.
+                All output buffers must be zeroed before kernel launch.
+        """
+        if tp_mode == 'column':
+            return GemmColumnParallelOp.schedule(**kwargs)
+        elif tp_mode == 'row':
+            return GemmRowParallelOp.schedule(**kwargs)
+        else:
+            raise ValueError(f"Unknown tp_mode: {tp_mode!r}. Use 'column' or 'row'.")
+
+
+class GemmColumnParallelOp(GemmOp):
+    """GemmOp with TMA S2G broadcast to peers (column-parallel TP).
+
+    Each GPU computes C_shard[M, N/P] = A @ W_shard[N/P, K]^T and
+    broadcasts the result to peer GPU buffers via TMA S2G copy.
+    """
+
+    peer_stores = {"c"}
+
+
+class GemmRowParallelOp(GemmOp):
+    """GemmOp with TMA S2G atomic add for row-parallel TP (all-reduce).
+
+    Each GPU computes C_partial[M, N] = A_shard[M, K/P] @ W[N, K/P]^T
+    and atomic-adds the result to both the local and all peer output buffers.
+    After kernel completion, each buffer contains C_full = sum(C_partial_i).
+
+    IMPORTANT: All output buffers must be zeroed before kernel launch.
+
+    TMA reduce S2G (CopyReduceBulkTensorTileS2GOp) is warp-collective:
+    all threads in the warp must execute the instruction, producing exactly
+    one atomic add per warp. Therefore store() and communicate() must NOT
+    use elect_one() — doing so causes non-elected threads to skip the
+    warp-collective instruction, resulting in a hang.
+    """
+
+    tma_stores = set()          # Override parent: no regular S2G for c
+    tma_reduce_stores = {"c"}   # Local store via atomic add
+    peer_reduce_stores = {"c"}  # Peer stores via atomic add
+
+    @cute.jit
+    def store(self, page_ptr, tile_B, tile_S, tile_N, c_tma, c_tma_gmem):
+        """TMA reduce store of C (atomic add) — warp-collective, no elect_one."""
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
+        )
+
+        gC = cute.local_tile(
+            c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+
+        # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
+        cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+    @cute.jit
+    def communicate(self, page_ptr, tile_B, tile_S, tile_N,
+                    c_p0_tma, c_p0_tma_gmem):
+        """TMA reduce store to peer (atomic add) — warp-collective, no elect_one."""
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                swz_c, dtype=self.c_dtype),
+            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                             stride=(1, self.tile_size_N,
+                                     self.tile_size_N * self.tile_size_S)),
+        )
+
+        gC = cute.local_tile(
+            c_p0_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_p0_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+
+        # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
+        cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])

@@ -11,7 +11,6 @@ from .benchmark_utils import (
     benchmark_backward,
     benchmark_memory,
     benchmark_fwd_bwd,
-    benchmark_cuda_graph,
     benchmark_jit_kernel,
     KernelBenchSpec,
     efficiency,
@@ -146,15 +145,15 @@ class Benchmark:
                 plt.close()
 
     def _bench_kernel_func(self, func_or_spec, warmup, rep):
-        """Benchmark a single function or KernelBenchSpec.
+        """Benchmark via CUDA graph capture + replay.
 
-        For KernelBenchSpec: per-iteration CUDA event timing with barrier
-        resets (persistent megakernel is incompatible with CUDA graph replay).
-        For callables: CUDA graph capture + replay.
+        Captures the callable (or KernelBenchSpec.launch_fn) into a CUDA graph,
+        then times graph replays with CUDA events. This eliminates host-side
+        overhead (Python calls, TMA descriptor creation) and measures pure GPU
+        execution time.
 
         Args:
-            func_or_spec: A callable (benchmarked with torch CUDA graphs)
-                or a KernelBenchSpec (benchmarked with per-iteration events).
+            func_or_spec: A callable or a KernelBenchSpec.
             warmup: Number of warmup iterations.
             rep: Number of timed iterations.
 
@@ -164,49 +163,43 @@ class Benchmark:
         if isinstance(func_or_spec, KernelBenchSpec):
             torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
-            setup = func_or_spec.setup_fn
-
-            with torch.cuda.stream(torch_stream):
-                # Warmup
-                for _ in range(warmup):
-                    if setup is not None:
-                        setup()
-                    launch()
-                torch_stream.synchronize()
-
-                # Timed iterations with CUDA events
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                times = []
-                for _ in range(rep):
-                    if setup is not None:
-                        setup()
-                    start.record(torch_stream)
-                    launch()
-                    end.record(torch_stream)
-                    torch_stream.synchronize()
-                    times.append(start.elapsed_time(end))
-
-            return sum(times) / len(times)
         else:
-            try:
-                return benchmark_cuda_graph(func_or_spec, warmup=warmup, rep=rep)
-            except Exception:
-                # Fallback to per-iteration CUDA event timing (e.g. for
-                # CuTe DSL compiled kernels that don't support graph capture).
-                for _ in range(warmup):
-                    func_or_spec()
-                torch.cuda.synchronize()
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                times = []
-                for _ in range(rep):
-                    start.record()
-                    func_or_spec()
-                    end.record()
-                    torch.cuda.synchronize()
-                    times.append(start.elapsed_time(end))
-                return sum(times) / len(times)
+            torch_stream = torch.cuda.Stream()
+            launch = func_or_spec
+
+        # Warmup
+        with torch.cuda.stream(torch_stream):
+            for _ in range(warmup):
+                launch()
+        torch_stream.synchronize()
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(torch_stream):
+            with torch.cuda.graph(graph, stream=torch_stream):
+                launch()
+        torch_stream.synchronize()
+
+        # Warmup graph replay
+        with torch.cuda.stream(torch_stream):
+            for _ in range(warmup):
+                graph.replay()
+        torch_stream.synchronize()
+
+        # Timed replays
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        times = []
+        with torch.cuda.stream(torch_stream):
+            for _ in range(rep):
+                start.record(torch_stream)
+                graph.replay()
+                end.record(torch_stream)
+                torch_stream.synchronize()
+                times.append(start.elapsed_time(end))
+
+        del graph
+        return sum(times) / len(times)
 
     def _print_kernel_summary(self, results, names, bytes_fn):
         """Print a formatted summary table for kernel benchmark results."""
@@ -274,7 +267,7 @@ class Benchmark:
         has_gbps = bytes_fn is not None
         baseline_name = names[0] if names else None
 
-        header = f"{'Config':<40}"
+        header = f"{'Config':<48}"
         for name in names:
             if has_gbps:
                 header += f" {name:>16}"
@@ -285,7 +278,7 @@ class Benchmark:
         print(header)
 
         if has_gbps:
-            sub = f"{'':<40}"
+            sub = f"{'':<48}"
             for name in names:
                 sub += f" {'ms':>8} {'GB/s':>7}"
                 if name != baseline_name:
@@ -299,10 +292,21 @@ class Benchmark:
         has_gbps = bytes_fn is not None
         baseline_name = names[0] if names else None
 
-        label = ", ".join(f"{k}={v}" for k, v in params.items())
-        if len(label) > 39:
-            label = label[:36] + "..."
-        line = f"{label:<40}"
+        # Abbreviate param names to fit more info: hidden_dim→D, seq_len→S, etc.
+        _ABBREV = {
+            "hidden_dim": "D", "seq_len": "S", "batch": "B", "page_size": "pg",
+            "BH": "BH", "M": "M", "N": "N", "K": "K", "D": "D",
+        }
+        def _fmt_val(k, v):
+            if k == "page_size" and isinstance(v, int):
+                return f"{v // 1024}K"
+            return str(v)
+        label = ", ".join(
+            f"{_ABBREV.get(k, k)}={_fmt_val(k, v)}" for k, v in params.items()
+        )
+        if len(label) > 47:
+            label = label[:44] + "..."
+        line = f"{label:<48}"
 
         baseline_ms = None
         for name in names:
@@ -337,6 +341,7 @@ class Benchmark:
         warmup: int = 25,
         rep: int = 100,
         print_summary: bool = True,
+        columns: Optional[list] = None,
     ):
         if self._configs is not None:
             param_names = self._config_names
@@ -348,8 +353,13 @@ class Benchmark:
 
         results = {}
 
-        names_seen = set()
-        names_ordered = []
+        # Use explicit columns if provided, otherwise discover dynamically
+        if columns is not None:
+            names_seen = set(columns)
+            names_ordered = list(columns)
+        else:
+            names_seen = set()
+            names_ordered = []
         _header_printed = False
 
         for combination in all_combinations:
@@ -357,37 +367,19 @@ class Benchmark:
 
             try:
                 funcs = self.func(**params)
-                # Update known names from successful retrieval
-                if funcs and not names_seen:
-                    names_seen = set(funcs.keys())
-                    names_ordered = list(funcs.keys())
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM during setup for params: {params}")
                 torch.cuda.empty_cache()
-                if names_seen:
-                    if mode == "kernel":
-                        results[str(params)] = {
-                            name: {"time_ms": 0.0, "gbps": 0.0} for name in names_seen
-                        }
-                    else:
-                        results[str(params)] = {
-                            name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen
-                        }
                 continue
             except Exception as e:
                 print(f"Error during setup for params: {params}, error: {e}")
-                if names_seen:
-                    if mode == "kernel":
-                        results[str(params)] = {
-                            name: {"time_ms": 0.0, "gbps": 0.0} for name in names_seen
-                        }
-                    else:
-                        results[str(params)] = {
-                            name: {"fwd": 0.0, "bwd": 0.0, "memory": 0.0} for name in names_seen
-                        }
                 continue
 
             for func_name, func in funcs.items():
+                if func_name not in names_seen:
+                    names_seen.add(func_name)
+                    names_ordered.append(func_name)
+
                 if str(params) not in results:
                     results[str(params)] = {}
                 results[str(params)][func_name] = {}

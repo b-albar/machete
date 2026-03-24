@@ -8,14 +8,13 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.ops import (
-    Op,
+from machete.megakernel.ops import Op
+from machete.megakernel.scheduling import (
     BarrierFormula,
     TileInstruction,
     InstructionStreamBuilder,
     INSTRUCTION_WORDS,
     TileScheduler,
-    LevelBatchedScheduler,
     BackwardScheduler,
     get_default_scheduler,
     set_default_scheduler,
@@ -507,14 +506,14 @@ class TestLinecacheCleanup:
 
     def test_cleanup_removes_entries(self):
         from machete.megakernel.compile import (
-            compile_compute,
+            compile_phase,
             cleanup_linecache,
             _linecache_entries,
         )
         import linecache
 
         before = len(_linecache_entries)
-        compile_compute(_NOPOp())
+        compile_phase(_NOPOp(), "compute")
         assert len(_linecache_entries) > before
 
         # Verify entries exist in linecache
@@ -631,10 +630,10 @@ class TestLevelBatchedScheduling:
 class TestSchedulerAPI:
     """Test the tile scheduler abstraction and different schedulers."""
 
-    def test_default_scheduler_is_level_batched(self):
-        """Default scheduler should be LevelBatchedScheduler."""
+    def test_default_scheduler_is_backward(self):
+        """Default scheduler should be BackwardScheduler."""
         scheduler = get_default_scheduler()
-        assert isinstance(scheduler, LevelBatchedScheduler)
+        assert isinstance(scheduler, BackwardScheduler)
 
     def test_set_default_scheduler(self):
         """Can change the default scheduler globally."""
@@ -653,7 +652,7 @@ class TestSchedulerAPI:
         builder.add_op(_NOPOp, tile_counts=(4,))
 
         # Using explicit scheduler should work
-        scheduler = LevelBatchedScheduler()
+        scheduler = BackwardScheduler()
         instructions = builder.build(scheduler=scheduler)
         assert len(instructions) == 9  # 8 tiles + end marker
 
@@ -710,10 +709,12 @@ class TestSchedulerAPI:
 
 from machete.megakernel.ops import (
     TensorMeta,
-    TensorRegistry,
     _build_tensor_and_dim_lists,
-    validate_op_compatibility,
     ScheduledOp,
+)
+from machete.megakernel.registries import (
+    TensorRegistry,
+    validate_op_compatibility,
 )
 
 

@@ -58,7 +58,7 @@ def global_barrier_wait(
         ".reg .u64 %addr; "
         "mad.wide.u32 %addr, $1, 4, $0; "
         "{loop}: "
-        "ld.acquire.sys.global.b32 %val, [%addr]; "
+        "ld.acquire.gpu.global.b32 %val, [%addr]; "
         "setp.ge.u32 %p, %val, $2; "
         "@%p bra {done}; "
         "nanosleep.u32 8; "
@@ -110,7 +110,7 @@ def check_barrier_ready(
             .reg .u32 %val;
             .reg .u64 %addr;
             mad.wide.u32 %addr, $2, 4, $1;
-            ld.acquire.sys.global.b32 %val, [%addr];
+            ld.acquire.gpu.global.b32 %val, [%addr];
             setp.ge.u32 %p, %val, $3;
             selp.u32 $0, 1, 0, %p;
         }
@@ -152,6 +152,111 @@ def global_barrier_signal(
         }
         """,
         "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def check_barrier_ready_gpu(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    expected: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Non-blocking barrier check with GPU scope (cheaper than sys scope).
+
+    Same as check_barrier_ready but uses .gpu scope instead of .sys.
+    Sufficient for intra-GPU barriers (not cross-GPU NVLink).
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [
+            barrier_ptr.ir_value(loc=loc, ip=ip),
+            barrier_idx.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred %p;
+            .reg .u32 %val;
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $2, 4, $1;
+            ld.acquire.gpu.global.b32 %val, [%addr];
+            setp.ge.u32 %p, %val, $3;
+            selp.u32 $0, 1, 0, %p;
+        }
+        """,
+        "=r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def global_barrier_signal_gpu(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Signal (increment) a global barrier with GPU scope (cheaper than sys scope).
+
+    Same as global_barrier_signal but uses .gpu scope instead of .sys.
+    Sufficient for intra-GPU barriers (not cross-GPU NVLink).
+    """
+    llvm.inline_asm(
+        None,
+        [barrier_ptr.ir_value(loc=loc, ip=ip), barrier_idx.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $1, 4, $0;
+            atom.add.release.gpu.global.u32 _, [%addr], 1;
+        }
+        """,
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def atomic_add_acq_rel_gpu_i32(
+    base_ptr: Int64,
+    idx: Int32,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Atomic increment (add 1) with acquire-release semantics, GPU scope.
+
+    Computes address as base_ptr + idx * 4, then atomically adds 1.
+    Returns the OLD value before the increment. Used for cross-block
+    coordination: release ensures this block's prior writes are visible,
+    acquire ensures the caller sees other blocks' released writes.
+    """
+    return llvm.inline_asm(
+        Int32.mlir_type,
+        [base_ptr.ir_value(loc=loc, ip=ip), idx.ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .u64 %addr;
+            mad.wide.u32 %addr, $2, 4, $1;
+            atom.add.acq_rel.gpu.global.u32 $0, [%addr], 1;
+        }
+        """,
+        "=r,l,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -535,6 +640,36 @@ def mbarrier_try_wait(
 
 
 @dsl_user_op
+def mbarrier_inval(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Invalidate an mbarrier object, releasing it for regular smem reuse.
+
+    After invalidation, the shared memory locations occupied by the mbarrier
+    can be safely overwritten with regular data (e.g., by TMA loads for a
+    different op reusing the same page).
+
+    Must only be called when no thread has pending arrive/wait operations
+    on this mbarrier.
+
+    Args:
+        smem_addr: Shared memory address of the mbarrier (8-byte aligned)
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "mbarrier.inval.shared.b64 [$0];",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def nanosleep(
     duration: Int32,
     *,
@@ -629,17 +764,60 @@ def get_smem_base_ptr(*, loc=None, ip=None) -> Int32:
     return Int32(result)
 
 
+@dsl_user_op
+def prefetch_instruction(
+    instr_ptr: Int64,
+    instr_idx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Prefetch an instruction from global memory into L2 cache.
+
+    Issues a ``prefetch.global.L2`` for the instruction at the given index.
+    This is a non-blocking hint — the hardware starts fetching the cache line
+    so that a subsequent ``ld.global`` hits L2 (~30-50 cycles) instead of
+    DRAM (~200-400 cycles).
+
+    Args:
+        instr_ptr: Pointer to instruction array in global memory (64-bit)
+        instr_idx: Instruction index (byte offset = instr_idx * 8)
+    """
+    llvm.inline_asm(
+        None,
+        [
+            instr_ptr.ir_value(loc=loc, ip=ip),
+            instr_idx.ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .u64 %gaddr;
+            mad.wide.u32 %gaddr, $1, 8, $0;
+            prefetch.global.L2 [%gaddr];
+        }
+        """,
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 __all__ = [
     "global_barrier_wait",
     "global_barrier_signal",
+    "global_barrier_signal_gpu",
     "check_barrier_ready",
+    "check_barrier_ready_gpu",
     "load_instruction_to_smem",
+    "prefetch_instruction",
     "ld_global_i32",
     "ld_global_i64",
     "st_global_i32",
     # mbarrier primitives
     "mbarrier_init",
     "mbarrier_init_fence",
+    "mbarrier_inval",
     "mbarrier_arrive",
     "mbarrier_arrive_expect_tx",
     "mbarrier_wait",

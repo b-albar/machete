@@ -24,16 +24,16 @@ from .autograd_op import AutogradOp
 from .kernel_cache import KernelCache
 
 
-def _run_cached(scheduled_ops, mk_config, backward):
+def _run_cached(scheduled_ops, mk_config):
     """Run a megakernel with kernel caching. Executes exactly once.
 
     On cache hit: injects the cached compiled kernel and launches via run().
     On cache miss: compiles + executes via mk.run(), then caches the result.
     """
     cache = KernelCache.get()
-    compiled_kernel = cache.lookup(scheduled_ops, mk_config, backward=backward)
+    compiled_kernel = cache.lookup(scheduled_ops, mk_config)
 
-    mk = Megakernel(scheduled_ops, config=mk_config, backward=backward)
+    mk = Megakernel(scheduled_ops, config=mk_config)
 
     if compiled_kernel is not None:
         # Cache hit: inject cached kernel, then use public run()
@@ -43,7 +43,7 @@ def _run_cached(scheduled_ops, mk_config, backward):
         # Cache miss: compile + execute once
         with contextlib.redirect_stdout(io.StringIO()):
             mk.run()
-        cache.store(scheduled_ops, mk_config, backward, mk._compiled_kernel)
+        cache.store(scheduled_ops, mk_config, mk._compiled_kernel)
 
 
 class MegakernelFunction(Function):
@@ -93,7 +93,7 @@ class MegakernelFunction(Function):
         # ---- Step 4: Run forward megakernel (in-place, cached) ----
         if mk_config is None:
             mk_config = MegakernelConfig()
-        _run_cached(scheduled_ops, mk_config, backward=False)
+        _run_cached(scheduled_ops, mk_config)
 
         # ---- Step 5: mark_dirty for in-place mutation ----
         ctx.mark_dirty(*mutated_tensors)
@@ -142,9 +142,10 @@ class MegakernelFunction(Function):
                 grad_offset += 1
             per_op_grads.append(grad_dict)
 
-        # ---- Step 3: Build backward ScheduledOps via schedule() ----
+        # ---- Step 3: Build backward ScheduledOps via bwd_op_cls.schedule() ----
         scheduled_ops = []
         for i, aop in enumerate(autograd_ops):
+            bwd_cls = aop.bwd_op_cls or aop.op_cls
             # Map grad_outputs to Op input names via mutated_from
             backward_tensors = dict(per_op_saved[i])
             for spec in aop.output_specs():
@@ -152,12 +153,12 @@ class MegakernelFunction(Function):
                     backward_tensors[spec.mutated_from] = per_op_grads[i][spec.name]
 
             prepared = aop.prepare_tensors(**backward_tensors)
-            scheduled_ops.extend(aop.op_cls.schedule(
+            scheduled_ops.extend(bwd_cls.schedule(
                 tile_sizes=aop.get_tile_sizes(), **prepared
             ))
 
         # ---- Step 4: Run backward megakernel (in-place on grad, cached) ----
-        _run_cached(scheduled_ops, mk_config, backward=True)
+        _run_cached(scheduled_ops, mk_config)
 
         # ---- Step 5: Build gradient tuple ----
         # Return None for autograd_ops, mk_config, then per-input grads

@@ -18,47 +18,57 @@ import torch
 def rope_pytorch(q, cos, sin):
     """Pure PyTorch RoPE forward reference.
 
+    Supports partial RoPE: when cos/sin have D2 < D//2 columns, only the
+    first 2*D2 dimensions are rotated; the rest pass through unchanged.
+
     Args:
         q: (B, S, H, D) float32
-        cos: (S, D//2) float32
-        sin: (S, D//2) float32
+        cos: (S, D2) float32 — D2 = rotary_dim // 2, may be < D//2
+        sin: (S, D2) float32
 
     Returns:
         (B, S, H, D) float32 — new tensor with RoPE applied
     """
     b, s, h, d = q.shape
-    half_d = d // 2
-    q0 = q[..., :half_d]
-    q1 = q[..., half_d:]
-    cos_exp = cos[:s].view(1, s, 1, half_d)
-    sin_exp = sin[:s].view(1, s, 1, half_d)
+    d2 = cos.shape[1]  # rotary_dim // 2
+    q0 = q[..., :d2]
+    q1 = q[..., d2:2 * d2]
+    cos_exp = cos[:s].view(1, s, 1, d2)
+    sin_exp = sin[:s].view(1, s, 1, d2)
     r0 = q0 * cos_exp - q1 * sin_exp
     r1 = q1 * cos_exp + q0 * sin_exp
-    return torch.cat([r0, r1], dim=-1)
+    out = q.clone()
+    out[..., :d2] = r0
+    out[..., d2:2 * d2] = r1
+    return out
 
 
 def rope_pytorch_backward(q, cos, sin):
     """Pure PyTorch inverse RoPE (backward) reference.
 
     Applies transpose of the rotation matrix: [[cos, sin], [-sin, cos]].
+    Supports partial RoPE (D2 < D//2).
 
     Args:
         q: (B, S, H, D) float32
-        cos: (S, D//2) float32
-        sin: (S, D//2) float32
+        cos: (S, D2) float32 — D2 = rotary_dim // 2, may be < D//2
+        sin: (S, D2) float32
 
     Returns:
         (B, S, H, D) float32 — new tensor with inverse RoPE applied
     """
     b, s, h, d = q.shape
-    half_d = d // 2
-    q0 = q[..., :half_d]
-    q1 = q[..., half_d:]
-    cos_exp = cos[:s].view(1, s, 1, half_d)
-    sin_exp = sin[:s].view(1, s, 1, half_d)
+    d2 = cos.shape[1]
+    q0 = q[..., :d2]
+    q1 = q[..., d2:2 * d2]
+    cos_exp = cos[:s].view(1, s, 1, d2)
+    sin_exp = sin[:s].view(1, s, 1, d2)
     r0 = q0 * cos_exp + q1 * sin_exp
     r1 = q1 * cos_exp - q0 * sin_exp
-    return torch.cat([r0, r1], dim=-1)
+    out = q.clone()
+    out[..., :d2] = r0
+    out[..., d2:2 * d2] = r1
+    return out
 
 
 # =============================================================================

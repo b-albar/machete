@@ -30,26 +30,6 @@ def get_tolerances(dtype):
     return {"rtol": 1e-2, "atol": 1e-2}
 
 
-def _compute_tile_sizes(n_heads, head_dim, dtype):
-    """Compute tile sizes for both RMSNorm and RoPE that fit in a 16KB page."""
-    elem_bytes = 4 if dtype == torch.float32 else 2
-    hidden_dim = n_heads * head_dim
-
-    # RMSNorm: tile_m_rms * hidden_dim * elem_bytes <= 16384
-    tile_m_rms = min(4, max(1, 16384 // (hidden_dim * elem_bytes)))
-
-    # RoPE tile_size_H: largest <= 8 that divides n_heads
-    tile_h = min(n_heads, 8)
-    while n_heads % tile_h != 0:
-        tile_h -= 1
-
-    # RoPE smem: q (tile_m * tile_h * D) + cos (tile_m * D/2) + sin (tile_m * D/2)
-    rope_row_bytes = (tile_h * head_dim + head_dim) * elem_bytes
-    tile_m_rope = min(4, max(1, 16384 // rope_row_bytes))
-
-    return tile_m_rms, tile_h, tile_m_rope
-
-
 # (batch, seq_len, n_heads, head_dim)
 SHAPE_PARAMS = [
     (1, 8, 1, 64),      # minimal: single head
@@ -79,33 +59,38 @@ class TestFusedRMSNormRoPE:
 
         Data flow:
             x (M, hidden_dim) -> RMSNorm -> y (M, hidden_dim)
-            y viewed as (M, H, D) = q -> RoPE -> q (modified in-place)
+            y viewed as (B, S, NH, HD) = q -> RoPE -> q (modified in-place)
 
         The dependency is automatically detected because y and q share the
         same tensor storage (y.data_ptr() == q.data_ptr()).
 
         Also verifies barrier reset by running the kernel multiple times.
         """
-        M = batch * seq_len
         hidden_dim = n_heads * head_dim
-        tile_m_rms, tile_h, tile_m_rope = _compute_tile_sizes(n_heads, head_dim, dtype)
 
-        # Input for RMSNorm
-        x = torch.randn(M, hidden_dim, dtype=dtype, device="cuda")
+        # RoPE tile_size_NH: largest <= 8 that divides n_heads
+        tile_nh = min(n_heads, 8)
+        while n_heads % tile_nh != 0:
+            tile_nh -= 1
+
+        # Input for RMSNorm (3D: B, S, D)
+        x = torch.randn(batch, seq_len, hidden_dim, dtype=dtype, device="cuda")
         weight = torch.randn(hidden_dim, dtype=dtype, device="cuda")
 
-        # Output of RMSNorm / Input for RoPE
+        # Output of RMSNorm / Input for RoPE (4D view for RopeOp)
         y = torch.empty_like(x)
-        q = y.view(M, n_heads, head_dim)  # Alias sharing storage
+        q = y.view(batch, seq_len, n_heads, head_dim)  # 4D alias sharing storage
 
         # RoPE tables
         cos = torch.randn(seq_len, head_dim // 2, dtype=dtype, device="cuda")
         sin = torch.randn(seq_len, head_dim // 2, dtype=dtype, device="cuda")
 
         # Fused megakernel: RMSNorm -> RoPE
-        # Dependency is auto-detected via tensor pointer matching
-        ops = (RMSNormOp.schedule(x=x, weight=weight, y=y, tile_sizes={"M": tile_m_rms})
-               + RopeOp.schedule(q=q, cos=cos, sin=sin, tile_sizes={"M": tile_m_rope, "H": tile_h}))
+        # RMSNormOp uses tile_S=1 (one row per block), RoPE uses its own tile_S
+        rms_ops = RMSNormOp.schedule(x=x, weight=weight, y=y)
+        rope_ops = RopeOp.schedule(q=q, cos=cos, sin=sin,
+                                   tile_sizes={"NH": tile_nh, "B": 1})
+        ops = rms_ops + rope_ops
         config = MegakernelConfig(threads_per_block=128)
         kernel = Megakernel(ops, config=config)
 
@@ -114,10 +99,10 @@ class TestFusedRMSNormRoPE:
             y.zero_()
             x.copy_(torch.randn_like(x))
 
-            # PyTorch reference
-            y_ref = rmsnorm_pytorch(x, weight)
-            q_ref_4d = rope_pytorch(y_ref.view(batch, seq_len, n_heads, head_dim), cos, sin)
-            q_ref = q_ref_4d.view(M, n_heads, head_dim)
+            # PyTorch reference (2D for reference fn, then reshape)
+            x_2d = x.view(-1, hidden_dim)
+            y_ref = rmsnorm_pytorch(x_2d, weight)
+            q_ref = rope_pytorch(y_ref.view(batch, seq_len, n_heads, head_dim), cos, sin)
 
             kernel.run()
 

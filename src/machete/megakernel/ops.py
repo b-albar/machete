@@ -25,9 +25,8 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute::
 
 import math
 import struct
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 import cutlass
 import torch
@@ -157,58 +156,44 @@ def _build_tensor_and_dim_lists(reads, writes):
 
 
 def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=None):
-    """Generate and attach pack_config / pack_backward_config staticmethods.
+    """Generate and attach pack_config staticmethod.
 
     Only packs pointers and dynamic dims into the config tensor. Static dims
     are baked into the compiled kernel as compile-time constants.
     """
-
-    def _make_pack_fn(tensors_decl, dims_list, dyn_names):
-        """Create a pack_config function for a given tensor/dim specification."""
-        num_unique = len(tensors_decl)
-        # Only pack dynamic dims
-        dynamic_dims = [(d, t, a) for d, t, a in dims_list if d in dyn_names]
-        num_dynamic = len(dynamic_dims)
-        config_size = 2 * num_unique + num_dynamic
-
-        def pack_config(**tensors):
-            config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
-            # Pack pointers
-            for i, (name, dtype, dims) in enumerate(tensors_decl):
-                t = tensors[name]
-                assert t.is_contiguous(), f"{name} must be contiguous"
-                lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
-                config[2 * i] = lo
-                config[2 * i + 1] = hi
-            # Pack dynamic dims only
-            offset = 2 * num_unique
-            for j, (dim_name, tensor_name, axis_idx) in enumerate(dynamic_dims):
-                config[offset + j] = tensors[tensor_name].shape[axis_idx]
-            return config
-
-        return staticmethod(pack_config)
-
-    # All dims are dynamic if no classification provided
+    num_unique = len(unique_tensors)
+    # Only pack dynamic dims
     if dynamic_dim_names is None:
         dynamic_dim_names = {d for d, _, _ in unique_dims}
+    dynamic_dims = [(d, t, a) for d, t, a in unique_dims if d in dynamic_dim_names]
+    num_dynamic = len(dynamic_dims)
+    config_size = 2 * num_unique + num_dynamic
 
-    cls.pack_config = _make_pack_fn(unique_tensors, unique_dims, dynamic_dim_names)
+    def pack_config(**tensors):
+        config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
+        # Pack pointers
+        for i, (name, dtype, dims) in enumerate(unique_tensors):
+            t = tensors[name]
+            assert t.is_contiguous() or t.stride(-1) == 1, (
+                f"{name} must be contiguous or have unit innermost stride"
+            )
+            lo, hi = struct.unpack("<2i", struct.pack("<Q", t.data_ptr()))
+            config[2 * i] = lo
+            config[2 * i + 1] = hi
+        # Pack dynamic dims only
+        offset = 2 * num_unique
+        for j, (dim_name, tensor_name, axis_idx) in enumerate(dynamic_dims):
+            config[offset + j] = tensors[tensor_name].shape[axis_idx]
+        return config
 
-    # Backward config: use backward_reads/backward_writes if defined
-    bwd_reads = getattr(cls, "backward_reads", None) or reads
-    bwd_writes = getattr(cls, "backward_writes", None) or writes
-    if bwd_reads is reads and bwd_writes is writes:
-        cls.pack_backward_config = cls.pack_config
-    else:
-        bwd_tensors, bwd_dims = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-        cls.pack_backward_config = _make_pack_fn(bwd_tensors, bwd_dims, dynamic_dim_names)
+    cls.pack_config = staticmethod(pack_config)
 
 
 def _process_op_declarations(cls):
     """Process reads/writes/tile declarations on an Op subclass.
 
     Auto-generates: INPUTS, OUTPUTS,
-    DIM_NAMES, pack_config, pack_backward_config, load/store stubs,
+    DIM_NAMES, pack_config, load/store stubs,
     and schedule() classmethod.
 
     Stores tensor/dim metadata on the class for deferred init generation
@@ -253,15 +238,6 @@ def _process_op_declarations(cls):
     cls._STATIC_DIM_NAMES = static_dim_names
     cls._TILE_DIM_NAMES_ORDERED = tile  # ordered tuple of tile dim names
 
-    # Backward tensor/dim metadata (may differ from forward)
-    bwd_reads = getattr(cls, "backward_reads", None) or reads
-    bwd_writes = getattr(cls, "backward_writes", None) or writes
-    if bwd_reads is reads and bwd_writes is writes:
-        cls._BWD_UNIQUE_TENSORS = unique_tensors
-        cls._BWD_UNIQUE_DIMS = unique_dims
-    else:
-        cls._BWD_UNIQUE_TENSORS, cls._BWD_UNIQUE_DIMS = _build_tensor_and_dim_lists(bwd_reads, bwd_writes)
-
     # Set INPUTS / OUTPUTS
     cls.INPUTS = list(reads.keys())
     cls.OUTPUTS = list(writes.keys())
@@ -283,22 +259,18 @@ def _process_op_declarations(cls):
     tma_stores = set(getattr(cls, "tma_stores", set()))
     tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
 
-    # Validate TMA tensors exist in reads/writes (including backward declarations).
-    # TMA names may appear in forward-only or backward-only tensors — the framework
-    # skips non-existent tensors at schedule time (TMARegistry.from_ops).
-    bwd_reads = getattr(cls, "backward_reads", None) or {}
-    bwd_writes = getattr(cls, "backward_writes", None) or {}
-    all_read_names = set(reads.keys()) | set(bwd_reads.keys())
-    all_write_names = set(writes.keys()) | set(bwd_writes.keys())
+    # Validate TMA tensors exist in reads/writes.
+    all_read_names = set(reads.keys())
+    all_write_names = set(writes.keys())
     for name in tma_loads:
         if name not in all_read_names:
-            raise ValueError(f"tma_loads tensor '{name}' not found in reads or backward_reads")
+            raise ValueError(f"tma_loads tensor '{name}' not found in reads")
     for name in tma_stores:
         if name not in all_write_names:
-            raise ValueError(f"tma_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"tma_stores tensor '{name}' not found in writes")
     for name in tma_reduce_stores:
         if name not in all_write_names:
-            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes")
 
     cls._TMA_LOADS = tma_loads
     cls._TMA_STORES = tma_stores
@@ -306,38 +278,38 @@ def _process_op_declarations(cls):
 
     # --- Process peer store declarations ---
     # peer_stores: set of tensor names to send to peer GPUs via TMA S2G
+    # peer_reduce_stores: set of tensor names to send via TMA S2G with atomic add
     peer_stores = set(getattr(cls, "peer_stores", set()))
     for name in peer_stores:
         if name not in all_write_names:
-            raise ValueError(f"peer_stores tensor '{name}' not found in writes or backward_writes")
+            raise ValueError(f"peer_stores tensor '{name}' not found in writes")
     cls._PEER_STORES = peer_stores
+
+    peer_reduce_stores = set(getattr(cls, "peer_reduce_stores", set()))
+    for name in peer_reduce_stores:
+        if name not in all_write_names:
+            raise ValueError(f"peer_reduce_stores tensor '{name}' not found in writes")
+    cls._PEER_REDUCE_STORES = peer_reduce_stores
 
     # Build TMA tile shape info per tensor.
     # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
     # The actual values are filled at schedule() time when static_dims are known.
-    # Include both forward and backward tensor dims so that TMA tensors
-    # declared in backward_writes (e.g., "dx") get correct tile shapes.
     tma_tensor_dims = {}  # {tensor_name: list of dim_names}
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    for name, _, dims in cls._BWD_UNIQUE_TENSORS:
-        if name not in tensor_dims_map:
-            tensor_dims_map[name] = dims
-    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores:
+    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores | peer_reduce_stores:
         if name in tensor_dims_map:
             tma_tensor_dims[name] = tensor_dims_map[name]
     cls._TMA_TENSOR_DIMS = tma_tensor_dims
 
-    # Generate pack_config / pack_backward_config (only packs dynamic dims)
+    # Generate pack_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
 
     # Add _schedule_single() classmethod (internal — returns one ScheduledOp)
     @classmethod
-    def _schedule_single(cls, backward=False, tile_sizes=None, **tensors):
+    def _schedule_single(cls, tile_sizes=None, **tensors):
         """Create a single ScheduledOp from tensor kwargs (internal).
 
         Args:
-            backward: If True, use backward_reads/backward_writes tensor
-                      declarations for packing and dim extraction.
             tile_sizes: Dict mapping tile dim names to tile sizes.
                 E.g., {"M": 4}. Unspecified dims default to full extent
                 (1 tile covering entire dimension).
@@ -346,15 +318,9 @@ def _process_op_declarations(cls):
         if tile_sizes is None:
             tile_sizes = {}
 
-        # Select forward or backward dim/tensor declarations
-        if backward and hasattr(cls, "_BWD_UNIQUE_DIMS"):
-            unique_dims = cls._BWD_UNIQUE_DIMS
-            unique_tensors = cls._BWD_UNIQUE_TENSORS
-            pack_fn = cls.pack_backward_config
-        else:
-            unique_dims = cls._UNIQUE_DIMS
-            unique_tensors = cls._UNIQUE_TENSORS
-            pack_fn = cls.pack_config
+        unique_dims = cls._UNIQUE_DIMS
+        unique_tensors = cls._UNIQUE_TENSORS
+        pack_fn = cls.pack_config
 
         # --- Validate tensor ndim matches declaration ---
         for name, dtype, dims in unique_tensors:
@@ -455,36 +421,17 @@ def _process_op_declarations(cls):
 
     cls._schedule_single = _schedule_single
 
-    # Add schedule() classmethod (public dispatcher — returns list of ScheduledOps)
-    @classmethod
-    def schedule(cls, backward=False, tile_sizes=None, **tensors):
-        """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
-
-        Checks for schedule_forward / schedule_backward overrides on the
-        subclass. If found, delegates to them. Otherwise wraps a single
-        _schedule_single() call in a list.
-        """
-        if not backward and hasattr(cls, "schedule_forward"):
-            return cls.schedule_forward(tile_sizes=tile_sizes, **tensors)
-        if backward and hasattr(cls, "schedule_backward"):
-            return cls.schedule_backward(tile_sizes=tile_sizes, **tensors)
-        return [cls._schedule_single(backward=backward, tile_sizes=tile_sizes, **tensors)]
-
-    cls.schedule = schedule
+    # Default schedule() is on Op base class. Subclasses override directly.
 
     # Add gen_tensor_param_names classmethod
     @classmethod
-    def gen_tensor_param_names(cls, backward=False):
+    def gen_tensor_param_names(cls):
         """Get the tensor parameter names for function signature in tensor mode.
 
         Returns the list of tensor names declared in reads/writes (deduplicated,
         in declaration order). Used to build the phase function signature.
-
-        Args:
-            backward: If True, use backward tensor declarations.
         """
-        tensors = cls._BWD_UNIQUE_TENSORS if backward else cls._UNIQUE_TENSORS
-        return [name for name, _, _ in tensors]
+        return [name for name, _, _ in cls._UNIQUE_TENSORS]
 
     cls.gen_tensor_param_names = gen_tensor_param_names
 
@@ -522,8 +469,8 @@ def _process_op_declarations(cls):
 # Operation Protocol
 # =============================================================================
 
-DEFAULT_PAGE_SIZE: int = 32768
-"""Default page size in bytes (32KB). Single source of truth for all ops."""
+DEFAULT_PAGE_SIZE: int = 49152
+"""Default page size in bytes (48KB). Must match MegakernelConfig.page_size."""
 
 
 class Op:
@@ -595,6 +542,19 @@ class Op:
             _process_op_declarations(cls)
 
     # =========================================================================
+    # Scheduling
+    # =========================================================================
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
+
+        Subclasses override this for custom scheduling (auto-tiling, etc.).
+        Default: wraps a single _schedule_single() call in a list.
+        """
+        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+
+    # =========================================================================
     # Pipelined Execution Interface
     # =========================================================================
 
@@ -651,30 +611,6 @@ class Op:
         """
         pass
 
-    # =========================================================================
-    # Backward Pass Interface
-    # =========================================================================
-
-    def backward_load(self, page_ptr) -> None:
-        """Load data for backward pass.
-
-        Default: no-op (for ops that don't use shared memory staging).
-        """
-        pass
-
-    def backward_compute(self, page_ptr) -> None:
-        """Backward computation for one tile.
-
-        Default: no-op.
-        """
-        pass
-
-    def backward_store(self, page_ptr) -> None:
-        """Store backward results from shared memory to global memory.
-
-        Default: no-op.
-        """
-        pass
 
 
 def build_op_config(
@@ -707,25 +643,20 @@ def build_op_config(
         config.update(op.static_dims)
 
     # Tensor dtypes (x_dtype, weight_dtype, dout_dtype, ...)
-    # Include both forward and backward tensor declarations since the same
-    # instance is used for all phases.
-    for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
-        if hasattr(op.op_cls, attr):
-            for name, dtype, dims in getattr(op.op_cls, attr):
-                key = f"{name}_dtype"
-                if key not in config:
-                    resolved = op.tensor_dtypes.get(name, dtype) if op.tensor_dtypes else dtype
-                    if resolved is not None:
-                        config[key] = resolved
+    if hasattr(op.op_cls, "_UNIQUE_TENSORS"):
+        for name, dtype, dims in op.op_cls._UNIQUE_TENSORS:
+            key = f"{name}_dtype"
+            if key not in config:
+                resolved = op.tensor_dtypes.get(name, dtype) if op.tensor_dtypes else dtype
+                if resolved is not None:
+                    config[key] = resolved
 
     # Tensor strides (x_stride_M, x_stride_D, ...)
-    if op.tensor_strides:
-        for attr in ("_UNIQUE_TENSORS", "_BWD_UNIQUE_TENSORS"):
-            if hasattr(op.op_cls, attr):
-                for name, dtype, dims in getattr(op.op_cls, attr):
-                    if name in op.tensor_strides:
-                        for i, dim_name in enumerate(dims):
-                            config[f"{name}_stride_{dim_name}"] = op.tensor_strides[name][i]
+    if op.tensor_strides and hasattr(op.op_cls, "_UNIQUE_TENSORS"):
+        for name, dtype, dims in op.op_cls._UNIQUE_TENSORS:
+            if name in op.tensor_strides:
+                for i, dim_name in enumerate(dims):
+                    config[f"{name}_stride_{dim_name}"] = op.tensor_strides[name][i]
 
     return config
 
@@ -763,6 +694,7 @@ class ScheduledOp:
     tensor_refs: Dict[str, Any] = field(default_factory=dict)  # {name: torch.Tensor} for tensor param mode
     tensor_metas: Dict[str, TensorMeta] = field(default_factory=dict)  # Per-tensor metadata (shape, strides, ndim)
     tensor_strides: Dict[str, Tuple[int, ...]] = field(default_factory=dict)  # {name: strides} for stride init source
+    dim_aliases: Dict[str, str] = field(default_factory=dict)  # Maps dim name → canonical for barrier matching
 
     def __post_init__(self):
         if self.dim_names is None:
@@ -795,1848 +727,16 @@ class ScheduledOp:
         """Get the tile axis index for a semantic dimension name, or None."""
         return self.dim_names.get(dim_name)
 
-
-# =============================================================================
-# Tensor Registry (Deduplication for Tensor Parameter Mode)
-# =============================================================================
-
-
-@dataclass
-class TensorRegistry:
-    """Deduplicates tensors across ops by data_ptr() for tensor parameter mode.
-
-    When multiple ops share the same underlying tensor (e.g., RMSNorm.y and
-    Rope.q point to the same GPU buffer), this registry assigns a single
-    canonical parameter name (t0, t1, ...) to avoid passing duplicate tensors.
-
-    Usage:
-        registry = TensorRegistry.from_ops(ops)
-        # registry.canonical_names → ['t0', 't1', 't2', 't3', 't4']
-        # registry.get_op_tensor_args(0, RMSNormOp) → ['t0', 't1', 't2']
-        # registry.get_op_tensor_args(1, RopeOp) → ['t2', 't3', 't4']
-    """
-
-    # List of (canonical_name, torch.Tensor, cutlass_dtype)
-    tensors: List[Tuple[str, Any, Any]]
-    # Per-op mappings: {op_idx: {local_name: canonical_name}}
-    op_mappings: Dict[int, Dict[str, str]]
-    # Reverse mapping: canonical_name -> index in tensors list
-    name_to_idx: Dict[str, int]
-
-    @classmethod
-    def from_ops(cls, ops: List[ScheduledOp], backward: bool = False) -> "TensorRegistry":
-        """Build a TensorRegistry from a list of ScheduledOps.
-
-        Iterates through each op's tensor_refs in declaration order,
-        deduplicating by data_ptr(). Tensors with the same GPU address
-        get the same canonical name.
-
-        Args:
-            ops: List of scheduled operations with tensor_refs populated.
-            backward: If True, use backward tensor declarations for ordering.
-        """
-        ptr_to_canonical: Dict[int, str] = {}
-        tensors: List[Tuple[str, Any, Any]] = []
-        op_mappings: Dict[int, Dict[str, str]] = {}
-        name_to_idx: Dict[str, int] = {}
-
-        for i, op in enumerate(ops):
-            mapping: Dict[str, str] = {}
-            # Skip ops that don't have tensor declarations (e.g., simple test ops
-            # like StampOp/TensorScaleOp that don't use the @op decorator)
-            if not hasattr(op.op_cls, "_UNIQUE_TENSORS"):
-                op_mappings[i] = mapping
-                continue
-
-            # Use the op's unique_tensors for consistent ordering
-            unique_tensors = op.op_cls._BWD_UNIQUE_TENSORS if backward else op.op_cls._UNIQUE_TENSORS
-
-            for name, dtype, dims in unique_tensors:
-                if name not in op.tensor_refs:
-                    continue
-                tensor = op.tensor_refs[name]
-                ptr = tensor.data_ptr()
-
-                if ptr not in ptr_to_canonical:
-                    canonical = f"t{len(tensors)}"
-                    ptr_to_canonical[ptr] = canonical
-
-                    # Resolve dtype (None means infer from tensor)
-                    resolved_dtype = dtype
-                    if resolved_dtype is None:
-                        resolved_dtype = TORCH_TO_CUTLASS_DTYPE.get(tensor.dtype)
-
-                    name_to_idx[canonical] = len(tensors)
-                    tensors.append((canonical, tensor, resolved_dtype))
-
-                mapping[name] = ptr_to_canonical[ptr]
-            op_mappings[i] = mapping
-
-        return cls(tensors=tensors, op_mappings=op_mappings, name_to_idx=name_to_idx)
-
-    @property
-    def canonical_names(self) -> List[str]:
-        """List of canonical tensor parameter names in order."""
-        return [name for name, _, _ in self.tensors]
-
-    @property
-    def num_tensors(self) -> int:
-        """Number of unique tensors."""
-        return len(self.tensors)
-
-    def get_op_tensor_args(self, op_idx: int, op_cls, backward: bool = False) -> List[str]:
-        """Get ordered canonical tensor names for an op's function call.
-
-        Returns canonical names in the same order as the op's tensor
-        declarations (reads then writes, deduplicated). This order matches
-        the tensor parameter positions in the compiled phase function.
-
-        Args:
-            op_idx: Index of the op in the ops list.
-            op_cls: The op class (for accessing _UNIQUE_TENSORS).
-            backward: If True, use backward tensor declarations.
-        """
-        if not hasattr(op_cls, "_UNIQUE_TENSORS"):
-            return []
-        unique_tensors = op_cls._BWD_UNIQUE_TENSORS if backward else op_cls._UNIQUE_TENSORS
-        mapping = self.op_mappings[op_idx]
-        return [mapping[name] for name, _, _ in unique_tensors if name in mapping]
-
-
-# =============================================================================
-# Peer Buffer Registry (Multi-GPU Communication)
-# =============================================================================
-
-
-@dataclass
-class PeerBufferInfo:
-    """Metadata for a single peer buffer entry.
-
-    Attributes:
-        canonical_name: Canonical tensor name from TensorRegistry (e.g., "t0")
-        peer_tensors: List of tensors on peer GPUs (one per peer device)
-    """
-
-    canonical_name: str
-    peer_tensors: List[Any]  # List[torch.Tensor]
-
-
-@dataclass
-class PeerBufferRegistry:
-    """Tracks identically-shaped pre-allocated buffers on peer GPUs.
-
-    Maps canonical tensor names to lists of peer GPU tensors for TMA
-    peer-to-peer stores. Users pre-allocate buffers on each peer device
-    and pass them via MegakernelConfig.peer_buffers.
-
-    Usage:
-        registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [gpu1_y, gpu2_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
-    """
-
-    buffers: List[PeerBufferInfo]
-    num_peers: int
-
-    @classmethod
-    def from_config(
-        cls,
-        peer_map: Dict[str, List[Any]],
-        tensor_registry: "TensorRegistry",
-        ops: List[ScheduledOp],
-    ) -> "PeerBufferRegistry":
-        """Build from user-provided peer tensor mapping.
-
-        Args:
-            peer_map: {tensor_name: [peer0_tensor, peer1_tensor, ...]}
-                Maps op-local tensor names to pre-allocated peer buffers.
-            tensor_registry: Local TensorRegistry for canonical name resolution.
-            ops: Scheduled ops list for resolving tensor names to canonical names.
-        """
-        if not peer_map:
-            return cls(buffers=[], num_peers=0)
-
-        # Validate all peer lists have the same length
-        num_peers = None
-        for name, peers in peer_map.items():
-            if num_peers is None:
-                num_peers = len(peers)
-            elif len(peers) != num_peers:
-                raise ValueError(
-                    f"Peer buffer '{name}' has {len(peers)} peers, "
-                    f"expected {num_peers} (must be consistent)"
-                )
-
-        if num_peers is None or num_peers == 0:
-            return cls(buffers=[], num_peers=0)
-
-        # Resolve tensor names to canonical names via op mappings
-        buffers: List[PeerBufferInfo] = []
-        seen_canonical: Set[str] = set()
-
-        for name, peers in peer_map.items():
-            # Find canonical name by searching op mappings
-            canonical = None
-            for op_idx, mapping in tensor_registry.op_mappings.items():
-                if name in mapping:
-                    canonical = mapping[name]
-                    break
-
-            if canonical is None:
-                raise ValueError(
-                    f"Peer buffer tensor '{name}' not found in any op's "
-                    f"tensor declarations"
-                )
-
-            if canonical in seen_canonical:
-                continue
-            seen_canonical.add(canonical)
-
-            buffers.append(PeerBufferInfo(
-                canonical_name=canonical,
-                peer_tensors=list(peers),
-            ))
-
-        return cls(buffers=buffers, num_peers=num_peers)
-
-    @property
-    def has_peers(self) -> bool:
-        """Whether any peer buffers are registered."""
-        return len(self.buffers) > 0
-
-    @property
-    def canonical_names(self) -> List[str]:
-        """Canonical tensor names that have peer buffers."""
-        return [b.canonical_name for b in self.buffers]
-
-    def get_peer_tensors(self, canonical_name: str) -> Optional[List[Any]]:
-        """Get peer tensors for a canonical tensor name."""
-        for b in self.buffers:
-            if b.canonical_name == canonical_name:
-                return b.peer_tensors
-        return None
-
-
-# =============================================================================
-# TMA Registry (Descriptor Management for TMA Parameter Mode)
-# =============================================================================
-
-
-@dataclass
-class TMADescriptorInfo:
-    """Metadata for a single TMA descriptor to create at launch time.
-
-    Attributes:
-        canonical_atom: Canonical name for the TMA copy atom (e.g., "tma0_atom")
-        canonical_gmem: Canonical name for the TMA gmem tensor (e.g., "tma0_gmem")
-        tensor_canonical: Canonical tensor name (e.g., "t0") for the source tensor
-        direction: "g2s" (load) or "s2g" (store)
-        tile_shape: Tuple of ints, TMA tile shape per tensor dimension
-        smem_layout_shape: Tuple of ints, shared memory layout shape
-        dtype: CUTLASS dtype for the tensor
-        smem_layout_src: Optional code string for composed smem layout with swizzle.
-            When set, replaces the plain make_layout in TMA descriptor creation
-            so make_tiled_tma_atom can detect the hardware swizzle mode.
-    """
-
-    canonical_atom: str
-    canonical_gmem: str
-    tensor_canonical: str
-    direction: str  # "g2s" or "s2g"
-    tile_shape: Tuple[int, ...]
-    smem_layout_shape: Tuple[int, ...]
-    dtype: Any
-    smem_layout_src: Optional[str] = None
-
-
-@dataclass
-class TMARegistry:
-    """Manages TMA descriptor naming and metadata across fused ops.
-
-    For each TMA load/store declaration, assigns canonical parameter names
-    and records the metadata needed to create TMA descriptors at launch time.
-
-    Usage:
-        registry = TMARegistry.from_ops(ops, tensor_registry)
-        # registry.descriptors → [TMADescriptorInfo(...), ...]
-        # registry.get_op_tma_args(0, "load") → ['tma0_atom', 'tma0_gmem']
-    """
-
-    descriptors: List[TMADescriptorInfo]
-    # Per-op, per-phase mappings: {(op_idx, phase): {local_name: canonical_name}}
-    op_mappings: Dict[Tuple[int, str], Dict[str, str]]
-
-    @classmethod
-    def from_ops(
-        cls,
-        ops: List["ScheduledOp"],
-        tensor_registry: "TensorRegistry",
-    ) -> "TMARegistry":
-        """Build a TMARegistry from scheduled ops.
-
-        For each TMA load/store declaration, computes the TMA tile shape
-        from the op's tile_sizes and static_dims, and assigns canonical names.
-        """
-        descriptors: List[TMADescriptorInfo] = []
-        op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
-        counter = 0
-
-        for i, op in enumerate(ops):
-            op_cls = op.op_cls
-            if not hasattr(op_cls, "_TMA_LOADS"):
-                op_mappings[(i, "load")] = {}
-                op_mappings[(i, "compute")] = {}
-                op_mappings[(i, "store")] = {}
-                continue
-
-            op_mappings[(i, "load")] = {}
-            op_mappings[(i, "compute")] = {}
-            op_mappings[(i, "store")] = {}
-
-            for phase, tma_names, direction in [
-                ("load", op_cls._TMA_LOADS, "g2s"),
-                ("store", op_cls._TMA_STORES, "s2g"),
-                ("store", getattr(op_cls, "_TMA_REDUCE_STORES", set()), "s2g_reduce"),
-            ]:
-                for tensor_name in tma_names:
-                    # Get canonical tensor name from tensor registry
-                    tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
-                    if tensor_canonical is None:
-                        continue
-
-                    # Compute TMA tile shape from op's dims.
-                    # Ops can override via get_tma_tile_shape() for dims
-                    # that need custom sub-tiling (e.g., K in GEMM).
-                    custom_shape = None
-                    if hasattr(op_cls, "get_tma_tile_shape"):
-                        custom_shape = op_cls.get_tma_tile_shape(
-                            tensor_name, op.tile_sizes, op.static_dims)
-                    if custom_shape is not None:
-                        tile_shape = tuple(custom_shape)
-                    else:
-                        tma_dims = op_cls._TMA_TENSOR_DIMS.get(tensor_name, [])
-                        tile_shape = []
-                        for dim_name in tma_dims:
-                            if dim_name in op.tile_sizes:
-                                tile_shape.append(op.tile_sizes[dim_name])
-                            elif dim_name in op.static_dims:
-                                tile_shape.append(op.static_dims[dim_name])
-                            else:
-                                raise ValueError(
-                                    f"TMA tensor '{tensor_name}' dim '{dim_name}' "
-                                    f"not found in tile_sizes or static_dims"
-                                )
-                        tile_shape = tuple(tile_shape)
-
-                    # TMA requires CuTe mode 0 to be contiguous. Since
-                    # PyTorch tensors are row-major, the gmem tensor is
-                    # transposed before from_dlpack (so mode 0 = last dim).
-                    # Reverse tile_shape to match the transposed dimension
-                    # order: original (tile_M, N) -> transposed (N, tile_M).
-                    tma_tile_shape = tuple(reversed(tile_shape))
-
-                    # Resolve dtype
-                    meta = op.tensor_metas.get(tensor_name)
-                    dtype = meta.dtype if meta else None
-
-                    canonical_atom = f"tma{counter}_atom"
-                    canonical_gmem = f"tma{counter}_gmem"
-
-                    # Check for custom smem layout (e.g., swizzle for GEMM)
-                    smem_layout_src = None
-                    if hasattr(op_cls, "get_tma_smem_layout_src"):
-                        smem_layout_src = op_cls.get_tma_smem_layout_src(
-                            tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
-                        )
-
-                    descriptors.append(
-                        TMADescriptorInfo(
-                            canonical_atom=canonical_atom,
-                            canonical_gmem=canonical_gmem,
-                            tensor_canonical=tensor_canonical,
-                            direction=direction,
-                            tile_shape=tma_tile_shape,
-                            smem_layout_shape=tma_tile_shape,
-                            dtype=dtype,
-                            smem_layout_src=smem_layout_src,
-                        )
-                    )
-
-                    # Map op-local names to canonical
-                    op_mappings[(i, phase)][f"{tensor_name}_tma"] = canonical_atom
-                    op_mappings[(i, phase)][f"{tensor_name}_tma_gmem"] = canonical_gmem
-                    counter += 1
-
-            # Compute phase can use the same TMA load descriptors
-            op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
-
-        return cls(descriptors=descriptors, op_mappings=op_mappings)
-
-    @property
-    def has_tma(self) -> bool:
-        """Whether any ops use TMA."""
-        return len(self.descriptors) > 0
-
-    @property
-    def all_canonical_names(self) -> List[str]:
-        """All canonical TMA parameter names (atoms + gmems) in order."""
-        names = []
-        for d in self.descriptors:
-            names.append(d.canonical_atom)
-            names.append(d.canonical_gmem)
-        return names
-
-    def get_op_tma_args(self, op_idx: int, phase: str) -> List[str]:
-        """Get canonical TMA param names for an op's phase function.
-
-        Args:
-            op_idx: Index of the op
-            phase: "load" or "store"
-
-        Returns:
-            List of canonical names in order: [atom, gmem, atom, gmem, ...]
-        """
-        mapping = self.op_mappings.get((op_idx, phase), {})
-        # Return in consistent order: for each TMA tensor, atom then gmem
-        result = []
-        for local_name, canonical in sorted(mapping.items()):
-            result.append(canonical)
-        return result
-
-
-# =============================================================================
-# Peer TMA Registry (Multi-GPU TMA Descriptors)
-# =============================================================================
-
-
-@dataclass
-class PeerTMADescriptorInfo:
-    """Metadata for a TMA descriptor targeting a peer GPU buffer.
-
-    Similar to TMADescriptorInfo but tracks which peer device the
-    descriptor targets. Created per (tensor, peer) pair.
-
-    Attributes:
-        canonical_atom: e.g., "ptma0_p0_atom" (peer 0), "ptma0_p1_atom" (peer 1)
-        canonical_gmem: e.g., "ptma0_p0_gmem"
-        tensor_canonical: Canonical tensor name from TensorRegistry (e.g., "t0")
-        peer_idx: Index of the peer device
-        tile_shape: TMA tile shape (transposed for row-major)
-        smem_layout_shape: Shared memory layout shape
-        dtype: CUTLASS dtype
-        smem_layout_src: Optional swizzle layout code string
-    """
-
-    canonical_atom: str
-    canonical_gmem: str
-    tensor_canonical: str
-    peer_idx: int
-    tile_shape: Tuple[int, ...]
-    smem_layout_shape: Tuple[int, ...]
-    dtype: Any
-    smem_layout_src: Optional[str] = None
-
-
-@dataclass
-class PeerTMARegistry:
-    """Manages TMA descriptors for peer GPU stores.
-
-    For each op with peer_stores, creates one set of TMA S2G descriptors
-    per peer device. Descriptors are created at runtime since peer GPU
-    addresses are runtime values.
-
-    Usage:
-        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
-        # registry.descriptors → [PeerTMADescriptorInfo(...), ...]
-        # registry.get_op_peer_tma_args(0, "communicate") → ['ptma0_p0_atom', ...]
-    """
-
-    descriptors: List[PeerTMADescriptorInfo]
-    # Per-op mappings: {(op_idx, "communicate"): {local_name: canonical_name}}
-    op_mappings: Dict[Tuple[int, str], Dict[str, str]]
-    num_peers: int
-
-    @classmethod
-    def from_ops(
-        cls,
-        ops: List[ScheduledOp],
-        tensor_registry: "TensorRegistry",
-        peer_buffer_registry: "PeerBufferRegistry",
-    ) -> "PeerTMARegistry":
-        """Build PeerTMARegistry from ops that declare peer_stores.
-
-        For each op's peer_stores tensor, for each peer device, creates
-        a TMA S2G descriptor targeting the peer's buffer.
-        """
-        descriptors: List[PeerTMADescriptorInfo] = []
-        op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
-        counter = 0
-        num_peers = peer_buffer_registry.num_peers
-
-        for i, op in enumerate(ops):
-            op_cls = op.op_cls
-            peer_stores = getattr(op_cls, "_PEER_STORES", set())
-            op_mappings[(i, "communicate")] = {}
-
-            if not peer_stores:
-                continue
-
-            for tensor_name in peer_stores:
-                # Get canonical tensor name
-                tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
-                if tensor_canonical is None:
-                    continue
-
-                # Compute TMA tile shape (same logic as TMARegistry)
-                custom_shape = None
-                if hasattr(op_cls, "get_tma_tile_shape"):
-                    custom_shape = op_cls.get_tma_tile_shape(
-                        tensor_name, op.tile_sizes, op.static_dims)
-
-                if custom_shape is not None:
-                    tile_shape = tuple(custom_shape)
-                else:
-                    tma_dims = getattr(op_cls, "_TMA_TENSOR_DIMS", {}).get(tensor_name, [])
-                    tile_shape = []
-                    for dim_name in tma_dims:
-                        if dim_name in op.tile_sizes:
-                            tile_shape.append(op.tile_sizes[dim_name])
-                        elif dim_name in op.static_dims:
-                            tile_shape.append(op.static_dims[dim_name])
-                        else:
-                            raise ValueError(
-                                f"Peer store tensor '{tensor_name}' dim '{dim_name}' "
-                                f"not found in tile_sizes or static_dims"
-                            )
-                    tile_shape = tuple(tile_shape)
-
-                tma_tile_shape = tuple(reversed(tile_shape))
-
-                # Resolve dtype
-                meta = op.tensor_metas.get(tensor_name)
-                dtype = meta.dtype if meta else None
-
-                # Smem layout (use same swizzle as local store if available)
-                smem_layout_src = None
-                if hasattr(op_cls, "get_tma_smem_layout_src"):
-                    smem_layout_src = op_cls.get_tma_smem_layout_src(
-                        tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
-                    )
-
-                # Create one descriptor per peer
-                for peer_idx in range(num_peers):
-                    canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
-                    canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
-
-                    descriptors.append(
-                        PeerTMADescriptorInfo(
-                            canonical_atom=canonical_atom,
-                            canonical_gmem=canonical_gmem,
-                            tensor_canonical=tensor_canonical,
-                            peer_idx=peer_idx,
-                            tile_shape=tma_tile_shape,
-                            smem_layout_shape=tma_tile_shape,
-                            dtype=dtype,
-                            smem_layout_src=smem_layout_src,
-                        )
-                    )
-
-                    # Map local names to canonical for communicate phase
-                    op_mappings[(i, "communicate")][
-                        f"{tensor_name}_p{peer_idx}_tma"
-                    ] = canonical_atom
-                    op_mappings[(i, "communicate")][
-                        f"{tensor_name}_p{peer_idx}_tma_gmem"
-                    ] = canonical_gmem
-
-                counter += 1
-
-        return cls(
-            descriptors=descriptors,
-            op_mappings=op_mappings,
-            num_peers=num_peers,
-        )
-
-    @property
-    def has_peer_tma(self) -> bool:
-        """Whether any ops use peer TMA stores."""
-        return len(self.descriptors) > 0
-
-    @property
-    def all_canonical_names(self) -> List[str]:
-        """All canonical peer TMA parameter names in order."""
-        names = []
-        for d in self.descriptors:
-            names.append(d.canonical_atom)
-            names.append(d.canonical_gmem)
-        return names
-
-    def get_op_peer_tma_args(self, op_idx: int, phase: str = "communicate") -> List[str]:
-        """Get canonical peer TMA param names for an op's communicate phase."""
-        mapping = self.op_mappings.get((op_idx, phase), {})
-        result = []
-        for local_name, canonical in sorted(mapping.items()):
-            result.append(canonical)
-        return result
-
-
-# =============================================================================
-# Cross-Op Compatibility Validation
-# =============================================================================
-
-
-def validate_op_compatibility(ops: List[ScheduledOp], registry: "TensorRegistry") -> None:
-    """Validate shared tensors across fused ops have compatible shapes.
-
-    When two ops share the same underlying tensor (same data_ptr), checks that:
-    1. Total element count matches (product of shapes).
-    2. Shared dimension names have matching values in static_dims.
-
-    This allows reshapes like (M, D) → (M, H, D) as long as total elements agree
-    and any dimension names in common (e.g. M) have the same value.
-
-    Args:
-        ops: List of scheduled operations.
-        registry: TensorRegistry with deduplication info.
-
-    Raises:
-        ValueError: If shared tensors have incompatible shapes.
-    """
-    # Build reverse map: data_ptr → list of (op_idx, tensor_name, TensorMeta)
-    ptr_to_uses: Dict[int, List[Tuple[int, str, TensorMeta]]] = {}
-    for i, op in enumerate(ops):
-        for name, meta in op.tensor_metas.items():
-            ptr_to_uses.setdefault(meta.data_ptr, []).append((i, name, meta))
-
-    # Check each shared tensor (data_ptr with multiple users)
-    for ptr, uses in ptr_to_uses.items():
-        if len(uses) < 2:
-            continue
-
-        # Check total element count compatibility
-        ref_idx, ref_name, ref_meta = uses[0]
-        ref_numel = math.prod(ref_meta.shape)
-        ref_op_name = ops[ref_idx].op_cls.__name__
-
-        for other_idx, other_name, other_meta in uses[1:]:
-            other_numel = math.prod(other_meta.shape)
-            other_op_name = ops[other_idx].op_cls.__name__
-
-            if ref_numel != other_numel:
-                raise ValueError(
-                    f"Shared tensor incompatibility: "
-                    f"{ref_op_name}.{ref_name} has shape {ref_meta.shape} "
-                    f"({ref_numel} elements) but "
-                    f"{other_op_name}.{other_name} has shape {other_meta.shape} "
-                    f"({other_numel} elements)"
-                )
-
-        # Note: We intentionally do NOT check per-dim name matching on shared
-        # tensors. Different ops can reshape the same buffer (e.g., RMSNorm
-        # outputs (M, D) and RoPE reads (M, H, D) from the same storage),
-        # and dim names like "D" can legitimately mean different things.
-        # The total element count check above is the correct constraint.
-
-
-# =============================================================================
-# Compile-Time Barrier Formulas
-# =============================================================================
-
-
-@dataclass
-class BarrierFormula:
-    """Compile-time formula for computing a barrier index from tile coordinates.
-
-    barrier_idx = base + sum((coeffs[i] * tile_i) // divs[i] for i in range(ndims))
-
-    Used by the megakernel handler to bake barrier wait/signal calls directly
-    into each op's handler at JIT compile time. No per-instruction encoding
-    needed — the formula coefficients are Python-level constants captured
-    by closure.
-
-    Attributes:
-        base: Barrier base offset
-        coeffs: Per-axis multipliers for tile indices (up to MAX_TILE_DIMS)
-        divs: Per-axis divisors for tile indices (for tile size ratios, default 1)
-        expected: For wait deps: how many signals to wait for (default 1)
-        guard_max: Only execute when the computed linear index is less than
-            this value. Defaults to NO_GUARD (always passes).
-    """
-
-    # Sentinel: guard_max value that always passes (larger than any tile count)
-    NO_GUARD: ClassVar[int] = 2**30
-
-    base: int
-    coeffs: Tuple[int, ...] = (0,) * MAX_TILE_DIMS
-    divs: Tuple[int, ...] = (1,) * MAX_TILE_DIMS
-    expected: int = 1
-    guard_max: int = NO_GUARD
-
-    def compute_index(self, tiles: Tuple[int, ...]) -> int:
-        """Compute barrier index for a given tile (host-side, for testing)."""
-        padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
-        result = self.base
-        for i in range(MAX_TILE_DIMS):
-            result += (self.coeffs[i] * padded[i]) // self.divs[i]
-        return result
-
-    def is_guarded(self, tiles: Tuple[int, ...]) -> bool:
-        """Check if the guard passes for a given tile (host-side, for testing)."""
-        padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
-        linear = sum(self.coeffs[i] * padded[i] for i in range(MAX_TILE_DIMS))
-        return linear < self.guard_max
-
-    @property
-    def has_guard(self) -> bool:
-        """Whether this formula has an active guard (not NO_GUARD)."""
-        return self.guard_max != self.NO_GUARD
-
-
-# =============================================================================
-# Instruction Stream (Lightweight — barriers baked into handlers)
-# =============================================================================
-
-INSTRUCTION_WORDS = 2  # op_idx + linear_tile_idx (flat encoding)
-
-
-@dataclass
-class TileInstruction:
-    """A single tile work instruction for the persistent megakernel.
-
-    Flat encoding in global memory (2 x int32):
-    [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
-    [1]  linear_tile_idx: Row-major linearized tile index
-
-    Tile coordinates are decomposed at runtime from the linear index
-    using compile-time per-op tile_counts (via decompose_tile JIT fn).
-
-    Barrier wait/signal logic is baked into op handlers at compile time
-    via BarrierFormula, not encoded in the instruction stream.
-    """
-
-    op_idx: int
-    tiles: Tuple[int, ...]  # Up to MAX_TILE_DIMS tile indices
-
-    # Sentinel for end of stream
-    END_MARKER: int = -1
-
-    def pack(self, strides: Optional[Tuple[int, ...]] = None) -> List[int]:
-        """Pack into list of int32: [op_idx, linear_tile_idx].
-
-        Args:
-            strides: Row-major strides for linearization. If None (e.g., end
-                marker), linear index is 0.
-        """
-        if self.op_idx == self.END_MARKER or strides is None:
-            return [self.op_idx, 0]
-        linear = sum(t * s for t, s in zip(self.tiles, strides))
-        return [self.op_idx, linear]
-
-    @classmethod
-    def end_instruction(cls) -> "TileInstruction":
-        """Create end-of-stream marker."""
-        return cls(op_idx=cls.END_MARKER, tiles=(0,) * MAX_TILE_DIMS)
-
-
-# =============================================================================
-# Dependency Resolution Helpers
-# =============================================================================
-
-
-def _linear_strides(tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
-    """Compute row-major linear strides from tile counts, padded to MAX_TILE_DIMS.
-
-    For tile_counts = (4, 8, 2): strides = (16, 2, 1, 0, 0)
-    stride[i] = product of tile_counts[i+1:]
-    """
-    ndims = len(tile_counts)
-    strides = [0] * MAX_TILE_DIMS
-    stride = 1
-    for i in range(ndims - 1, -1, -1):
-        strides[i] = stride
-        stride *= tile_counts[i]
-    return tuple(strides)
-
-
-@dataclass
-class _OpRecord:
-    """Internal record for an op added to the builder."""
-
-    op_idx: int
-    op: ScheduledOp
-    # Flat list of tile coordinate tuples: [(i0, i1, ...), ...]
-    tiles: List[Tuple[int, ...]]
-
-
-@dataclass
-class _DepEdge:
-    """A dependency edge between two ops for tile scheduling.
-
-    Attributes:
-        producer_idx: Index of the producing op
-        consumer_idx: Index of the consuming op
-        kind: Dependency type — determines how many producer tiles
-              must be emitted before each consumer tile:
-              "one_to_one": consumer tile k needs producer tile k
-              "many_to_one": each consumer tile needs ALL producer tiles
-              "one_to_many": consumer tile k needs a proportional subset
-    """
-
-    producer_idx: int
-    consumer_idx: int
-    kind: str  # "one_to_one", "many_to_one", "one_to_many"
-
-
-def _compute_formula_coeffs(
-    source_op: ScheduledOp,
-    target_op: ScheduledOp,
-    shared_dims: Set[str],
-) -> Tuple[int, ...]:
-    """Compute coefficients for source computing target's barrier index.
-
-    Maps shared dimension values from source tile coordinates to target's
-    linear index. The target's strides are computed from tile_counts
-    (row-major: stride[i] = product of tile_counts[i+1:]).
-
-    For each shared dim, find which axis it maps to on each side, then
-    accumulate the target stride onto the source axis coefficient.
-
-    Returns:
-        Tuple of MAX_TILE_DIMS coefficients.
-    """
-    s_dims = source_op.dim_names
-    t_dims = target_op.dim_names
-
-    # Compute target strides from tile_counts (row-major linearization)
-    t_counts = target_op.tile_counts
-    t_strides = {}
-    stride = 1
-    for i in range(len(t_counts) - 1, -1, -1):
-        t_strides[i] = stride
-        stride *= t_counts[i]
-
-    coeffs = [0] * MAX_TILE_DIMS
-
-    if shared_dims:
-        for dim in shared_dims:
-            s_axis = s_dims[dim]
-            t_axis = t_dims[dim]
-            coeffs[s_axis] += t_strides[t_axis]
-    elif not s_dims and not t_dims:
-        # Raw ops (no named dimensions): use source's own linear index
-        s_counts = source_op.tile_counts
-        stride = 1
-        for i in range(len(s_counts) - 1, -1, -1):
-            coeffs[i] = stride
-            stride *= s_counts[i]
-    # else: named ops with no shared dims → all zeros (all tiles map to same barrier)
-
-    return tuple(coeffs)
-
-
-# =============================================================================
-# Tile Schedulers
-# =============================================================================
-
-
-class TileScheduler(ABC):
-    """Abstract base class for tile scheduling strategies.
-
-    A scheduler takes the dependency graph and produces an ordered list of
-    TileInstructions that SMs will fetch and execute. Different strategies
-    optimize for different goals (load balance, latency, overlap, etc.).
-
-    The scheduler receives:
-    - op_records: List of _OpRecord with op metadata and tile coordinates
-    - consumer_deps: Dict mapping op_idx -> list of _DepEdge dependencies
-    - edges: All dependency edges in the graph
-
-    And produces a list of TileInstruction in execution order.
-    """
-
-    @abstractmethod
-    def schedule(
-        self,
-        op_records: List["_OpRecord"],
-        consumer_deps: Dict[int, List["_DepEdge"]],
-        edges: List["_DepEdge"],
-    ) -> List[TileInstruction]:
-        """Build the instruction list from ops and dependencies.
-
-        Args:
-            op_records: List of op records with tiles
-            consumer_deps: Maps consumer op_idx to its dependency edges
-            edges: All dependency edges
-
-        Returns:
-            Ordered list of TileInstruction (without END marker)
-        """
-        pass
-
-    @staticmethod
-    def _producer_threshold(
-        edge: "_DepEdge",
-        consumer_cursor: int,
-        producer_total: int,
-        consumer_total: int,
-    ) -> int:
-        """Minimum producer tiles that must be emitted before consumer tile k."""
-        if edge.kind == "many_to_one":
-            return producer_total
-        elif edge.kind == "one_to_many":
-            return min(
-                (consumer_cursor * producer_total) // consumer_total + 1,
-                producer_total,
-            )
-        else:
-            return min(consumer_cursor + 1, producer_total)
-
-
-class LevelBatchedScheduler(TileScheduler):
-    """Level-batched wavefront scheduler.
-
-    Emits tiles in dependency order, batching tiles from the same "level"
-    together to naturally spread work across SMs when they fetch
-    instructions with strided distribution.
-
-    Strategy:
-    1. Emit ALL tiles from source ops (no dependencies) first
-    2. Then emit dependent ops using greedy wavefront
-
-    This spreads producer tiles across SMs (better load balancing) while
-    still respecting dependencies via barriers.
-
-    Example (one-to-many, Producer 4 tiles → Consumer 16 tiles):
-        P0, P1, P2, P3, C0, C1, C2, ...
-    With 2 SMs: Block 0 gets P0,P2,C0,... Block 1 gets P1,P3,C1,...
-    """
-
-    def schedule(
-        self,
-        op_records: List["_OpRecord"],
-        consumer_deps: Dict[int, List["_DepEdge"]],
-        edges: List["_DepEdge"],
-    ) -> List[TileInstruction]:
-        num_ops = len(op_records)
-        cursors = [0] * num_ops
-        total_tiles = sum(rec.op.total_tiles for rec in op_records)
-        instructions: List[TileInstruction] = []
-
-        # Phase 1: Emit ALL tiles from source ops (no dependencies)
-        for rec in op_records:
-            idx = rec.op_idx
-            if idx not in consumer_deps:
-                for tile in rec.tiles:
-                    instructions.append(TileInstruction(op_idx=idx, tiles=tile))
-                cursors[idx] = rec.op.total_tiles
-
-        # Phase 2: Greedy wavefront for remaining ops
-        while len(instructions) < total_tiles:
-            progress = False
-            for rec in op_records:
-                idx = rec.op_idx
-                if cursors[idx] >= rec.op.total_tiles:
-                    continue
-
-                can_emit = True
-                for edge in consumer_deps.get(idx, []):
-                    prod_rec = op_records[edge.producer_idx]
-                    needed = self._producer_threshold(
-                        edge,
-                        cursors[idx],
-                        prod_rec.op.total_tiles,
-                        rec.op.total_tiles,
-                    )
-                    if cursors[edge.producer_idx] < needed:
-                        can_emit = False
-                        break
-
-                if can_emit:
-                    tile = rec.tiles[cursors[idx]]
-                    instructions.append(TileInstruction(op_idx=idx, tiles=tile))
-                    cursors[idx] += 1
-                    progress = True
-
-            if not progress:
-                scheduled = [
-                    f"{op_records[i].op.op_cls.__name__}: {cursors[i]}/{op_records[i].op.total_tiles}"
-                    for i in range(num_ops)
-                ]
-                raise RuntimeError(f"Deadlock in tile scheduling. Cursors: {scheduled}")
-
-        return instructions
-
-
-class BackwardScheduler(TileScheduler):
-    """Backward scheduler optimized for latency.
-
-    Plans execution from the final outputs backward, assigning each tile
-    the latest possible "start time" that still meets dependencies. Then
-    schedules tiles in order of their deadlines (earliest deadline first).
-
-    This achieves better overlap between stages because producers complete
-    "just in time" for consumers, minimizing idle waiting.
-
-    Algorithm:
-    1. Compute "depth" for each op (longest path to any sink)
-    2. For each tile, compute latest_start = max_depth - depth[op]
-    3. Sort tiles by (latest_start, op_idx, tile_idx) for determinism
-    4. Emit in sorted order, respecting dependencies
-
-    The depth-based ordering ensures:
-    - Sink tiles (final outputs) have highest priority (depth=0, latest_start=max)
-    - Source tiles (no deps) have lowest priority, scheduled last but still valid
-    - Critical path tiles are interleaved optimally
-    """
-
-    def schedule(
-        self,
-        op_records: List["_OpRecord"],
-        consumer_deps: Dict[int, List["_DepEdge"]],
-        edges: List["_DepEdge"],
-    ) -> List[TileInstruction]:
-        num_ops = len(op_records)
-        if num_ops == 0:
-            return []
-
-        # Build producer_deps: op_idx -> list of producer op indices
-        producer_deps: Dict[int, List[int]] = {i: [] for i in range(num_ops)}
-        for edge in edges:
-            producer_deps[edge.consumer_idx].append(edge.producer_idx)
-
-        # Compute depth: longest path FROM this op TO any sink (no outgoing edges)
-        # Sinks have depth 0, their producers have depth 1, etc.
-        # We compute "reverse depth" - distance to nearest sink
-        depth = [-1] * num_ops
-
-        # Find sinks (ops with no consumers)
-        has_consumer = set()
-        for edge in edges:
-            has_consumer.add(edge.producer_idx)
-        sinks = [i for i in range(num_ops) if i not in has_consumer]
-
-        # BFS from sinks backward
-        from collections import deque
-
-        queue = deque()
-        for sink_idx in sinks:
-            depth[sink_idx] = 0
-            queue.append(sink_idx)
-
-        while queue:
-            op_idx = queue.popleft()
-            current_depth = depth[op_idx]
-            # All producers of this op should have depth >= current + 1
-            for prod_idx in producer_deps[op_idx]:
-                if depth[prod_idx] < current_depth + 1:
-                    depth[prod_idx] = current_depth + 1
-                    queue.append(prod_idx)
-
-        # Handle disconnected ops (sources with no path to sink)
-        max_depth = max(depth) if depth else 0
-        for i in range(num_ops):
-            if depth[i] < 0:
-                depth[i] = max_depth + 1
-
-        # Compute priority for each tile: (depth, op_idx, tile_idx)
-        # Lower depth = closer to output = higher priority (schedule later)
-        # We want to schedule high-depth (sources) first, low-depth (sinks) last
-        # But we emit in order that respects dependencies
-
-        # Create all tile entries with priorities
-        tile_entries = []
-        for rec in op_records:
-            op_depth = depth[rec.op_idx]
-            for tile_idx, tile in enumerate(rec.tiles):
-                # Priority: higher depth = earlier in schedule
-                # This naturally puts producers before consumers
-                priority = (-op_depth, rec.op_idx, tile_idx)
-                tile_entries.append((priority, rec.op_idx, tile))
-
-        # Sort by priority (highest depth first = sources first)
-        tile_entries.sort(key=lambda x: x[0])
-
-        # Now emit in priority order, but verify dependencies are met
-        # Use cursors to track emitted tiles per op
-        cursors = [0] * num_ops
-        emitted = set()
-        instructions: List[TileInstruction] = []
-
-        # Track which tiles we've scheduled
-        pending = list(tile_entries)
-
-        while pending:
-            progress = False
-            next_pending = []
-
-            for priority, op_idx, tile in pending:
-                tile_global_idx = (op_idx, cursors[op_idx])
-
-                # Check if dependencies are met
-                can_emit = True
-                for edge in consumer_deps.get(op_idx, []):
-                    prod_rec = op_records[edge.producer_idx]
-                    needed = self._producer_threshold(
-                        edge,
-                        cursors[op_idx],
-                        prod_rec.op.total_tiles,
-                        op_records[op_idx].op.total_tiles,
-                    )
-                    if cursors[edge.producer_idx] < needed:
-                        can_emit = False
-                        break
-
-                if can_emit and tile_global_idx not in emitted:
-                    # Verify this is the next tile for this op
-                    expected_tile = op_records[op_idx].tiles[cursors[op_idx]]
-                    if tile == expected_tile:
-                        instructions.append(TileInstruction(op_idx=op_idx, tiles=tile))
-                        emitted.add(tile_global_idx)
-                        cursors[op_idx] += 1
-                        progress = True
-                    else:
-                        next_pending.append((priority, op_idx, tile))
-                else:
-                    next_pending.append((priority, op_idx, tile))
-
-            if not progress and next_pending:
-                # Try emitting any ready tile (fallback to greedy)
-                for i, (priority, op_idx, tile) in enumerate(next_pending):
-                    if cursors[op_idx] < op_records[op_idx].op.total_tiles:
-                        can_emit = True
-                        for edge in consumer_deps.get(op_idx, []):
-                            prod_rec = op_records[edge.producer_idx]
-                            needed = self._producer_threshold(
-                                edge,
-                                cursors[op_idx],
-                                prod_rec.op.total_tiles,
-                                op_records[op_idx].op.total_tiles,
-                            )
-                            if cursors[edge.producer_idx] < needed:
-                                can_emit = False
-                                break
-
-                        if can_emit:
-                            actual_tile = op_records[op_idx].tiles[cursors[op_idx]]
-                            instructions.append(TileInstruction(op_idx=op_idx, tiles=actual_tile))
-                            cursors[op_idx] += 1
-                            progress = True
-                            break
-
-                if not progress:
-                    scheduled = [
-                        f"{op_records[i].op.op_cls.__name__}: {cursors[i]}/{op_records[i].op.total_tiles}"
-                        for i in range(num_ops)
-                    ]
-                    raise RuntimeError(f"Deadlock in backward scheduling. Cursors: {scheduled}")
-
-            pending = next_pending
-
-        return instructions
-
-
-# Default scheduler instance
-_default_scheduler: TileScheduler = LevelBatchedScheduler()
-
-
-def get_default_scheduler() -> TileScheduler:
-    """Get the default tile scheduler."""
-    return _default_scheduler
-
-
-def set_default_scheduler(scheduler: TileScheduler) -> None:
-    """Set the default tile scheduler."""
-    global _default_scheduler
-    _default_scheduler = scheduler
-
-
-# =============================================================================
-# Instruction Stream Builder
-# =============================================================================
-
-
-class InstructionStreamBuilder:
-    """Builds instruction stream with compile-time baked barrier formulas.
-
-    Supports automatic dependency inference from named buffers declared on ops.
-    Dependencies are resolved at build time and expressed as BarrierFormula
-    objects that get baked into op handlers at JIT compile time.
-
-    Tile mappings between ops with different grid shapes are computed via
-    named dimensions (dim_names on ScheduledOp):
-    - Shared dims: 1:1 tile mapping
-    - Producer-only dims (many-to-one): consumer waits for all producer tiles
-    - Consumer-only dims (one-to-many): all consumer tiles wait on one producer
-
-    Example with named buffers:
-        builder = InstructionStreamBuilder()
-        builder.add_op(OpA, tile_counts=(4, 32),
-                       dim_names={"batch": 0, "seqlen": 1})
-        builder.add_op(OpB, tile_counts=(4,),
-                       dim_names={"batch": 0})
-        # OpB reads OpA's output → OpB batch=0 waits for all 32 seqlen tiles
-
-    Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
-    """
-
-    def __init__(self):
-        self._op_records: List[_OpRecord] = []
-        self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
-        self._barrier_count: Optional[int] = None
-
-    @property
-    def ops(self) -> List[ScheduledOp]:
-        """Scheduled ops in order."""
-        return [r.op for r in self._op_records]
-
-    def add_op(
-        self,
-        op_or_cls: Union[ScheduledOp, Type[Op]],
-        tile_counts: Optional[Tuple[int, ...]] = None,
-        dim_names: Optional[Dict[str, int]] = None,
-        **params,
-    ) -> "InstructionStreamBuilder":
-        """Add an operation to the stream.
-
-        Can be called in two ways:
-        1. With a ScheduledOp: add_op(scheduled_op)
-           Preserves all fields including tensor_ptrs for dependency detection.
-        2. With an Op class: add_op(OpClass, tile_counts=(4, 1), ...)
-           Creates a new ScheduledOp from the parameters.
-
-        Args:
-            op_or_cls: Either a ScheduledOp instance or an Op class
-            tile_counts: Tuple of tile counts per axis (required when passing Op class)
-            dim_names: Maps semantic dimension names to tile axis indices.
-                Example: {"M": 0, "D": 1}
-            **params: Operation-specific parameters (only used with Op class)
-        """
-        # Handle ScheduledOp instance
-        if isinstance(op_or_cls, ScheduledOp):
-            op = op_or_cls
-        else:
-            # Handle Op class with parameters
-            if tile_counts is None:
-                raise ValueError("tile_counts is required when passing an Op class")
-            op = ScheduledOp(
-                op_cls=op_or_cls,
-                tile_counts=tile_counts,
-                params=params,
-                dim_names=dim_names or {},
-            )
-
-        # Validate dim_names
-        if op.dim_names:
-            for dim, axis in op.dim_names.items():
-                if not isinstance(axis, int) or axis < 0 or axis >= MAX_TILE_DIMS:
-                    raise ValueError(f"Invalid axis {axis} for dim '{dim}'. Must be int in [0, {MAX_TILE_DIMS})")
-            axes = list(op.dim_names.values())
-            if len(axes) != len(set(axes)):
-                raise ValueError(f"dim_names maps multiple dims to the same axis: {op.dim_names}")
-
-        # Pre-compute flat tile list using row-major linearization
-        tiles = []
-        counts = op.tile_counts
-        ndims = len(counts)
-        for linear_idx in range(op.total_tiles):
-            # Decompose linear index into multi-dim tile coordinates (row-major)
-            tile = []
-            remainder = linear_idx
-            for i in range(ndims):
-                # Stride for axis i = product of counts[i+1:]
-                stride = math.prod(counts[i + 1 :]) if i + 1 < ndims else 1
-                tile.append(remainder // stride)
-                remainder %= stride
-            tiles.append(tuple(tile))
-
-        record = _OpRecord(
-            op_idx=len(self._op_records),
-            op=op,
-            tiles=tiles,
-        )
-        self._op_records.append(record)
-        # Invalidate cache
-        self._cached_formulas = None
-        self._barrier_count = None
-        return self
-
-    def _has_named_buffers(self) -> bool:
-        """Check if any op declares INPUTS or OUTPUTS."""
-        return any(r.op.op_cls.INPUTS or r.op.op_cls.OUTPUTS for r in self._op_records)
-
-    def _resolve_dep_edges(self) -> List[_DepEdge]:
-        """Resolve op-level dependency edges for tile scheduling.
-
-        Returns a list of _DepEdge with producer/consumer indices and
-        dependency kind. Used by build() to determine tile emission order.
-        """
-        if not self._has_named_buffers():
-            # Linear chain fallback: each op depends on previous, 1:1
-            return [
-                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one") for i in range(1, len(self._op_records))
-            ]
-
-        # Named buffer dependencies
-        buffer_producers: Dict[str, int] = {}
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.OUTPUTS:
-                buffer_producers[buf] = rec.op_idx
-
-        edges: List[_DepEdge] = []
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.INPUTS:
-                if buf not in buffer_producers:
-                    continue  # External input (provided by host, not by another op)
-                prod_idx = buffer_producers[buf]
-                if prod_idx == rec.op_idx:
-                    continue  # Self-dependency (in-place op reads/writes same buffer)
-                producer = self._op_records[prod_idx]
-
-                p_dims = set(producer.op.dim_names.keys())
-                c_dims = set(rec.op.dim_names.keys())
-                producer_only = p_dims - c_dims
-                consumer_only = c_dims - p_dims
-
-                if producer_only:
-                    # Producer has extra dims (many-to-one on shared dims).
-                    # Applies whether or not consumer also has extra dims.
-                    kind = "many_to_one"
-                elif consumer_only and not producer_only:
-                    kind = "one_to_many"
-                else:
-                    kind = "one_to_one"
-
-                edges.append(
-                    _DepEdge(
-                        producer_idx=prod_idx,
-                        consumer_idx=rec.op_idx,
-                        kind=kind,
-                    )
-                )
-
-        return edges
-
-    def _resolve(
-        self,
-    ) -> Tuple[
-        Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        int,
-    ]:
-        """Resolve dependencies into barrier formulas.
-
-        Returns:
-            (formulas, barrier_count)
-            formulas: {op_idx: (wait_formulas, signal_formulas)}
-        """
-        if self._cached_formulas is not None:
-            return self._cached_formulas, self._barrier_count
-
-        if self._has_named_buffers():
-            formulas, count = self._resolve_named_formulas()
-        else:
-            formulas, count = self._resolve_linear_chain_formulas()
-
-        self._cached_formulas = formulas
-        self._barrier_count = count
-        return formulas, count
-
-    def _resolve_linear_chain_formulas(
-        self,
-    ) -> Tuple[
-        Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        int,
-    ]:
-        """Compute barrier formulas for linear chain (no named buffers).
-
-        Each op signals its own barrier set. The next op waits on the
-        previous op's barriers with 1:1 tile index mapping.
-        """
-        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {}
-        barrier_counter = 0
-
-        for i, rec in enumerate(self._op_records):
-            op = rec.op
-            signal_base = barrier_counter
-
-            # Own linear index strides (row-major)
-            coeffs = _linear_strides(op.tile_counts)
-
-            # Signal: own barrier
-            signal_formulas = [BarrierFormula(base=signal_base, coeffs=coeffs)]
-
-            # Wait: previous op's barrier (if exists)
-            wait_formulas: List[BarrierFormula] = []
-            if i > 0:
-                prev_op = self._op_records[i - 1].op
-                prev_base = barrier_counter - prev_op.total_tiles
-                # Guard for mismatched tile counts
-                guard = prev_op.total_tiles if prev_op.total_tiles != op.total_tiles else BarrierFormula.NO_GUARD
-                wait_formulas.append(
-                    BarrierFormula(
-                        base=prev_base,
-                        coeffs=coeffs,
-                        expected=1,
-                        guard_max=guard,
-                    )
-                )
-
-            formulas[i] = (wait_formulas, signal_formulas)
-            barrier_counter += op.total_tiles
-
-        return formulas, barrier_counter
-
-    def _resolve_named_formulas(
-        self,
-    ) -> Tuple[
-        Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        int,
-    ]:
-        """Compute barrier formulas from named buffer dependencies.
-
-        For each (producer, consumer, buffer) edge:
-        1. Determine barrier allocation side (target):
-           - Many-to-one → target = consumer (fewer tiles)
-           - One-to-many → target = producer (fewer tiles)
-           - 1:1 → target = consumer
-        2. Compute formula coefficients for both sides
-        3. Allocate barriers
-        """
-        # Track buffer producers by name.
-        # When two ops produce the same buffer name but target different
-        # tensors (different data_ptr), they are independent — no conflict.
-        # Only raise if the same buffer name AND same data_ptr are produced
-        # by multiple ops (true conflict).
-        buffer_producers: Dict[str, int] = {}
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.OUTPUTS:
-                if buf in buffer_producers:
-                    prev_idx = buffer_producers[buf]
-                    prev_ptr = self._op_records[prev_idx].op.tensor_ptrs.get(buf)
-                    curr_ptr = rec.op.tensor_ptrs.get(buf)
-                    if prev_ptr is not None and curr_ptr is not None and prev_ptr != curr_ptr:
-                        # Different tensors — independent, no conflict
-                        continue
-                    raise ValueError(f"Buffer '{buf}' produced by both op {prev_idx} and op {rec.op_idx}")
-                buffer_producers[buf] = rec.op_idx
-
-        # Also track buffer producers by tensor data pointer for automatic dependency detection
-        # This maps (consumer_op_idx, consumer_input_buf) -> producer_op_idx
-        # when tensors share the same data pointer but have different buffer names
-        tensor_ptr_deps: Dict[Tuple[int, str], int] = {}
-        for cons_rec in self._op_records:
-            for cons_buf in cons_rec.op.op_cls.INPUTS:
-                cons_ptr = cons_rec.op.tensor_ptrs.get(cons_buf)
-                if cons_ptr is None:
-                    continue
-                # Look for a producer with matching tensor pointer
-                for prod_rec in self._op_records:
-                    if prod_rec.op_idx >= cons_rec.op_idx:
-                        continue  # Only look at earlier ops
-                    for prod_buf in prod_rec.op.op_cls.OUTPUTS:
-                        prod_ptr = prod_rec.op.tensor_ptrs.get(prod_buf)
-                        if prod_ptr is not None and prod_ptr == cons_ptr:
-                            # Found a match by tensor identity
-                            tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
-
-        # Init per-op formula lists
-        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {
-            i: ([], []) for i in range(len(self._op_records))
-        }
-        barrier_counter = 0
-
-        # Process each dependency edge
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.INPUTS:
-                # First try matching by buffer name
-                prod_idx = buffer_producers.get(buf)
-
-                # If no name match, or name matches self (in-place op), try tensor identity
-                # This handles cases like RopeOp (q->q in-place) depending on RMSNormOp (->y)
-                # where the tensor pointers match but buffer names differ
-                if prod_idx is None or prod_idx == rec.op_idx:
-                    ptr_prod_idx = tensor_ptr_deps.get((rec.op_idx, buf))
-                    if ptr_prod_idx is not None:
-                        prod_idx = ptr_prod_idx
-
-                if prod_idx is None:
-                    continue  # External input (provided by host, not by another op)
-                if prod_idx == rec.op_idx:
-                    continue  # True self-dependency (same op produces and consumes)
-                producer = self._op_records[prod_idx]
-                consumer = rec
-
-                p_op = producer.op
-                c_op = consumer.op
-                p_dims = set(p_op.dim_names.keys())
-                c_dims = set(c_op.dim_names.keys())
-                shared_dims = p_dims & c_dims
-                producer_only = p_dims - c_dims
-                consumer_only = c_dims - p_dims
-
-                # Handle non-divisible tile sizes on shared dims.
-                # When tile sizes don't divide evenly (e.g., producer M=4,
-                # consumer M=3), the integer division in BarrierFormula can't
-                # express the correct per-tile mapping. Move such dims to
-                # producer_only so all producer tiles on that dim get collapsed
-                # into a single barrier group (conservative but correct).
-                non_divisible = set()
-                for dim in shared_dims:
-                    p_ts = p_op.tile_sizes.get(dim, 1)
-                    c_ts = c_op.tile_sizes.get(dim, 1)
-                    if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        non_divisible.add(dim)
-                if non_divisible:
-                    shared_dims = shared_dims - non_divisible
-                    producer_only = producer_only | non_divisible
-
-                # Determine target side and compute barrier count / expected
-                # Also compute divisors for tile size ratio handling
-                p_divs = [1] * MAX_TILE_DIMS  # Producer divisors
-                c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
-                expected = 1
-
-                if producer_only:
-                    # Many-to-one: producer has extra dims not in consumer.
-                    # Also handles both-sides-extra: consumer extra dims are
-                    # broadcast (all consumer tiles with same shared-dim values
-                    # wait on the same barrier, so extra consumer dims get
-                    # coefficient 0 in the formula).
-
-                    # Handle tile size ratios on shared dims
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-                            expected *= ratio
-
-                    # Barrier count: min tile counts on shared dims
-                    num_barriers = 1
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        num_barriers *= min(
-                            p_op.tiles_for_axis(p_axis),
-                            c_op.tiles_for_axis(c_axis),
-                        )
-
-                    # Collapse producer-only dims
-                    collapsed = 1
-                    for dim in producer_only:
-                        axis = p_op.dim_names[dim]
-                        collapsed *= p_op.tiles_for_axis(axis)
-                    expected *= collapsed
-
-                    if consumer_only:
-                        # Both-sides-extra: compute coefficients using
-                        # shared-dim-only strides (not target_op strides)
-                        # so consumer extra dims get coefficient 0.
-                        shared_dims_sorted = sorted(shared_dims)
-                        shared_strides: Dict[str, int] = {}
-                        stride = 1
-                        for dim in reversed(shared_dims_sorted):
-                            shared_strides[dim] = stride
-                            p_axis = p_op.dim_names[dim]
-                            c_axis = c_op.dim_names[dim]
-                            stride *= min(
-                                p_op.tiles_for_axis(p_axis),
-                                c_op.tiles_for_axis(c_axis),
-                            )
-
-                        p_coeffs_list = [0] * MAX_TILE_DIMS
-                        for dim in shared_dims:
-                            p_coeffs_list[p_op.dim_names[dim]] = shared_strides[dim]
-                        p_coeffs = tuple(p_coeffs_list)
-
-                        c_coeffs_list = [0] * MAX_TILE_DIMS
-                        for dim in shared_dims:
-                            c_coeffs_list[c_op.dim_names[dim]] = shared_strides[dim]
-                        c_coeffs = tuple(c_coeffs_list)
-
-                        # Skip _compute_formula_coeffs below
-                        formulas[prod_idx][1].append(
-                            BarrierFormula(
-                                base=barrier_counter,
-                                coeffs=p_coeffs,
-                                divs=tuple(p_divs),
-                            )
-                        )
-                        formulas[rec.op_idx][0].append(
-                            BarrierFormula(
-                                base=barrier_counter,
-                                coeffs=c_coeffs,
-                                divs=tuple(c_divs),
-                                expected=expected,
-                            )
-                        )
-                        barrier_counter += num_barriers
-                        continue
-                    else:
-                        target_op = c_op
-
-                elif consumer_only and not producer_only:
-                    # One-to-many: producer has fewer dims
-                    target_op = p_op
-
-                    # Handle tile size ratios on shared dims
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-
-                    # Barrier count: min tile counts on shared dims
-                    num_barriers = 1
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        num_barriers *= min(
-                            p_op.tiles_for_axis(p_axis),
-                            c_op.tiles_for_axis(c_axis),
-                        )
-                    expected = 1
-                else:
-                    # Same dims (or no dims) - check for tile size differences
-                    for dim in shared_dims:
-                        p_axis = p_op.dim_names[dim]
-                        c_axis = c_op.dim_names[dim]
-                        p_ts = p_op.tile_sizes.get(dim, 1)
-                        c_ts = c_op.tile_sizes.get(dim, 1)
-
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_divs[c_axis] = ratio
-                        elif c_ts > p_ts:
-                            ratio = c_ts // p_ts
-                            p_divs[p_axis] = ratio
-                            expected *= ratio
-
-                    target_op = c_op
-                    num_barriers = min(p_op.total_tiles, c_op.total_tiles)
-
-                # Compute formula coefficients
-                p_coeffs = _compute_formula_coeffs(p_op, target_op, shared_dims)
-                c_coeffs = _compute_formula_coeffs(c_op, target_op, shared_dims)
-
-                # Producer signal formula
-                formulas[prod_idx][1].append(
-                    BarrierFormula(
-                        base=barrier_counter,
-                        coeffs=p_coeffs,
-                        divs=tuple(p_divs),
-                    )
-                )
-
-                # Consumer wait formula
-                formulas[rec.op_idx][0].append(
-                    BarrierFormula(
-                        base=barrier_counter,
-                        coeffs=c_coeffs,
-                        divs=tuple(c_divs),
-                        expected=expected,
-                    )
-                )
-
-                barrier_counter += num_barriers
-
-        return formulas, barrier_counter
-
-    def build(self, scheduler: Optional[TileScheduler] = None) -> List[TileInstruction]:
-        """Build an instruction list using the specified scheduler.
-
-        Args:
-            scheduler: Tile scheduler to use. If None, uses the default
-                scheduler (LevelBatchedScheduler by default).
-
-        Returns:
-            List of TileInstructions with END marker at the end.
-
-        The default LevelBatchedScheduler emits tiles in dependency order,
-        batching tiles from the same "level" together to naturally spread
-        work across SMs when they fetch instructions with strided distribution.
-
-        For example with one-to-many (Producer 4 tiles → Consumer 16 tiles):
-            P0, P1, P2, P3, C0, C1, C2, ...
-        With 2 SMs: Block 0 gets P0,P2,C0,... Block 1 gets P1,P3,C1,...
-        """
-        # Ensure formulas are resolved (sets _barrier_count)
-        self._resolve()
-
-        if not self._op_records:
-            return [TileInstruction.end_instruction()]
-
-        # Resolve dependency edges and group by consumer
-        edges = self._resolve_dep_edges()
-        consumer_deps: Dict[int, List[_DepEdge]] = {}
-        for edge in edges:
-            consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
-
-        # Use provided scheduler or default
-        if scheduler is None:
-            scheduler = get_default_scheduler()
-
-        instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
-        instructions.append(TileInstruction.end_instruction())
-        return instructions
-
-    def build_tensor(self, device: str = "cuda"):
-        """Build instruction stream as GPU tensor.
-
-        Returns:
-            Tensor of shape [num_instructions, INSTRUCTION_WORDS] where
-            INSTRUCTION_WORDS=2 (op_idx + linear_tile_idx).
-        """
-        import torch
-
-        instructions = self.build()
-        # Precompute row-major strides per op for linearization
-        strides_by_op = {
-            r.op_idx: _linear_strides(r.op.tile_counts)
-            for r in self._op_records
-        }
-        packed = [
-            instr.pack(strides=strides_by_op.get(instr.op_idx))
-            for instr in instructions
-        ]
-        return torch.tensor(packed, dtype=torch.int32, device=device)
-
-    def build_decompose_tile_fn(self):
-        """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).
-
-        Uses compile-time baked per-op tile_counts to perform integer
-        div/mod decomposition. Pure ALU — no memory access.
-
-        Returns:
-            A @cute.jit function: decompose_tile(op_idx, linear_idx) → (t0, t1, t2, t3, t4)
-        """
-        import cutlass.cute as cute
-        from cutlass import Int32
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
-        lines = []
-        for rec in self._op_records:
-            idx = rec.op_idx
-            tc = rec.op.tile_counts
-            ndims = len(tc)
-            keyword = "if" if idx == 0 else "elif"
-
-            # Build decomposition: divide linear_idx by strides
-            # For tile_counts = (4, 3, 2): strides = (6, 2, 1)
-            # t0 = linear_idx // 6; rem = linear_idx % 6
-            # t1 = rem // 2; t2 = rem % 2
-            body_lines = []
-            if ndims == 1:
-                body_lines.append("        t0 = _lin")
-            else:
-                remainder = "_lin"
-                for d in range(ndims):
-                    stride = 1
-                    for k in range(d + 1, ndims):
-                        stride *= tc[k]
-                    if d == ndims - 1:
-                        body_lines.append(f"        t{d} = {remainder}")
-                    else:
-                        body_lines.append(
-                            f"        t{d} = {remainder} // Int32({stride})"
-                        )
-                        if d < ndims - 2:
-                            body_lines.append(
-                                f"        {remainder} = {remainder} % Int32({stride})"
-                            )
-                        else:
-                            # Last remainder becomes the final dim
-                            body_lines.append(
-                                f"        t{d+1} = {remainder} % Int32({stride})"
-                            )
-                            break
-
-            lines.append(
-                f"    {keyword} op_idx == Int32({idx}):\n"
-                + "\n".join(body_lines)
-            )
-
-        body = "\n".join(lines) if lines else "    pass"
-        fn_source = (
-            "@cute.jit\n"
-            "def decompose_tile(op_idx, linear_idx):\n"
-            "    t0 = Int32(0)\n"
-            "    t1 = Int32(0)\n"
-            "    t2 = Int32(0)\n"
-            "    t3 = Int32(0)\n"
-            "    t4 = Int32(0)\n"
-            "    _lin = linear_idx\n"
-            f"{body}\n"
-            "    return t0, t1, t2, t3, t4\n"
-        )
-
-        exec_globals = {"cute": cute, "Int32": Int32}
-        compile_mod._compile_counter += 1
-        unique_filename = f"<decompose_tile>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source), None, fn_source.splitlines(True), unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
-        return exec_globals["decompose_tile"]
-
-    def get_op_barrier_formulas(self) -> Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]:
-        """Get per-op barrier formulas for compile-time baking.
-
-        Returns:
-            {op_idx: (wait_formulas, signal_formulas)}
-            Each formula specifies how to compute a barrier index from
-            tile coordinates at runtime.
-        """
-        formulas, _ = self._resolve()
-        return formulas
-
-    @property
-    def total_tiles(self) -> int:
-        """Total number of work tiles."""
-        return sum(r.op.total_tiles for r in self._op_records)
-
-    @property
-    def num_barriers(self) -> int:
-        """Number of barriers needed."""
-        _, count = self._resolve()
-        return count
-
-
 __all__ = [
+    # Constants
+    "MAX_TILE_DIMS",
+    "DEFAULT_PAGE_SIZE",
+    "TORCH_TO_CUTLASS_DTYPE",
+    # Metadata
+    "TensorMeta",
     # Protocol
     "Op",
     "build_op_config",
     # Scheduling
     "ScheduledOp",
-    "TensorRegistry",
-    "TMARegistry",
-    "TMADescriptorInfo",
-    "TileScheduler",
-    "LevelBatchedScheduler",
-    "BackwardScheduler",
-    "get_default_scheduler",
-    "set_default_scheduler",
-    # Barrier Formulas
-    "BarrierFormula",
-    # Instruction Stream
-    "INSTRUCTION_WORDS",
-    "TileInstruction",
-    "InstructionStreamBuilder",
 ]

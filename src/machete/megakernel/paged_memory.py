@@ -26,12 +26,12 @@ from cutlass._mlir.dialects import llvm
 # =============================================================================
 
 MAX_PAGES: int = 16  # Maximum number of pages
-IQ_DEPTH: int = 8  # Instruction queue depth for out-of-order loading
+IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by load warp, store warp, and all load-warp threads for communication.
 FLAG_DISPATCH_LOAD: int = 4    # Load warp thread 0 → all load threads: page slot to dispatch
-FLAG_PREV_LINEAR: int = 12     # Previous tile's linear index (same-op page reuse detection)
+FLAG_LOADER_ACK: int = 8       # Loader warp → controller: previous dispatch consumed (3-warp mode)
 FLAG_PRODUCE_IDX: int = 16     # Load warp's produce counter (written by load, read by store)
 FLAG_STORE_IDX: int = 20       # Store warp's store counter (written by store, read by load)
 FLAG_LOAD_DONE: int = 24       # Load warp signals completion (read by store warp + load warp)
@@ -76,6 +76,58 @@ def ld_shared_i32(
         ir.IntegerType.get_signless(32),
         [smem_addr.ir_value(loc=loc, ip=ip)],
         "ld.shared.b32 $0, [$1];",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def st_shared_release_cta_i32(
+    smem_addr: Int32,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Release-store a 32-bit integer to shared memory (CTA scope).
+
+    Ensures all prior shared memory writes are visible to other warps
+    before this store becomes visible. Use for inter-warp signaling.
+    """
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "st.release.cta.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_shared_acquire_cta_i32(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Acquire-load a 32-bit integer from shared memory (CTA scope).
+
+    Ensures all subsequent shared memory reads see writes that were
+    visible before the corresponding release-store. Use for inter-warp signaling.
+    """
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "ld.acquire.cta.shared.b32 $0, [$1];",
         "=r,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -319,12 +371,13 @@ __all__ = [
     "MAX_PAGES",
     "IQ_DEPTH",
     "FLAG_DISPATCH_LOAD",
-    "FLAG_PREV_LINEAR",
     "FLAG_PRODUCE_IDX",
     "FLAG_STORE_IDX",
     "FLAG_LOAD_DONE",
     "st_shared_i32",
     "ld_shared_i32",
+    "st_shared_release_cta_i32",
+    "ld_shared_acquire_cta_i32",
     "ld_shared_v2_b32",
     "st_shared_v2_b32",
     "NPageLayout",

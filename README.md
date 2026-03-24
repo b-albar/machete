@@ -229,8 +229,8 @@ class ScaleOp(Op):
 |--------|----------|-------------|
 | Flash Attention | `FlashAttentionOp` | Auto-selects SM100 (Hopper) or SM120 (Blackwell) |
 | GEMM | `GemmOp` | Tiled matrix multiply with TMA and smem swizzle |
-| RoPE | `RopeOp` | Rotary position embedding (forward + backward) |
-| RMSNorm | `RMSNormOp` | Root mean square normalization (forward + backward) |
+| RoPE | `RopeOp` / `RopeBwdOp` | Rotary position embedding (forward + backward) |
+| RMSNorm | `RMSNormOp` / `RMSNormBwdOp` | Root mean square normalization (forward + backward) |
 | Activation | `ActivationOp` | Element-wise ReLU / SiLU (fuses with GEMM) |
 
 ## License

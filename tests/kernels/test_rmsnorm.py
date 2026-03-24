@@ -8,7 +8,7 @@ a pure PyTorch reference implementation. Covers all variants:
     - Gemma-style (w_eff = 1 + w)
     - Fused add + RMSNorm (residual_out = x + residual_in, y = rmsnorm(residual_out))
     - Gated RMSNorm (y = rmsnorm(x) * silu(gate))
-    - Per-row weight (weight is (M, D) instead of shared (D,))
+    - Per-row weight (weight is (B, S, D) instead of shared (D,))
 """
 
 import contextlib
@@ -53,145 +53,145 @@ requires_gpu = pytest.mark.skipif(
 # =============================================================================
 
 
-def _tile_size_M(D, elem_bytes=4):
-    """Compute largest tile_size_M that fits in a 16KB page."""
-    return min(4, max(1, 16384 // (D * elem_bytes)))
+def _to_3d(t):
+    """Wrap 2D (M, D) tensor to 3D (1, M, D) for RMSNormOp."""
+    if t.ndim == 2:
+        return t.unsqueeze(0)
+    return t
 
 
 def _run_rmsnorm_forward(x_2d, weight, eps=1e-6, residual=False, gemma=False,
                          per_row_weight=False):
     """Run RMSNormOp forward and return output tensor."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    D = x_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    y = torch.zeros_like(x_2d)
+    x = _to_3d(x_2d)
+    y = torch.zeros_like(x)
     ops = RMSNormOp.schedule(
-        x=x_2d, weight=weight, y=y, tile_sizes={"M": tile_m},
-        residual=residual, gemma=gemma, per_row_weight=per_row_weight,
+        x=x, weight=_to_3d(weight) if weight.ndim == 2 else weight,
+        y=y, residual=residual, gemma=gemma, per_row_weight=per_row_weight,
     )
-    kernel = Megakernel(ops, config=MegakernelConfig())
+    config = RMSNormOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return y
+    return y.squeeze(0)
 
 
 def _run_rmsnorm_backward(dout_2d, x_2d, weight, eps=1e-6, residual=False,
                           gemma=False, per_row_weight=False):
-    """Run RMSNormOp backward and return dx tensor."""
-    from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    """Run RMSNormBwdOp backward and return dx tensor."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
-    D = x_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    dx = torch.zeros_like(x_2d)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=x_2d, weight=weight, dx=dx,
-        tile_sizes={"M": tile_m},
-        residual=residual, gemma=gemma, per_row_weight=per_row_weight,
+    x = _to_3d(x_2d)
+    dout = _to_3d(dout_2d)
+    dx = torch.zeros_like(x)
+    ops = RMSNormBwdOp.schedule(
+        dout=dout, x=x,
+        weight=_to_3d(weight) if weight.ndim == 2 else weight,
+        dx=dx, residual=residual, gemma=gemma, per_row_weight=per_row_weight,
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    config = RMSNormBwdOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return dx
+    return dx.squeeze(0)
 
 
 def _run_fused_add_rmsnorm_forward(x_2d, residual_in, weight):
     """Run RMSNormOp forward with fused add (residual_in provided)."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    D = x_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    y = torch.zeros_like(x_2d)
-    residual_out = torch.zeros_like(x_2d)
+    x = _to_3d(x_2d)
+    y = torch.zeros_like(x)
+    residual_out = torch.zeros_like(x)
     ops = RMSNormOp.schedule(
-        x=x_2d, weight=weight, y=y,
-        residual_in=residual_in, residual_out=residual_out,
-        tile_sizes={"M": tile_m},
+        x=x, weight=weight, y=y,
+        residual_in=_to_3d(residual_in), residual_out=residual_out,
     )
-    kernel = Megakernel(ops, config=MegakernelConfig())
+    config = RMSNormOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return y, residual_out
+    return y.squeeze(0), residual_out.squeeze(0)
 
 
 def _run_fused_add_rmsnorm_backward(dout_2d, residual_out_2d, weight):
-    """Run RMSNormOp backward with fused add (d_residual output)."""
-    from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    """Run RMSNormBwdOp backward with fused add (d_residual output)."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
-    D = dout_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    dx = torch.zeros_like(dout_2d)
-    d_residual = torch.zeros_like(dout_2d)
-    # For fused-add backward, pass residual_out as x (it's what gets TMA loaded)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=residual_out_2d, weight=weight,
+    dout = _to_3d(dout_2d)
+    x = _to_3d(residual_out_2d)
+    dx = torch.zeros_like(dout)
+    d_residual = torch.zeros_like(dout)
+    ops = RMSNormBwdOp.schedule(
+        dout=dout, x=x, weight=weight,
         dx=dx, d_residual=d_residual,
-        tile_sizes={"M": tile_m},
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    config = RMSNormBwdOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return dx, d_residual
+    return dx.squeeze(0), d_residual.squeeze(0)
 
 
 def _run_rmsnorm_gated_forward(x_2d, gate, weight):
     """Run RMSNormOp forward with gating (gate provided)."""
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.rms_norm import RMSNormOp
 
-    D = x_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    y = torch.zeros_like(x_2d)
+    x = _to_3d(x_2d)
+    y = torch.zeros_like(x)
     ops = RMSNormOp.schedule(
-        x=x_2d, weight=weight, y=y, gate=gate,
-        tile_sizes={"M": tile_m},
+        x=x, weight=weight, y=y, gate=_to_3d(gate),
     )
-    kernel = Megakernel(ops, config=MegakernelConfig())
+    config = RMSNormOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return y
+    return y.squeeze(0)
 
 
 def _run_rmsnorm_gated_backward(dout_2d, x_2d, gate, weight):
-    """Run RMSNormOp backward with gating."""
-    from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.rms_norm import RMSNormOp
+    """Run RMSNormBwdOp backward with gating."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.rms_norm import RMSNormBwdOp
 
-    D = x_2d.shape[1]
-    tile_m = _tile_size_M(D)
-    dx = torch.zeros_like(x_2d)
-    dgate = torch.zeros_like(gate)
-    ops = RMSNormOp.schedule(
-        backward=True, dout=dout_2d, x=x_2d, weight=weight,
-        dx=dx, gate=gate, dgate=dgate,
-        tile_sizes={"M": tile_m},
+    x = _to_3d(x_2d)
+    dout = _to_3d(dout_2d)
+    dx = torch.zeros_like(x)
+    dgate = torch.zeros_like(_to_3d(gate))
+    ops = RMSNormBwdOp.schedule(
+        dout=dout, x=x, weight=weight,
+        dx=dx, gate=_to_3d(gate), dgate=dgate,
     )
-    kernel = Megakernel(ops, config=MegakernelConfig(), backward=True)
+    config = RMSNormBwdOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
     torch.cuda.synchronize()
-    return dx, dgate
+    return dx.squeeze(0), dgate.squeeze(0)
 
 
 # =============================================================================

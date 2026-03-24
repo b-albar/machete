@@ -49,17 +49,20 @@ def _gemm_reference(a, b_t):
 
 
 def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
-    """Run GemmOp and return output tensor C."""
+    """Run GemmOp and return output tensor C.
+
+    Inputs are 2D (M, K)/(N, K), auto-wrapped to 3D (1, M, K) for GemmOp.
+    """
     from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
     M, K = a.shape
     N = b_t.shape[0]
-    c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
+    c = torch.zeros(1, M, N, dtype=a.dtype, device=a.device)
 
     ops = GemmOp.schedule(
-        a=a, b=b_t, c=c,
-        tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+        a=a.unsqueeze(0), b=b_t, c=c,
+        tile_sizes={"S": tile_m, "N": tile_n, "K": tile_k},
     )
     config = GemmOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -67,7 +70,7 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
-    return c
+    return c.squeeze(0)
 
 
 # =============================================================================
@@ -207,6 +210,7 @@ def _run_gemm_backward(dout, a, b, da=None, db=None,
                        tile_m=64, tile_n=32, tile_k=32):
     """Run GemmOp backward and return (da, db).
 
+    Inputs are 2D (M, K)/(N, K), auto-wrapped to 3D (1, M, K) for GemmOp.
     Both dA and dB ops go into the same megakernel. They both produce
     buffer 'c' but with different data_ptr, so the framework treats
     them as independent.
@@ -214,10 +218,16 @@ def _run_gemm_backward(dout, a, b, da=None, db=None,
     from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
-    ts = {"M": tile_m, "N": tile_n, "K": tile_k}
+    ts = {"S": tile_m, "N": tile_n, "K": tile_k}
 
-    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
-                          tile_sizes=ts)
+    # Wrap 2D → 3D with B=1
+    dout_3d = dout.unsqueeze(0)
+    a_3d = a.unsqueeze(0)
+    da_3d = da.unsqueeze(0) if da is not None else None
+    db_3d = db.unsqueeze(0) if db is not None else None
+
+    ops = GemmOp.schedule_backward(dout=dout_3d, a=a_3d, b=b, da=da_3d, db=db_3d,
+                                   tile_sizes=ts)
     if ops:
         config = GemmOp.kernel_config(ops)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -308,17 +318,20 @@ class TestGemmBackward:
 
 
 def _run_gemm_fused_act(a, b_t, activation, tile_m=64, tile_n=32, tile_k=32):
-    """Run GemmOp with fused activation and return output tensor C."""
+    """Run GemmOp with fused activation and return output tensor C.
+
+    Inputs are 2D (M, K)/(N, K), auto-wrapped to 3D (1, M, K) for GemmOp.
+    """
     from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
     M, K = a.shape
     N = b_t.shape[0]
-    c = torch.zeros(M, N, dtype=a.dtype, device=a.device)
+    c = torch.zeros(1, M, N, dtype=a.dtype, device=a.device)
 
-    ops = GemmOp.schedule_forward(
-        a=a, b=b_t, c=c, activation=activation,
-        tile_sizes={"M": tile_m, "N": tile_n, "K": tile_k},
+    ops = GemmOp.schedule(
+        a=a.unsqueeze(0), b=b_t, c=c, activation=activation,
+        tile_sizes={"S": tile_m, "N": tile_n, "K": tile_k},
     )
     config = GemmOp.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
@@ -326,7 +339,7 @@ def _run_gemm_fused_act(a, b_t, activation, tile_m=64, tile_n=32, tile_k=32):
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
 
-    return c
+    return c.squeeze(0)
 
 
 @requires_gpu
@@ -366,14 +379,26 @@ class TestGemmFusedActivation:
 def _run_gemm_fused_act_backward(dout, a, b, activation, c=None, pre_act=None,
                                   da=None, db=None,
                                   tile_m=64, tile_n=32, tile_k=32):
-    """Run GemmOp backward with fused activation and return (da, db)."""
+    """Run GemmOp backward with fused activation and return (da, db).
+
+    Inputs are 2D, auto-wrapped to 3D (1, M, K) for GemmOp.
+    """
     from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
 
-    ts = {"M": tile_m, "N": tile_n, "K": tile_k}
-    ops = GemmOp.schedule(backward=True, dout=dout, a=a, b=b, da=da, db=db,
-                          activation=activation, c=c, pre_act=pre_act,
-                          tile_sizes=ts)
+    ts = {"S": tile_m, "N": tile_n, "K": tile_k}
+
+    # Wrap 2D → 3D with B=1
+    dout_3d = dout.unsqueeze(0)
+    a_3d = a.unsqueeze(0)
+    da_3d = da.unsqueeze(0) if da is not None else None
+    db_3d = db.unsqueeze(0) if db is not None else None
+    c_3d = c.unsqueeze(0) if c is not None else None
+    pre_act_3d = pre_act.unsqueeze(0) if pre_act is not None else None
+
+    ops = GemmOp.schedule_backward(dout=dout_3d, a=a_3d, b=b, da=da_3d, db=db_3d,
+                                   activation=activation, c=c_3d, pre_act=pre_act_3d,
+                                   tile_sizes=ts)
     if ops:
         config = GemmOp.kernel_config(ops)
         with contextlib.redirect_stdout(io.StringIO()):

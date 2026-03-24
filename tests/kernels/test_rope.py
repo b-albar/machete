@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.rope import RopeOp
+from machete.kernels.rope import RopeOp, RopeBwdOp
 from machete.kernels.rope.ref import (
     rope_pytorch,
     rope_pytorch_backward,
@@ -56,36 +56,37 @@ def ref_atol(ref_func, q, cos, sin):
     return max(2 * err, 1e-7)
 
 
-def run_rope_megakernel(q_4d, cos, sin, backward=False, num_sms=2):
-    """Run RopeOp via megakernel on a (B, S, H, D) tensor. Modifies q_4d in-place.
+def run_rope_megakernel(q_4d, cos, sin, op_cls=None, num_sms=2):
+    """Run RopeOp/RopeBwdOp via megakernel on a (B, S, H, D) tensor. Modifies q_4d in-place.
 
     The kernel operates in fp32 internally. Input tensors are cast to fp32
     before launching and the result is written back in-place.
     """
-    b, s, h, d = q_4d.shape
-    q_flat = q_4d.float().view(b * s, h, d).contiguous()
+    if op_cls is None:
+        op_cls = RopeOp
+    q_f32 = q_4d.float().contiguous()
     cos_f32 = cos.float().contiguous()
     sin_f32 = sin.float().contiguous()
 
-    ops = RopeOp.schedule(q=q_flat, cos=cos_f32, sin=sin_f32)
+    ops = op_cls.schedule(q=q_f32, cos=cos_f32, sin=sin_f32)
     mk_config = MegakernelConfig(num_sms=num_sms)
-    kernel = Megakernel(ops, config=mk_config, backward=backward)
+    kernel = Megakernel(ops, config=mk_config)
     kernel.run()
 
-    q_4d.copy_(q_flat.view(b, s, h, d).to(q_4d.dtype))
+    q_4d.copy_(q_f32.to(q_4d.dtype))
 
 
 def mk_rope_forward(q, cos, sin):
     """Megakernel RoPE forward returning a new tensor."""
     q_out = q.clone()
-    run_rope_megakernel(q_out, cos, sin, backward=False)
+    run_rope_megakernel(q_out, cos, sin, op_cls=RopeOp)
     return q_out
 
 
 def mk_rope_backward(q, cos, sin):
     """Megakernel inverse RoPE returning a new tensor."""
     q_out = q.clone()
-    run_rope_megakernel(q_out, cos, sin, backward=True)
+    run_rope_megakernel(q_out, cos, sin, op_cls=RopeBwdOp)
     return q_out
 
 
@@ -149,6 +150,47 @@ class TestRopeForwardGPU:
             check_grad=False,
         )
 
+    @pytest.mark.parametrize(
+        "b,s,h,d,d2",
+        [
+            # Qwen3.5-style: 25% partial RoPE (D=128, rotary_dim=32 → D2=16)
+            (1, 16, 4, 128, 16),
+            (2, 64, 8, 128, 16),
+            # Qwen3.5-style: 25% partial RoPE (D=256, rotary_dim=64 → D2=32)
+            (1, 16, 4, 256, 32),
+            (2, 32, 8, 256, 32),
+            # 50% partial RoPE (D=128, D2=32)
+            (1, 16, 4, 128, 32),
+            # Large head dim, small rotary (D=256, D2=64)
+            (1, 16, 4, 256, 64),
+        ],
+        ids=[
+            "qwen_d128_d2_16",
+            "qwen_d128_d2_16_multi",
+            "qwen_d256_d2_32",
+            "qwen_d256_d2_32_multi",
+            "half_d128_d2_32",
+            "quarter_d256_d2_64",
+        ],
+    )
+    def test_partial_rope_forward(self, b, s, h, d, d2):
+        """Partial RoPE: only first 2*D2 dims rotated, rest unchanged."""
+        torch.manual_seed(42)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+
+        atol = ref_atol(rope_pytorch, q, cos, sin)
+        verify_kernel(
+            "RoPE partial forward",
+            func=mk_rope_forward,
+            ref_func=rope_pytorch,
+            inputs=(q, cos, sin),
+            dtype=torch.float32,
+            atol=atol,
+            check_grad=False,
+        )
+
     @pytest.mark.skipif(not HAS_TRITON, reason="Triton not installed")
     def test_forward_matches_triton(self):
         """Megakernel RoPE forward matches Triton (Unsloth) reference."""
@@ -196,10 +238,10 @@ class TestRopeBackwardGPU:
         q_original = q.clone()
         atol = ref_atol(rope_pytorch, q, cos, sin)
 
-        run_rope_megakernel(q, cos, sin, backward=False)
+        run_rope_megakernel(q, cos, sin, op_cls=RopeOp)
         assert not torch.allclose(q, q_original, atol=atol)
 
-        run_rope_megakernel(q, cos, sin, backward=True)
+        run_rope_megakernel(q, cos, sin, op_cls=RopeBwdOp)
         assert torch.allclose(q, q_original, atol=atol), f"Roundtrip max diff: {(q - q_original).abs().max().item()}"
 
     @pytest.mark.parametrize(
@@ -241,6 +283,55 @@ class TestRopeBackwardGPU:
         atol = ref_atol(rope_pytorch_backward, q, cos, sin)
         verify_kernel(
             "RoPE backward",
+            func=mk_rope_backward,
+            ref_func=rope_pytorch_backward,
+            inputs=(q, cos, sin),
+            dtype=torch.float32,
+            atol=atol,
+            check_grad=False,
+        )
+
+    def test_partial_rope_roundtrip(self):
+        """Partial RoPE roundtrip: backward(forward(q)) recovers q."""
+        b, s, h, d, d2 = 2, 16, 4, 256, 32
+        torch.manual_seed(42)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda")
+        angles = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+
+        q_original = q.clone()
+        atol = ref_atol(rope_pytorch, q, cos, sin)
+
+        run_rope_megakernel(q, cos, sin, op_cls=RopeOp)
+        # First 2*D2 dims should change, rest unchanged
+        assert not torch.allclose(q[..., :2 * d2], q_original[..., :2 * d2], atol=atol)
+        assert torch.allclose(q[..., 2 * d2:], q_original[..., 2 * d2:], atol=1e-6)
+
+        run_rope_megakernel(q, cos, sin, op_cls=RopeBwdOp)
+        assert torch.allclose(q, q_original, atol=atol), (
+            f"Partial RoPE roundtrip max diff: {(q - q_original).abs().max().item()}"
+        )
+
+    @pytest.mark.parametrize(
+        "b,s,h,d,d2",
+        [
+            (1, 16, 4, 128, 16),
+            (2, 32, 8, 256, 32),
+            (1, 16, 4, 256, 64),
+        ],
+        ids=["d128_d2_16", "d256_d2_32", "d256_d2_64"],
+    )
+    def test_partial_rope_backward_matches_pytorch(self, b, s, h, d, d2):
+        """Partial RoPE backward matches PyTorch inverse reference."""
+        torch.manual_seed(42)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+
+        atol = ref_atol(rope_pytorch_backward, q, cos, sin)
+        verify_kernel(
+            "RoPE partial backward",
             func=mk_rope_backward,
             ref_func=rope_pytorch_backward,
             inputs=(q, cos, sin),
