@@ -253,23 +253,26 @@ def _compute_tma_tile_shape(
     op_cls,
     tensor_name: str,
     op: ScheduledOp,
+    dim_perm: Tuple[int, ...] = (),
 ) -> Tuple[int, ...]:
-    """Compute TMA tile shape for a tensor, transposed for row-major.
+    """Compute TMA tile shape for a tensor, permuted for TMA compatibility.
 
     Ops can override via get_tma_tile_shape() for dims that need custom
     sub-tiling (e.g., K in GEMM). Otherwise, uses the op's tile_sizes
     and static_dims to build the shape from _TMA_TENSOR_DIMS.
 
-    The result is reversed to match the transposed dimension order
-    (PyTorch row-major → CuTe mode 0 contiguous).
+    The result is permuted to match the gmem tensor's dimension order after
+    stride-sorting (see _prepare_tma_tensors). For contiguous tensors this
+    is equivalent to simple reversal.
 
     Args:
         op_cls: The Op class with TMA declarations.
         tensor_name: Name of the tensor (e.g., "x", "y").
         op: ScheduledOp with tile_sizes and static_dims.
+        dim_perm: Stride-sorted dimension permutation from the tensor.
 
     Returns:
-        Transposed TMA tile shape tuple.
+        Permuted TMA tile shape tuple.
     """
     custom_shape = None
     if hasattr(op_cls, "get_tma_tile_shape"):
@@ -293,9 +296,13 @@ def _compute_tma_tile_shape(
                 )
         tile_shape = tuple(tile_shape)
 
-    # TMA requires CuTe mode 0 to be contiguous. Since PyTorch tensors are
-    # row-major, the gmem tensor is transposed before from_dlpack (so mode 0 =
-    # last dim). Reverse tile_shape to match the transposed dimension order.
+    # Permute tile shape to match the gmem tensor's stride-sorted dim order.
+    # TMA requires CuTe mode 0 to be contiguous (stride 1). Sorting dims by
+    # stride (ascending) ensures this and guarantees monotonically increasing
+    # strides for the TMA descriptor. For contiguous row-major tensors, this
+    # is equivalent to simple reversal.
+    if dim_perm:
+        return tuple(tile_shape[p] for p in dim_perm)
     return tuple(reversed(tile_shape))
 
 
@@ -331,6 +338,7 @@ class TMADescriptorInfo:
     tensor_shape: Tuple[int, ...] = ()  # original tensor shape from the op
     original_tensor: Any = None  # actual tensor from op.tensor_refs (for strided TMA)
     smem_layout_src: Optional[str] = None
+    dim_perm: Tuple[int, ...] = ()  # stride-sorted dimension permutation for TMA
 
 
 @dataclass
@@ -388,7 +396,17 @@ class TMARegistry:
                     if tensor_canonical is None:
                         continue
 
-                    tma_tile_shape = _compute_tma_tile_shape(op_cls, tensor_name, op)
+                    # Compute stride-sorted dimension permutation for TMA.
+                    # TMA requires monotonically increasing strides; sorting
+                    # dims by stride (ascending) guarantees this. For contiguous
+                    # row-major tensors, this equals simple reversal.
+                    original_ref = op.tensor_refs[tensor_name]
+                    dim_perm = tuple(sorted(
+                        range(original_ref.ndim),
+                        key=lambda i: (original_ref.stride(i), -i)))
+
+                    tma_tile_shape = _compute_tma_tile_shape(
+                        op_cls, tensor_name, op, dim_perm=dim_perm)
 
                     # Resolve dtype
                     meta = op.tensor_metas.get(tensor_name)
@@ -404,12 +422,6 @@ class TMARegistry:
                             tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
                         )
 
-                    # Store the original tensor shape and reference from the op so
-                    # _prepare_tma_tensors can use the correct tensor layout.
-                    # The original_tensor is needed when the op's tensor is a
-                    # strided view (e.g., as_strided FA tensors sharing data_ptr
-                    # with GEMM outputs) — reshape would give wrong strides.
-                    original_ref = op.tensor_refs[tensor_name]
                     tensor_shape = tuple(original_ref.shape)
 
                     descriptors.append(
@@ -424,6 +436,7 @@ class TMARegistry:
                             tensor_shape=tensor_shape,
                             original_tensor=original_ref,
                             smem_layout_src=smem_layout_src,
+                            dim_perm=dim_perm,
                         )
                     )
 

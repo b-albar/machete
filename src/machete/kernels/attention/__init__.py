@@ -38,7 +38,16 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
     Returns:
         (ops, config): ScheduledOps and MegakernelConfig.
     """
-    BH, M, D = q.shape
+    # 3D backward compat
+    if q.ndim == 3:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        o = o.unsqueeze(0)
+        if lse is not None:
+            lse = lse.unsqueeze(0)
+
+    B, H, M, D = q.shape
     elem = q.element_size()
 
     num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -52,13 +61,13 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
         nw *= 2
     tile_M = max(16, nw * 16)
 
-    total_tiles = BH * ((M + tile_M - 1) // tile_M)
+    total_tiles = B * H * ((M + tile_M - 1) // tile_M)
 
     # Flash decoding constraints: Q must fit in a single page, M must be MMA-aligned
     fd_possible = (M * D * elem <= page_size and M >= 16 and M % 16 == 0)
 
     # Dispatch: use FD when too few tiles to saturate SMs.
-    # Exception: BH=1 with large M (>64) — combine overhead dominates.
+    # Exception: single head with large M (>64) — combine overhead dominates.
     use_fd = (fd_possible
               and total_tiles < num_SMs // 2
               and (total_tiles >= 2 or M <= 64))

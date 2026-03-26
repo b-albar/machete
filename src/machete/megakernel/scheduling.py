@@ -825,10 +825,13 @@ class InstructionStreamBuilder:
                 ]
                 producer_only_dims = [p_canon_to_orig[c] for c in producer_only_canonical]
 
-                # Validate tile sizes on shared dims are divisible.
-                # Non-divisible tile sizes cannot be expressed by BarrierFormula
-                # integer division. Move incompatible dims to producer_only
-                # for conservative many-to-one barriers.
+                # Validate tile sizes on shared dims are divisible and
+                # the tile-size ratio maps both sides to the same number
+                # of barriers.  Non-divisible tile sizes or mismatched
+                # effective tile counts cannot be expressed by
+                # BarrierFormula integer division.  Move incompatible
+                # dims to producer_only for conservative many-to-one
+                # barriers.
                 incompatible = []
                 compatible_pairs = []
                 for canon, p_dim, c_dim in shared_pairs:
@@ -839,7 +842,7 @@ class InstructionStreamBuilder:
                     p_tiles = p_op.tiles_for_axis(p_axis)
                     c_tiles = c_op.tiles_for_axis(c_axis)
                     if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        # Incompatible tile sizes
+                        # Incompatible tile sizes (not evenly divisible)
                         incompatible.append(p_dim)
                     elif p_tiles != c_tiles and p_ts == c_ts:
                         # Same tile size but different extents → different
@@ -848,6 +851,27 @@ class InstructionStreamBuilder:
                         # globally along this dim (reduction), so per-tile
                         # barriers are unsafe. Fall back to many-to-one.
                         incompatible.append(p_dim)
+                    elif p_tiles != c_tiles and p_ts != c_ts:
+                        # Different tile sizes AND different tile counts.
+                        # Verify the tile-size ratio maps both sides to
+                        # the same effective barrier count.  If not, the
+                        # dim extents truly differ (e.g., QKNormRope H=2
+                        # vs FA H=8) and per-tile barriers would produce
+                        # out-of-bounds indices.
+                        if p_ts > c_ts:
+                            ratio = p_ts // c_ts
+                            c_eff = (c_tiles + ratio - 1) // ratio
+                            if c_eff != p_tiles:
+                                incompatible.append(p_dim)
+                            else:
+                                compatible_pairs.append((canon, p_dim, c_dim))
+                        else:
+                            ratio = c_ts // p_ts
+                            p_eff = (p_tiles + ratio - 1) // ratio
+                            if p_eff != c_tiles:
+                                incompatible.append(p_dim)
+                            else:
+                                compatible_pairs.append((canon, p_dim, c_dim))
                     else:
                         compatible_pairs.append((canon, p_dim, c_dim))
                 shared_pairs = compatible_pairs

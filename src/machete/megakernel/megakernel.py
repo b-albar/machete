@@ -310,8 +310,12 @@ class Megakernel:
 
         self._cute_tensors = []
         for canonical_name, tensor, dtype in self._tensor_registry.tensors:
-            # detach() for gradient-tracking tensors, contiguous() for layout.
-            t = tensor.detach().contiguous()
+            # detach() for gradient-tracking tensors.  Do NOT call
+            # .contiguous() — ops that store per-dim strides in
+            # static_dims (e.g., FlashAttention K/V) rely on the
+            # original strided layout.  from_dlpack handles strided
+            # tensors via DLPack strides.
+            t = tensor.detach()
             # Convert all tensors to CuTe _Tensor objects with explicit
             # leading_dim to handle ambiguous strides (size-1 dims).
             cute_t = from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -376,12 +380,14 @@ class Megakernel:
                     t = t.reshape(-1, *t.shape[-keep:])
                 else:
                     t = t.reshape(-1)
-            # TMA requires CuTe mode 0 to be contiguous (stride 1).
-            # PyTorch row-major tensors have mode 0 = rows (stride N),
-            # so we reverse dims to get mode 0 = last dim (stride 1).
-            # For 2D (M,D) → (D,M); for 3D (BH,M,D) → (D,M,BH).
+            # TMA requires CuTe mode 0 to be contiguous (stride 1) and
+            # monotonically increasing strides. Sort dims by stride (ascending)
+            # to guarantee both. For contiguous row-major tensors this is
+            # equivalent to simple reversal. For strided views (e.g., FA Q/O
+            # from view+permute), sorting avoids TMA descriptor violations.
             if t.ndim >= 2:
-                t = t.permute(*reversed(range(t.ndim)))
+                perm = desc.dim_perm if desc.dim_perm else tuple(reversed(range(t.ndim)))
+                t = t.permute(perm)
             cute_t = from_dlpack(t, assumed_align=16)
             self._tma_cute_tensors.append(
                 (f"{desc.tensor_canonical}_{ndim}d", cute_t))

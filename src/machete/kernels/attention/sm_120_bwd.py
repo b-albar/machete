@@ -67,19 +67,19 @@ class FlashAttentionSm120BwdOp(Op):
     """
 
     reads = {
-        "k": (None, ("BH_kv", "N", "D")),
-        "v": (None, ("BH_kv", "N", "D")),
-        "q": (None, ("BH", "M", "D")),
-        "dout": (None, ("BH", "M", "D")),
-        "lse": (cutlass.Float32, ("BH", "M")),
-        "dpsum": (cutlass.Float32, ("BH", "M")),
+        "k": (None, ("B", "H_kv", "N", "D")),
+        "v": (None, ("B", "H_kv", "N", "D")),
+        "q": (None, ("B", "H", "M", "D")),
+        "dout": (None, ("B", "H", "M", "D")),
+        "lse": (cutlass.Float32, ("B", "H", "M")),
+        "dpsum": (cutlass.Float32, ("B", "H", "M")),
     }
     writes = {
-        "dk": (None, ("BH_kv", "N", "D")),
-        "dv": (None, ("BH_kv", "N", "D")),
-        "dq": (None, ("BH", "M", "D")),
+        "dk": (None, ("B", "H_kv", "N", "D")),
+        "dv": (None, ("B", "H_kv", "N", "D")),
+        "dq": (None, ("B", "H", "M", "D")),
     }
-    tile = ("BH_kv", "N", "D")
+    tile = ("B", "H_kv", "N", "D")
 
     tma_loads = {"k", "v"}
     tma_stores = {"dk", "dv"}
@@ -97,12 +97,17 @@ class FlashAttentionSm120BwdOp(Op):
         else:
             B = 1
 
-        dim0, dim1, dim2 = tma_tile_shape
+        dims = tma_tile_shape
+        strides = [1]
+        for i in range(len(dims) - 1):
+            strides.append(strides[-1] * dims[i])
+        shape_str = ", ".join(str(d) for d in dims)
+        stride_str = ", ".join(str(s) for s in strides)
         return (
             f"cute.make_composed_layout("
             f"cute.make_swizzle({B}, 4, 3), 0, "
-            f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
-            f"stride=(1, {dim0}, {dim0 * dim1})))"
+            f"cute.make_layout(({shape_str}), "
+            f"stride=({stride_str})))"
         )
 
     def __init__(self, **config):
@@ -110,6 +115,14 @@ class FlashAttentionSm120BwdOp(Op):
         self.causal = getattr(self, "causal", 0)
         self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
         self.kv_group_size = getattr(self, "kv_group_size", 1)
+
+        # 4D: H/H_kv and per-dimension strides for Q/dO/dQ global reads/writes
+        self.H = getattr(self, 'H', self.tile_size_B * self.tile_size_H_kv * self.kv_group_size)
+        self.H_kv = getattr(self, 'H_kv', self.H // self.kv_group_size)
+        self.q_b_stride = getattr(self, 'q_b_stride', self.H * self.M * self.D)
+        self.q_h_stride = getattr(self, 'q_h_stride', self.M * self.D)
+        self.dq_b_stride = getattr(self, 'dq_b_stride', self.H * self.M * self.D)
+        self.dq_h_stride = getattr(self, 'dq_h_stride', self.M * self.D)
 
         assert self.k_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120BwdOp requires fp16 or bf16, got {self.k_dtype}"
@@ -200,12 +213,31 @@ class FlashAttentionSm120BwdOp(Op):
         If page_size is None, auto-detects optimal page_size from GPU shared
         memory to maximize tile_N (and thus MMA warp count).
         """
+        import torch
         tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("BH_kv", 1)
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("H_kv", 1)
         k = tensors.get("k")
+        q = tensors.get("q")
+
+        # 3D backward compat: unsqueeze batch dim
+        if k is not None and k.ndim == 3:
+            for name in ("k", "v", "dk", "dv"):
+                if name in tensors and tensors[name] is not None:
+                    tensors[name] = tensors[name].unsqueeze(0)
+            for name in ("q", "dout", "dq"):
+                if name in tensors and tensors[name] is not None:
+                    tensors[name] = tensors[name].unsqueeze(0)
+            for name in ("lse", "dpsum"):
+                if name in tensors and tensors[name] is not None:
+                    tensors[name] = tensors[name].unsqueeze(0)
+            k = tensors["k"]
+            q = tensors.get("q")
+
         if k is not None:
             assert k.element_size() == 2
-            D = k.shape[-1]
+            B, H_kv, N_dim, D = k.shape
+            H = q.shape[1] if q is not None else H_kv * kv_group_size
             eb = k.element_size()
 
             if "N" not in tile_sizes:
@@ -240,6 +272,19 @@ class FlashAttentionSm120BwdOp(Op):
             ops[0].static_dims["causal"] = 1
         if kv_group_size > 1:
             ops[0].static_dims["kv_group_size"] = kv_group_size
+
+        # Store H/H_kv and per-dim strides
+        if k is not None:
+            ops[0].static_dims["H"] = H
+            ops[0].static_dims["H_kv"] = H_kv
+            if q is not None:
+                ops[0].static_dims["q_b_stride"] = q.stride(0)
+                ops[0].static_dims["q_h_stride"] = q.stride(1)
+                dq = tensors.get("dq")
+                if dq is not None:
+                    ops[0].static_dims["dq_b_stride"] = dq.stride(0)
+                    ops[0].static_dims["dq_h_stride"] = dq.stride(1)
+
         return ops
 
     @classmethod
@@ -262,7 +307,7 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_BH_kv, tile_N, tile_D,
+    def load(self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
              k_tma, k_tma_gmem, v_tma, v_tma_gmem, work_mbar):
         """TMA load K and V into page (K at offset 0, V at offset kv_tile_bytes)."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -272,35 +317,35 @@ class FlashAttentionSm120BwdOp(Op):
         # K at page start
         sK = cute.make_tensor(
             cute.make_ptr(self.dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_N, 1)),
+            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
         )
         gK = cute.local_tile(
-            k_tma_gmem, (self.D, self.tile_size_N, 1), (None, None, None),
+            k_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
         )
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
             k_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
+            cute.group_modes(sK, 0, 4), cute.group_modes(gK, 0, 4),
         )
 
         # V at page_ptr + kv_tile_bytes
         v_base = page_ptr + Int32(self.kv_tile_bytes)
         sV = cute.make_tensor(
             cute.make_ptr(self.dtype, v_base, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_N, 1)),
+            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
         )
         gV = cute.local_tile(
-            v_tma_gmem, (self.D, self.tile_size_N, 1), (None, None, None),
+            v_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
         )
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             v_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sV, 0, 3), cute.group_modes(gV, 0, 3),
+            cute.group_modes(sV, 0, 4), cute.group_modes(gV, 0, 4),
         )
 
         nbytes = Int32(2 * self.kv_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(k_tma, tKgK[(None, tile_D, tile_N, tile_BH_kv)], tKsK, tma_bar_ptr=mbar_ptr)
-        cute.copy(v_tma, tVgV[(None, tile_D, tile_N, tile_BH_kv)], tVsV, tma_bar_ptr=mbar_ptr)
+        cute.copy(k_tma, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
+        cute.copy(v_tma, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # MMA Helpers
@@ -324,7 +369,7 @@ class FlashAttentionSm120BwdOp(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_BH_kv, tile_N, tile_D,
+        self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
         k, v, q, dout, lse, dpsum, dk, dv, dq
     ):
         """Backward compute: iterate M-blocks, accumulate dK/dV, atomicAdd dQ.
@@ -543,20 +588,20 @@ class FlashAttentionSm120BwdOp(Op):
             # =============================================================
             q_head_offset = Int32(0)
             while q_head_offset < Int32(self.kv_group_size):
-                q_bh = tile_BH_kv * Int32(self.kv_group_size) + q_head_offset
+                q_h = tile_H_kv * Int32(self.kv_group_size) + q_head_offset
 
                 # Global Q and dO pointers for current Q head
-                q_head_ptr = (q.iterator + q_bh * Int32(self.M * self.D)).align(16)
-                do_head_ptr = (dout.iterator + q_bh * Int32(self.M * self.D)).align(16)
+                q_head_ptr = (q.iterator + tile_B * Int32(self.q_b_stride) + q_h * Int32(self.q_h_stride)).align(16)
+                do_head_ptr = (dout.iterator + tile_B * Int32(self.q_b_stride) + q_h * Int32(self.q_h_stride)).align(16)
                 gQ_head = cute.make_tensor(q_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1)))
                 gdO_head = cute.make_tensor(do_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1)))
 
                 # Global LSE, dPsum, dQ for current Q head
-                lse_head_ptr = lse.iterator + q_bh * Int32(self.M)
+                lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + q_h) * Int32(self.M)
                 g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
-                dpsum_head_ptr = dpsum.iterator + q_bh * Int32(self.M)
+                dpsum_head_ptr = dpsum.iterator + (tile_B * Int32(self.H) + q_h) * Int32(self.M)
                 g_dpsum = cute.make_tensor(dpsum_head_ptr, cute.make_layout(self.M))
-                dqa_head_ptr = dq.iterator + q_bh * Int32(self.M * self.D)
+                dqa_head_ptr = dq.iterator + tile_B * Int32(self.dq_b_stride) + q_h * Int32(self.dq_h_stride)
                 g_dq = cute.make_tensor(
                     dqa_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1))
                 )
@@ -789,7 +834,7 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_BH_kv, tile_N, tile_D,
+    def store(self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
               dk_tma, dk_tma_gmem, dv_tma, dv_tma_gmem):
         """TMA store dK and dV from shared to global memory."""
         _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
@@ -799,17 +844,17 @@ class FlashAttentionSm120BwdOp(Op):
             cute.recast_ptr(
                 cute.make_ptr(self.dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.dtype
             ),
-            cute.make_layout((self.D, self.tile_size_N, 1)),
+            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
         )
         gdK = cute.local_tile(
-            dk_tma_gmem, (self.D, self.tile_size_N, 1), (None, None, None),
+            dk_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
         )
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
             dk_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sdK, 0, 3), cute.group_modes(gdK, 0, 3),
+            cute.group_modes(sdK, 0, 4), cute.group_modes(gdK, 0, 4),
         )
         with cute.arch.elect_one():
-            cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_N, tile_BH_kv)])
+            cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)])
 
         # dV at page offset kv_tile_bytes
         sdV = cute.make_tensor(
@@ -817,17 +862,17 @@ class FlashAttentionSm120BwdOp(Op):
                 cute.make_ptr(self.dtype, page_ptr + Int32(self.kv_tile_bytes), cute.AddressSpace.smem),
                 _o_swz, dtype=self.dtype,
             ),
-            cute.make_layout((self.D, self.tile_size_N, 1)),
+            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
         )
         gdV = cute.local_tile(
-            dv_tma_gmem, (self.D, self.tile_size_N, 1), (None, None, None),
+            dv_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
         )
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             dv_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sdV, 0, 3), cute.group_modes(gdV, 0, 3),
+            cute.group_modes(sdV, 0, 4), cute.group_modes(gdV, 0, 4),
         )
         with cute.arch.elect_one():
-            cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_N, tile_BH_kv)])
+            cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)])
 
 
 __all__ = ["FlashAttentionSm120BwdOp"]
