@@ -5,7 +5,6 @@ from .sm_100 import FlashAttentionSm100Op
 from .sm_120 import FlashAttentionSm120Op
 from .sm_120_bwd import FlashAttentionSm120BwdOp
 from .flash_decoding import FlashDecodingSplitOp, flash_decoding_schedule
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE
 
 import torch
 
@@ -27,13 +26,32 @@ def _get_flash_attention_op():
 FlashAttentionOp = _get_flash_attention_op()
 
 
-def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SIZE,
+def _max_attention_page_size(device=None):
+    """Max page_size for attention with num_pages=1 (full smem budget).
+
+    Attention ops do KV pipelining internally via cpasync, so the framework's
+    ring-buffer page pipeline provides no benefit. Using the full smem budget
+    as a single page maximizes the KV buffer size.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    max_smem = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    # Reserve 512 bytes for framework scratch (ring_state, flags, IQ, mbarriers).
+    # With num_pages=1, overhead is minimal.
+    return ((max_smem - 512) // 128) * 128
+
+
+def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
                              kv_group_size=1, lse=None):
     """Schedule attention with auto-dispatch between FA and FlashDecoding.
 
     Uses FlashDecoding for decode-like workloads where there aren't enough
     tiles to saturate the GPU (small BH × ceil(M/tile_M) vs SM count).
     Falls back to regular FlashAttention for prefill workloads.
+
+    Args:
+        page_size: Size of each smem page in bytes. None = auto-detect max
+            available smem (recommended for attention).
 
     Returns:
         (ops, config): ScheduledOps and MegakernelConfig.
@@ -49,6 +67,10 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
 
     B, H, M, D = q.shape
     elem = q.element_size()
+
+    # Auto-detect max page_size for attention
+    if page_size is None:
+        page_size = _max_attention_page_size(q.device)
 
     num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
 

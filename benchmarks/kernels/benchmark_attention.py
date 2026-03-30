@@ -354,7 +354,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
             dk = torch.zeros_like(k)
             dv = torch.zeros_like(v)
 
-            bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+            bwd_ops = FlashAttentionSm120BwdOp.schedule(
                 k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
                 dq=dq_accum, dk=dk, dv=dv, page_size=page_size,
             )
@@ -388,7 +388,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
             dk_so = torch.zeros_like(k)
             dv_so = torch.zeros_like(v)
 
-            so_bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+            so_bwd_ops = FlashAttentionSm120BwdOp.schedule(
                 k=k, v=v, q=q, dout=dout, lse=lse_so, dpsum=dpsum_so,
                 dq=dq_so, dk=dk_so, dv=dv_so, page_size=page_size,
             )
@@ -461,7 +461,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
             dk = torch.zeros_like(k)
             dv = torch.zeros_like(v)
 
-            bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+            bwd_ops = FlashAttentionSm120BwdOp.schedule(
                 k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
                 dq=dq_accum, dk=dk, dv=dv, causal=True, page_size=page_size,
             )
@@ -495,7 +495,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
             dk_so = torch.zeros_like(k)
             dv_so = torch.zeros_like(v)
 
-            so_bwd_ops = FlashAttentionSm120BwdOp.schedule_backward(
+            so_bwd_ops = FlashAttentionSm120BwdOp.schedule(
                 k=k, v=v, q=q, dout=dout, lse=lse_so, dpsum=dpsum_so,
                 dq=dq_so, dk=dk_so, dv=dv_so, causal=True, page_size=page_size,
             )

@@ -738,3 +738,70 @@ class TestPerRowWeightBackward:
         dx_per_row = _run_rmsnorm_backward(dout, x, weight_2d, per_row_weight=True)
 
         torch.testing.assert_close(dx_shared, dx_per_row, atol=1e-5, rtol=1e-5)
+
+
+class TestRMSNormScratchOverflow:
+    """Regression test: tile_S must be clamped so scratch fits in page.
+
+    When tile_S * D * elem_bytes == page_size, the 64-byte scratch area
+    overflows the page boundary, corrupting the next page's data. This
+    caused NaN in combined megakernels (e.g., RMSNorm + GEMM).
+    """
+
+    @requires_gpu
+    def test_tile_s_clamped(self):
+        """tile_sizes={'S': 16} must be clamped to 15 for D=1024, pg=32768."""
+        from machete.kernels.rms_norm import RMSNormOp
+
+        D = 1024
+        x = torch.randn(1, 64, D, dtype=torch.bfloat16, device="cuda")
+        y = torch.zeros_like(x)
+        w = torch.randn(D, dtype=torch.bfloat16, device="cuda")
+
+        # Explicit tile_S=16 would overflow: 16*1024*2 = 32768 = page_size
+        ops = RMSNormOp.schedule(
+            x=x, weight=w, y=y, tile_sizes={"S": 16}, page_size=32768,
+        )
+        assert ops[0].tile_sizes["S"] <= 15, (
+            f"tile_S should be clamped to 15, got {ops[0].tile_sizes['S']}"
+        )
+
+    @requires_gpu
+    def test_combined_rmsnorm_gemm_no_nan(self):
+        """RMSNorm + independent GEMM must not produce NaN (scratch overflow)."""
+        from machete.megakernel import Megakernel
+        from machete.kernels.rms_norm import RMSNormOp
+        from machete.kernels.gemm import GemmOp
+
+        torch.manual_seed(42)
+        B, S, D = 1, 1024, 1024
+        page_size = 32768
+        dtype = torch.bfloat16
+        dev = "cuda"
+
+        x = torch.randn(B, S, D, dtype=dtype, device=dev)
+        residual = torch.randn(B, S, D, dtype=dtype, device=dev)
+        w = torch.randn(D, dtype=dtype, device=dev)
+        res_out = torch.empty(B, S, D, dtype=dtype, device=dev)
+        h = torch.empty(B, S, D, dtype=dtype, device=dev)
+
+        a = torch.randn(B, S, 2048, dtype=dtype, device=dev)
+        W = torch.randn(D, 2048, dtype=dtype, device=dev) * 0.02
+        c = torch.empty(B, S, D, dtype=dtype, device=dev)
+
+        ops = (
+            RMSNormOp.schedule(
+                x=x, weight=w, y=h,
+                residual_in=residual, residual_out=res_out,
+                tile_sizes={"S": 16}, page_size=page_size,
+            )
+            + GemmOp.schedule(a=a, b=W, c=c, page_size=page_size)
+        )
+        config = GemmOp.kernel_config(ops)
+        kernel = Megakernel(ops, config=config)
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel.run()
+        torch.cuda.synchronize()
+
+        assert not torch.isnan(h).any(), "RMSNorm output h has NaN"
+        assert not torch.isnan(c).any(), "GEMM output c has NaN"

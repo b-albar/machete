@@ -253,8 +253,8 @@ class NPageLayout:
 
     def __post_init__(self):
         """Calculate layout offsets after initialization."""
-        if self.num_pages < 2:
-            raise ValueError(f"num_pages must be >= 2, got {self.num_pages}")
+        if self.num_pages < 1:
+            raise ValueError(f"num_pages must be >= 1, got {self.num_pages}")
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
 
