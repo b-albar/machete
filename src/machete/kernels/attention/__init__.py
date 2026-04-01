@@ -85,8 +85,10 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
     total_tiles = B * H * ((M + tile_M - 1) // tile_M)
 
-    # Flash decoding constraints: Q must fit in a single page, M must be MMA-aligned
-    fd_possible = (M * D * elem <= page_size and M >= 16 and M % 16 == 0)
+    # Flash decoding constraints: Q must fit in page with room for KV, M must be MMA-aligned
+    fd_q_bytes = M * D * elem
+    fd_kv_min = 2 * 16 * D * elem  # 2 KV buffers × 16 rows minimum
+    fd_possible = (fd_q_bytes + fd_kv_min <= page_size and M >= 16 and M % 16 == 0)
 
     # Dispatch: use FD when too few tiles to saturate SMs.
     # Exception: single head with large M (>64) — combine overhead dominates.

@@ -1254,17 +1254,10 @@ class Megakernel:
 
                 while _ctrl_done == Int32(0):
                     if lane_id == Int32(0):
-                        # Wait for page available
-                        _si = ld_shared_i32(store_idx_ptr)
-                        while (produce_idx - _si) >= Int32(num_pages):
-                            _wait_slot = produce_idx % Int32(num_pages)
-                            _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
-                            mbarrier_wait(
-                                _compute_done_mbar(smem_base, _wait_slot), _wait_phase
-                            )
-                            _si = ld_shared_i32(store_idx_ptr)
-
-                        # Fetch next instruction
+                        # Prefetch next instruction BEFORE waiting for page.
+                        # Instruction fetch uses IQ smem (not the page), so it
+                        # overlaps with the previous tile's store. This hides
+                        # ~400 cycles of global memory latency per tile.
                         _instr_op = Int32(TileInstruction.END_MARKER)
                         _instr_lin = Int32(0)
                         if _fetch_idx < num_instructions:
@@ -1277,13 +1270,25 @@ class Megakernel:
                                 _fetch_idx = _fetch_idx + num_blocks
 
                         if _instr_op >= Int32(0):
-                            # Pre-computed blocking barrier wait
+                            # Pre-computed blocking barrier wait (also overlaps
+                            # with store — reads global mem, not smem page)
                             for _w in range_constexpr(max_waits):
                                 _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
                                 _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
                                 if _bar_idx >= Int32(0):
                                     _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
                                     global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+
+                            # Wait for page available (blocks until store
+                            # completes for 1-page; usually instant for 2+ pages)
+                            _si = ld_shared_i32(store_idx_ptr)
+                            while (produce_idx - _si) >= Int32(num_pages):
+                                _wait_slot = produce_idx % Int32(num_pages)
+                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
+                                mbarrier_wait(
+                                    _compute_done_mbar(smem_base, _wait_slot), _wait_phase
+                                )
+                                _si = ld_shared_i32(store_idx_ptr)
 
                             # Wait for loader to consume previous dispatch
                             _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
