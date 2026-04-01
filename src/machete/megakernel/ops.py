@@ -251,44 +251,32 @@ def _process_op_declarations(cls):
         if t not in dim_lookup:
             raise ValueError(f"Tile dim '{t}' not found in any tensor shape declaration")
 
-    # --- Process TMA declarations ---
-    # tma_loads: set of tensor names to load via TMA G2S
-    # tma_stores: set of tensor names to store via TMA S2G
-    # tma_reduce_stores: set of tensor names to store via TMA S2G with atomic add
+    # --- Process TMA and peer store declarations ---
+    all_read_names = set(reads.keys())
+    all_write_names = set(writes.keys())
+
+    def _validate_tensor_set(tensor_set, valid_names, decl_name):
+        for name in tensor_set:
+            if name not in valid_names:
+                kind = "reads" if valid_names is all_read_names else "writes"
+                raise ValueError(f"{decl_name} tensor '{name}' not found in {kind}")
+
     tma_loads = set(getattr(cls, "tma_loads", set()))
     tma_stores = set(getattr(cls, "tma_stores", set()))
     tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
+    peer_stores = set(getattr(cls, "peer_stores", set()))
+    peer_reduce_stores = set(getattr(cls, "peer_reduce_stores", set()))
 
-    # Validate TMA tensors exist in reads/writes.
-    all_read_names = set(reads.keys())
-    all_write_names = set(writes.keys())
-    for name in tma_loads:
-        if name not in all_read_names:
-            raise ValueError(f"tma_loads tensor '{name}' not found in reads")
-    for name in tma_stores:
-        if name not in all_write_names:
-            raise ValueError(f"tma_stores tensor '{name}' not found in writes")
-    for name in tma_reduce_stores:
-        if name not in all_write_names:
-            raise ValueError(f"tma_reduce_stores tensor '{name}' not found in writes")
+    _validate_tensor_set(tma_loads, all_read_names, "tma_loads")
+    _validate_tensor_set(tma_stores, all_write_names, "tma_stores")
+    _validate_tensor_set(tma_reduce_stores, all_write_names, "tma_reduce_stores")
+    _validate_tensor_set(peer_stores, all_write_names, "peer_stores")
+    _validate_tensor_set(peer_reduce_stores, all_write_names, "peer_reduce_stores")
 
     cls._TMA_LOADS = tma_loads
     cls._TMA_STORES = tma_stores
     cls._TMA_REDUCE_STORES = tma_reduce_stores
-
-    # --- Process peer store declarations ---
-    # peer_stores: set of tensor names to send to peer GPUs via TMA S2G
-    # peer_reduce_stores: set of tensor names to send via TMA S2G with atomic add
-    peer_stores = set(getattr(cls, "peer_stores", set()))
-    for name in peer_stores:
-        if name not in all_write_names:
-            raise ValueError(f"peer_stores tensor '{name}' not found in writes")
     cls._PEER_STORES = peer_stores
-
-    peer_reduce_stores = set(getattr(cls, "peer_reduce_stores", set()))
-    for name in peer_reduce_stores:
-        if name not in all_write_names:
-            raise ValueError(f"peer_reduce_stores tensor '{name}' not found in writes")
     cls._PEER_REDUCE_STORES = peer_reduce_stores
 
     # Build TMA tile shape info per tensor.

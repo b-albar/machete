@@ -163,17 +163,13 @@ class Benchmark:
         if isinstance(func_or_spec, KernelBenchSpec):
             torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
+            setup = func_or_spec.setup_fn
         else:
             torch_stream = torch.cuda.Stream()
             launch = func_or_spec
+            setup = None
 
-        # Warmup
-        with torch.cuda.stream(torch_stream):
-            for _ in range(warmup):
-                launch()
-        torch_stream.synchronize()
-
-        # Capture
+        # Use CUDA graph capture + replay for all specs.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(torch_stream):
             with torch.cuda.graph(graph, stream=torch_stream):

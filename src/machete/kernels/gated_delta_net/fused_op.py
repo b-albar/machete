@@ -82,7 +82,7 @@ def _auto_block_sizes(page_size, K, V, elem_bytes=2):
     )
 
 
-def _kernel_config(ops):
+def _kernel_config(cls, ops):
     """Shared kernel config for GDNFused forward and backward."""
     from machete.megakernel import MegakernelConfig
     from machete.megakernel.megakernel import NUM_DMA_WARPS
@@ -239,7 +239,7 @@ class GDNFusedOp(Op):
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "u")
 
-    kernel_config = staticmethod(_kernel_config)
+    kernel_config = classmethod(_kernel_config)
 
     # =========================================================================
     # Load (DMA warp: TMA Q for chunk 0)
@@ -848,7 +848,7 @@ class GDNFusedBwdOp(Op):
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
         return _schedule(cls, scale, page_size, tile_sizes, tensors, "q", "do")
 
-    kernel_config = staticmethod(_kernel_config)
+    kernel_config = classmethod(_kernel_config)
 
     # =========================================================================
     # Load (DMA warp: TMA do for last chunk)

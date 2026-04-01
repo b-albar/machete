@@ -26,11 +26,42 @@ import textwrap
 import cutlass.cute as cute
 from cutlass import Int32, Int64
 
+from .ops import MAX_TILE_DIMS
+
 # Counter for unique filenames in linecache
 _compile_counter = 0
 
 # Track linecache entries for cleanup
 _linecache_entries: list = []
+
+
+def exec_generated_source(source: str, label: str, exec_globals: dict) -> dict:
+    """Compile and exec generated source code with linecache support.
+
+    Registers the source in linecache so that tracebacks show meaningful
+    file names and line numbers for generated code.
+
+    Args:
+        source: Python source code string.
+        label: Descriptive label for linecache (e.g., "kernel_loop", "dispatch_load").
+        exec_globals: Globals dict for exec(). Updated in-place with defined names.
+
+    Returns:
+        The exec_globals dict (same object, for convenience).
+    """
+    global _compile_counter
+    _compile_counter += 1
+    filename = f"<{label}>_{_compile_counter}"
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        source.splitlines(True),
+        filename,
+    )
+    _linecache_entries.append(filename)
+    code = compile(source, filename, "exec")
+    exec(code, exec_globals)
+    return exec_globals
 
 
 # =============================================================================
@@ -180,7 +211,7 @@ def _build_phase_wrapper(
     call_str = ", ".join(call_args)
 
     # Build wrapper function signature (standard dispatch format)
-    tile_params = ", ".join(f"tile_{i}" for i in range(5))
+    tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
     extra_str = ""
     if extra_params:
         extra_str = ", " + ", ".join(extra_params)

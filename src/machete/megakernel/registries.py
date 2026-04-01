@@ -15,7 +15,7 @@ Classes:
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .ops import (
     TORCH_TO_CUTLASS_DTYPE,

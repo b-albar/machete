@@ -99,11 +99,12 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
         tensors["lse"] = lse
 
     if use_fd:
-        ops = FlashDecodingSplitOp.schedule(
-            causal=causal, page_size=page_size, kv_group_size=kv_group_size,
-            **tensors,
+        # flash_decoding_schedule creates its own lse internally
+        fd_tensors = {k: v for k, v in tensors.items() if k != "lse"}
+        ops, config = flash_decoding_schedule(
+            page_size=page_size, causal=causal, kv_group_size=kv_group_size,
+            **fd_tensors,
         )
-        config = FlashDecodingSplitOp.kernel_config(ops)
     else:
         ops = FlashAttentionOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,

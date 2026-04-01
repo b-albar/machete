@@ -68,7 +68,7 @@ def _auto_tile_S(D, elem_bytes, page_size):
     return max(1, usable // (D * elem_bytes))
 
 
-def _tma_kernel_config(ops):
+def _tma_kernel_config(cls, ops):
     """Return config for TMA-mode RMSNorm.
 
     threads_per_block includes DMA warps (framework always reserves them).
@@ -150,7 +150,7 @@ class RMSNormOp(Op):
                 self.effective_threads = t
         self.effective_warps = self.effective_threads // 32
 
-    kernel_config = staticmethod(_tma_kernel_config)
+    kernel_config = classmethod(_tma_kernel_config)
 
     @classmethod
     def _fill_dummies(cls, tensors):
@@ -451,7 +451,7 @@ class RMSNormBwdOp(Op):
                 self.effective_threads = t
         self.effective_warps = self.effective_threads // 32
 
-    kernel_config = staticmethod(_tma_kernel_config)
+    kernel_config = classmethod(_tma_kernel_config)
 
     @classmethod
     def _fill_dummies(cls, tensors):

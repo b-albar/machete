@@ -263,6 +263,28 @@ class FlashDecodingSplitOp(Op):
 
         return ops, o_partial, lse_partial
 
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for flash decoding ops."""
+        from machete.megakernel import MegakernelConfig
+        from machete.megakernel.megakernel import NUM_DMA_WARPS
+        import torch
+
+        num_mma_warps = 8
+        threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+
+        total_tiles = sum(op.total_tiles for op in ops)
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        num_sms = min(num_sms, total_tiles)
+
+        return MegakernelConfig(
+            threads_per_block=threads_per_block,
+            page_size=page_size,
+            noinline=True,
+            num_sms=num_sms,
+        )
+
     # =========================================================================
     # Load (TMA Q + init mbarriers)
     # =========================================================================
@@ -701,6 +723,11 @@ class FlashDecodingCombineOp(Op):
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         return ops
 
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for combine ops."""
+        return FlashDecodingSplitOp.kernel_config(ops)
+
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_H, o_partial, lse_partial, o, lse):
         """Reduce num_splits partial O/LSE into final output.
@@ -801,30 +828,6 @@ class FlashDecodingCombineOp(Op):
 # =============================================================================
 
 
-def flash_decoding_kernel_config(ops):
-    """Return recommended MegakernelConfig for flash decoding ops."""
-    from machete.megakernel import MegakernelConfig
-    from machete.megakernel.megakernel import NUM_DMA_WARPS
-    import torch
-
-    # Use 8 MMA warps: SplitOp uses M//16 (typically 1), CombineOp uses all 8
-    num_mma_warps = 8
-    threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
-    page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
-
-    total_tiles = sum(op.total_tiles for op in ops)
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    num_sms = min(num_sms, total_tiles)
-
-    return MegakernelConfig(
-        threads_per_block=threads_per_block,
-        page_size=page_size,
-        noinline=True,
-        num_pages=2,
-        num_sms=num_sms,
-    )
-
-
 def flash_decoding_schedule(q, k, v, o, num_splits=0,
                             page_size=DEFAULT_PAGE_SIZE,
                             causal=False, kv_group_size=1):
@@ -860,7 +863,7 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     )
 
     ops = split_ops + combine_ops
-    config = flash_decoding_kernel_config(ops)
+    config = FlashDecodingSplitOp.kernel_config(ops)
     return ops, config
 
 

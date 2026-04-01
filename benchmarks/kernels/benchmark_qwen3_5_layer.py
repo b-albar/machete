@@ -37,6 +37,56 @@ try:
 except ImportError:
     CUTLASS_AVAILABLE = False
 
+
+def _combined_bench_spec(kernels, setup_fn=None, keep_alive=None):
+    """Create a KernelBenchSpec that launches multiple megakernels on one shared stream."""
+    import cuda.bindings.driver as cuda
+    from machete.utils.benchmark_utils import KernelBenchSpec
+    from cutlass import Int64
+
+    bench_stream = torch.cuda.Stream()
+    cu_stream = cuda.CUstream(bench_stream.cuda_stream)
+
+    # Compile all kernels and capture their launch state
+    launch_data = []
+    for mk in kernels:
+        mk.compile()
+        launch_data.append({
+            "compiled": mk._compiled_kernel,
+            "instructions_ptr": Int64(mk._instructions_tensor.data_ptr()),
+            "barriers_ptr": Int64(mk._barriers_tensor.data_ptr()),
+            "barriers_tensor": mk._barriers_tensor,
+            "op_configs_ptr": Int64(mk._op_configs_tensor.data_ptr()),
+            "wait_info_ptr": Int64(mk._wait_info.data_ptr()),
+            "trace_ptr": Int64(0),
+            "num_instructions": mk._num_instructions_i32,
+            "cute_tensors": list(mk._cute_tensors) if mk._cute_tensors else [],
+            "tma_args": [ct for _, ct in mk._tma_cute_tensors] if mk._tma_cute_tensors else [],
+            "peer_tma_args": [ct for _, _, ct in mk._peer_tma_cute_tensors] if mk._peer_tma_cute_tensors else [],
+        })
+
+    def _setup():
+        if setup_fn is not None:
+            setup_fn()
+        for ld in launch_data:
+            ld["barriers_tensor"].zero_()
+
+    def _launch():
+        for ld in launch_data:
+            ld["compiled"](
+                ld["instructions_ptr"], ld["barriers_ptr"],
+                ld["op_configs_ptr"], ld["trace_ptr"], ld["wait_info_ptr"],
+                ld["num_instructions"],
+                *ld["cute_tensors"], *ld["tma_args"], *ld["peer_tma_args"],
+                cu_stream,
+            )
+
+    return KernelBenchSpec(
+        launch_fn=_launch, setup_fn=_setup,
+        stream=(bench_stream, cu_stream),
+        _keep_alive=(kernels, keep_alive),
+    )
+
 # =============================================================================
 # Qwen 3.5-0.8B Attention Layer Config
 # =============================================================================
@@ -52,6 +102,8 @@ Q_DIM = NUM_Q_HEADS * HEAD_DIM  # 2048
 KV_DIM = NUM_KV_HEADS * HEAD_DIM  # 512
 KV_GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS  # 4
 EPS = 1e-6
+
+PAGE_SIZES = [32768, 49152, 65536, 98304]  # 32K, 48K, 64K, 96K
 
 
 def is_sm90_or_newer():
@@ -172,18 +224,17 @@ def megakernel_forward_build(
     w_mlp_norm,
     W_gate_up,
     W_down,
-    page_size=49152,
+    page_size=32768,
 ):
     """Build a single fused megakernel for full layer forward.
 
     Uses view+permute so FlashAttention reads/writes directly from/to
     GEMM output buffers with correct strided layout — no inter-kernel copies.
     """
-    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.megakernel import Megakernel
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.glu import GLUOp
-    from machete.kernels.attention import flash_attention_schedule
     from machete.kernels.qknorm_rope import QKNormRopeOp
 
     dtype = x.dtype
@@ -232,6 +283,7 @@ def megakernel_forward_build(
     qknorm_q_ops = QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
     qknorm_k_ops = QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
 
+    from machete.kernels.attention import flash_attention_schedule
     fa_ops, fa_config = flash_attention_schedule(
         q=q_fa, k=k_fa, v=v_fa, o=o_fa, lse=lse,
         causal=True, kv_group_size=KV_GROUP_SIZE, page_size=page_size,
@@ -245,85 +297,44 @@ def megakernel_forward_build(
 
     gemm_o_ops = GemmOp.schedule(a=attn_out_3d, b=W_o, c=proj, page_size=page_size)
     rmsnorm2_ops = RMSNormOp.schedule(
-        x=proj,
-        weight=w_mlp_norm,
-        y=h2,
-        residual_in=residual_out,
-        residual_out=residual_out2,
-        tile_sizes={"S": 16},
-        page_size=page_size,
+        x=proj, weight=w_mlp_norm, y=h2,
+        residual_in=residual_out, residual_out=residual_out2,
+        tile_sizes={"S": 16}, page_size=page_size,
     )
     gemm_gu_ops = GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
     glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", tile_sizes={"S": 2}, page_size=page_size)
     gemm_down_ops = GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size)
 
-    all_ops = (
-        rmsnorm1_ops
-        + gemm_q_ops
-        + gemm_k_ops
-        + gemm_v_ops
-        + qknorm_q_ops
-        + qknorm_k_ops
-        + fa_ops
-        + gemm_o_ops
-        + rmsnorm2_ops
-        + gemm_gu_ops
-        + glu_ops
-        + gemm_down_ops
-    )
+    keep_alive = [
+        x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
+        cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
+        residual_out, h, q_3d, k_3d, v_3d, q_4d, k_4d,
+        q_fa, k_fa, v_fa, o_fa, lse, attn_out_3d, proj,
+        residual_out2, h2, gate_up, mlp_h, out,
+    ]
 
-    # Combined config: max threads and page_size across GEMM and FA
-    gemm_config = GemmOp.kernel_config([op for op in all_ops if op not in fa_ops])
-    config = MegakernelConfig(
-        threads_per_block=max(gemm_config.threads_per_block, fa_config.threads_per_block),
-        page_size=max(page_size, fa_config.page_size),
-    )
+    # --- 3-kernel split: pre-attn (small page) + FA (large page) + post-attn ---
+    pre_attn_ops = rmsnorm1_ops + gemm_q_ops + gemm_k_ops + gemm_v_ops + qknorm_q_ops + qknorm_k_ops
+    post_attn_ops = gemm_o_ops + rmsnorm2_ops + gemm_gu_ops + glu_ops + gemm_down_ops
 
-    kernel = Megakernel(all_ops, config=config)
+    pre_kernel = Megakernel(pre_attn_ops, config=GemmOp.kernel_config(pre_attn_ops))
+    fa_kernel = Megakernel(fa_ops, config=fa_config)
+    post_kernel = Megakernel(post_attn_ops, config=GemmOp.kernel_config(post_attn_ops))
 
-    # Warmup / compile
     with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
+        pre_kernel.run()
+    torch.cuda.synchronize()
+    with contextlib.redirect_stdout(io.StringIO()):
+        fa_kernel.run()
+    torch.cuda.synchronize()
+    with contextlib.redirect_stdout(io.StringIO()):
+        post_kernel.run()
     torch.cuda.synchronize()
 
-    spec = kernel.bench_spec(
-        keep_alive=[
-            x,
-            residual,
-            w_attn_norm,
-            W_q,
-            W_k,
-            W_v,
-            w_q_norm,
-            w_k_norm,
-            cos,
-            sin,
-            W_o,
-            w_mlp_norm,
-            W_gate_up,
-            W_down,
-            residual_out,
-            h,
-            q_3d,
-            k_3d,
-            v_3d,
-            q_4d,
-            k_4d,
-            q_fa,
-            k_fa,
-            v_fa,
-            o_fa,
-            lse,
-            attn_out_3d,
-            proj,
-            residual_out2,
-            h2,
-            gate_up,
-            mlp_h,
-            out,
-        ]
+    spec = _combined_bench_spec(
+        [pre_kernel, fa_kernel, post_kernel],
+        keep_alive=keep_alive,
     )
-
     return spec, out, residual_out2
 
 
@@ -528,20 +539,15 @@ def megakernel_layer_bwd_build(
     # These ops would complete the chain but are not benchmarked yet.
 
     # =========================================================================
-    # Build two megakernels: GEMM/GLU/RMSNorm chain + FA bwd
-    # (FA bwd needs different thread/page config — can't share one megakernel)
+    # Split: MLP/GEMM chain (small page, pipelined) + FA bwd (large page)
     # =========================================================================
-    mlp_attn_ops = (
-        gemm_down_bwd_ops + glu_bwd_ops + gemm_gu_bwd_ops
-        + rmsnorm2_bwd_ops + gemm_o_bwd_ops
-    )
-    mlp_config = GemmOp.kernel_config(mlp_attn_ops)
-    mlp_kernel = Megakernel(mlp_attn_ops, config=mlp_config)
-
+    mlp_ops = (gemm_down_bwd_ops + glu_bwd_ops + gemm_gu_bwd_ops
+               + rmsnorm2_bwd_ops + gemm_o_bwd_ops)
     fa_bwd_config = FlashAttentionSm120BwdOp.kernel_config(fa_bwd_ops)
+
+    mlp_kernel = Megakernel(mlp_ops, config=GemmOp.kernel_config(mlp_ops))
     fa_kernel = Megakernel(fa_bwd_ops, config=fa_bwd_config)
 
-    # Warmup / compile
     with contextlib.redirect_stdout(io.StringIO()):
         mlp_kernel.run()
     torch.cuda.synchronize()
@@ -561,29 +567,15 @@ def megakernel_layer_bwd_build(
         d_attn_out_3d, d_attn_fa, dpsum, dq_fa, dk_fa, dv_fa,
     ]
 
-    mlp_spec = mlp_kernel.bench_spec(keep_alive=keep_alive)
-    fa_spec = fa_kernel.bench_spec(
+    spec = _combined_bench_spec(
+        [mlp_kernel, fa_kernel],
         setup_fn=lambda: (dq_fa.zero_(), dk_fa.zero_(), dv_fa.zero_()),
         keep_alive=keep_alive,
     )
-
-    # Combined spec: run both kernels sequentially
-    def combined_launch():
-        mlp_spec.launch_fn()
-        fa_spec.launch_fn()
-
-    def combined_setup():
-        mlp_spec.setup_fn()
-        fa_spec.setup_fn()
-
-    from machete.utils.benchmark_utils import KernelBenchSpec
-    spec = KernelBenchSpec(
-        launch_fn=combined_launch, setup_fn=combined_setup,
-        stream=mlp_spec.stream, _keep_alive=keep_alive)
     return spec, d_out
 
 
-def _layer_bwd_flops(seq_len, batch):
+def _layer_bwd_flops(seq_len, batch, page_size=32768):
     """Approximate FLOPs for full layer backward."""
     M = batch * seq_len
     # GEMM backward: each forward GEMM produces 2 backward GEMMs (dA and dB)
@@ -765,7 +757,8 @@ def verify_layer_backward(B, S):
 
 @Benchmark.parametrize("batch", [1])
 @Benchmark.parametrize("seq_len", [128, 256, 512, 1024, 2048, 4096])
-def bench_qwen35_layer_bwd(seq_len, batch):
+@Benchmark.parametrize("page_size", PAGE_SIZES)
+def bench_qwen35_layer_bwd(seq_len, batch, page_size):
     """Benchmark Qwen 3.5 full layer backward."""
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -802,6 +795,7 @@ def bench_qwen35_layer_bwd(seq_len, batch):
             spec, _ = megakernel_layer_bwd_build(
                 batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
                 w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
+                page_size=page_size,
             )
             funcs["megakernel"] = spec
         except Exception as e:
@@ -817,7 +811,7 @@ def bench_qwen35_layer_bwd(seq_len, batch):
 # =============================================================================
 
 
-def _total_bytes(seq_len, batch):
+def _total_bytes(seq_len, batch, page_size=32768):
     """Approximate total bytes moved for one layer forward."""
     elem = 2  # bf16
     # Activations: x, residual, h, q, k, v, attn_out, proj, h2, gate_up, mlp_h, out
@@ -844,7 +838,7 @@ def _total_bytes(seq_len, batch):
     return (act_elems + weight_elems) * elem
 
 
-def _total_flops(seq_len, batch):
+def _total_flops(seq_len, batch, page_size=32768):
     """Approximate total FLOPs for one layer forward."""
     M = batch * seq_len
     # GEMMs: 2*M*N*K each
@@ -863,7 +857,8 @@ def _total_flops(seq_len, batch):
 
 @Benchmark.parametrize("batch", [1, 8])
 @Benchmark.parametrize("seq_len", [128, 256, 512, 1024, 2048, 4096, 8192, 16384])
-def bench_qwen35_layer_fwd(seq_len, batch):
+@Benchmark.parametrize("page_size", PAGE_SIZES)
+def bench_qwen35_layer_fwd(seq_len, batch, page_size):
     """Benchmark Qwen 3.5 attention layer forward."""
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -896,31 +891,15 @@ def bench_qwen35_layer_fwd(seq_len, batch):
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_forward(*args)
 
-    # --- Megakernel fused ---
+    # --- Megakernel (3-kernel split: optimal page_size per op group) ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
+        build_args = (batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
+                      w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down)
         try:
-            spec, _, _ = megakernel_forward_build(
-                batch,
-                seq_len,
-                x,
-                residual,
-                w_attn_norm,
-                W_q,
-                W_k,
-                W_v,
-                w_q_norm,
-                w_k_norm,
-                cos,
-                sin,
-                W_o,
-                w_mlp_norm,
-                W_gate_up,
-                W_down,
-            )
+            spec, _, _ = megakernel_forward_build(*build_args, page_size=page_size)
             funcs["megakernel"] = spec
         except Exception as e:
             import traceback
-
             traceback.print_exc()
             print(f"  megakernel build failed: {e}")
 
@@ -955,7 +934,8 @@ def sequential_no_attn(
 
 @Benchmark.parametrize("batch", [1, 8])
 @Benchmark.parametrize("seq_len", [128, 256, 512, 1024, 2048, 4096, 8192, 16384])
-def bench_qwen35_no_attn(seq_len, batch):
+@Benchmark.parametrize("page_size", PAGE_SIZES)
+def bench_qwen35_no_attn(seq_len, batch, page_size):
     """Benchmark non-attention ops only (K1 + K3): GEMMs + norms + GLU."""
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -990,8 +970,6 @@ def bench_qwen35_no_attn(seq_len, batch):
             from machete.kernels.rms_norm import RMSNormOp
             from machete.kernels.glu import GLUOp
             from machete.kernels.qknorm_rope import QKNormRopeOp
-
-            page_size = 32768
 
             # K1: RMSNorm → GEMM(Q,K,V) → QKNormRope
             res_out = torch.empty_like(x)

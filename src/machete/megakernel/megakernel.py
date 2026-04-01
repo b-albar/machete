@@ -42,9 +42,8 @@ from .registries import (
 from .scheduling import (
     InstructionStreamBuilder,
     TileInstruction,
-    INSTRUCTION_WORDS,
 )
-from .compile import compile_phase
+from .compile import compile_phase, exec_generated_source
 from .interpreter import (
     global_barrier_signal,
     global_barrier_signal_gpu,
@@ -82,38 +81,57 @@ from .paged_memory import (
 # Three DMA warps: controller (fetch + barrier wait), loader (TMA dispatch), store (S→G).
 NUM_DMA_WARPS = 3
 
+# PTX minimum register count for setmaxnreg (idle warp floor).
+MIN_IDLE_REGS = 24
+
 
 @dataclass
 class MegakernelConfig:
     """Configuration for the persistent megakernel.
 
-    Attributes:
-        threads_per_block: Threads per block (default: 256)
-        num_sms: Number of SMs to use (None = auto-detect)
-        page_size: Size of each page in bytes (default: 16KB)
-        num_pages: Number of pages for pipelining (None = auto-detect max).
-            With N pages, up to N-1 loads can overlap with compute.
-            Minimum is 2 (double-buffering).
+    Kernel geometry:
+        threads_per_block: Total threads (MMA warps + DMA warps). Default 256.
+        num_sms: SMs to occupy (None = auto-detect from device).
+        page_size: Shared memory page size in bytes (default: 48KB).
+        num_pages: Ring buffer pages (None = auto-detect max that fits smem).
+            With N pages, up to N-1 loads overlap with compute. N=1 is valid
+            but serializes load→compute→store (no pipelining).
+
+    Register budget:
+        dma_reg_count: Registers per DMA warp thread (default: 40).
+        mma_reg_count: Registers per MMA warp thread (default: 232).
+            Total must fit: num_mma_warps * mma_reg_count + NUM_DMA_WARPS * dma_reg_count
+            <= 65536 registers per SM.
+
+    Compilation:
+        noinline: Emit each op's compute as noinline device function (default: True).
+            Reduces register pressure by isolating op register usage.
+        opt_level: LLVM optimization level 0-3 (default: 2). noinline requires <= 2.
         tracing: Enable cutedsl-trace instrumentation (default: False).
-            When False, all trace calls are eliminated at compile time
-            via constexpr (zero overhead).
+            When False, trace blocks are stripped at source level (zero overhead).
+
+    Multi-GPU (peer TMA):
+        peer_buffers: {tensor_name: [peer0_tensor, peer1_tensor, ...]}
+        peer_barriers: torch.Tensor for cross-GPU barrier signaling.
+        device_idx: This GPU's index in the peer group.
+        num_devices: Total devices in peer group.
     """
 
     threads_per_block: int = 256
     num_sms: Optional[int] = None
     page_size: int = 49152
-    num_pages: Optional[int] = None  # None = auto-detect max for GPU
+    num_pages: Optional[int] = None
     tracing: bool = False
     dma_reg_count: int = 40
     mma_reg_count: int = 232
-    noinline: bool = True  # Emit each op's compute as a separate noinline device function
-    opt_level: int = 2  # LLVM opt level (0-3). noinline requires <= 2.
+    noinline: bool = True
+    opt_level: int = 2
 
-    # Multi-GPU communication (ParallelKittens-style peer TMA stores)
-    peer_buffers: Optional[Dict[str, List[Any]]] = None  # {tensor_name: [peer0, peer1, ...]}
-    peer_barriers: Optional[Any] = None  # torch.Tensor for cross-GPU barrier signaling
-    device_idx: int = 0  # This GPU's index in the peer group
-    num_devices: int = 1  # Total devices in peer group
+    # Multi-GPU communication
+    peer_buffers: Optional[Dict[str, List[Any]]] = None
+    peer_barriers: Optional[Any] = None
+    device_idx: int = 0
+    num_devices: int = 1
 
     @property
     def warps_per_block(self) -> int:
@@ -189,7 +207,7 @@ class Megakernel:
             # Auto-detect maximum pages that fit in shared memory
             self._layout = NPageLayout.for_device(
                 page_size=self.config.page_size,
-                min_pages=2,
+                min_pages=1,
             )
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
@@ -503,21 +521,10 @@ class Megakernel:
             op_tensor_args.append(tensor_args)
 
             # Get TMA canonical names and local mappings per phase
-            load_tma_args = tma_registry.get_op_tma_args(i, "load")
-            compute_tma_args = tma_registry.get_op_tma_args(i, "compute")
-            store_tma_args = tma_registry.get_op_tma_args(i, "store")
-            load_tma_mapping = tma_registry.op_mappings.get((i, "load"), {})
-            compute_tma_mapping = tma_registry.op_mappings.get((i, "compute"), {})
-            store_tma_mapping = tma_registry.op_mappings.get((i, "store"), {})
-
-            # Peer TMA mappings for communicate phase
-            comm_tma_args = peer_tma_registry.get_op_peer_tma_args(i, "communicate")
-            comm_tma_mapping = peer_tma_registry.op_mappings.get((i, "communicate"), {})
-
-            op_tma_args["load"].append(load_tma_args)
-            op_tma_args["compute"].append(compute_tma_args)
-            op_tma_args["store"].append(store_tma_args)
-            op_tma_args["communicate"].append(comm_tma_args)
+            for phase in ("load", "compute", "store"):
+                op_tma_args[phase].append(tma_registry.get_op_tma_args(i, phase))
+            op_tma_args["communicate"].append(
+                peer_tma_registry.get_op_peer_tma_args(i, "communicate"))
 
             kernel_config = {"threads_per_row": num_compute_threads}
 
@@ -527,45 +534,28 @@ class Megakernel:
             inner_iters_list.append(getattr(instance, "inner_iters", 1))
             per_op_warps.append(getattr(instance, "num_mma_warps", num_mma_warps))
 
-            load_fns.append(
-                compile_phase(
-                    instance,
-                    "load",
-                    tensor_param_names=tensor_args,
-                    tma_param_names=load_tma_args,
-                    tma_local_mapping=load_tma_mapping,
+            # Compile all four phases
+            phase_fn_lists = {
+                "load": load_fns, "compute": compute_fns,
+                "store": store_fns, "communicate": communicate_fns,
+            }
+            for phase_name, fn_list in phase_fn_lists.items():
+                if phase_name in ("load", "compute", "store"):
+                    tma_args = tma_registry.get_op_tma_args(i, phase_name)
+                    tma_mapping = tma_registry.op_mappings.get((i, phase_name), {})
+                else:
+                    tma_args = op_tma_args["communicate"][-1]
+                    tma_mapping = peer_tma_registry.op_mappings.get((i, "communicate"), {})
+                fn_list.append(
+                    compile_phase(
+                        instance,
+                        phase_name,
+                        tensor_param_names=tensor_args,
+                        tma_param_names=tma_args,
+                        tma_local_mapping=tma_mapping,
+                        noinline=(self.config.noinline if phase_name == "compute" else False),
+                    )
                 )
-            )
-            compute_fns.append(
-                compile_phase(
-                    instance,
-                    "compute",
-                    tensor_param_names=tensor_args,
-                    tma_param_names=compute_tma_args,
-                    tma_local_mapping=compute_tma_mapping,
-                    noinline=self.config.noinline,
-                )
-            )
-            store_fns.append(
-                compile_phase(
-                    instance,
-                    "store",
-                    tensor_param_names=tensor_args,
-                    tma_param_names=store_tma_args,
-                    tma_local_mapping=store_tma_mapping,
-                )
-            )
-
-            # Communicate: sends results to peer GPUs
-            communicate_fns.append(
-                compile_phase(
-                    instance,
-                    "communicate",
-                    tensor_param_names=tensor_args,
-                    tma_param_names=comm_tma_args,
-                    tma_local_mapping=comm_tma_mapping,
-                )
-            )
 
         # Generate dispatch functions via exec() — each accepts ALL canonical
         # tensor and TMA names and routes the correct subset to each phase fn.
@@ -613,9 +603,6 @@ class Megakernel:
                 if op_idx == Int32(0):
                     _fn_0(page_ptr, tile_0, ..., tile_4, op_config_ptr, work_mbar, t0, t1, tma0_atom, tma0_gmem)
         """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
         is_load = phase_name == "load"
         tensor_params = ", ".join(all_canonical)
 
@@ -657,7 +644,7 @@ class Megakernel:
         tma_sig = f", {tma_params}" if tma_params else ""
         extra_sig = ""
         if is_load:
-            extra_sig = f", work_mbar, inner_iter_idx"
+            extra_sig = ", work_mbar, inner_iter_idx"
         fn_source = (
             "@cute.jit\n"
             f"def {fn_name}(op_idx, page_ptr, {tile_params}, "
@@ -669,20 +656,7 @@ class Megakernel:
         for i, fn in enumerate(phase_fns):
             exec_globals[f"_fn_{i}"] = fn
 
-        # Use compile module's counter for unique filenames
-        compile_mod._compile_counter += 1
-        unique_filename = f"<{fn_name}>_{compile_mod._compile_counter}"
-
-        linecache.cache[unique_filename] = (
-            len(fn_source),
-            None,
-            fn_source.splitlines(True),
-            unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
+        exec_generated_source(fn_source, fn_name, exec_globals)
         return exec_globals[fn_name]
 
     def _build_kernel(
@@ -710,8 +684,6 @@ class Megakernel:
         """
         import re
         import textwrap
-        import linecache
-        import machete.megakernel.compile as compile_mod
         from .compile import _extract_body
 
         all_canonical = self._tensor_registry.canonical_names
@@ -789,18 +761,7 @@ class Megakernel:
         if extra_exec_globals:
             exec_globals.update(extra_exec_globals)
 
-        compile_mod._compile_counter += 1
-        kl_filename = f"<kernel_loop>_{compile_mod._compile_counter}"
-        linecache.cache[kl_filename] = (
-            len(fn_source),
-            None,
-            fn_source.splitlines(True),
-            kl_filename,
-        )
-        compile_mod._linecache_entries.append(kl_filename)
-
-        code = compile(fn_source, kl_filename, "exec")
-        exec(code, exec_globals)
+        exec_generated_source(fn_source, "kernel_loop", exec_globals)
         kernel_loop = exec_globals["_kernel_loop"]
 
         # --- Build PersistentKernel ---
@@ -822,38 +783,42 @@ class Megakernel:
         # Generate TMA descriptor creation code for __call__
         tma_creation_lines = []
         tma_kernel_args = []  # TMA args to pass from __call__ to kernel
+
+        def _gen_tma_desc_code(desc, tma_src):
+            """Generate make_tiled_tma_atom codegen for one TMA descriptor."""
+            direction = getattr(desc, 'direction', 's2g')
+            if direction == "g2s":
+                copy_op = "CopyBulkTensorTileG2SOp()"
+            elif direction == "s2g":
+                copy_op = "CopyBulkTensorTileS2GOp()"
+            elif direction == "s2g_reduce":
+                copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
+            else:
+                raise ValueError(f"Unknown TMA direction: {direction}")
+            shape_str = ", ".join(str(s) for s in desc.tile_shape)
+            smem_layout_code = (
+                desc.smem_layout_src if desc.smem_layout_src
+                else f"cute.make_layout(({shape_str},))"
+            )
+            tma_creation_lines.append(
+                f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
+                f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
+                f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
+                f"            {copy_op},\n"
+                f"            {tma_src},\n"
+                f"            _smem_layout_{desc.canonical_atom},\n"
+                f"            ({shape_str},),\n"
+                f"            num_multicast=1,\n"
+                f"        )"
+            )
+            tma_kernel_args.append(desc.canonical_atom)
+            tma_kernel_args.append(desc.canonical_gmem)
+
+        # Local TMA descriptors
         if tma_registry.has_tma:
             for desc in tma_registry.descriptors:
                 ndim = len(desc.tile_shape)
-                tma_src = f"tma_{desc.tensor_canonical}_{ndim}d"
-                if desc.direction == "g2s":
-                    copy_op = "CopyBulkTensorTileG2SOp()"
-                elif desc.direction == "s2g":
-                    copy_op = "CopyBulkTensorTileS2GOp()"
-                elif desc.direction == "s2g_reduce":
-                    copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
-                else:
-                    raise ValueError(f"Unknown TMA direction: {desc.direction}")
-                shape_str = ", ".join(str(s) for s in desc.tile_shape)
-                # Use swizzled smem layout if op provides one (e.g., GEMM),
-                # otherwise plain layout.
-                if desc.smem_layout_src:
-                    smem_layout_code = desc.smem_layout_src
-                else:
-                    smem_layout_code = f"cute.make_layout(({shape_str},))"
-                tma_creation_lines.append(
-                    f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
-                    f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
-                    f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
-                    f"            {copy_op},\n"
-                    f"            {tma_src},\n"
-                    f"            _smem_layout_{desc.canonical_atom},\n"
-                    f"            ({shape_str},),\n"
-                    f"            num_multicast=1,\n"
-                    f"        )"
-                )
-                tma_kernel_args.append(desc.canonical_atom)
-                tma_kernel_args.append(desc.canonical_gmem)
+                _gen_tma_desc_code(desc, f"tma_{desc.tensor_canonical}_{ndim}d")
 
         # Peer TMA tensors: passed to __call__ as ptma_t0_p0, ptma_t0_p1, ...
         peer_tma_tensor_names = []
@@ -867,32 +832,10 @@ class Megakernel:
         if peer_tma_tensor_names:
             peer_tma_tensor_input_sig = ", " + ", ".join(peer_tma_tensor_names)
 
-        # Generate peer TMA descriptor creation code for __call__
+        # Peer TMA descriptors
         if peer_tma_registry.has_peer_tma:
             for desc in peer_tma_registry.descriptors:
-                ptma_src = f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}"
-                if getattr(desc, 'direction', 's2g') == "s2g_reduce":
-                    copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
-                else:
-                    copy_op = "CopyBulkTensorTileS2GOp()"
-                shape_str = ", ".join(str(s) for s in desc.tile_shape)
-                if desc.smem_layout_src:
-                    smem_layout_code = desc.smem_layout_src
-                else:
-                    smem_layout_code = f"cute.make_layout(({shape_str},))"
-                tma_creation_lines.append(
-                    f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
-                    f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
-                    f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
-                    f"            {copy_op},\n"
-                    f"            {ptma_src},\n"
-                    f"            _smem_layout_{desc.canonical_atom},\n"
-                    f"            ({shape_str},),\n"
-                    f"            num_multicast=1,\n"
-                    f"        )"
-                )
-                tma_kernel_args.append(desc.canonical_atom)
-                tma_kernel_args.append(desc.canonical_gmem)
+                _gen_tma_desc_code(desc, f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}")
 
         tma_creation_code = "\n".join(tma_creation_lines)
         if tma_creation_code:
@@ -979,18 +922,7 @@ class Megakernel:
             pk_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
             pk_globals["ReductionOp"] = ReductionOp
 
-        compile_mod._compile_counter += 1
-        pk_filename = f"<persistent_kernel>_{compile_mod._compile_counter}"
-        linecache.cache[pk_filename] = (
-            len(pk_source),
-            None,
-            pk_source.splitlines(True),
-            pk_filename,
-        )
-        compile_mod._linecache_entries.append(pk_filename)
-
-        code = compile(pk_source, pk_filename, "exec")
-        exec(code, pk_globals)
+        exec_generated_source(pk_source, "persistent_kernel", pk_globals)
         return pk_globals["PersistentKernel"]()
 
     def _build_signal_barriers(self):
@@ -1000,9 +932,6 @@ class Megakernel:
         given tile after it completes. Uses if/elif chain so only the
         matching op's barriers are evaluated.
         """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
         barrier_formulas = self._builder.get_op_barrier_formulas()
         tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
 
@@ -1049,18 +978,7 @@ class Megakernel:
             "global_barrier_signal": global_barrier_signal_gpu,
         }
 
-        compile_mod._compile_counter += 1
-        unique_filename = f"<{fn_name}>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source),
-            None,
-            fn_source.splitlines(True),
-            unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
+        exec_generated_source(fn_source, fn_name, exec_globals)
         return exec_globals[fn_name]
 
     def _build_signal_peer_barriers(self):
@@ -1072,9 +990,6 @@ class Megakernel:
 
         Barrier index = per-op offset + linear_tile_idx within op.
         """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
         lines = []
         barrier_offset = 0
         first = True
@@ -1105,18 +1020,7 @@ class Megakernel:
             "global_barrier_signal": global_barrier_signal,
         }
 
-        compile_mod._compile_counter += 1
-        unique_filename = f"<signal_peer_barriers>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source),
-            None,
-            fn_source.splitlines(True),
-            unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
+        exec_generated_source(fn_source, "signal_peer_barriers", exec_globals)
         return exec_globals["signal_peer_barriers"]
 
     @property
@@ -1204,7 +1108,6 @@ class Megakernel:
 
         # Per-op warp transition: enable if any op uses fewer warps than total
         needs_warp_transition = any(w < num_mma_warps for w in per_op_warps)
-        MIN_IDLE_REGS = 24  # PTX minimum for setmaxnreg
 
         # Build barrier functions
         signal_barriers = self._build_signal_barriers()
@@ -1231,18 +1134,20 @@ class Megakernel:
         def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
             return smem_base + Int32(pages_start) + page_idx * Int32(aligned_page_size)
 
+        # Mbarrier stride (each mbarrier object is 8 bytes, PTX requirement)
+        mbarrier_stride = NPageLayout._MBARRIER_SIZE  # 8
+
         # Helper to get work_notify mbarrier smem address (per slot)
         @cute.jit
         def _work_notify_mbar(smem_base: Int32, slot: Int32) -> Int32:
-            return smem_base + Int32(work_notify_mbar_offset_0) + slot * Int32(8)
+            return smem_base + Int32(work_notify_mbar_offset_0) + slot * Int32(mbarrier_stride)
 
         # Helper to get compute_done mbarrier smem address (per slot)
         @cute.jit
         def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
-            return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(8)
+            return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(mbarrier_stride)
 
-        # Tile info size in bytes: INSTRUCTION_WORDS int32s per slot
-        tile_info_bytes = INSTRUCTION_WORDS * 4  # 2 * 4 = 8 bytes
+        tile_info_bytes = NPageLayout._TILE_INFO_SIZE  # 2 int32s = 8 bytes
 
         # Build decompose_tile JIT function for runtime tile coord recovery
         decompose_tile = self._builder.build_decompose_tile_fn()
@@ -1258,20 +1163,8 @@ class Megakernel:
         _iters_src = (
             f"@cute.jit\ndef _get_inner_iters(op_idx) -> Int32:\n    _r = Int32(1)\n{_iters_body}\n    return _r\n"
         )
-        import linecache
-        import machete.megakernel.compile as _compile_mod
-
         _iters_globals = {"cute": cute, "Int32": Int32}
-        _compile_mod._compile_counter += 1
-        _iters_filename = f"<_get_inner_iters>_{_compile_mod._compile_counter}"
-        linecache.cache[_iters_filename] = (
-            len(_iters_src),
-            None,
-            _iters_src.splitlines(True),
-            _iters_filename,
-        )
-        _compile_mod._linecache_entries.append(_iters_filename)
-        exec(compile(_iters_src, _iters_filename, "exec"), _iters_globals)
+        exec_generated_source(_iters_src, "_get_inner_iters", _iters_globals)
         _get_inner_iters = _iters_globals["_get_inner_iters"]
 
         # Ring buffer kernel loop
@@ -1289,10 +1182,12 @@ class Megakernel:
         ) -> None:
             """Warp-specialized ring buffer loop.
 
-            Controller warp (warp N-2): fetches instructions, pre-computed barrier wait.
-            Loader warp (warp N-1): TMA dispatch.
-            Store warp (warp N): waits for compute_done, dispatches TMA stores.
-            MMA warps (0..N-3): compute from ring buffer slots (page == slot).
+            Warp roles (NUM_DMA_WARPS=3, W = num_mma_warps):
+              Warps 0..W-1:  MMA warps — compute from ring buffer pages
+              Warp W:        Controller — fetches instructions, pre-computed barrier wait
+              Warp W+1:      Loader — dispatches TMA loads
+              Warp W+2:      Store — waits for compute_done, dispatches TMA stores
+
             Mbarrier phases alternate 0/1 with each use (hardware auto-reset).
             """
             warp_id = tidx // Int32(32)
