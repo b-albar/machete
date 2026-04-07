@@ -356,6 +356,7 @@ class BackwardScheduler(TileScheduler):
         consumer_deps: Dict[int, List["_DepEdge"]],
         edges: List["_DepEdge"],
     ) -> List[TileInstruction]:
+        """Schedule tile instructions from the dependency graph."""
         if not op_records:
             return []
         depth = _compute_op_depths(len(op_records), edges)
@@ -401,6 +402,7 @@ class GroupedScheduler(TileScheduler):
         consumer_deps: Dict[int, List["_DepEdge"]],
         edges: List["_DepEdge"],
     ) -> List[TileInstruction]:
+        """Interleave tile groups that share common dependency dimensions."""
         if not op_records:
             return []
 
@@ -484,6 +486,7 @@ class InstructionStreamBuilder:
     """
 
     def __init__(self):
+        """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
         self._barrier_count: Optional[int] = None
@@ -768,6 +771,143 @@ class InstructionStreamBuilder:
 
         return formulas, barrier_counter
 
+    def _canonical_dim_map(self, op: ScheduledOp) -> Dict[str, str]:
+        """Map canonical dimension names back to the op's original dim names."""
+        canon_to_orig = {}
+        for dim_name in op.dim_names:
+            canonical_name = op.dim_aliases.get(dim_name, dim_name)
+            canon_to_orig[canonical_name] = dim_name
+        return canon_to_orig
+
+    def _shared_dim_pairs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+    ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
+        """Resolve shared and producer-only dimensions between two ops."""
+        producer_dims = self._canonical_dim_map(producer)
+        consumer_dims = self._canonical_dim_map(consumer)
+        shared_canonical = set(producer_dims) & set(consumer_dims)
+        producer_only = set(producer_dims) - shared_canonical
+        shared_pairs = [
+            (canonical_name, producer_dims[canonical_name], consumer_dims[canonical_name])
+            for canonical_name in shared_canonical
+        ]
+        producer_only_dims = [producer_dims[canonical_name] for canonical_name in producer_only]
+        return shared_pairs, producer_only_dims
+
+    def _compatible_shared_dim_pairs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+    ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
+        """Filter shared dims down to those representable by BarrierFormula."""
+        incompatible_dims = []
+        compatible_pairs = []
+
+        for canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
+            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            producer_tiles = producer.tiles_for_axis(producer_axis)
+            consumer_tiles = consumer.tiles_for_axis(consumer_axis)
+
+            if (
+                producer_tile_size != consumer_tile_size
+                and producer_tile_size % consumer_tile_size != 0
+                and consumer_tile_size % producer_tile_size != 0
+            ):
+                incompatible_dims.append(producer_dim)
+            elif producer_tiles != consumer_tiles and producer_tile_size == consumer_tile_size:
+                incompatible_dims.append(producer_dim)
+            elif producer_tiles != consumer_tiles and producer_tile_size != consumer_tile_size:
+                if producer_tile_size > consumer_tile_size:
+                    ratio = producer_tile_size // consumer_tile_size
+                    consumer_effective_tiles = (consumer_tiles + ratio - 1) // ratio
+                    if consumer_effective_tiles != producer_tiles:
+                        incompatible_dims.append(producer_dim)
+                    else:
+                        compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+                else:
+                    ratio = consumer_tile_size // producer_tile_size
+                    producer_effective_tiles = (producer_tiles + ratio - 1) // ratio
+                    if producer_effective_tiles != consumer_tiles:
+                        incompatible_dims.append(producer_dim)
+                    else:
+                        compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+            else:
+                compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+
+        return compatible_pairs, incompatible_dims
+
+    def _barrier_formula_params(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+        producer_only_dims: List[str],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
+        """Compute divisor vectors plus expected/barrier counts for a dependency edge."""
+        producer_divs = [1] * MAX_TILE_DIMS
+        consumer_divs = [1] * MAX_TILE_DIMS
+        expected = 1
+
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
+            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            if producer_tile_size > consumer_tile_size:
+                consumer_divs[consumer_axis] = producer_tile_size // consumer_tile_size
+            elif consumer_tile_size > producer_tile_size:
+                producer_divs[producer_axis] = consumer_tile_size // producer_tile_size
+                expected *= consumer_tile_size // producer_tile_size
+
+        num_barriers = 1
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            num_barriers *= min(
+                producer.tiles_for_axis(producer_axis),
+                consumer.tiles_for_axis(consumer_axis),
+            )
+
+        if producer_only_dims:
+            collapsed = 1
+            for producer_dim in producer_only_dims:
+                collapsed *= producer.tiles_for_axis(producer.dim_names[producer_dim])
+            expected *= collapsed
+
+        return tuple(producer_divs), tuple(consumer_divs), expected, num_barriers
+
+    def _barrier_formula_coeffs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        """Compute producer/consumer barrier-index coefficients for shared dims."""
+        shared_pairs_sorted = sorted(shared_pairs, key=lambda item: item[0])
+        shared_strides: Dict[str, int] = {}
+        stride = 1
+        for canonical_name, producer_dim, consumer_dim in reversed(shared_pairs_sorted):
+            shared_strides[canonical_name] = stride
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            stride *= min(
+                producer.tiles_for_axis(producer_axis),
+                consumer.tiles_for_axis(consumer_axis),
+            )
+
+        producer_coeffs = [0] * MAX_TILE_DIMS
+        consumer_coeffs = [0] * MAX_TILE_DIMS
+        for canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_coeffs[producer.dim_names[producer_dim]] = shared_strides[canonical_name]
+            consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
+        return tuple(producer_coeffs), tuple(consumer_coeffs)
+
     def _resolve_named_formulas(
         self,
     ) -> Tuple[
@@ -803,155 +943,30 @@ class InstructionStreamBuilder:
                 p_op = producer.op
                 c_op = consumer.op
 
-                # Build canonical → original dim mappings (applying dim_aliases)
-                # E.g., if consumer has dims {"M","H"} with alias {"M":"S"},
-                # then canonical "S" maps to consumer's "M", matching producer's "S".
-                p_canon_to_orig = {}
-                for d in p_op.dim_names:
-                    canon = p_op.dim_aliases.get(d, d)
-                    p_canon_to_orig[canon] = d
-                c_canon_to_orig = {}
-                for d in c_op.dim_names:
-                    canon = c_op.dim_aliases.get(d, d)
-                    c_canon_to_orig[canon] = d
+                shared_pairs, producer_only_dims = self._shared_dim_pairs(p_op, c_op)
+                shared_pairs, incompatible_dims = self._compatible_shared_dim_pairs(
+                    p_op, c_op, shared_pairs
+                )
+                producer_only_dims.extend(incompatible_dims)
 
-                shared_canonical = set(p_canon_to_orig.keys()) & set(c_canon_to_orig.keys())
-                producer_only_canonical = set(p_canon_to_orig.keys()) - shared_canonical
-
-                # Build shared_pairs: [(canonical, p_orig, c_orig), ...]
-                shared_pairs = [
-                    (canon, p_canon_to_orig[canon], c_canon_to_orig[canon])
-                    for canon in shared_canonical
-                ]
-                producer_only_dims = [p_canon_to_orig[c] for c in producer_only_canonical]
-
-                # Validate tile sizes on shared dims are divisible and
-                # the tile-size ratio maps both sides to the same number
-                # of barriers.  Non-divisible tile sizes or mismatched
-                # effective tile counts cannot be expressed by
-                # BarrierFormula integer division.  Move incompatible
-                # dims to producer_only for conservative many-to-one
-                # barriers.
-                incompatible = []
-                compatible_pairs = []
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_ts = p_op.tile_sizes.get(p_dim, 1)
-                    c_ts = c_op.tile_sizes.get(c_dim, 1)
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    p_tiles = p_op.tiles_for_axis(p_axis)
-                    c_tiles = c_op.tiles_for_axis(c_axis)
-                    if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        # Incompatible tile sizes (not evenly divisible)
-                        incompatible.append(p_dim)
-                    elif p_tiles != c_tiles and p_ts == c_ts:
-                        # Same tile size but different extents → different
-                        # semantics. E.g., GEMM_Q N=2048 vs GEMM_O N=1024
-                        # both with tile_N=64. Consumer likely reads
-                        # globally along this dim (reduction), so per-tile
-                        # barriers are unsafe. Fall back to many-to-one.
-                        incompatible.append(p_dim)
-                    elif p_tiles != c_tiles and p_ts != c_ts:
-                        # Different tile sizes AND different tile counts.
-                        # Verify the tile-size ratio maps both sides to
-                        # the same effective barrier count.  If not, the
-                        # dim extents truly differ (e.g., QKNormRope H=2
-                        # vs FA H=8) and per-tile barriers would produce
-                        # out-of-bounds indices.
-                        if p_ts > c_ts:
-                            ratio = p_ts // c_ts
-                            c_eff = (c_tiles + ratio - 1) // ratio
-                            if c_eff != p_tiles:
-                                incompatible.append(p_dim)
-                            else:
-                                compatible_pairs.append((canon, p_dim, c_dim))
-                        else:
-                            ratio = c_ts // p_ts
-                            p_eff = (p_tiles + ratio - 1) // ratio
-                            if p_eff != c_tiles:
-                                incompatible.append(p_dim)
-                            else:
-                                compatible_pairs.append((canon, p_dim, c_dim))
-                    else:
-                        compatible_pairs.append((canon, p_dim, c_dim))
-                shared_pairs = compatible_pairs
-                producer_only_dims.extend(incompatible)
-
-                # When named ops share no dimensions, all tiles map to the
-                # same barrier (all-or-nothing). This is correct but suboptimal.
-
-                # Determine target side and compute barrier count / expected
-                # Also compute divisors for tile size ratio handling
-                p_divs = [1] * MAX_TILE_DIMS  # Producer divisors
-                c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
-                expected = 1
-
-                # Handle tile size ratios on shared dims
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    p_ts = p_op.tile_sizes.get(p_dim, 1)
-                    c_ts = c_op.tile_sizes.get(c_dim, 1)
-                    if p_ts > c_ts:
-                        ratio = p_ts // c_ts
-                        c_divs[c_axis] = ratio
-                    elif c_ts > p_ts:
-                        ratio = c_ts // p_ts
-                        p_divs[p_axis] = ratio
-                        expected *= ratio
-
-                # Barrier count: product of min tile counts on shared dims
-                num_barriers = 1
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    num_barriers *= min(
-                        p_op.tiles_for_axis(p_axis),
-                        c_op.tiles_for_axis(c_axis),
-                    )
-
-                if producer_only_dims:
-                    # Many-to-one (or both-sides-extra): collapse
-                    # producer-only dims — all producer tiles on those dims
-                    # signal the same barrier, so consumer expects them all.
-                    collapsed = 1
-                    for dim in producer_only_dims:
-                        axis = p_op.dim_names[dim]
-                        collapsed *= p_op.tiles_for_axis(axis)
-                    expected *= collapsed
-
-                # Compute coefficients using dense shared strides.
-                # Extra dims (producer-only / consumer-only) get coefficient 0
-                # since they don't appear in shared_pairs. This correctly
-                # handles different axis orderings and tile size differences.
-                shared_pairs_sorted = sorted(shared_pairs, key=lambda t: t[0])
-                shared_strides: Dict[str, int] = {}
-                stride = 1
-                for canon, p_dim, c_dim in reversed(shared_pairs_sorted):
-                    shared_strides[canon] = stride
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    stride *= min(
-                        p_op.tiles_for_axis(p_axis),
-                        c_op.tiles_for_axis(c_axis),
-                    )
-
-                p_coeffs_list = [0] * MAX_TILE_DIMS
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_coeffs_list[p_op.dim_names[p_dim]] = shared_strides[canon]
-                p_coeffs = tuple(p_coeffs_list)
-
-                c_coeffs_list = [0] * MAX_TILE_DIMS
-                for canon, p_dim, c_dim in shared_pairs:
-                    c_coeffs_list[c_op.dim_names[c_dim]] = shared_strides[canon]
-                c_coeffs = tuple(c_coeffs_list)
+                producer_divs, consumer_divs, expected, num_barriers = self._barrier_formula_params(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                    producer_only_dims,
+                )
+                producer_coeffs, consumer_coeffs = self._barrier_formula_coeffs(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                )
 
                 # Producer signal formula
                 formulas[prod_idx][1].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeffs=p_coeffs,
-                        divs=tuple(p_divs),
+                        coeffs=producer_coeffs,
+                        divs=producer_divs,
                     )
                 )
 
@@ -959,8 +974,8 @@ class InstructionStreamBuilder:
                 formulas[rec.op_idx][0].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeffs=c_coeffs,
-                        divs=tuple(c_divs),
+                        coeffs=consumer_coeffs,
+                        divs=consumer_divs,
                         expected=expected,
                     )
                 )

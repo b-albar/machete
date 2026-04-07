@@ -170,6 +170,7 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
     config_size = 2 * num_unique + num_dynamic
 
     def pack_config(**tensors):
+        """Pack tensor pointers and dynamic dimensions into the runtime config tensor."""
         config = torch.zeros(config_size, dtype=torch.int32, device=next(iter(tensors.values())).device)
         # Pack pointers
         for i, (name, dtype, dims) in enumerate(unique_tensors):
@@ -187,6 +188,173 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
         return config
 
     cls.pack_config = staticmethod(pack_config)
+
+
+def _validate_declared_tensor_ranks(cls, unique_tensors, tensors):
+    """Validate runtime tensor ranks against the op declaration."""
+    for name, _dtype, dims in unique_tensors:
+        if name not in tensors:
+            continue
+        tensor = tensors[name]
+        expected_ndim = len(dims)
+        if hasattr(tensor, "ndim") and tensor.ndim != expected_ndim:
+            raise ValueError(
+                f"{cls.__name__}: tensor '{name}' declared as {expected_ndim}D "
+                f"(dims={dims}) but got {tensor.ndim}D tensor with shape {tuple(tensor.shape)}"
+            )
+
+
+def _extract_static_dims(cls, unique_dims, tensors):
+    """Extract compile-time dimension sizes from scheduled tensors."""
+    static_dims = {}
+    for dim_name, tensor_name, axis_idx in unique_dims:
+        value = int(tensors[tensor_name].shape[axis_idx])
+        if dim_name in static_dims and static_dims[dim_name] != value:
+            raise ValueError(
+                f"{cls.__name__}: dim '{dim_name}' conflict: "
+                f"expected {static_dims[dim_name]} but tensor '{tensor_name}' "
+                f"axis {axis_idx} has {value}"
+            )
+        static_dims[dim_name] = value
+    return static_dims
+
+
+def _resolve_schedule_tile_sizes(tile_dim_names, tile_sizes, static_dims):
+    """Resolve per-dimension tile sizes and derived tile counts."""
+    resolved_tile_sizes = {}
+    tile_counts = []
+    for dim_name in tile_dim_names:
+        requested_tile_size = tile_sizes.get(dim_name)
+        dim_extent = static_dims[dim_name]
+        if requested_tile_size is None:
+            resolved_tile_sizes[dim_name] = dim_extent
+            tile_counts.append(1)
+            continue
+
+        clamped_tile_size = min(requested_tile_size, dim_extent)
+        resolved_tile_sizes[dim_name] = clamped_tile_size
+        tile_counts.append((dim_extent + clamped_tile_size - 1) // clamped_tile_size)
+
+    return resolved_tile_sizes, tuple(tile_counts)
+
+
+def _infer_tensor_dtypes(unique_tensors, tensors):
+    """Infer CUTLASS dtypes for tensors declared with dtype=None."""
+    inferred_dtypes = {}
+    for name, declared_dtype, _dims in unique_tensors:
+        if declared_dtype is None:
+            inferred_dtypes[name] = _resolve_dtype(None, tensors[name].dtype)
+    return inferred_dtypes
+
+
+def _capture_tensor_runtime_info(unique_tensors, tensors, tensor_dtypes):
+    """Capture pointers, refs, strides, and TensorMeta for scheduled tensors."""
+    tensor_ptrs = {}
+    tensor_refs = {}
+    tensor_metas = {}
+    tensor_strides = {}
+
+    for name in tensors:
+        tensor = tensors[name]
+        if hasattr(tensor, "data_ptr"):
+            tensor_ptrs[name] = tensor.data_ptr()
+            tensor_refs[name] = tensor
+
+    for name, declared_dtype, dims in unique_tensors:
+        if name not in tensors:
+            continue
+        tensor = tensors[name]
+        resolved_dtype = tensor_dtypes.get(name, declared_dtype)
+        tensor_metas[name] = TensorMeta(
+            name=name,
+            declared_dims=tuple(dims),
+            ndim=len(dims),
+            shape=tuple(tensor.shape),
+            strides=tuple(tensor.stride()),
+            dtype=resolved_dtype,
+            is_contiguous=tensor.is_contiguous(),
+            data_ptr=tensor.data_ptr(),
+        )
+        tensor_strides[name] = tuple(tensor.stride())
+
+    return tensor_ptrs, tensor_refs, tensor_metas, tensor_strides
+
+
+def _classify_declared_dims(cls, unique_dims, tile_dim_names):
+    """Split declared dimensions into static and dynamic sets.
+
+    Tile dimensions are compile-time constants. Non-tile dimensions are
+    dynamic by default, and ops can force additional dimensions dynamic via
+    ``dynamic_dims`` overrides on the class.
+    """
+    dynamic_dim_overrides = set(getattr(cls, "dynamic_dims", ()))
+    non_tile_dims = {dim_name for dim_name, _, _ in unique_dims if dim_name not in tile_dim_names}
+    dynamic_dim_names = non_tile_dims | dynamic_dim_overrides
+    static_dim_names = [dim_name for dim_name, _, _ in unique_dims if dim_name not in dynamic_dim_names]
+    return dynamic_dim_overrides, dynamic_dim_names, static_dim_names
+
+
+def _validate_tile_dims_exist(tile_dim_names, unique_dims):
+    """Ensure every tiled dimension appears in at least one tensor declaration."""
+    dim_lookup = {dim_name for dim_name, _, _ in unique_dims}
+    for dim_name in tile_dim_names:
+        if dim_name not in dim_lookup:
+            raise ValueError(f"Tile dim '{dim_name}' not found in any tensor shape declaration")
+
+
+def _validate_tensor_set(tensor_set, valid_names, decl_name, io_kind):
+    """Validate that a TMA or peer-store declaration references known tensors."""
+    for name in tensor_set:
+        if name not in valid_names:
+            raise ValueError(f"{decl_name} tensor '{name}' not found in {io_kind}")
+
+
+def _resolve_transfer_tensor_sets(cls, reads, writes):
+    """Collect and validate TMA and peer-store tensor declarations."""
+    read_names = set(reads.keys())
+    write_names = set(writes.keys())
+
+    transfer_sets = {
+        "_TMA_LOADS": set(getattr(cls, "tma_loads", set())),
+        "_TMA_STORES": set(getattr(cls, "tma_stores", set())),
+        "_TMA_REDUCE_STORES": set(getattr(cls, "tma_reduce_stores", set())),
+        "_PEER_STORES": set(getattr(cls, "peer_stores", set())),
+        "_PEER_REDUCE_STORES": set(getattr(cls, "peer_reduce_stores", set())),
+    }
+
+    _validate_tensor_set(transfer_sets["_TMA_LOADS"], read_names, "tma_loads", "reads")
+    _validate_tensor_set(transfer_sets["_TMA_STORES"], write_names, "tma_stores", "writes")
+    _validate_tensor_set(
+        transfer_sets["_TMA_REDUCE_STORES"],
+        write_names,
+        "tma_reduce_stores",
+        "writes",
+    )
+    _validate_tensor_set(transfer_sets["_PEER_STORES"], write_names, "peer_stores", "writes")
+    _validate_tensor_set(
+        transfer_sets["_PEER_REDUCE_STORES"],
+        write_names,
+        "peer_reduce_stores",
+        "writes",
+    )
+    return transfer_sets
+
+
+def _collect_tma_tensor_dims(unique_tensors, transfer_sets):
+    """Map each TMA-capable tensor name to its declared dimension list."""
+    tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
+    tma_tensor_names = (
+        transfer_sets["_TMA_LOADS"]
+        | transfer_sets["_TMA_STORES"]
+        | transfer_sets["_TMA_REDUCE_STORES"]
+        | transfer_sets["_PEER_STORES"]
+        | transfer_sets["_PEER_REDUCE_STORES"]
+    )
+    return {
+        name: tensor_dims_map[name]
+        for name in tma_tensor_names
+        if name in tensor_dims_map
+    }
 
 
 def _process_op_declarations(cls):
@@ -220,15 +388,12 @@ def _process_op_declarations(cls):
     # Build tensor and dim lists
     unique_tensors, unique_dims = _build_tensor_and_dim_lists(reads, writes)
 
-    # --- Classify dims as static or dynamic ---
-    # Tile dims are static (their sizes are compile-time constants).
-    # Non-tile dims are dynamic by default (packed into config tensor).
-    # Ops can override with dynamic_dims = ("S",) to force specific dims dynamic.
     tile_dim_names = set(tile)
-    dynamic_dim_overrides = set(getattr(cls, "dynamic_dims", ()))
-    non_tile_dims = {d for d, _, _ in unique_dims if d not in tile_dim_names}
-    dynamic_dim_names = non_tile_dims | dynamic_dim_overrides
-    static_dim_names = [d for d, _, _ in unique_dims if d not in dynamic_dim_names]
+    dynamic_dim_overrides, dynamic_dim_names, static_dim_names = _classify_declared_dims(
+        cls,
+        unique_dims,
+        tile_dim_names,
+    )
 
     # Store metadata for deferred init generation at compile time
     cls._UNIQUE_TENSORS = unique_tensors
@@ -245,49 +410,14 @@ def _process_op_declarations(cls):
     # DIM_NAMES: map tile dim names to axis indices (0..4)
     cls.DIM_NAMES = {tile[i]: i for i in range(len(tile))}
 
-    # Validate tile dims exist in tensor declarations
-    dim_lookup = {d: (tname, idx) for d, tname, idx in unique_dims}
-    for t in tile:
-        if t not in dim_lookup:
-            raise ValueError(f"Tile dim '{t}' not found in any tensor shape declaration")
+    _validate_tile_dims_exist(tile, unique_dims)
 
-    # --- Process TMA and peer store declarations ---
-    all_read_names = set(reads.keys())
-    all_write_names = set(writes.keys())
+    transfer_sets = _resolve_transfer_tensor_sets(cls, reads, writes)
+    for attr_name, value in transfer_sets.items():
+        setattr(cls, attr_name, value)
 
-    def _validate_tensor_set(tensor_set, valid_names, decl_name):
-        for name in tensor_set:
-            if name not in valid_names:
-                kind = "reads" if valid_names is all_read_names else "writes"
-                raise ValueError(f"{decl_name} tensor '{name}' not found in {kind}")
-
-    tma_loads = set(getattr(cls, "tma_loads", set()))
-    tma_stores = set(getattr(cls, "tma_stores", set()))
-    tma_reduce_stores = set(getattr(cls, "tma_reduce_stores", set()))
-    peer_stores = set(getattr(cls, "peer_stores", set()))
-    peer_reduce_stores = set(getattr(cls, "peer_reduce_stores", set()))
-
-    _validate_tensor_set(tma_loads, all_read_names, "tma_loads")
-    _validate_tensor_set(tma_stores, all_write_names, "tma_stores")
-    _validate_tensor_set(tma_reduce_stores, all_write_names, "tma_reduce_stores")
-    _validate_tensor_set(peer_stores, all_write_names, "peer_stores")
-    _validate_tensor_set(peer_reduce_stores, all_write_names, "peer_reduce_stores")
-
-    cls._TMA_LOADS = tma_loads
-    cls._TMA_STORES = tma_stores
-    cls._TMA_REDUCE_STORES = tma_reduce_stores
-    cls._PEER_STORES = peer_stores
-    cls._PEER_REDUCE_STORES = peer_reduce_stores
-
-    # Build TMA tile shape info per tensor.
-    # For each dim of a TMA tensor: use tile_size if tiled, else full extent.
-    # The actual values are filled at schedule() time when static_dims are known.
-    tma_tensor_dims = {}  # {tensor_name: list of dim_names}
-    tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    for name in tma_loads | tma_stores | tma_reduce_stores | peer_stores | peer_reduce_stores:
-        if name in tensor_dims_map:
-            tma_tensor_dims[name] = tensor_dims_map[name]
-    cls._TMA_TENSOR_DIMS = tma_tensor_dims
+    # Record the tensor dimensions that may need TMA tile-shape derivation later.
+    cls._TMA_TENSOR_DIMS = _collect_tma_tensor_dims(unique_tensors, transfer_sets)
 
     # Generate pack_config (only packs dynamic dims)
     _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_dim_names=dynamic_dim_names)
@@ -310,87 +440,26 @@ def _process_op_declarations(cls):
         unique_tensors = cls._UNIQUE_TENSORS
         pack_fn = cls.pack_config
 
-        # --- Validate tensor ndim matches declaration ---
-        for name, dtype, dims in unique_tensors:
-            if name not in tensors:
-                continue
-            t = tensors[name]
-            expected_ndim = len(dims)
-            if hasattr(t, "ndim") and t.ndim != expected_ndim:
-                raise ValueError(
-                    f"{cls.__name__}: tensor '{name}' declared as {expected_ndim}D "
-                    f"(dims={dims}) but got {t.ndim}D tensor with shape {tuple(t.shape)}"
-                )
+        _validate_declared_tensor_ranks(cls, unique_tensors, tensors)
 
         # Extract ALL dim values from actual tensor shapes (compile-time constants).
         # The cache key includes static_dims, so different values trigger recompilation.
-        static_dims = {}
-        for dim_name, tensor_name, axis_idx in unique_dims:
-            val = int(tensors[tensor_name].shape[axis_idx])
-            # Validate dim consistency: if we already saw this dim, values must agree
-            if dim_name in static_dims and static_dims[dim_name] != val:
-                raise ValueError(
-                    f"{cls.__name__}: dim '{dim_name}' conflict: "
-                    f"expected {static_dims[dim_name]} but tensor '{tensor_name}' "
-                    f"axis {axis_idx} has {val}"
-                )
-            static_dims[dim_name] = val
+        static_dims = _extract_static_dims(cls, unique_dims, tensors)
 
         # Compute tile_counts from tile_sizes and static_dims
-        resolved_tile_sizes = {}
-        tile_counts = []
-        for dim_name in cls._TILE_DIM_NAMES_ORDERED:
-            ts = tile_sizes.get(dim_name)
-            dim_size = static_dims[dim_name]
-            if ts is None:
-                # Full extent: 1 tile covering entire dimension
-                tile_counts.append(1)
-                resolved_tile_sizes[dim_name] = dim_size
-            else:
-                # Clamp tile size to dimension extent — TMA descriptors
-                # require box size <= tensor extent in each mode.
-                clamped_ts = min(ts, dim_size)
-                tile_counts.append((dim_size + clamped_ts - 1) // clamped_ts)
-                resolved_tile_sizes[dim_name] = clamped_ts
-        tile_counts = tuple(tile_counts)
+        resolved_tile_sizes, tile_counts = _resolve_schedule_tile_sizes(
+            cls._TILE_DIM_NAMES_ORDERED,
+            tile_sizes,
+            static_dims,
+        )
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
-        tensor_dtypes = {}
-        for name, dtype, dims in unique_tensors:
-            if dtype is None:
-                # Infer dtype from the actual tensor
-                tensor_dtypes[name] = _resolve_dtype(None, tensors[name].dtype)
-            # Note: if dtype is specified, we don't store it (use the declared one)
-
-        # Capture tensor data pointers for automatic dependency detection
-        # This allows the framework to detect when the same tensor is used
-        # as output of one op and input of another, regardless of buffer names
-        tensor_ptrs = {}
-        tensor_refs = {}
-        for name in tensors:
-            if hasattr(tensors[name], "data_ptr"):
-                tensor_ptrs[name] = tensors[name].data_ptr()
-                tensor_refs[name] = tensors[name]
-
-        # Build tensor metadata and strides
-        tensor_metas = {}
-        tensor_strides = {}
-        for name, dtype, dims in unique_tensors:
-            if name not in tensors:
-                continue
-            t = tensors[name]
-            resolved_dtype = tensor_dtypes.get(name, dtype)
-            tensor_metas[name] = TensorMeta(
-                name=name,
-                declared_dims=tuple(dims),
-                ndim=len(dims),
-                shape=tuple(t.shape),
-                strides=tuple(t.stride()),
-                dtype=resolved_dtype,
-                is_contiguous=t.is_contiguous(),
-                data_ptr=t.data_ptr(),
-            )
-            tensor_strides[name] = tuple(t.stride())
+        tensor_dtypes = _infer_tensor_dtypes(unique_tensors, tensors)
+        tensor_ptrs, tensor_refs, tensor_metas, tensor_strides = _capture_tensor_runtime_info(
+            unique_tensors,
+            tensors,
+            tensor_dtypes,
+        )
 
         config_data = pack_fn(**tensors)
         return ScheduledOp(
@@ -525,6 +594,7 @@ class Op:
             setattr(self, key, value)
 
     def __init_subclass__(cls, **kwargs):
+        """Process op declarations when subclasses define reads and writes."""
         super().__init_subclass__(**kwargs)
         if hasattr(cls, "reads") and hasattr(cls, "writes"):
             _process_op_declarations(cls)
@@ -685,6 +755,7 @@ class ScheduledOp:
     dim_aliases: Dict[str, str] = field(default_factory=dict)  # Maps dim name → canonical for barrier matching
 
     def __post_init__(self):
+        """Populate default dim-name metadata from the op class."""
         if self.dim_names is None:
             self.dim_names = getattr(self.op_cls, "DIM_NAMES", {})
 

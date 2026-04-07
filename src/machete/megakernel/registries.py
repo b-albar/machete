@@ -306,6 +306,47 @@ def _compute_tma_tile_shape(
     return tuple(reversed(tile_shape))
 
 
+def _resolve_tma_dtype(op: ScheduledOp, tensor_name: str) -> Any:
+    """Resolve the CUTLASS dtype for a TMA-managed tensor."""
+    meta = op.tensor_metas.get(tensor_name)
+    return meta.dtype if meta else None
+
+
+def _resolve_tma_smem_layout_src(
+    op_cls,
+    tensor_name: str,
+    tma_tile_shape: Tuple[int, ...],
+    op: ScheduledOp,
+) -> Optional[str]:
+    """Resolve an optional custom smem layout source for a TMA descriptor."""
+    if not hasattr(op_cls, "get_tma_smem_layout_src"):
+        return None
+    return op_cls.get_tma_smem_layout_src(
+        tensor_name,
+        tma_tile_shape,
+        op.tile_sizes,
+        op.static_dims,
+    )
+
+
+def _set_tma_mapping(mapping: Dict[str, str], tensor_name: str, canonical_atom: str, canonical_gmem: str) -> None:
+    """Store op-local TMA parameter names for a tensor."""
+    mapping[f"{tensor_name}_tma"] = canonical_atom
+    mapping[f"{tensor_name}_tma_gmem"] = canonical_gmem
+
+
+def _set_peer_tma_mapping(
+    mapping: Dict[str, str],
+    tensor_name: str,
+    peer_idx: int,
+    canonical_atom: str,
+    canonical_gmem: str,
+) -> None:
+    """Store op-local peer TMA parameter names for a tensor/peer pair."""
+    mapping[f"{tensor_name}_p{peer_idx}_tma"] = canonical_atom
+    mapping[f"{tensor_name}_p{peer_idx}_tma_gmem"] = canonical_gmem
+
+
 # =============================================================================
 # TMA Registry (Descriptor Management for TMA Parameter Mode)
 # =============================================================================
@@ -391,37 +432,23 @@ class TMARegistry:
                 ("store", getattr(op_cls, "_TMA_REDUCE_STORES", set()), "s2g_reduce"),
             ]:
                 for tensor_name in tma_names:
-                    # Get canonical tensor name from tensor registry
                     tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
                     if tensor_canonical is None:
                         continue
 
-                    # Compute stride-sorted dimension permutation for TMA.
-                    # TMA requires monotonically increasing strides; sorting
-                    # dims by stride (ascending) guarantees this. For contiguous
-                    # row-major tensors, this equals simple reversal.
                     original_ref = op.tensor_refs[tensor_name]
                     dim_perm = tuple(sorted(
                         range(original_ref.ndim),
                         key=lambda i: (original_ref.stride(i), -i)))
-
                     tma_tile_shape = _compute_tma_tile_shape(
                         op_cls, tensor_name, op, dim_perm=dim_perm)
-
-                    # Resolve dtype
-                    meta = op.tensor_metas.get(tensor_name)
-                    dtype = meta.dtype if meta else None
+                    dtype = _resolve_tma_dtype(op, tensor_name)
 
                     canonical_atom = f"tma{counter}_atom"
                     canonical_gmem = f"tma{counter}_gmem"
-
-                    # Check for custom smem layout (e.g., swizzle for GEMM)
-                    smem_layout_src = None
-                    if hasattr(op_cls, "get_tma_smem_layout_src"):
-                        smem_layout_src = op_cls.get_tma_smem_layout_src(
-                            tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
-                        )
-
+                    smem_layout_src = _resolve_tma_smem_layout_src(
+                        op_cls, tensor_name, tma_tile_shape, op
+                    )
                     tensor_shape = tuple(original_ref.shape)
 
                     descriptors.append(
@@ -439,10 +466,12 @@ class TMARegistry:
                             dim_perm=dim_perm,
                         )
                     )
-
-                    # Map op-local names to canonical
-                    op_mappings[(i, phase)][f"{tensor_name}_tma"] = canonical_atom
-                    op_mappings[(i, phase)][f"{tensor_name}_tma_gmem"] = canonical_gmem
+                    _set_tma_mapping(
+                        op_mappings[(i, phase)],
+                        tensor_name,
+                        canonical_atom,
+                        canonical_gmem,
+                    )
                     counter += 1
 
             # Compute phase can use TMA load descriptors + reduce store descriptors
@@ -574,23 +603,15 @@ class PeerTMARegistry:
                 [(n, "s2g") for n in peer_stores]
                 + [(n, "s2g_reduce") for n in peer_reduce_stores]
             ):
-                # Get canonical tensor name
                 tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
                 if tensor_canonical is None:
                     continue
 
                 tma_tile_shape = _compute_tma_tile_shape(op_cls, tensor_name, op)
-
-                # Resolve dtype
-                meta = op.tensor_metas.get(tensor_name)
-                dtype = meta.dtype if meta else None
-
-                # Smem layout (use same swizzle as local store if available)
-                smem_layout_src = None
-                if hasattr(op_cls, "get_tma_smem_layout_src"):
-                    smem_layout_src = op_cls.get_tma_smem_layout_src(
-                        tensor_name, tma_tile_shape, op.tile_sizes, op.static_dims
-                    )
+                dtype = _resolve_tma_dtype(op, tensor_name)
+                smem_layout_src = _resolve_tma_smem_layout_src(
+                    op_cls, tensor_name, tma_tile_shape, op
+                )
 
                 # Create one descriptor per peer
                 for peer_idx in range(num_peers):
@@ -610,14 +631,13 @@ class PeerTMARegistry:
                             direction=direction,
                         )
                     )
-
-                    # Map local names to canonical for communicate phase
-                    op_mappings[(i, "communicate")][
-                        f"{tensor_name}_p{peer_idx}_tma"
-                    ] = canonical_atom
-                    op_mappings[(i, "communicate")][
-                        f"{tensor_name}_p{peer_idx}_tma_gmem"
-                    ] = canonical_gmem
+                    _set_peer_tma_mapping(
+                        op_mappings[(i, "communicate")],
+                        tensor_name,
+                        peer_idx,
+                        canonical_atom,
+                        canonical_gmem,
+                    )
 
                 counter += 1
 
