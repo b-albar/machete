@@ -226,12 +226,16 @@ def megakernel_forward_build(
     W_down,
     page_size=32768,
 ):
-    """Build a single fused megakernel for full layer forward.
+    """Build megakernel(s) for full layer forward.
 
     Uses view+permute so FlashAttention reads/writes directly from/to
     GEMM output buffers with correct strided layout — no inter-kernel copies.
+
+    Returns:
+        (spec_1k, spec_3k, out, residual_out2) — single-kernel spec,
+        3-kernel split spec, and output tensors for correctness verification.
     """
-    from machete.megakernel import Megakernel
+    from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.glu import GLUOp
@@ -267,43 +271,39 @@ def megakernel_forward_build(
     mlp_h = torch.empty(B, S, INTERMEDIATE, dtype=dtype, device=device)
     out = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
 
-    # --- Schedule all ops ---
-    rmsnorm1_ops = RMSNormOp.schedule(
-        x=x,
-        weight=w_attn_norm,
-        y=h,
-        residual_in=residual,
-        residual_out=residual_out,
-        tile_sizes={"S": 16},
-        page_size=page_size,
-    )
-    gemm_q_ops = GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=page_size)
-    gemm_k_ops = GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=page_size)
-    gemm_v_ops = GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=page_size)
-    qknorm_q_ops = QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
-    qknorm_k_ops = QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
-
+    # --- Schedule all ops (using FA's page_size for single-kernel) ---
     from machete.kernels.attention import flash_attention_schedule
+
     fa_ops, fa_config = flash_attention_schedule(
         q=q_fa, k=k_fa, v=v_fa, o=o_fa, lse=lse,
         causal=True, kv_group_size=KV_GROUP_SIZE, page_size=page_size,
     )
+    fa_page_size = fa_config.page_size
 
-    # FA tiles on (B, H, M, D) where M=seqlen, but flat-space ops (GEMM,
-    # QKNormRope) tile on (M, ...) where M=B*S.  Alias FA's "M" so the
-    # framework doesn't incorrectly match it with flat-space "M" for B>1.
+    # Schedule non-FA ops with FA's page_size so they fit in the single kernel
+    rmsnorm1_ops = RMSNormOp.schedule(
+        x=x, weight=w_attn_norm, y=h,
+        residual_in=residual, residual_out=residual_out,
+        tile_sizes={"S": 16}, page_size=fa_page_size,
+    )
+    gemm_q_ops = GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=fa_page_size)
+    gemm_k_ops = GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=fa_page_size)
+    gemm_v_ops = GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=fa_page_size)
+    qknorm_q_ops = QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=fa_page_size)
+    qknorm_k_ops = QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=fa_page_size)
+
     for op in fa_ops:
         op.dim_aliases["M"] = "seq"
 
-    gemm_o_ops = GemmOp.schedule(a=attn_out_3d, b=W_o, c=proj, page_size=page_size)
+    gemm_o_ops = GemmOp.schedule(a=attn_out_3d, b=W_o, c=proj, page_size=fa_page_size)
     rmsnorm2_ops = RMSNormOp.schedule(
         x=proj, weight=w_mlp_norm, y=h2,
         residual_in=residual_out, residual_out=residual_out2,
-        tile_sizes={"S": 16}, page_size=page_size,
+        tile_sizes={"S": 16}, page_size=fa_page_size,
     )
-    gemm_gu_ops = GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
-    glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", tile_sizes={"S": 2}, page_size=page_size)
-    gemm_down_ops = GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size)
+    gemm_gu_ops = GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=fa_page_size)
+    glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", tile_sizes={"S": 2}, page_size=fa_page_size)
+    gemm_down_ops = GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=fa_page_size)
 
     keep_alive = [
         x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
@@ -313,10 +313,26 @@ def megakernel_forward_build(
         residual_out2, h2, gate_up, mlp_h, out,
     ]
 
-    # --- 3-kernel split: pre-attn (small page) + FA (large page) + post-attn ---
     pre_attn_ops = rmsnorm1_ops + gemm_q_ops + gemm_k_ops + gemm_v_ops + qknorm_q_ops + qknorm_k_ops
     post_attn_ops = gemm_o_ops + rmsnorm2_ops + gemm_gu_ops + glu_ops + gemm_down_ops
 
+    # --- Single kernel: all ops in one megakernel (FA page_size, num_pages=1) ---
+    all_ops = pre_attn_ops + fa_ops + post_attn_ops
+    gemm_config = GemmOp.kernel_config(pre_attn_ops + post_attn_ops)
+    single_config = MegakernelConfig(
+        threads_per_block=max(gemm_config.threads_per_block, fa_config.threads_per_block),
+        page_size=fa_page_size,
+        num_pages=1,
+    )
+    single_kernel = Megakernel(all_ops, config=single_config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        single_kernel.run()
+    torch.cuda.synchronize()
+
+    spec_1k = single_kernel.bench_spec(keep_alive=keep_alive)
+
+    # --- 3-kernel split: pre-attn (small page) + FA (large page) + post-attn ---
     pre_kernel = Megakernel(pre_attn_ops, config=GemmOp.kernel_config(pre_attn_ops))
     fa_kernel = Megakernel(fa_ops, config=fa_config)
     post_kernel = Megakernel(post_attn_ops, config=GemmOp.kernel_config(post_attn_ops))
@@ -331,11 +347,11 @@ def megakernel_forward_build(
         post_kernel.run()
     torch.cuda.synchronize()
 
-    spec = _combined_bench_spec(
+    spec_3k = _combined_bench_spec(
         [pre_kernel, fa_kernel, post_kernel],
         keep_alive=keep_alive,
     )
-    return spec, out, residual_out2
+    return spec_1k, spec_3k, out, residual_out2
 
 
 # =============================================================================
@@ -407,7 +423,7 @@ def megakernel_layer_bwd_build(
         → GEMM(O) bwd → FA bwd → [QKNormRope bwd — TODO]
         → GEMM(Q/K/V) bwd → RMSNorm1 bwd
     """
-    from machete.megakernel import Megakernel
+    from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm.rms_norm import RMSNormBwdOp
     from machete.kernels.glu.glu import GLUBwdOp
@@ -539,12 +555,44 @@ def megakernel_layer_bwd_build(
     # These ops would complete the chain but are not benchmarked yet.
 
     # =========================================================================
-    # Split: MLP/GEMM chain (small page, pipelined) + FA bwd (large page)
+    # Build kernels: single-kernel + 2-kernel split (reference)
     # =========================================================================
     mlp_ops = (gemm_down_bwd_ops + glu_bwd_ops + gemm_gu_bwd_ops
                + rmsnorm2_bwd_ops + gemm_o_bwd_ops)
     fa_bwd_config = FlashAttentionSm120BwdOp.kernel_config(fa_bwd_ops)
 
+    keep_alive = [
+        x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
+        cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
+        h, q_3d, k_3d, v_3d, q_fa, k_fa, v_fa, o_fa, lse,
+        attn_out_3d, proj, residual_out, residual_out2, h2, gate_up, mlp_h,
+        d_out, d_mlp_h, d_gate_up, d_h2, d_proj, d_res2,
+        d_attn_out_3d, d_attn_fa, dpsum, dq_fa, dk_fa, dv_fa,
+    ]
+    setup_fn = lambda: (dq_fa.zero_(), dk_fa.zero_(), dv_fa.zero_())
+
+    # --- Single kernel: all backward ops in one megakernel ---
+    all_bwd_ops = mlp_ops + fa_bwd_ops
+    gemm_config = GemmOp.kernel_config(mlp_ops)
+    single_config = MegakernelConfig(
+        threads_per_block=max(gemm_config.threads_per_block, fa_bwd_config.threads_per_block),
+        page_size=fa_bwd_config.page_size,
+        num_pages=1,
+    )
+    single_kernel = Megakernel(all_bwd_ops, config=single_config)
+
+    dq_fa.zero_()
+    dk_fa.zero_()
+    dv_fa.zero_()
+    with contextlib.redirect_stdout(io.StringIO()):
+        single_kernel.run()
+    torch.cuda.synchronize()
+
+    spec_1k = single_kernel.bench_spec(
+        setup_fn=setup_fn, keep_alive=keep_alive,
+    )
+
+    # --- 2-kernel split: MLP chain + FA bwd (reference) ---
     mlp_kernel = Megakernel(mlp_ops, config=GemmOp.kernel_config(mlp_ops))
     fa_kernel = Megakernel(fa_bwd_ops, config=fa_bwd_config)
 
@@ -558,21 +606,12 @@ def megakernel_layer_bwd_build(
         fa_kernel.run()
     torch.cuda.synchronize()
 
-    keep_alive = [
-        x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
-        cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
-        h, q_3d, k_3d, v_3d, q_fa, k_fa, v_fa, o_fa, lse,
-        attn_out_3d, proj, residual_out, residual_out2, h2, gate_up, mlp_h,
-        d_out, d_mlp_h, d_gate_up, d_h2, d_proj, d_res2,
-        d_attn_out_3d, d_attn_fa, dpsum, dq_fa, dk_fa, dv_fa,
-    ]
-
-    spec = _combined_bench_spec(
+    spec_2k = _combined_bench_spec(
         [mlp_kernel, fa_kernel],
-        setup_fn=lambda: (dq_fa.zero_(), dk_fa.zero_(), dv_fa.zero_()),
+        setup_fn=setup_fn,
         keep_alive=keep_alive,
     )
-    return spec, d_out
+    return spec_1k, spec_2k, d_out
 
 
 def _layer_bwd_flops(seq_len, batch, page_size=32768):
@@ -789,15 +828,16 @@ def bench_qwen35_layer_bwd(seq_len, batch, page_size):
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_layer_bwd(*args)
 
-    # --- Megakernel backward ---
+    # --- Megakernel backward: single kernel + 2-kernel split ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         try:
-            spec, _ = megakernel_layer_bwd_build(
+            spec_1k, spec_2k, _ = megakernel_layer_bwd_build(
                 batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
                 w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
                 page_size=page_size,
             )
-            funcs["megakernel"] = spec
+            funcs["megakernel"] = spec_1k
+            funcs["megakernel_2k"] = spec_2k
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -891,13 +931,14 @@ def bench_qwen35_layer_fwd(seq_len, batch, page_size):
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_forward(*args)
 
-    # --- Megakernel (3-kernel split: optimal page_size per op group) ---
+    # --- Megakernel: single kernel + 3-kernel split ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         build_args = (batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
                       w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down)
         try:
-            spec, _, _ = megakernel_forward_build(*build_args, page_size=page_size)
-            funcs["megakernel"] = spec
+            spec_1k, spec_3k, _, _ = megakernel_forward_build(*build_args, page_size=page_size)
+            funcs["megakernel"] = spec_1k
+            funcs["megakernel_3k"] = spec_3k
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1101,7 +1142,7 @@ def verify_correctness(B, S):
     torch.cuda.synchronize()
 
     # Megakernel (outputs populated during build's warmup run)
-    spec, mk_out, mk_res = megakernel_forward_build(B, S, *args)
+    _, _, mk_out, mk_res = megakernel_forward_build(B, S, *args)
 
     out_err = (mk_out.float() - ref_out.float()).abs().max().item()
     res_err = (mk_res.float() - ref_res.float()).abs().max().item()
