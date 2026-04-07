@@ -844,6 +844,22 @@ class GemmOp(Op):
             ts.setdefault("N", auto_N)
             ts.setdefault("K", auto_K)
         tile_K = ts.pop("K", 32)
+
+        # Validate tiles fit in page_size; reduce tile_K if necessary.
+        a_factor = 2 if has_a_scale else 1
+        a = tensors.get('a')
+        elem_bytes = a.element_size() if a is not None else 2
+        tile_S = ts["S"]
+        tile_N = ts["N"]
+        mbar_bytes = 32
+        while tile_K > 16:
+            buf_stride = (a_factor * tile_S + tile_N) * tile_K * elem_bytes
+            ab_total = 2 * buf_stride + mbar_bytes
+            c_total = tile_S * tile_N * elem_bytes
+            if max(ab_total, c_total) <= page_size:
+                break
+            tile_K //= 2
+
         scheduled = cls._schedule_single(tile_sizes=ts, **tensors)
         scheduled.static_dims["tile_K"] = tile_K
         scheduled.static_dims["page_size"] = page_size

@@ -212,6 +212,17 @@ class Megakernel:
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
 
+        # Validate that config page_size is large enough for all ops
+        for op in ops:
+            op_page = op.static_dims.get('page_size')
+            if op_page is not None and op_page > self.config.page_size:
+                raise ValueError(
+                    f"Op {op.op_class.__name__} was scheduled for "
+                    f"page_size={op_page}B but megakernel config has "
+                    f"page_size={self.config.page_size}B. Use "
+                    f"kernel_config(ops) or increase config.page_size."
+                )
+
         # Build instruction stream
         # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
         self._builder = InstructionStreamBuilder()
