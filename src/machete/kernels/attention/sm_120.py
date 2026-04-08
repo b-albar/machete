@@ -653,7 +653,7 @@ class FlashAttentionSm120Op(Op):
                 cute.arch.cp_async_wait_group(0)
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-                # --- Start V[i] cpasync → buf1 ---
+                # --- Start V[i] cpasync → buf1  (group 1) ---
                 gV_block = cute.local_tile(gV_head, (self.n_block, self.D), (kv_idx, Int32(0)))
                 tVgV = thr_copy.partition_S(gV_block)
                 for ci in cutlass.range_constexpr(cute.size(tVsV_cp.shape[2])):
@@ -661,6 +661,8 @@ class FlashAttentionSm120Op(Op):
                 cute.arch.cp_async_commit_group()
 
                 # --- S GEMM with K-only LdMatrix pipeline (Q in registers) ---
+                # K[i] in buf0 is consumed here via LdMatrix into registers.
+                # After this loop, buf0 is free for K[i+1].
                 acc_S.fill(0.0)
                 cute.copy(smem_tiled_copy_K, tKsK[None, None, 0], tKrK_view[None, None, 0])
                 for kb in cutlass.range_constexpr(self.D // 16):
@@ -668,17 +670,26 @@ class FlashAttentionSm120Op(Op):
                     cute.copy(smem_tiled_copy_K, tKsK[None, None, kb_next], tKrK_view[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_S, tCrQ[None, None, kb], tCrK[None, None, kb], acc_S)
 
-                # --- Wait for V[i] in buf1 ---
-                cute.arch.cp_async_wait_group(0)
-                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-
-                # --- Start K[i+1] cpasync → buf0 (if not last) ---
+                # --- Start K[i+1] cpasync → buf0 (overlaps with V wait + softmax + O GEMM) ---
+                # After S GEMM, buf0 (K) is fully consumed. Start loading next K
+                # before waiting for V so K[i+1] load overlaps with the rest of
+                # this iteration. Commit as a separate group so wait_group(1)
+                # drains V while K[i+1] stays in flight.
+                # On the last iteration we still commit an empty group so the
+                # wait_group(1) count is consistent.
                 if kv_idx + Int32(1) < num_kv_blocks_eff:
                     gK_next = cute.local_tile(gK_head, (self.n_block, self.D), (kv_idx + Int32(1), Int32(0)))
                     tKgK_next = thr_copy.partition_S(gK_next)
                     for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
                         cute.copy(gmem_tiled_copy, tKgK_next[None, None, ci], tKsK_cp[None, None, ci])
-                    cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_commit_group()
+
+                # --- Wait for V[i] in buf1 (leave K[i+1] in flight) ---
+                # 2 groups outstanding: V (group 1) + K[i+1] (group 2).
+                # wait_group(1) drains until ≤1 outstanding → V completes, K[i+1] stays.
+                # On last iteration: empty K group + V → wait_group(1) drains V.
+                cute.arch.cp_async_wait_group(1)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 # --- Masking (boundary blocks only) ---
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
@@ -1004,17 +1015,17 @@ class FlashAttentionSm120Op(Op):
                     cute.copy(smem_tiled_copy_K, tKsK[None, None, kb_next], tKrK_view[None, None, kb_next])
                     cute.gemm(tiled_mma, acc_S, tCrQ[None, None, kb], tCrK[None, None, kb], acc_S)
 
-                # --- Wait for V[i] in buf1 ---
-                cute.arch.cp_async_wait_group(0)
-                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
-
-                # --- Start K[i+1] cpasync → buf0 (if not last) ---
+                # --- Start K[i+1] cpasync → buf0 (overlaps with V wait + softmax + O GEMM) ---
                 if kv_idx + Int32(1) < num_kv_blocks_eff:
                     gK_next = cute.local_tile(gK_head, (self.n_block, self.D), (kv_idx + Int32(1), Int32(0)))
                     tKgK_next = thr_copy.partition_S(gK_next)
                     for ci in cutlass.range_constexpr(cute.size(tKsK_cp.shape[2])):
                         cute.copy(gmem_tiled_copy, tKgK_next[None, None, ci], tKsK_cp[None, None, ci])
-                    cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_commit_group()
+
+                # --- Wait for V[i] in buf1 (leave K[i+1] in flight) ---
+                cute.arch.cp_async_wait_group(1)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
                 # --- Masking ---
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
