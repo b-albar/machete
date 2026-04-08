@@ -21,11 +21,13 @@ Usage:
 """
 
 from dataclasses import dataclass
+import re
+import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 import cutlass.cute as cute
-from cutlass import Int32, Int64
+from cutlass import Int32, Int64, const_expr, range_constexpr
 
 from .ops import (
     MAX_TILE_DIMS,
@@ -42,6 +44,7 @@ from .registries import (
 from .scheduling import (
     InstructionStreamBuilder,
     TileInstruction,
+    TileScheduler,
 )
 from .compile import compile_phase, exec_generated_source
 from .interpreter import (
@@ -394,7 +397,7 @@ class Megakernel:
         """Permute tensor dims into a TMA-safe stride order."""
         if tensor.ndim < 2:
             return tensor
-        perm = dim_perm if dim_perm else tuple(reversed(range(tensor.ndim)))
+        perm = dim_perm if dim_perm and len(dim_perm) == tensor.ndim else tuple(reversed(range(tensor.ndim)))
         return tensor.permute(perm)
 
     def _to_static_cute_tensor(self, tensor: torch.Tensor):
@@ -694,66 +697,39 @@ class Megakernel:
         exec_generated_source(fn_source, fn_name, exec_globals)
         return exec_globals[fn_name]
 
-    def _build_kernel(
+    @staticmethod
+    def _signature_suffix(param_names: List[str]) -> str:
+        """Return a comma-prefixed signature fragment for optional params."""
+        return f", {', '.join(param_names)}" if param_names else ""
+
+    def _build_kernel_loop_source(
         self,
         kernel_loop_fn,
-        dispatch_load,
-        dispatch_compute,
-        dispatch_store,
-        signal_barriers,
-        get_page_ptr_fn,
-        num_sms,
-        threads_per_block,
-        smem_size,
-        num_pages,
-        iq_offset,
-        flags_offset,
-        ring_state_offset,
-        extra_exec_globals=None,
-    ):
-        """Build the PersistentKernel via source transformation.
-
-        Extracts the kernel loop body, adds tensor and TMA params to dispatch
-        call sites (if any), and exec-generates the PersistentKernel class
-        with all params threaded through __call__ -> kernel -> _kernel_loop.
-        """
-        import re
-        import textwrap
+        *,
+        tensor_sig: str,
+        tma_sig: str,
+        peer_tma_sig: str,
+        extra_dispatch_params: str,
+    ) -> str:
+        """Render the generated `_kernel_loop` source."""
         from .compile import _extract_body
 
-        all_canonical = self._tensor_registry.canonical_names
-        tensor_params = ", ".join(all_canonical)
-        tensor_sig = f", {tensor_params}" if tensor_params else ""
-
-        # TMA params that flow through kernel -> loop -> dispatch
-        tma_registry = self._tma_registry
-        all_tma_canonical = tma_registry.all_canonical_names
-        tma_params = ", ".join(all_tma_canonical)
-        tma_sig = f", {tma_params}" if tma_params else ""
-
-        # Peer TMA params for multi-GPU communication
-        peer_tma_registry = self._peer_tma_registry
-        all_peer_tma_canonical = peer_tma_registry.all_canonical_names
-        peer_tma_params = ", ".join(all_peer_tma_canonical)
-        peer_tma_sig = f", {peer_tma_params}" if peer_tma_params else ""
-
-        # Combined extra params for dispatch calls (tensor + TMA + peer TMA)
-        extra_dispatch_params = ", ".join(filter(None, [tensor_params, tma_params, peer_tma_params]))
-
-        # Extract kernel loop body and add tensor + TMA args to dispatch calls
         body = _extract_body(kernel_loop_fn)
         if extra_dispatch_params:
             body = re.sub(
                 r"(dispatch_(?:load|compute|store|communicate))\(([^)]*)\)",
-                lambda m: (m.group(1) + "(" + m.group(2).rstrip().rstrip(",") + ", " + extra_dispatch_params + ")"),
+                lambda m: (
+                    m.group(1)
+                    + "("
+                    + m.group(2).rstrip().rstrip(",")
+                    + ", "
+                    + extra_dispatch_params
+                    + ")"
+                ),
                 body,
             )
 
-        # `if const_expr(tracing):` in the kernel body is resolved by CuTe DSL's
-        # AST preprocessor — only the taken branch is compiled (zero overhead).
-
-        # Build kernel loop with tensor + TMA + peer TMA params in signature
-        fn_source = (
+        return (
             "@cute.jit\n"
             "def _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             "                  num_instructions, tidx, block_id, num_blocks,\n"
@@ -762,7 +738,21 @@ class Megakernel:
             + "\n"
         )
 
-        # Exec globals: all references used in the kernel loop body
+    def _build_kernel_exec_globals(
+        self,
+        *,
+        dispatch_load,
+        dispatch_compute,
+        dispatch_store,
+        signal_barriers,
+        get_page_ptr_fn,
+        num_pages: int,
+        iq_offset: int,
+        flags_offset: int,
+        ring_state_offset: int,
+        extra_exec_globals=None,
+    ) -> Dict[str, Any]:
+        """Build exec globals for the generated `_kernel_loop`."""
         exec_globals = {
             "cute": cute,
             "Int32": Int32,
@@ -795,96 +785,112 @@ class Megakernel:
         }
         if extra_exec_globals:
             exec_globals.update(extra_exec_globals)
+        return exec_globals
 
-        exec_generated_source(fn_source, "kernel_loop", exec_globals)
-        kernel_loop = exec_globals["_kernel_loop"]
-
-        # --- Build PersistentKernel ---
-        # TMA tensors need separate static-layout params for descriptor creation.
-        # These are passed to __call__ as tma_t0, tma_t1, ... and used to create
-        # TMA descriptors in __call__ before launching the kernel.
-        tma_tensor_names = []  # param names like "tma_t0_2d", "tma_t0_3d"
-        tma_tensor_seen = set()
+    def _collect_tma_tensor_names(self, tma_registry) -> List[str]:
+        """Return unique parameter names for local static-layout TMA tensors."""
+        tensor_names: List[str] = []
+        seen = set()
         for desc in tma_registry.descriptors:
             ndim = len(desc.tile_shape)
-            tname = f"tma_{desc.tensor_canonical}_{ndim}d"
-            if tname not in tma_tensor_seen:
-                tma_tensor_seen.add(tname)
-                tma_tensor_names.append(tname)
-        tma_tensor_sig = ""
-        if tma_tensor_names:
-            tma_tensor_sig = ", " + ", ".join(tma_tensor_names)
+            tensor_name = f"tma_{desc.tensor_canonical}_{ndim}d"
+            if tensor_name in seen:
+                continue
+            seen.add(tensor_name)
+            tensor_names.append(tensor_name)
+        return tensor_names
 
-        # Generate TMA descriptor creation code for __call__
-        tma_creation_lines = []
-        tma_kernel_args = []  # TMA args to pass from __call__ to kernel
-
-        def _gen_tma_desc_code(desc, tma_src):
-            """Generate make_tiled_tma_atom codegen for one TMA descriptor."""
-            direction = getattr(desc, 'direction', 's2g')
-            if direction == "g2s":
-                copy_op = "CopyBulkTensorTileG2SOp()"
-            elif direction == "s2g":
-                copy_op = "CopyBulkTensorTileS2GOp()"
-            elif direction == "s2g_reduce":
-                copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
-            else:
-                raise ValueError(f"Unknown TMA direction: {direction}")
-            shape_str = ", ".join(str(s) for s in desc.tile_shape)
-            smem_layout_code = (
-                desc.smem_layout_src if desc.smem_layout_src
-                else f"cute.make_layout(({shape_str},))"
-            )
-            tma_creation_lines.append(
-                f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
-                f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
-                f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
-                f"            {copy_op},\n"
-                f"            {tma_src},\n"
-                f"            _smem_layout_{desc.canonical_atom},\n"
-                f"            ({shape_str},),\n"
-                f"            num_multicast=1,\n"
-                f"        )"
-            )
-            tma_kernel_args.append(desc.canonical_atom)
-            tma_kernel_args.append(desc.canonical_gmem)
-
-        # Local TMA descriptors
-        if tma_registry.has_tma:
-            for desc in tma_registry.descriptors:
-                ndim = len(desc.tile_shape)
-                _gen_tma_desc_code(desc, f"tma_{desc.tensor_canonical}_{ndim}d")
-
-        # Peer TMA tensors: passed to __call__ as ptma_t0_p0, ptma_t0_p1, ...
-        peer_tma_tensor_names = []
-        peer_tma_tensor_seen = set()
+    def _collect_peer_tma_tensor_names(self, peer_tma_registry) -> List[str]:
+        """Return unique parameter names for peer static-layout TMA tensors."""
+        tensor_names: List[str] = []
+        seen = set()
         for desc in peer_tma_registry.descriptors:
-            tname = f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}"
-            if tname not in peer_tma_tensor_seen:
-                peer_tma_tensor_seen.add(tname)
-                peer_tma_tensor_names.append(tname)
-        peer_tma_tensor_input_sig = ""
-        if peer_tma_tensor_names:
-            peer_tma_tensor_input_sig = ", " + ", ".join(peer_tma_tensor_names)
+            tensor_name = f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}"
+            if tensor_name in seen:
+                continue
+            seen.add(tensor_name)
+            tensor_names.append(tensor_name)
+        return tensor_names
 
-        # Peer TMA descriptors
-        if peer_tma_registry.has_peer_tma:
-            for desc in peer_tma_registry.descriptors:
-                _gen_tma_desc_code(desc, f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}")
+    def _append_tma_descriptor_code(self, tma_creation_lines, tma_kernel_args, desc, tensor_source: str) -> None:
+        """Append source that constructs one TMA descriptor pair."""
+        direction = getattr(desc, "direction", "s2g")
+        if direction == "g2s":
+            copy_op = "CopyBulkTensorTileG2SOp()"
+        elif direction == "s2g":
+            copy_op = "CopyBulkTensorTileS2GOp()"
+        elif direction == "s2g_reduce":
+            copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
+        else:
+            raise ValueError(f"Unknown TMA direction: {direction}")
+
+        shape_str = ", ".join(str(s) for s in desc.tile_shape)
+        smem_layout_code = desc.smem_layout_src or f"cute.make_layout(({shape_str},))"
+        tma_creation_lines.append(
+            f"        _smem_layout_{desc.canonical_atom} = {smem_layout_code}\n"
+            f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
+            f"cute.nvgpu.cpasync.make_tiled_tma_atom(\n"
+            f"            {copy_op},\n"
+            f"            {tensor_source},\n"
+            f"            _smem_layout_{desc.canonical_atom},\n"
+            f"            ({shape_str},),\n"
+            f"            num_multicast=1,\n"
+            f"        )"
+        )
+        tma_kernel_args.extend((desc.canonical_atom, desc.canonical_gmem))
+
+    def _build_tma_kernel_components(self, tma_registry, peer_tma_registry) -> Dict[str, Any]:
+        """Assemble the TMA-specific signature fragments and descriptor setup code."""
+        tma_tensor_names = self._collect_tma_tensor_names(tma_registry)
+        peer_tma_tensor_names = self._collect_peer_tma_tensor_names(peer_tma_registry)
+
+        tma_creation_lines: List[str] = []
+        tma_kernel_args: List[str] = []
+
+        for desc in tma_registry.descriptors:
+            ndim = len(desc.tile_shape)
+            self._append_tma_descriptor_code(
+                tma_creation_lines,
+                tma_kernel_args,
+                desc,
+                f"tma_{desc.tensor_canonical}_{ndim}d",
+            )
+
+        for desc in peer_tma_registry.descriptors:
+            self._append_tma_descriptor_code(
+                tma_creation_lines,
+                tma_kernel_args,
+                desc,
+                f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}",
+            )
 
         tma_creation_code = "\n".join(tma_creation_lines)
         if tma_creation_code:
             tma_creation_code = "\n" + tma_creation_code + "\n"
 
-        tma_kernel_args_sig = ""
-        if tma_kernel_args:
-            tma_kernel_args_sig = ", " + ", ".join(tma_kernel_args)
+        combined_tma_names = [
+            *tma_registry.all_canonical_names,
+            *peer_tma_registry.all_canonical_names,
+        ]
+        return {
+            "tma_tensor_sig": self._signature_suffix(tma_tensor_names),
+            "peer_tma_tensor_input_sig": self._signature_suffix(peer_tma_tensor_names),
+            "tma_kernel_args_sig": self._signature_suffix(tma_kernel_args),
+            "combined_tma_sig": self._signature_suffix(combined_tma_names),
+            "tma_creation_code": tma_creation_code,
+        }
 
-        # Combined TMA sig for kernel method (local + peer TMA descriptors)
-        combined_tma_sig = ", ".join(filter(None, [tma_params, peer_tma_params]))
-        combined_tma_sig = f", {combined_tma_sig}" if combined_tma_sig else ""
-
-        pk_source = (
+    def _build_persistent_kernel_source(
+        self,
+        *,
+        num_sms: int,
+        threads_per_block: int,
+        smem_size: int,
+        tensor_sig: str,
+        tma_components: Dict[str, Any],
+    ) -> str:
+        """Render the `PersistentKernel` class source."""
+        return (
             "class PersistentKernel:\n"
             "    def __init__(self):\n"
             f"        self.num_sms = {num_sms}\n"
@@ -894,10 +900,11 @@ class Megakernel:
             "    @cute.jit\n"
             "    def __call__(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             f"                 trace_buffer_ptr, wait_info_ptr, num_instructions"
-            f"{tensor_sig}{tma_tensor_sig}{peer_tma_tensor_input_sig}, stream):\n"
-            f"{tma_creation_code}"
+            f"{tensor_sig}{tma_components['tma_tensor_sig']}{tma_components['peer_tma_tensor_input_sig']}, stream):\n"
+            f"{tma_components['tma_creation_code']}"
             "        self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                    trace_buffer_ptr, wait_info_ptr, num_instructions{tensor_sig}{tma_kernel_args_sig}).launch(\n"
+            f"                    trace_buffer_ptr, wait_info_ptr,\n"
+            f"                    num_instructions{tensor_sig}{tma_components['tma_kernel_args_sig']}).launch(\n"
             "            grid=[self.num_sms, 1, 1],\n"
             "            block=[self.threads_per_block, 1, 1],\n"
             "            smem=self.smem_size,\n"
@@ -907,22 +914,30 @@ class Megakernel:
             "\n"
             "    @cute.kernel\n"
             "    def kernel(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"               trace_buffer_ptr, wait_info_ptr, num_instructions{tensor_sig}{combined_tma_sig}):\n"
+            f"               trace_buffer_ptr, wait_info_ptr, num_instructions{tensor_sig}{tma_components['combined_tma_sig']}):\n"
             "        tidx = cute.arch.thread_idx()[0]\n"
             "        block_id = cute.arch.block_idx()[0]\n"
             "        num_blocks = cute.arch.grid_dim()[0]\n"
             "        smem_base = get_smem_base_ptr()\n"
             "        _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             "                     num_instructions, tidx, block_id, num_blocks,\n"
-            f"                     smem_base, trace_buffer_ptr, wait_info_ptr{tensor_sig}{combined_tma_sig})\n"
+            f"                     smem_base, trace_buffer_ptr, wait_info_ptr{tensor_sig}{tma_components['combined_tma_sig']})\n"
         )
 
+    def _build_persistent_kernel_globals(self, tma_registry, peer_tma_registry, kernel_loop) -> Dict[str, Any]:
+        """Build exec globals for the generated `PersistentKernel` class."""
+        cutlass = __import__("cutlass")
         pk_globals = {
             "cute": cute,
+            "cutlass": cutlass,
+            "Int32": Int32,
+            "Int64": Int64,
+            "range_constexpr": cutlass.range_constexpr,
+            "const_expr": cutlass.const_expr,
             "get_smem_base_ptr": get_smem_base_ptr,
             "_kernel_loop": kernel_loop,
         }
-        # Add TMA copy op classes to pk_globals if TMA is used
+
         if tma_registry.has_tma:
             from cutlass.cute.nvgpu.cpasync import (
                 CopyBulkTensorTileG2SOp,
@@ -932,31 +947,751 @@ class Megakernel:
             pk_globals["CopyBulkTensorTileG2SOp"] = CopyBulkTensorTileG2SOp
             pk_globals["CopyBulkTensorTileS2GOp"] = CopyBulkTensorTileS2GOp
 
-            # Add reduce store op if any descriptor uses s2g_reduce
-            if any(d.direction == "s2g_reduce" for d in tma_registry.descriptors):
+            if self._registry_uses_reduce_store(tma_registry):
                 from cutlass.cute.nvgpu.cpasync import CopyReduceBulkTensorTileS2GOp
                 from cutlass.cute.tensor import ReductionOp
 
                 pk_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
                 pk_globals["ReductionOp"] = ReductionOp
 
-        # Add S2G copy op for peer TMA if needed (may not have local TMA)
         if peer_tma_registry.has_peer_tma and not tma_registry.has_tma:
             from cutlass.cute.nvgpu.cpasync import CopyBulkTensorTileS2GOp
 
             pk_globals["CopyBulkTensorTileS2GOp"] = CopyBulkTensorTileS2GOp
 
-        # Add reduce store op for peer TMA if any peer descriptor uses s2g_reduce
-        if peer_tma_registry.has_peer_tma and any(
-            getattr(d, 'direction', 's2g') == "s2g_reduce"
-            for d in peer_tma_registry.descriptors
-        ):
+        if peer_tma_registry.has_peer_tma and self._registry_uses_reduce_store(peer_tma_registry):
             from cutlass.cute.nvgpu.cpasync import CopyReduceBulkTensorTileS2GOp
             from cutlass.cute.tensor import ReductionOp
 
             pk_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
             pk_globals["ReductionOp"] = ReductionOp
 
+        return pk_globals
+
+    @staticmethod
+    def _registry_uses_reduce_store(registry) -> bool:
+        """Return whether any descriptor in the registry performs a reduce-store."""
+        return any(getattr(desc, "direction", "s2g") == "s2g_reduce" for desc in registry.descriptors)
+
+    @staticmethod
+    def _op_has_peer_barriers(op: ScheduledOp) -> bool:
+        """Return whether an op emits cross-GPU barrier signals."""
+        return bool(
+            getattr(op.op_cls, "_PEER_STORES", set())
+            | getattr(op.op_cls, "_PEER_REDUCE_STORES", set())
+        )
+
+    @staticmethod
+    def _resolve_warp_register_api():
+        """Resolve the CuTe warp register allocation API, with a no-op fallback."""
+        try:
+            from cutlass.cute.arch import (
+                setmaxregister_decrease,
+                setmaxregister_increase,
+            )
+
+            return setmaxregister_increase, setmaxregister_decrease
+        except ImportError:
+            try:
+                from cutlass.cute.arch import (
+                    warpgroup_reg_alloc as setmaxregister_increase,
+                    warpgroup_reg_dealloc as setmaxregister_decrease,
+                )
+
+                return setmaxregister_increase, setmaxregister_decrease
+            except ImportError:
+
+                def _setmaxregister_noop(_n):
+                    """Fallback when the local CuTe build exposes no register API."""
+
+                return _setmaxregister_noop, _setmaxregister_noop
+
+    def _build_inner_iters_fn(self, inner_iters_list):
+        """Build a small JIT function that maps op index to inner iteration count."""
+        iters_lines = []
+        for idx, n_iters in enumerate(inner_iters_list):
+            keyword = "if" if idx == 0 else "elif"
+            iters_lines.append(f"    {keyword} op_idx == Int32({idx}):\n        _r = Int32({n_iters})")
+        iters_body = "\n".join(iters_lines) if iters_lines else "    _r = Int32(1)"
+        iters_source = (
+            "@cute.jit\n"
+            "def _get_inner_iters(op_idx) -> Int32:\n"
+            "    _r = Int32(1)\n"
+            f"{iters_body}\n"
+            "    return _r\n"
+        )
+        iters_globals = {"cute": cute, "Int32": Int32}
+        exec_generated_source(iters_source, "_get_inner_iters", iters_globals)
+        return iters_globals["_get_inner_iters"]
+
+    def _kernel_static_config(self) -> Dict[str, Any]:
+        """Collect the compile-time constants used to build the persistent kernel."""
+        layout = self._layout
+        threads_per_block = self.config.threads_per_block
+        num_mma_warps = (threads_per_block // 32) - NUM_DMA_WARPS
+
+        return {
+            "num_sms": self.config.num_sms,
+            "threads_per_block": threads_per_block,
+            "smem_size": layout.total_size,
+            "tracing": self.config.tracing,
+            "num_pages": layout.num_pages,
+            "iq_offset": layout.iq_offset,
+            "flags_offset": layout.flags_offset,
+            "ring_state_offset": layout.ring_state_offset,
+            "pages_start": layout.pages_start,
+            "aligned_page_size": layout.aligned_page_size,
+            "work_notify_mbar_offset_0": layout.work_notify_mbar_offset(0),
+            "compute_done_mbar_offset_0": layout.compute_done_mbar_offset(0),
+            "num_mma_warps": num_mma_warps,
+            "num_compute_threads": num_mma_warps * 32,
+            "dma_reg_count": self.config.dma_reg_count,
+            "mma_reg_count": self.config.mma_reg_count,
+            "actual_threads_per_block": threads_per_block,
+            "mbarrier_stride": NPageLayout._MBARRIER_SIZE,
+            "tile_info_bytes": NPageLayout._TILE_INFO_SIZE,
+            "peer_barriers_data_ptr": (
+                self.config.peer_barriers.data_ptr()
+                if self.config.peer_barriers is not None
+                else 0
+            ),
+        }
+
+    def _kernel_runtime_components(self, kernel_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Build reusable runtime helpers needed by `_create_kernel`."""
+        setmaxregister_increase, setmaxregister_decrease = self._resolve_warp_register_api()
+        (
+            dispatch_load,
+            dispatch_compute,
+            dispatch_store,
+            dispatch_communicate,
+            inner_iters_list,
+            has_communicate,
+            per_op_warps,
+        ) = self._build_pipelined_dispatch_fns()
+
+        from .tracing import get_trace_exec_globals
+
+        trace_exec_globals = get_trace_exec_globals(self._tracing_state)
+        signal_barriers = self._build_signal_barriers()
+        signal_peer_barriers = self._build_signal_peer_barriers()
+
+        @cute.jit
+        def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
+            """Return the shared-memory base pointer for a page slot."""
+            return (
+                smem_base
+                + Int32(kernel_cfg["pages_start"])
+                + page_idx * Int32(kernel_cfg["aligned_page_size"])
+            )
+
+        @cute.jit
+        def _work_notify_mbar(smem_base: Int32, slot: Int32) -> Int32:
+            """Return the work-available mbarrier address for one slot."""
+            return (
+                smem_base
+                + Int32(kernel_cfg["work_notify_mbar_offset_0"])
+                + slot * Int32(kernel_cfg["mbarrier_stride"])
+            )
+
+        @cute.jit
+        def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
+            """Return the compute-complete mbarrier address for one page."""
+            return (
+                smem_base
+                + Int32(kernel_cfg["compute_done_mbar_offset_0"])
+                + page_idx * Int32(kernel_cfg["mbarrier_stride"])
+            )
+
+        return {
+            "setmaxregister_increase": setmaxregister_increase,
+            "setmaxregister_decrease": setmaxregister_decrease,
+            "dispatch_load": dispatch_load,
+            "dispatch_compute": dispatch_compute,
+            "dispatch_store": dispatch_store,
+            "dispatch_communicate": dispatch_communicate,
+            "inner_iters_list": inner_iters_list,
+            "has_communicate": has_communicate,
+            "per_op_warps": per_op_warps,
+            "needs_warp_transition": any(w < kernel_cfg["num_mma_warps"] for w in per_op_warps),
+            "max_waits": max(1, self._builder.max_wait_deps),
+            "signal_barriers": signal_barriers,
+            "signal_peer_barriers": signal_peer_barriers,
+            "trace_exec_globals": trace_exec_globals,
+            "decompose_tile": self._builder.build_decompose_tile_fn(),
+            "_get_inner_iters": self._build_inner_iters_fn(inner_iters_list),
+            "_get_page_ptr": _get_page_ptr,
+            "_work_notify_mbar": _work_notify_mbar,
+            "_compute_done_mbar": _compute_done_mbar,
+        }
+
+    def _kernel_extra_exec_globals(
+        self,
+        kernel_cfg: Dict[str, Any],
+        runtime: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the extra globals consumed by the generated kernel loop."""
+        return {
+            "_work_notify_mbar": runtime["_work_notify_mbar"],
+            "_compute_done_mbar": runtime["_compute_done_mbar"],
+            "decompose_tile": runtime["decompose_tile"],
+            "ld_shared_v2_b32": ld_shared_v2_b32,
+            "st_shared_v2_b32": st_shared_v2_b32,
+            "num_mma_warps": kernel_cfg["num_mma_warps"],
+            "num_compute_threads": kernel_cfg["num_compute_threads"],
+            "threads_per_block": kernel_cfg["actual_threads_per_block"],
+            "setmaxregister_increase": runtime["setmaxregister_increase"],
+            "setmaxregister_decrease": runtime["setmaxregister_decrease"],
+            "dma_reg_count": kernel_cfg["dma_reg_count"],
+            "mma_reg_count": kernel_cfg["mma_reg_count"],
+            "tile_info_bytes": kernel_cfg["tile_info_bytes"],
+            "FLAG_DISPATCH_LOAD": FLAG_DISPATCH_LOAD,
+            "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
+            "FLAG_STORE_IDX": FLAG_STORE_IDX,
+            "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
+            "_get_inner_iters": runtime["_get_inner_iters"],
+            "max_waits": runtime["max_waits"],
+            "global_barrier_wait": global_barrier_wait,
+            "ld_global_i32": ld_global_i32,
+            "dispatch_communicate": runtime["dispatch_communicate"],
+            "has_communicate": runtime["has_communicate"],
+            "signal_peer_barriers": runtime["signal_peer_barriers"],
+            "_peer_barriers_data_ptr": kernel_cfg["peer_barriers_data_ptr"],
+            "needs_warp_transition": runtime["needs_warp_transition"],
+            "per_op_warps": runtime["per_op_warps"],
+            "MIN_IDLE_REGS": MIN_IDLE_REGS,
+            "num_ops": len(self.ops),
+            **runtime["trace_exec_globals"],
+        }
+
+    def _build_ring_kernel_loop(self, kernel_cfg: Dict[str, Any], runtime: Dict[str, Any]):
+        """Build the warp-specialized ring-buffer loop used by the persistent kernel.
+
+        Returns a flat function whose body contains all dispatch_load/compute/store
+        calls directly, so that _build_kernel_loop_source's regex can inject
+        tensor and TMA parameters into every call site.
+        """
+        # Unpack into locals so they are captured by the closure below.
+        # _build_kernel_loop_source extracts the function body as source text
+        # and uses a regex to append tensor/TMA params to dispatch_* calls.
+        # This only works when dispatch calls appear in the body itself (not
+        # hidden inside nested @cute.jit sub-functions).
+
+        def _kernel_loop_ring(
+            instructions_ptr: Int64,
+            barriers_ptr: Int64,
+            op_configs_ptr: Int64,
+            num_instructions: Int32,
+            tidx: Int32,
+            block_id: Int32,
+            num_blocks: Int32,
+            smem_base: Int32,
+            trace_buffer_ptr: Int64,
+            wait_info_ptr: Int64,
+        ) -> None:
+            """Warp-specialized ring buffer loop.
+
+            Warp roles (NUM_DMA_WARPS=3, W = num_mma_warps):
+              Warps 0..W-1:  MMA warps — compute from ring buffer pages
+              Warp W:        Controller — fetches instructions, pre-computed barrier wait
+              Warp W+1:      Loader — dispatches TMA loads
+              Warp W+2:      Store — waits for compute_done, dispatches TMA stores
+
+            Mbarrier phases alternate 0/1 with each use (hardware auto-reset).
+            """
+            warp_id = tidx // Int32(32)
+            lane_id = tidx % Int32(32)
+
+            is_store_warp = warp_id == Int32(num_mma_warps + 2)
+
+            if warp_id >= Int32(num_mma_warps):
+                setmaxregister_decrease(dma_reg_count)
+            if warp_id < Int32(num_mma_warps):
+                setmaxregister_increase(mma_reg_count)
+
+            iq_base = smem_base + Int32(iq_offset)
+            flags_ptr = smem_base + Int32(flags_offset)
+
+            if const_expr(tracing):
+                _trace_buf = cute.make_tensor(
+                    cute.make_ptr(cute.Uint8, trace_buffer_ptr),
+                    cute.make_layout(1 << 24),
+                )
+
+            # ========== INIT (controller warp thread 0) ==========
+            if warp_id == Int32(num_mma_warps):
+                with cute.arch.elect_one():
+                    st_shared_i32(flags_ptr + FLAG_DISPATCH_LOAD, Int32(-1))
+                    st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
+                    st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
+                    st_shared_i32(flags_ptr + FLAG_LOAD_DONE, Int32(0))
+                    for _ip in range(num_pages):
+                        _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
+                        st_shared_i32(_slot_ti, Int32(-1))
+                        mbarrier_init(
+                            _work_notify_mbar(smem_base, Int32(_ip)),
+                            Int32(1),
+                        )
+                        mbarrier_init(
+                            _compute_done_mbar(smem_base, Int32(_ip)),
+                            Int32(num_mma_warps),
+                        )
+                    mbarrier_init_fence()
+
+            named_barrier_sync(Int32(0), Int32(threads_per_block))
+
+            # ========== CONTROLLER WARP (fetch + pre-computed barrier wait) ==========
+            if warp_id == Int32(num_mma_warps):
+                produce_idx = Int32(0)
+                _fetch_idx = block_id
+                _fetch_idx_save = Int32(0)
+                _ctrl_done = Int32(0)
+
+                dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
+                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
+                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
+                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+                _temp_instr = iq_base
+
+                while _ctrl_done == Int32(0):
+                    if lane_id == Int32(0):
+                        _instr_op = Int32(TileInstruction.END_MARKER)
+                        _instr_lin = Int32(0)
+                        if _fetch_idx < num_instructions:
+                            load_instruction_to_smem(instructions_ptr, _fetch_idx, _temp_instr)
+                            _instr_op, _instr_lin = ld_shared_v2_b32(_temp_instr)
+                            if _instr_op == Int32(TileInstruction.END_MARKER):
+                                _fetch_idx = num_instructions
+                            if _instr_op != Int32(TileInstruction.END_MARKER):
+                                _fetch_idx_save = _fetch_idx
+                                _fetch_idx = _fetch_idx + num_blocks
+
+                        if _instr_op >= Int32(0):
+                            for _w in range_constexpr(max_waits):
+                                _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
+                                _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
+                                if _bar_idx >= Int32(0):
+                                    _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
+                                    global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+
+                            _si = ld_shared_i32(store_idx_ptr)
+                            while (produce_idx - _si) >= Int32(num_pages):
+                                _wait_slot = produce_idx % Int32(num_pages)
+                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
+                                mbarrier_wait(
+                                    _compute_done_mbar(smem_base, _wait_slot), _wait_phase
+                                )
+                                _si = ld_shared_i32(store_idx_ptr)
+
+                            _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
+                            while _dl_prev != Int32(-1):
+                                _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
+
+                            _p_slot = produce_idx % Int32(num_pages)
+                            _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
+                            st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
+                            produce_idx = produce_idx + Int32(1)
+                            st_shared_i32(produce_idx_ptr, produce_idx)
+                            st_shared_release_cta_i32(dispatch_load_slot_ptr, _p_slot)
+
+                        if _instr_op == Int32(TileInstruction.END_MARKER):
+                            if _fetch_idx >= num_instructions:
+                                _store_idx_done = ld_shared_i32(store_idx_ptr)
+                                if (produce_idx - _store_idx_done) < Int32(num_pages):
+                                    _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
+                                    while _dl_last != Int32(-1):
+                                        _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
+                                    _sent = produce_idx % Int32(num_pages)
+                                    st_shared_i32(
+                                        smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
+                                        Int32(TileInstruction.END_MARKER),
+                                    )
+                                    mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
+                                    st_shared_i32(load_done_ptr, Int32(1))
+
+                    _ctrl_done = ld_shared_i32(load_done_ptr)
+
+            # ========== LOADER WARP (TMA dispatch) ==========
+            if warp_id == Int32(num_mma_warps + 1):
+                if const_expr(tracing):
+                    _dma_lane = begin_lane_dynamic_raw(
+                        Int32(3),
+                        Int32(trace_row_stride),
+                        block_id,
+                        Int32(0),
+                        lane_id == Int32(0),
+                    )
+
+                _dl_cached_op_idx = Int32(-1)
+                _dl_cached_config = Int64(0)
+                _ldr_done = Int32(0)
+                _ldr_dispatch_ptr = flags_ptr + FLAG_DISPATCH_LOAD
+                _ldr_load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+
+                while _ldr_done == Int32(0):
+                    _dl_slot = ld_shared_acquire_cta_i32(_ldr_dispatch_ptr)
+                    if _dl_slot != Int32(-1):
+                        _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
+                        _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
+                        _dl_0, _dl_1, _dl_2, _dl_3, _dl_4 = decompose_tile(_dl_op, _dl_lin)
+                        _dl_pp = _get_page_ptr(smem_base, _dl_slot)
+                        if _dl_op != _dl_cached_op_idx:
+                            _dl_cached_config = ld_global_i64(op_configs_ptr, _dl_op)
+                            _dl_cached_op_idx = _dl_op
+                        _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
+                        _dl_iter = Int32(0)
+                        if const_expr(tracing):
+                            _tl = trace_start()
+                        dispatch_load(
+                            _dl_op,
+                            _dl_pp,
+                            _dl_0,
+                            _dl_1,
+                            _dl_2,
+                            _dl_3,
+                            _dl_4,
+                            _dl_cached_config,
+                            _dl_mbar,
+                            _dl_iter,
+                        )
+                        if const_expr(tracing):
+                            for _i in range_constexpr(num_ops):
+                                if _dl_op == Int32(_i):
+                                    _dma_lane = end_event_dynamic_raw_1(
+                                        _tl,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _dma_lane,
+                                        Int32(trace_load_fmts[_i]),
+                                        _dl_op,
+                                    )
+                        with cute.arch.elect_one():
+                            st_shared_release_cta_i32(_ldr_dispatch_ptr, Int32(-1))
+
+                    if _dl_slot == Int32(-1):
+                        nanosleep(Int32(100))
+
+                    _ldr_done = ld_shared_i32(_ldr_load_done_ptr)
+                    if _ldr_done == Int32(1):
+                        _dl_final = ld_shared_i32(_ldr_dispatch_ptr)
+                        if _dl_final != Int32(-1):
+                            _ldr_done = Int32(0)
+
+                if const_expr(tracing):
+                    finish_lane_dynamic_raw(_trace_buf, _dma_lane)
+
+            # ========== STORE WARP LOOP ==========
+            if is_store_warp:
+                if const_expr(tracing):
+                    _store_lane = begin_lane_dynamic_raw(
+                        Int32(3),
+                        Int32(trace_row_stride),
+                        block_id,
+                        Int32(2),
+                        lane_id == Int32(0),
+                    )
+                _sw_done = Int32(0)
+                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
+                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
+                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+                _ds_cached_op_idx = Int32(-1)
+                _ds_cached_config = Int64(0)
+
+                while _sw_done == Int32(0):
+                    _s_idx = ld_shared_i32(store_idx_ptr)
+                    _p_idx = ld_shared_i32(produce_idx_ptr)
+
+                    if _s_idx < _p_idx:
+                        _s_slot = _s_idx % Int32(num_pages)
+                        _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+
+                        _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
+                        _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
+                        _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(_ds_op, _ds_lin)
+                        _ds_pp = _get_page_ptr(smem_base, _s_slot)
+                        if _ds_op != _ds_cached_op_idx:
+                            _ds_cached_config = ld_global_i64(op_configs_ptr, _ds_op)
+                            _ds_cached_op_idx = _ds_op
+                        _ds_mbar = _work_notify_mbar(smem_base, _s_slot)
+
+                        _n_iters = _get_inner_iters(_ds_op)
+                        if _n_iters > Int32(1):
+                            mbarrier_wait(_ds_mbar, _s_phase)
+                        _iter_idx = Int32(1)
+                        while _iter_idx < _n_iters:
+                            dispatch_load(
+                                _ds_op,
+                                _ds_pp,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_4,
+                                _ds_cached_config,
+                                _ds_mbar,
+                                _iter_idx,
+                            )
+                            _iter_idx = _iter_idx + Int32(1)
+
+                        if const_expr(tracing):
+                            _tsw = trace_start()
+                        mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
+                        if const_expr(tracing):
+                            _store_lane = end_event_dynamic_raw_1(
+                                _tsw,
+                                _trace_buf,
+                                Int32(trace_row_stride),
+                                _store_lane,
+                                Int32(trace_compute_wait_fmt),
+                                _ds_op,
+                            )
+
+                        if const_expr(tracing):
+                            _tss = trace_start()
+                        dispatch_store(
+                            _ds_op,
+                            _ds_pp,
+                            _ds_0,
+                            _ds_1,
+                            _ds_2,
+                            _ds_3,
+                            _ds_4,
+                            _ds_cached_config,
+                        )
+                        if const_expr(has_communicate):
+                            dispatch_communicate(
+                                _ds_op,
+                                _ds_pp,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_4,
+                                _ds_cached_config,
+                            )
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        if const_expr(tracing):
+                            for _si in range_constexpr(num_ops):
+                                if _ds_op == Int32(_si):
+                                    _store_lane = end_event_dynamic_raw_1(
+                                        _tss,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _store_lane,
+                                        Int32(trace_store_fmts[_si]),
+                                        _ds_op,
+                                    )
+
+                        with cute.arch.elect_one():
+                            signal_barriers(
+                                _ds_op,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_4,
+                                barriers_ptr,
+                            )
+                            if const_expr(has_communicate):
+                                signal_peer_barriers(
+                                    _ds_op,
+                                    _ds_lin,
+                                    Int64(_peer_barriers_data_ptr),
+                                )
+                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))
+
+                    if _s_idx >= _p_idx:
+                        if ld_shared_i32(load_done_ptr) == Int32(1):
+                            _sw_done = Int32(1)
+                        if ld_shared_i32(load_done_ptr) != Int32(1):
+                            _sw_next_slot = _s_idx % Int32(num_pages)
+                            _sw_next_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+                            mbarrier_wait(
+                                _work_notify_mbar(smem_base, _sw_next_slot),
+                                _sw_next_phase,
+                            )
+
+                if const_expr(tracing):
+                    finish_lane_dynamic_raw(_trace_buf, _store_lane)
+
+            # ========== MMA WARP LOOP ==========
+            if warp_id < Int32(num_mma_warps):
+                if const_expr(tracing):
+                    _mma_lane = begin_lane_dynamic_raw(
+                        Int32(3),
+                        Int32(trace_row_stride),
+                        block_id,
+                        Int32(1),
+                        (warp_id == Int32(0)) & (lane_id == Int32(0)),
+                    )
+
+                consume_ptr = Int32(0)
+                mma_running = Int32(1)
+                _cached_op_idx = Int32(-1)
+                _cached_op_config = Int64(0)
+
+                while mma_running == Int32(1):
+                    slot = consume_ptr % Int32(num_pages)
+
+                    _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
+                    if const_expr(tracing):
+                        _tw = trace_start()
+                    mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
+
+                    tile_info_ptr = smem_base + Int32(ring_state_offset) + slot * Int32(tile_info_bytes)
+                    op_idx, _mma_lin = ld_shared_v2_b32(tile_info_ptr)
+
+                    if op_idx == Int32(TileInstruction.END_MARKER):
+                        mma_running = Int32(0)
+
+                    if op_idx != Int32(TileInstruction.END_MARKER):
+                        if const_expr(tracing):
+                            _mma_lane = end_event_dynamic_raw_1(
+                                _tw,
+                                _trace_buf,
+                                Int32(trace_row_stride),
+                                _mma_lane,
+                                Int32(trace_data_wait_fmt),
+                                op_idx,
+                            )
+
+                        tile_0, tile_1, tile_2, tile_3, tile_4 = decompose_tile(op_idx, _mma_lin)
+
+                        page_ptr = _get_page_ptr(smem_base, slot)
+                        if op_idx != _cached_op_idx:
+                            _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
+                            _cached_op_idx = op_idx
+
+                            if const_expr(needs_warp_transition):
+                                for _ow in range_constexpr(num_ops):
+                                    if op_idx == Int32(_ow):
+                                        if warp_id >= Int32(per_op_warps[_ow]):
+                                            setmaxregister_decrease(
+                                                MIN_IDLE_REGS)
+                                named_barrier_sync(
+                                    Int32(1), Int32(num_compute_threads))
+                                for _ow in range_constexpr(num_ops):
+                                    if op_idx == Int32(_ow):
+                                        if warp_id < Int32(per_op_warps[_ow]):
+                                            setmaxregister_increase(
+                                                mma_reg_count)
+
+                        if const_expr(tracing):
+                            _tc = trace_start()
+
+                        dispatch_compute(
+                            op_idx,
+                            page_ptr,
+                            tile_0,
+                            tile_1,
+                            tile_2,
+                            tile_3,
+                            tile_4,
+                            _cached_op_config,
+                        )
+
+                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+                        if const_expr(tracing):
+                            for _i in range_constexpr(num_ops):
+                                if op_idx == Int32(_i):
+                                    _mma_lane = end_event_dynamic_raw_1(
+                                        _tc,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _mma_lane,
+                                        Int32(trace_compute_fmts[_i]),
+                                        op_idx,
+                                    )
+
+                        with cute.arch.elect_one():
+                            mbarrier_arrive(_compute_done_mbar(smem_base, slot))
+
+                        consume_ptr = consume_ptr + Int32(1)
+
+                if const_expr(tracing):
+                    finish_lane_dynamic_raw(_trace_buf, _mma_lane)
+
+        return _kernel_loop_ring
+
+    def _build_kernel(
+        self,
+        kernel_loop_fn,
+        dispatch_load,
+        dispatch_compute,
+        dispatch_store,
+        signal_barriers,
+        get_page_ptr_fn,
+        num_sms,
+        threads_per_block,
+        smem_size,
+        num_pages,
+        iq_offset,
+        flags_offset,
+        ring_state_offset,
+        extra_exec_globals=None,
+    ):
+        """Build the PersistentKernel via source transformation.
+
+        Extracts the kernel loop body, adds tensor and TMA params to dispatch
+        call sites (if any), and exec-generates the PersistentKernel class
+        with all params threaded through __call__ -> kernel -> _kernel_loop.
+        """
+        all_canonical = self._tensor_registry.canonical_names
+        tensor_params = ", ".join(all_canonical)
+        tensor_sig = self._signature_suffix(all_canonical)
+
+        # TMA params that flow through kernel -> loop -> dispatch
+        tma_registry = self._tma_registry
+        all_tma_canonical = tma_registry.all_canonical_names
+        tma_params = ", ".join(all_tma_canonical)
+        tma_sig = self._signature_suffix(all_tma_canonical)
+
+        # Peer TMA params for multi-GPU communication
+        peer_tma_registry = self._peer_tma_registry
+        all_peer_tma_canonical = peer_tma_registry.all_canonical_names
+        peer_tma_params = ", ".join(all_peer_tma_canonical)
+        peer_tma_sig = self._signature_suffix(all_peer_tma_canonical)
+
+        # Combined extra params for dispatch calls (tensor + TMA + peer TMA)
+        extra_dispatch_params = ", ".join(filter(None, [tensor_params, tma_params, peer_tma_params]))
+        fn_source = self._build_kernel_loop_source(
+            kernel_loop_fn,
+            tensor_sig=tensor_sig,
+            tma_sig=tma_sig,
+            peer_tma_sig=peer_tma_sig,
+            extra_dispatch_params=extra_dispatch_params,
+        )
+
+        exec_globals = self._build_kernel_exec_globals(
+            dispatch_load=dispatch_load,
+            dispatch_compute=dispatch_compute,
+            dispatch_store=dispatch_store,
+            signal_barriers=signal_barriers,
+            get_page_ptr_fn=get_page_ptr_fn,
+            num_pages=num_pages,
+            iq_offset=iq_offset,
+            flags_offset=flags_offset,
+            ring_state_offset=ring_state_offset,
+            extra_exec_globals=extra_exec_globals,
+        )
+
+        exec_generated_source(fn_source, "kernel_loop", exec_globals)
+        kernel_loop = exec_globals["_kernel_loop"]
+        tma_components = self._build_tma_kernel_components(tma_registry, peer_tma_registry)
+        pk_source = self._build_persistent_kernel_source(
+            num_sms=num_sms,
+            threads_per_block=threads_per_block,
+            smem_size=smem_size,
+            tensor_sig=tensor_sig,
+            tma_components=tma_components,
+        )
+        pk_globals = self._build_persistent_kernel_globals(
+            tma_registry,
+            peer_tma_registry,
+            kernel_loop,
+        )
         exec_generated_source(pk_source, "persistent_kernel", pk_globals)
         return pk_globals["PersistentKernel"]()
 
@@ -1029,11 +1764,7 @@ class Megakernel:
         barrier_offset = 0
         first = True
         for i, op in enumerate(self.ops):
-            has_peer = (
-                getattr(op.op_cls, "_PEER_STORES", set())
-                | getattr(op.op_cls, "_PEER_REDUCE_STORES", set())
-            )
-            if not has_peer:
+            if not self._op_has_peer_barriers(op):
                 continue
             keyword = "if" if first else "elif"
             first = False
@@ -1063,11 +1794,7 @@ class Megakernel:
         """Number of peer barriers needed for cross-GPU signaling."""
         total = 0
         for op in self.ops:
-            has_peer = (
-                getattr(op.op_cls, "_PEER_STORES", set())
-                | getattr(op.op_cls, "_PEER_REDUCE_STORES", set())
-            )
-            if has_peer:
+            if self._op_has_peer_barriers(op):
                 total += op.total_tiles
         return total
 
@@ -1087,666 +1814,25 @@ class Megakernel:
         - work_notify[slot]:  DMA->MMA data ready (1 arrive per tile via TMA)
         - compute_done[slot]: MMA->DMA (num_mma_warps arrivals)
         """
-        num_sms = self.config.num_sms
-        threads_per_block = self.config.threads_per_block
-        layout = self._layout
-        smem_size = layout.total_size
-        tracing = self.config.tracing
-        num_pages = layout.num_pages
-
-        # Capture layout offsets as compile-time constants
-        iq_offset = layout.iq_offset
-        flags_offset = layout.flags_offset
-        ring_state_offset = layout.ring_state_offset
-        pages_start = layout.pages_start
-        aligned_page_size = layout.aligned_page_size
-
-        # Mbarrier sub-offsets (work_notify at 0, compute_done at N)
-        work_notify_mbar_offset_0 = layout.work_notify_mbar_offset(0)
-        compute_done_mbar_offset_0 = layout.compute_done_mbar_offset(0)
-
-        # Warp specialization constants
-        num_mma_warps = (threads_per_block // 32) - NUM_DMA_WARPS
-        num_compute_threads = num_mma_warps * 32
-        dma_reg_count = self.config.dma_reg_count
-        mma_reg_count = self.config.mma_reg_count
-
-        actual_threads_per_block = threads_per_block
-
-        # Warp register reallocation: newer API uses setmaxregister_*,
-        # older CuTe DSL versions use warpgroup_reg_alloc/dealloc.
-        try:
-            from cutlass.cute.arch import (
-                setmaxregister_increase,
-                setmaxregister_decrease,
-            )
-        except ImportError:
-            try:
-                from cutlass.cute.arch import (
-                    warpgroup_reg_alloc as setmaxregister_increase,
-                    warpgroup_reg_dealloc as setmaxregister_decrease,
-                )
-            except ImportError:
-
-                def _setmaxregister_noop(n):
-                    """Fallback when the local CuTe build exposes no warp register API."""
-                    pass
-
-                setmaxregister_increase = _setmaxregister_noop
-                setmaxregister_decrease = _setmaxregister_noop
-
-        # Build pipelined dispatch functions (with barrier replacement for compute)
-        (
-            dispatch_load, dispatch_compute, dispatch_store,
-            dispatch_communicate, inner_iters_list, has_communicate,
-            per_op_warps,
-        ) = self._build_pipelined_dispatch_fns()
-
-        # Per-op warp transition: enable if any op uses fewer warps than total
-        needs_warp_transition = any(w < num_mma_warps for w in per_op_warps)
-
-        # Build barrier functions
-        signal_barriers = self._build_signal_barriers()
-
-        # Pre-computed wait info: max_waits is a compile-time constant.
-        # Must be >= 1 so range_constexpr(max_waits) generates at least one
-        # iteration (avoids potential AST preprocessor issues with 0).
-        # barrier_idx == -1 entries are skipped at runtime.
-        max_waits = max(1, self._builder.max_wait_deps)
-        signal_peer_barriers = self._build_signal_peer_barriers()
-
-        # Peer barriers data pointer (captured as compile-time constant)
-        peer_barriers_data_ptr = self.config.peer_barriers.data_ptr() if self.config.peer_barriers is not None else 0
-
-        # Trace exec globals: device-side functions and format_ids.
-        # `if const_expr(tracing):` blocks are resolved by CuTe DSL's AST
-        # preprocessor, so these globals are only referenced when tracing is enabled.
-        from .tracing import get_trace_exec_globals
-
-        trace_exec_globals = get_trace_exec_globals(self._tracing_state)
-
-        # Helper to get page pointer by index
-        @cute.jit
-        def _get_page_ptr(smem_base: Int32, page_idx: Int32) -> Int32:
-            """Return the shared-memory base pointer for a page slot."""
-            return smem_base + Int32(pages_start) + page_idx * Int32(aligned_page_size)
-
-        # Mbarrier stride (each mbarrier object is 8 bytes, PTX requirement)
-        mbarrier_stride = NPageLayout._MBARRIER_SIZE  # 8
-
-        # Helper to get work_notify mbarrier smem address (per slot)
-        @cute.jit
-        def _work_notify_mbar(smem_base: Int32, slot: Int32) -> Int32:
-            """Return the mbarrier address used to notify work availability for a slot."""
-            return smem_base + Int32(work_notify_mbar_offset_0) + slot * Int32(mbarrier_stride)
-
-        # Helper to get compute_done mbarrier smem address (per slot)
-        @cute.jit
-        def _compute_done_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
-            """Return the mbarrier address used to signal compute completion for a page."""
-            return smem_base + Int32(compute_done_mbar_offset_0) + page_idx * Int32(mbarrier_stride)
-
-        tile_info_bytes = NPageLayout._TILE_INFO_SIZE  # 2 int32s = 8 bytes
-
-        # Build decompose_tile JIT function for runtime tile coord recovery
-        decompose_tile = self._builder.build_decompose_tile_fn()
-
-        # Build _get_inner_iters JIT function: op_idx → inner iteration count.
-        # Store warp calls dispatch_load for iterations 1..inner_iters-1.
-        # Ops without inner_iters return 1 (loop body never executes).
-        _iters_lines = []
-        for idx, n_iters in enumerate(inner_iters_list):
-            kw = "if" if idx == 0 else "elif"
-            _iters_lines.append(f"    {kw} op_idx == Int32({idx}):\n        _r = Int32({n_iters})")
-        _iters_body = "\n".join(_iters_lines) if _iters_lines else "    _r = Int32(1)"
-        _iters_src = (
-            f"@cute.jit\ndef _get_inner_iters(op_idx) -> Int32:\n    _r = Int32(1)\n{_iters_body}\n    return _r\n"
-        )
-        _iters_globals = {"cute": cute, "Int32": Int32}
-        exec_generated_source(_iters_src, "_get_inner_iters", _iters_globals)
-        _get_inner_iters = _iters_globals["_get_inner_iters"]
-
-        # Ring buffer kernel loop
-        def _kernel_loop_ring(
-            instructions_ptr: Int64,
-            barriers_ptr: Int64,
-            op_configs_ptr: Int64,
-            num_instructions: Int32,
-            tidx: Int32,
-            block_id: Int32,
-            num_blocks: Int32,
-            smem_base: Int32,
-            trace_buffer_ptr: Int64,
-            wait_info_ptr: Int64,
-        ) -> None:
-            """Warp-specialized ring buffer loop.
-
-            Warp roles (NUM_DMA_WARPS=3, W = num_mma_warps):
-              Warps 0..W-1:  MMA warps — compute from ring buffer pages
-              Warp W:        Controller — fetches instructions, pre-computed barrier wait
-              Warp W+1:      Loader — dispatches TMA loads
-              Warp W+2:      Store — waits for compute_done, dispatches TMA stores
-
-            Mbarrier phases alternate 0/1 with each use (hardware auto-reset).
-            """
-            warp_id = tidx // Int32(32)
-            lane_id = tidx % Int32(32)
-
-            # Warp role assignment: controller=N-2, loader=N-1, store=N
-            is_store_warp = warp_id == Int32(num_mma_warps + 2)
-
-            # Register reallocation: all DMA warps free registers, MMA warps gain
-            if warp_id >= Int32(num_mma_warps):
-                setmaxregister_decrease(dma_reg_count)
-            if warp_id < Int32(num_mma_warps):
-                setmaxregister_increase(mma_reg_count)
-
-            # Instruction queue base pointer (out-of-order lookahead)
-            iq_base = smem_base + Int32(iq_offset)
-            flags_ptr = smem_base + Int32(flags_offset)
-
-            # ========== TRACE INIT ==========
-            if const_expr(tracing):
-                _trace_buf = cute.make_tensor(
-                    cute.make_ptr(cute.Uint8, trace_buffer_ptr),
-                    cute.make_layout(1 << 24),
-                )
-
-            # ========== INIT (controller/load warp thread 0) ==========
-            # Controller warp (split) or load warp (non-split) is always
-            # warp num_mma_warps — same ID in both modes.
-            if warp_id == Int32(num_mma_warps):
-                with cute.arch.elect_one():
-                    st_shared_i32(flags_ptr + FLAG_DISPATCH_LOAD, Int32(-1))
-                    st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
-                    st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
-                    st_shared_i32(flags_ptr + FLAG_LOAD_DONE, Int32(0))
-                    for _ip in range(num_pages):
-                        # Init per-slot op_idx to -1 (no previous op)
-                        _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
-                        st_shared_i32(_slot_ti, Int32(-1))
-                        mbarrier_init(
-                            _work_notify_mbar(smem_base, Int32(_ip)),
-                            Int32(1),
-                        )
-                        mbarrier_init(
-                            _compute_done_mbar(smem_base, Int32(_ip)),
-                            Int32(num_mma_warps),
-                        )
-                    mbarrier_init_fence()
-
-            # Sync all threads after init (named barrier 0 = full block)
-            named_barrier_sync(Int32(0), Int32(threads_per_block))
-
-            # ========== CONTROLLER WARP (fetch + pre-computed barrier wait) ==========
-            if warp_id == Int32(num_mma_warps):
-                produce_idx = Int32(0)
-                _fetch_idx = block_id
-                _fetch_idx_save = Int32(0)
-                _ctrl_done = Int32(0)
-
-                dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
-                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
-                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
-                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
-                _temp_instr = iq_base  # reuse IQ area as 8-byte temp
-
-                while _ctrl_done == Int32(0):
-                    if lane_id == Int32(0):
-                        # Prefetch next instruction BEFORE waiting for page.
-                        # Instruction fetch uses IQ smem (not the page), so it
-                        # overlaps with the previous tile's store. This hides
-                        # ~400 cycles of global memory latency per tile.
-                        _instr_op = Int32(TileInstruction.END_MARKER)
-                        _instr_lin = Int32(0)
-                        if _fetch_idx < num_instructions:
-                            load_instruction_to_smem(instructions_ptr, _fetch_idx, _temp_instr)
-                            _instr_op, _instr_lin = ld_shared_v2_b32(_temp_instr)
-                            if _instr_op == Int32(TileInstruction.END_MARKER):
-                                _fetch_idx = num_instructions
-                            if _instr_op != Int32(TileInstruction.END_MARKER):
-                                _fetch_idx_save = _fetch_idx
-                                _fetch_idx = _fetch_idx + num_blocks
-
-                        if _instr_op >= Int32(0):
-                            # Pre-computed blocking barrier wait (also overlaps
-                            # with store — reads global mem, not smem page)
-                            for _w in range_constexpr(max_waits):
-                                _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
-                                _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
-                                if _bar_idx >= Int32(0):
-                                    _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
-                                    global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
-
-                            # Wait for page available (blocks until store
-                            # completes for 1-page; usually instant for 2+ pages)
-                            _si = ld_shared_i32(store_idx_ptr)
-                            while (produce_idx - _si) >= Int32(num_pages):
-                                _wait_slot = produce_idx % Int32(num_pages)
-                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
-                                mbarrier_wait(
-                                    _compute_done_mbar(smem_base, _wait_slot), _wait_phase
-                                )
-                                _si = ld_shared_i32(store_idx_ptr)
-
-                            # Wait for loader to consume previous dispatch
-                            _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-                            while _dl_prev != Int32(-1):
-                                _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-
-                            # Write to ring buffer + signal loader
-                            _p_slot = produce_idx % Int32(num_pages)
-                            _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
-                            st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
-                            produce_idx = produce_idx + Int32(1)
-                            st_shared_i32(produce_idx_ptr, produce_idx)
-                            st_shared_release_cta_i32(dispatch_load_slot_ptr, _p_slot)
-
-                        if _instr_op == Int32(TileInstruction.END_MARKER):
-                            if _fetch_idx >= num_instructions:
-                                _store_idx_done = ld_shared_i32(store_idx_ptr)
-                                if (produce_idx - _store_idx_done) < Int32(num_pages):
-                                    _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-                                    while _dl_last != Int32(-1):
-                                        _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-                                    _sent = produce_idx % Int32(num_pages)
-                                    st_shared_i32(
-                                        smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
-                                        Int32(TileInstruction.END_MARKER),
-                                    )
-                                    mbarrier_arrive(_work_notify_mbar(smem_base, _sent))
-                                    st_shared_i32(load_done_ptr, Int32(1))
-
-                    _ctrl_done = ld_shared_i32(load_done_ptr)
-
-            # ========== LOADER WARP (TMA dispatch) ==========
-            if warp_id == Int32(num_mma_warps + 1):
-                if const_expr(tracing):
-                    _dma_lane = begin_lane_dynamic_raw(
-                        Int32(3),
-                        Int32(trace_row_stride),
-                        block_id,
-                        Int32(0),
-                        lane_id == Int32(0),
-                    )
-
-                _dl_cached_op_idx = Int32(-1)
-                _dl_cached_config = Int64(0)
-                _ldr_done = Int32(0)
-                _ldr_dispatch_ptr = flags_ptr + FLAG_DISPATCH_LOAD
-                _ldr_load_done_ptr = flags_ptr + FLAG_LOAD_DONE
-
-                while _ldr_done == Int32(0):
-                    # Acquire-load: ensures subsequent tile info reads see
-                    # controller's prior writes (release-store on flag)
-                    _dl_slot = ld_shared_acquire_cta_i32(_ldr_dispatch_ptr)
-                    if _dl_slot != Int32(-1):
-                        _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
-                        _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
-                        _dl_0, _dl_1, _dl_2, _dl_3, _dl_4 = decompose_tile(_dl_op, _dl_lin)
-                        _dl_pp = _get_page_ptr(smem_base, _dl_slot)
-                        if _dl_op != _dl_cached_op_idx:
-                            _dl_cached_config = ld_global_i64(op_configs_ptr, _dl_op)
-                            _dl_cached_op_idx = _dl_op
-                        _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
-                        _dl_iter = Int32(0)
-                        if const_expr(tracing):
-                            _tl = trace_start()
-                        dispatch_load(
-                            _dl_op,
-                            _dl_pp,
-                            _dl_0,
-                            _dl_1,
-                            _dl_2,
-                            _dl_3,
-                            _dl_4,
-                            _dl_cached_config,
-                            _dl_mbar,
-                            _dl_iter,
-                        )
-                        if const_expr(tracing):
-                            for _i in range_constexpr(num_ops):
-                                if _dl_op == Int32(_i):
-                                    _dma_lane = end_event_dynamic_raw_1(
-                                        _tl,
-                                        _trace_buf,
-                                        Int32(trace_row_stride),
-                                        _dma_lane,
-                                        Int32(trace_load_fmts[_i]),
-                                        _dl_op,
-                                    )
-                        # Signal controller: dispatch consumed (release ensures
-                        # TMA dispatch is ordered before flag reset)
-                        with cute.arch.elect_one():
-                            st_shared_release_cta_i32(_ldr_dispatch_ptr, Int32(-1))
-
-                    if _dl_slot == Int32(-1):
-                        nanosleep(Int32(100))
-
-                    _ldr_done = ld_shared_i32(_ldr_load_done_ptr)
-                    # If load_done but we have a pending dispatch, process it first
-                    if _ldr_done == Int32(1):
-                        _dl_final = ld_shared_i32(_ldr_dispatch_ptr)
-                        if _dl_final != Int32(-1):
-                            _ldr_done = Int32(0)
-
-                if const_expr(tracing):
-                    finish_lane_dynamic_raw(_trace_buf, _dma_lane)
-
-            # ========== STORE WARP LOOP ==========
-            # For each tile: optionally issue K-block TMA loads (iterations
-            # 1..inner_iters-1), then wait for compute_done, then TMA store.
-            if is_store_warp:
-                if const_expr(tracing):
-                    _store_lane = begin_lane_dynamic_raw(
-                        Int32(3),
-                        Int32(trace_row_stride),
-                        block_id,
-                        Int32(2),
-                        lane_id == Int32(0),
-                    )
-                _sw_done = Int32(0)
-                store_idx_ptr = flags_ptr + FLAG_STORE_IDX
-                produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
-                load_done_ptr = flags_ptr + FLAG_LOAD_DONE
-                # Cache op_config_ptr per op_idx (avoid repeated global loads)
-                _ds_cached_op_idx = Int32(-1)
-                _ds_cached_config = Int64(0)
-
-                while _sw_done == Int32(0):
-                    _s_idx = ld_shared_i32(store_idx_ptr)
-                    _p_idx = ld_shared_i32(produce_idx_ptr)
-
-                    if _s_idx < _p_idx:
-                        _s_slot = _s_idx % Int32(num_pages)
-                        _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
-
-                        # Read tile info early (valid once load warp incremented
-                        # produce_idx). ALL 32 threads read for TMA convergence.
-                        _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
-                        _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
-                        _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(_ds_op, _ds_lin)
-                        _ds_pp = _get_page_ptr(smem_base, _s_slot)
-                        if _ds_op != _ds_cached_op_idx:
-                            _ds_cached_config = ld_global_i64(op_configs_ptr, _ds_op)
-                            _ds_cached_op_idx = _ds_op
-                        _ds_mbar = _work_notify_mbar(smem_base, _s_slot)
-
-                        # K-block iteration: store warp issues remaining TMA
-                        # loads (iter 1..N-1) while compute processes K-blocks.
-                        # Ops without inner_iters get _n_iters=1, loop is skipped.
-                        # Must wait for work_notify first so load(iter=0) has
-                        # initialized op-managed mbarriers before iter 1+ uses them.
-                        _n_iters = _get_inner_iters(_ds_op)
-                        if _n_iters > Int32(1):
-                            mbarrier_wait(_ds_mbar, _s_phase)
-                        _iter_idx = Int32(1)
-                        while _iter_idx < _n_iters:
-                            dispatch_load(
-                                _ds_op,
-                                _ds_pp,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_4,
-                                _ds_cached_config,
-                                _ds_mbar,
-                                _iter_idx,
-                            )
-                            _iter_idx = _iter_idx + Int32(1)
-
-                        # Wait for full compute completion
-                        if const_expr(tracing):
-                            _tsw = trace_start()
-                        mbarrier_wait(_compute_done_mbar(smem_base, _s_slot), _s_phase)
-                        if const_expr(tracing):
-                            _store_lane = end_event_dynamic_raw_1(
-                                _tsw,
-                                _trace_buf,
-                                Int32(trace_row_stride),
-                                _store_lane,
-                                Int32(trace_compute_wait_fmt),
-                                _ds_op,
-                            )
-
-                        # ALL 32 threads dispatch store (TMA warp convergence)
-                        if const_expr(tracing):
-                            _tss = trace_start()
-                        dispatch_store(
-                            _ds_op,
-                            _ds_pp,
-                            _ds_0,
-                            _ds_1,
-                            _ds_2,
-                            _ds_3,
-                            _ds_4,
-                            _ds_cached_config,
-                        )
-                        # Communicate: send results to peer GPUs via TMA S2G
-                        # (all 32 threads for TMA warp convergence)
-                        if const_expr(has_communicate):
-                            dispatch_communicate(
-                                _ds_op,
-                                _ds_pp,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_4,
-                                _ds_cached_config,
-                            )
-                        # Commit local + peer S2G stores in one group so the
-                        # TMA engine pipelines both concurrently.
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        if const_expr(tracing):
-                            for _si in range_constexpr(num_ops):
-                                if _ds_op == Int32(_si):
-                                    _store_lane = end_event_dynamic_raw_1(
-                                        _tss,
-                                        _trace_buf,
-                                        Int32(trace_row_stride),
-                                        _store_lane,
-                                        Int32(trace_store_fmts[_si]),
-                                        _ds_op,
-                                    )
-
-                        # Elect one thread: signal barriers + update store_idx
-                        with cute.arch.elect_one():
-                            signal_barriers(
-                                _ds_op,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_4,
-                                barriers_ptr,
-                            )
-                            if const_expr(has_communicate):
-                                signal_peer_barriers(
-                                    _ds_op,
-                                    _ds_lin,
-                                    Int64(_peer_barriers_data_ptr),
-                                )
-                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))
-
-                    if _s_idx >= _p_idx:
-                        # No tiles to store — check if load warp is done
-                        if ld_shared_i32(load_done_ptr) == Int32(1):
-                            _sw_done = Int32(1)
-                        if ld_shared_i32(load_done_ptr) != Int32(1):
-                            _sw_next_slot = _s_idx % Int32(num_pages)
-                            _sw_next_phase = (_s_idx // Int32(num_pages)) % Int32(2)
-                            mbarrier_wait(
-                                _work_notify_mbar(smem_base, _sw_next_slot),
-                                _sw_next_phase,
-                            )
-
-                if const_expr(tracing):
-                    finish_lane_dynamic_raw(_trace_buf, _store_lane)
-
-            # ========== MMA WARP LOOP ==========
-            if warp_id < Int32(num_mma_warps):
-                if const_expr(tracing):
-                    _mma_lane = begin_lane_dynamic_raw(
-                        Int32(3),
-                        Int32(trace_row_stride),
-                        block_id,
-                        Int32(1),
-                        (warp_id == Int32(0)) & (lane_id == Int32(0)),
-                    )
-
-                consume_ptr = Int32(0)
-                mma_running = Int32(1)
-                # Cache op_config_ptr: only reload from global when op_idx changes
-                _cached_op_idx = Int32(-1)
-                _cached_op_config = Int64(0)
-
-                while mma_running == Int32(1):
-                    slot = consume_ptr % Int32(num_pages)
-
-                    # work_notify phase: 1 arrive per tile, alternates
-                    # each time the slot is reused. Pure register formula.
-                    _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
-                    if const_expr(tracing):
-                        _tw = trace_start()
-                    mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
-
-                    # Read tile info (page == slot, no work queue indirection)
-                    tile_info_ptr = smem_base + Int32(ring_state_offset) + slot * Int32(tile_info_bytes)
-                    op_idx, _mma_lin = ld_shared_v2_b32(tile_info_ptr)
-
-                    # Check for sentinel (END_MARKER = exit)
-                    if op_idx == Int32(TileInstruction.END_MARKER):
-                        mma_running = Int32(0)
-
-                    if op_idx != Int32(TileInstruction.END_MARKER):
-                        if const_expr(tracing):
-                            _mma_lane = end_event_dynamic_raw_1(
-                                _tw,
-                                _trace_buf,
-                                Int32(trace_row_stride),
-                                _mma_lane,
-                                Int32(trace_data_wait_fmt),
-                                op_idx,
-                            )
-
-                        tile_0, tile_1, tile_2, tile_3, tile_4 = decompose_tile(op_idx, _mma_lin)
-
-                        page_ptr = _get_page_ptr(smem_base, slot)
-                        # Cache op_config_ptr: avoid global load when op unchanged
-                        if op_idx != _cached_op_idx:
-                            _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
-                            _cached_op_idx = op_idx
-
-                            # Per-op register transition: idle warps
-                            # release registers, active warps reclaim them.
-                            if const_expr(needs_warp_transition):
-                                # Phase 1: warps idle for this op decrease
-                                for _ow in range_constexpr(num_ops):
-                                    if op_idx == Int32(_ow):
-                                        if warp_id >= Int32(per_op_warps[_ow]):
-                                            setmaxregister_decrease(
-                                                MIN_IDLE_REGS)
-                                # Sync: frees must complete before claims
-                                named_barrier_sync(
-                                    Int32(1), Int32(num_compute_threads))
-                                # Phase 2: active warps increase (no-op if
-                                # already at mma_reg_count)
-                                for _ow in range_constexpr(num_ops):
-                                    if op_idx == Int32(_ow):
-                                        if warp_id < Int32(per_op_warps[_ow]):
-                                            setmaxregister_increase(
-                                                mma_reg_count)
-
-                        if const_expr(tracing):
-                            _tc = trace_start()
-
-                        dispatch_compute(
-                            op_idx,
-                            page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
-                            tile_4,
-                            _cached_op_config,
-                        )
-
-                        # Sync MMA warps post-compute
-                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
-
-                        if const_expr(tracing):
-                            for _i in range_constexpr(num_ops):
-                                if op_idx == Int32(_i):
-                                    _mma_lane = end_event_dynamic_raw_1(
-                                        _tc,
-                                        _trace_buf,
-                                        Int32(trace_row_stride),
-                                        _mma_lane,
-                                        Int32(trace_compute_fmts[_i]),
-                                        op_idx,
-                                    )
-
-                        # Signal compute_done for this slot
-                        with cute.arch.elect_one():
-                            mbarrier_arrive(_compute_done_mbar(smem_base, slot))
-
-                        consume_ptr = consume_ptr + Int32(1)
-
-                if const_expr(tracing):
-                    finish_lane_dynamic_raw(_trace_buf, _mma_lane)
+        kernel_cfg = self._kernel_static_config()
+        runtime = self._kernel_runtime_components(kernel_cfg)
+        kernel_loop_fn = self._build_ring_kernel_loop(kernel_cfg, runtime)
 
         return self._build_kernel(
-            _kernel_loop_ring,
-            dispatch_load,
-            dispatch_compute,
-            dispatch_store,
-            signal_barriers,
-            _get_page_ptr,
-            num_sms,
-            actual_threads_per_block,
-            smem_size,
-            num_pages,
-            iq_offset,
-            flags_offset,
-            ring_state_offset,
-            extra_exec_globals={
-                "_work_notify_mbar": _work_notify_mbar,
-                "_compute_done_mbar": _compute_done_mbar,
-                "decompose_tile": decompose_tile,
-                "ld_shared_v2_b32": ld_shared_v2_b32,
-                "st_shared_v2_b32": st_shared_v2_b32,
-                "num_mma_warps": num_mma_warps,
-                "num_compute_threads": num_compute_threads,
-                "threads_per_block": actual_threads_per_block,
-                "setmaxregister_increase": setmaxregister_increase,
-                "setmaxregister_decrease": setmaxregister_decrease,
-                "dma_reg_count": dma_reg_count,
-                "mma_reg_count": mma_reg_count,
-                "tile_info_bytes": tile_info_bytes,
-                "FLAG_DISPATCH_LOAD": FLAG_DISPATCH_LOAD,
-                "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
-                "FLAG_STORE_IDX": FLAG_STORE_IDX,
-                "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
-                "_get_inner_iters": _get_inner_iters,
-                # Pre-computed barrier wait
-                "max_waits": max_waits,
-                "global_barrier_wait": global_barrier_wait,
-                "ld_global_i32": ld_global_i32,
-                # Multi-GPU communication (peer TMA stores)
-                "dispatch_communicate": dispatch_communicate,
-                "has_communicate": has_communicate,
-                "signal_peer_barriers": signal_peer_barriers,
-                "_peer_barriers_data_ptr": peer_barriers_data_ptr,
-                # Per-op warp register transitions
-                "needs_warp_transition": needs_warp_transition,
-                "per_op_warps": per_op_warps,
-                "MIN_IDLE_REGS": MIN_IDLE_REGS,
-                "num_ops": len(self.ops),
-                **trace_exec_globals,
-            },
+            kernel_loop_fn,
+            runtime["dispatch_load"],
+            runtime["dispatch_compute"],
+            runtime["dispatch_store"],
+            runtime["signal_barriers"],
+            runtime["_get_page_ptr"],
+            kernel_cfg["num_sms"],
+            kernel_cfg["actual_threads_per_block"],
+            kernel_cfg["smem_size"],
+            kernel_cfg["num_pages"],
+            kernel_cfg["iq_offset"],
+            kernel_cfg["flags_offset"],
+            kernel_cfg["ring_state_offset"],
+            extra_exec_globals=self._kernel_extra_exec_globals(kernel_cfg, runtime),
         )
 
     def _make_cache_key(self) -> Tuple:

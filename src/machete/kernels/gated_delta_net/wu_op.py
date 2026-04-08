@@ -41,7 +41,8 @@ from machete.megakernel.interpreter import (
 )
 
 
-_BT = 64   # Chunk size (fixed by algorithm)
+from machete.kernels.gated_delta_net.chunk_size import auto_bt, _DEFAULT_BT
+
 _BK = 64   # Default K-block
 _BV = 64   # Default V-block
 _MBAR_BYTES = 32  # 4 mbarriers × 8 bytes (buf_free×2 + kblock_ready×2)
@@ -81,26 +82,28 @@ class GDNWUOp(Op):
 
     @classmethod
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
+        BT = static_dims.get("BT", _DEFAULT_BT)
         if tensor_name == "a_solved":
-            return (_BT, tile_sizes.get("NH", 1), _BT)
+            return (BT, tile_sizes.get("NH", 1), BT)
         if tensor_name == "k":
             BK = static_dims.get("BK", _BK)
-            return (_BT, tile_sizes.get("NH", 1), BK)
+            return (BT, tile_sizes.get("NH", 1), BK)
         return None
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
                                  tile_sizes, static_dims):
+        BT = static_dims.get("BT", _DEFAULT_BT)
         if tensor_name == "a_solved":
             return (
-                f"cute.make_layout(({_BT}, 1, {_BT}), "
-                f"stride=(1, {_BT}, {_BT}))"
+                f"cute.make_layout(({BT}, 1, {BT}), "
+                f"stride=(1, {BT}, {BT}))"
             )
         if tensor_name == "k":
             BK = static_dims.get("BK", _BK)
             # Compact layout (no swizzle) — allows in-place weighting writes
             return (
-                f"cute.make_layout(({BK}, 1, {_BT}), "
+                f"cute.make_layout(({BK}, 1, {BT}), "
                 f"stride=(1, {BK}, {BK}))"
             )
         return None
@@ -114,7 +117,7 @@ class GDNWUOp(Op):
         )
         self.elem_bytes = 2
 
-        self.BT = _BT
+        self.BT = getattr(self, "BT", _DEFAULT_BT)
         self.BK = getattr(self, "BK", _BK)
         self.BV = getattr(self, "BV", _BV)
         self.NK = self.K // self.BK
@@ -190,16 +193,15 @@ class GDNWUOp(Op):
     # =========================================================================
 
     @classmethod
-    def _auto_block_sizes(cls, page_size, K, V, elem_bytes=2):
+    def _auto_block_sizes(cls, page_size, K, V, BT, elem_bytes=2):
         """Compute largest (BK, BV) that fit in page_size.
 
         Smem layout (two phases sharing src area):
-            a_solved [BT, BT] fp16           8KB
-            gc_buf + beta_buf                512B
-            K-phase: 1-2 × [BT, BK] + mbar  (1 or 2)*BT*BK*2 + 32
-            V-phase: 1-2 × [BT, BV_PAD]     (1 or 2)*BT*(BV+8)*2
+            a_solved [BT, BT] fp16
+            gc_buf + beta_buf
+            K-phase: 1-2 × [BT, BK] + mbar
+            V-phase: 1-2 × [BT, BV_PAD]
         """
-        BT = _BT
         a_bytes = BT * BT * elem_bytes
         scalars_start = ((a_bytes + 15) // 16) * 16
         scalars_end = scalars_start + 2 * BT * 4  # gc + beta
@@ -238,18 +240,20 @@ class GDNWUOp(Op):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("NH", 1)
-        tile_sizes.setdefault("S", _BT)
+        BT = auto_bt(page_size)
+        tile_sizes.setdefault("S", BT)
 
         k = tensors.get("k")
         K = k.shape[-1] if k is not None else 64
         v = tensors.get("v")
         V = v.shape[-1] if v is not None else 64
         elem_bytes = k.element_size() if k is not None else 2
-        BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
+        BK, BV = cls._auto_block_sizes(page_size, K, V, BT, elem_bytes)
 
         S = k.shape[1] if k is not None else 64
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["BT"] = BT
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["BV"] = BV
         ops[0].static_dims["K"] = K
@@ -262,7 +266,8 @@ class GDNWUOp(Op):
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        num_mma_warps = _BT // 16
+        BT = max(op.static_dims.get("BT", _DEFAULT_BT) for op in ops)
+        num_mma_warps = BT // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = max(
             op.static_dims.get("page_size", DEFAULT_PAGE_SIZE) for op in ops

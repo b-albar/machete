@@ -28,7 +28,8 @@ from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import named_barrier_sync
 
 
-_BT = 64
+from machete.kernels.gated_delta_net.chunk_size import auto_bt, _DEFAULT_BT
+
 _BK = 64
 _BV = 64
 
@@ -67,7 +68,7 @@ class GDNStateRecurrenceOp(Op):
         assert self.k_dtype in (cutlass.Float16, cutlass.BFloat16)
         self.elem_bytes = 2
 
-        self.BT = _BT
+        self.BT = getattr(self, "BT", _DEFAULT_BT)
         self.BK = getattr(self, "BK", _BK)
         self.BV = getattr(self, "BV", _BV)
         self.NK = self.K // self.BK
@@ -119,9 +120,8 @@ class GDNStateRecurrenceOp(Op):
     # =========================================================================
 
     @classmethod
-    def _auto_block_sizes(cls, page_size, K, V, elem_bytes=2):
+    def _auto_block_sizes(cls, page_size, K, V, BT, elem_bytes=2):
         """Compute largest (BK, BV) fitting in page_size."""
-        BT = _BT
         for BK in [128, 64, 32]:
             if K % BK != 0 or BK > BT:
                 continue
@@ -148,6 +148,8 @@ class GDNStateRecurrenceOp(Op):
         tile_sizes.setdefault("NH", 1)
         tile_sizes.setdefault("V", _BV)
 
+        BT = auto_bt(page_size)
+
         k = tensors.get("k")
         u = tensors.get("u")
         K = k.shape[-1] if k is not None else 64
@@ -155,10 +157,11 @@ class GDNStateRecurrenceOp(Op):
         elem_bytes = k.element_size() if k is not None else 2
         S = k.shape[1] if k is not None else 64
 
-        BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
+        BK, BV = cls._auto_block_sizes(page_size, K, V, BT, elem_bytes)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["BT"] = BT
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["BV"] = BV
         ops[0].static_dims["K"] = K
@@ -171,7 +174,8 @@ class GDNStateRecurrenceOp(Op):
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        num_mma_warps = _BT // 16
+        BT = max(op.static_dims.get("BT", _DEFAULT_BT) for op in ops)
+        num_mma_warps = BT // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = max(
             op.static_dims.get("page_size", DEFAULT_PAGE_SIZE) for op in ops

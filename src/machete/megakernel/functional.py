@@ -1,8 +1,9 @@
 # Copyright (c) 2025, Machete Authors
 """
-User-facing API for autograd-enabled megakernel ops.
+User-facing wrappers for autograd-enabled megakernel ops.
 
-Provides functional and module wrappers around MegakernelFunction.
+This module exposes the smallest public surface for running fused kernels
+without instantiating ``Megakernel`` directly.
 
 Usage:
     # Functional API
@@ -28,7 +29,7 @@ def megakernel_apply(
     config: Optional[MegakernelConfig] = None,
     **named_tensors: torch.Tensor,
 ) -> torch.Tensor:
-    """Run fused megakernel ops with autograd support.
+    """Execute one or more autograd-aware megakernel ops.
 
     Args:
         *autograd_ops: One or more AutogradOp instances.
@@ -36,8 +37,7 @@ def megakernel_apply(
         **named_tensors: Input tensors by name (must match tensor_specs).
 
     Returns:
-        Output tensor(s). For single-output ops, returns a single tensor.
-        For multi-output, returns a tuple.
+        Output tensor or tuple of output tensors.
 
     Example::
 
@@ -66,7 +66,7 @@ def megakernel_apply(
 
 
 class MegakernelModule(nn.Module):
-    """nn.Module wrapper for megakernel ops.
+    """``nn.Module`` wrapper over :func:`megakernel_apply`.
 
     Example::
 
@@ -84,6 +84,7 @@ class MegakernelModule(nn.Module):
         self.config = config or MegakernelConfig()
 
     def forward(self, **tensors: torch.Tensor) -> torch.Tensor:
+        """Apply the configured autograd ops to named input tensors."""
         return megakernel_apply(
             *self.autograd_ops,
             config=self.config,

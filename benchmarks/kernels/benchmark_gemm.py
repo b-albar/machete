@@ -18,7 +18,6 @@ import torch
 
 from machete.megakernel import Megakernel
 from machete.kernels.gemm import GemmOp
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -96,20 +95,6 @@ def bench_gemm(M, K, N, dtype, page_size):
         except Exception:
             pass
 
-        try:
-            c_so = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
-            so_ops = GemmOp.schedule(a=a, b=b_t, c=c_so, page_size=page_size)
-            so_kernel = SingleOpKernel(so_ops)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(
-                setup_fn=lambda c_so=c_so: c_so.zero_(),
-                keep_alive=[a, b_t, c_so],
-            )
-        except Exception:
-            pass
-
     return funcs
 
 
@@ -161,24 +146,6 @@ def bench_gemm_bwd(M, K, N, dtype, page_size):
                 funcs["megakernel"] = kernel.bench_spec(
                     setup_fn=lambda da=da, db=db: (da.zero_(), db.zero_()),
                     keep_alive=[a, b_t, dout, da, db],
-                )
-        except Exception:
-            pass
-
-        try:
-            da_so = torch.zeros(1, M, K, dtype=torch_dtype, device="cuda")
-            db_so = torch.zeros(1, N, K, dtype=torch_dtype, device="cuda")
-            so_bwd_ops = GemmOp.schedule_backward(
-                dout=dout, a=a, b=b_t, da=da_so, db=db_so, page_size=page_size,
-            )
-            if so_bwd_ops:
-                so_bwd_kernel = SingleOpKernel(so_bwd_ops)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    so_bwd_kernel.run()
-                torch.cuda.synchronize()
-                funcs["single_op"] = so_bwd_kernel.bench_spec(
-                    setup_fn=lambda da_so=da_so, db_so=db_so: (da_so.zero_(), db_so.zero_()),
-                    keep_alive=[a, b_t, dout, da_so, db_so],
                 )
         except Exception:
             pass

@@ -8,7 +8,6 @@ Compares GPU kernel execution time and memory throughput of GLU
 Implementations:
 - PyTorch: Pure PyTorch reference (F.silu(gate) * up)
 - Megakernel: Machete megakernel framework (direct global access)
-- SingleOp: Single-op kernel (no megakernel overhead)
 
 Usage:
     python benchmarks/kernels/benchmark_glu.py
@@ -22,7 +21,6 @@ import torch.nn.functional as F
 
 from machete.megakernel import Megakernel
 from machete.kernels.glu import GLUOp, GLUBwdOp
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -87,7 +85,7 @@ def bench_glu_fwd(hidden_dim, seq_len, batch):
     torch.cuda.synchronize()
     funcs["pytorch"] = pytorch_glu
 
-    # Megakernel + SingleOp
+    # Megakernel
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         x_3d = x.view(batch, seq_len, N)
 
@@ -100,18 +98,6 @@ def bench_glu_fwd(hidden_dim, seq_len, batch):
                 kernel.run()
             torch.cuda.synchronize()
             funcs["megakernel"] = kernel.bench_spec(keep_alive=[x_3d, y_3d])
-        except Exception:
-            pass
-
-        try:
-            y_so = torch.empty(batch, seq_len, D, dtype=x.dtype, device="cuda")
-            so_ops = GLUOp.schedule(x=x_3d, y=y_so)
-            so_config = GLUOp.kernel_config(so_ops)
-            so_kernel = SingleOpKernel(so_ops, config=so_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x_3d, y_so])
         except Exception:
             pass
 
@@ -168,20 +154,6 @@ def bench_glu_bwd(hidden_dim, seq_len, batch):
             torch.cuda.synchronize()
             funcs["megakernel"] = kernel.bench_spec(
                 keep_alive=[dy_3d, x_3d, dx_3d])
-        except Exception:
-            pass
-
-        try:
-            dx_so = torch.empty_like(x_3d)
-            so_ops = GLUBwdOp.schedule(
-                dy=dy_3d, x=x_3d, dx=dx_so)
-            so_config = GLUBwdOp.kernel_config(so_ops)
-            so_kernel = SingleOpKernel(so_ops, config=so_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(
-                keep_alive=[dy_3d, x_3d, dx_so])
         except Exception:
             pass
 

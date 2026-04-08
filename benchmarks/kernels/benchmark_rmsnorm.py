@@ -23,7 +23,6 @@ import torch
 from machete.megakernel import Megakernel
 from machete.kernels.rms_norm import RMSNormOp, RMSNormBwdOp
 from machete.kernels.rms_norm.ref import rmsnorm_pytorch, rmsnorm_backward_pytorch, HAS_TRITON, HAS_CUTLASS_RMSNORM
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 if HAS_TRITON:
@@ -94,7 +93,7 @@ def bench_rmsnorm(hidden_dim, seq_len, batch):
         except Exception:
             pass
 
-    # Megakernel + SingleOp forward
+    # Megakernel forward
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         x_3d = x.view(batch, seq_len, D)
         try:
@@ -106,18 +105,6 @@ def bench_rmsnorm(hidden_dim, seq_len, batch):
                 kernel.run()
             torch.cuda.synchronize()
             funcs["megakernel"] = kernel.bench_spec(keep_alive=[x_3d, weight, y_3d])
-        except Exception:
-            pass
-
-        try:
-            y_so_3d = torch.empty_like(x_3d)
-            so_ops = RMSNormOp.schedule(x=x_3d, weight=weight, y=y_so_3d)
-            so_config = RMSNormOp.kernel_config(so_ops)
-            so_kernel = SingleOpKernel(so_ops, config=so_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x_3d, weight, y_so_3d])
         except Exception:
             pass
 
@@ -172,20 +159,6 @@ def bench_rmsnorm_bwd(hidden_dim, seq_len, batch):
             torch.cuda.synchronize()
             funcs["megakernel"] = bwd_kernel.bench_spec(
                 keep_alive=[dout_3d, x_3d, weight, dx_3d])
-        except Exception:
-            pass
-
-        try:
-            dx_so_3d = torch.empty_like(x_3d)
-            so_bwd_ops = RMSNormBwdOp.schedule(
-                dout=dout_3d, x=x_3d, weight=weight, dx=dx_so_3d)
-            so_bwd_config = RMSNormBwdOp.kernel_config(so_bwd_ops)
-            so_bwd_kernel = SingleOpKernel(so_bwd_ops, config=so_bwd_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_bwd_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_bwd_kernel.bench_spec(
-                keep_alive=[dout_3d, x_3d, weight, dx_so_3d])
         except Exception:
             pass
 

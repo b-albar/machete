@@ -17,10 +17,9 @@ BarrierFormula objects that get baked into op handlers at JIT compile time.
 import math
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from dataclasses import dataclass
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
-import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 
@@ -336,6 +335,25 @@ def _depth_sorted_instructions(
     ]
 
 
+def _decompose_linear_tile(linear_idx: int, tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Decompose a row-major linear tile index into tile coordinates."""
+    tile = []
+    remainder = linear_idx
+    for axis in range(len(tile_counts)):
+        stride = math.prod(tile_counts[axis + 1 :]) if axis + 1 < len(tile_counts) else 1
+        tile.append(remainder // stride)
+        remainder %= stride
+    return tuple(tile)
+
+
+def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]:
+    """Group dependency edges by consumer op index."""
+    consumer_deps: Dict[int, List[_DepEdge]] = {}
+    for edge in edges:
+        consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
+    return consumer_deps
+
+
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
 
@@ -491,6 +509,11 @@ class InstructionStreamBuilder:
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
         self._barrier_count: Optional[int] = None
 
+    def _invalidate_resolution_cache(self) -> None:
+        """Clear cached formulas after the op list changes."""
+        self._cached_formulas = None
+        self._barrier_count = None
+
     @property
     def ops(self) -> List[ScheduledOp]:
         """Scheduled ops in order."""
@@ -541,20 +564,10 @@ class InstructionStreamBuilder:
             if len(axes) != len(set(axes)):
                 raise ValueError(f"dim_names maps multiple dims to the same axis: {op.dim_names}")
 
-        # Pre-compute flat tile list using row-major linearization
-        tiles = []
-        counts = op.tile_counts
-        ndims = len(counts)
-        for linear_idx in range(op.total_tiles):
-            # Decompose linear index into multi-dim tile coordinates (row-major)
-            tile = []
-            remainder = linear_idx
-            for i in range(ndims):
-                # Stride for axis i = product of counts[i+1:]
-                stride = math.prod(counts[i + 1 :]) if i + 1 < ndims else 1
-                tile.append(remainder // stride)
-                remainder %= stride
-            tiles.append(tuple(tile))
+        tiles = [
+            _decompose_linear_tile(linear_idx, op.tile_counts)
+            for linear_idx in range(op.total_tiles)
+        ]
 
         record = _OpRecord(
             op_idx=len(self._op_records),
@@ -562,9 +575,7 @@ class InstructionStreamBuilder:
             tiles=tiles,
         )
         self._op_records.append(record)
-        # Invalidate cache
-        self._cached_formulas = None
-        self._barrier_count = None
+        self._invalidate_resolution_cache()
         return self
 
     def _has_named_buffers(self) -> bool:
@@ -701,6 +712,11 @@ class InstructionStreamBuilder:
                 ))
 
         return edges
+
+    def _resolve_edges_and_consumers(self) -> Tuple[List["_DepEdge"], Dict[int, List["_DepEdge"]]]:
+        """Resolve dependency edges and the consumer-grouped view used by schedulers."""
+        edges = self._resolve_dep_edges()
+        return edges, _group_consumer_deps(edges)
 
     def _resolve(
         self,
@@ -1000,11 +1016,7 @@ class InstructionStreamBuilder:
         if not self._op_records:
             return [TileInstruction.end_instruction()]
 
-        # Resolve dependency edges and group by consumer
-        edges = self._resolve_dep_edges()
-        consumer_deps: Dict[int, List[_DepEdge]] = {}
-        for edge in edges:
-            consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
+        edges, consumer_deps = self._resolve_edges_and_consumers()
 
         # Use provided scheduler or default
         if scheduler is None:
@@ -1053,23 +1065,34 @@ class InstructionStreamBuilder:
         formulas, _ = self._resolve()
         max_waits = max(1, self.max_wait_deps)
 
-        wait_data = []
-        for instr in instructions:
-            entry = []
-            if instr.op_idx == TileInstruction.END_MARKER:
-                entry = [-1, 0] * max_waits
-            else:
-                wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
-                for wf in wait_formulas:
-                    if wf.has_guard and not wf.is_guarded(instr.tiles):
-                        entry.extend([-1, 0])
-                    else:
-                        entry.extend([wf.compute_index(instr.tiles), wf.expected])
-                while len(entry) < max_waits * 2:
-                    entry.extend([-1, 0])
-            wait_data.append(entry)
+        wait_data = [
+            self._build_wait_info_entry(instr, formulas, max_waits)
+            for instr in instructions
+        ]
 
         return torch.tensor(wait_data, dtype=torch.int32, device=device)
+
+    @staticmethod
+    def _build_wait_info_entry(
+        instr: TileInstruction,
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+        max_waits: int,
+    ) -> List[int]:
+        """Pack wait metadata for one instruction into `[barrier, expected, ...]`."""
+        if instr.op_idx == TileInstruction.END_MARKER:
+            return [-1, 0] * max_waits
+
+        entry: List[int] = []
+        wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
+        for formula in wait_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                entry.extend([-1, 0])
+            else:
+                entry.extend([formula.compute_index(instr.tiles), formula.expected])
+
+        while len(entry) < max_waits * 2:
+            entry.extend([-1, 0])
+        return entry
 
     def build_decompose_tile_fn(self):
         """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).

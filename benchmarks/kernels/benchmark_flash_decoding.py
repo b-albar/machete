@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from machete.megakernel import Megakernel
 from machete.kernels.attention import FlashAttentionSm120Op
 from machete.kernels.attention.flash_decoding import flash_decoding_schedule
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:

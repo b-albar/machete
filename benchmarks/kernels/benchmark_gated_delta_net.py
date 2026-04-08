@@ -21,7 +21,6 @@ import io
 
 import torch
 
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 from machete.utils.benchmark_utils import KernelBenchSpec
 
@@ -189,28 +188,6 @@ def bench_prep(B, T, H, K, V, page_size):
         except Exception:
             pass
 
-        try:
-            gc_so = torch.zeros(B, T, H, device=k.device, dtype=torch.float32)
-            w_so = torch.zeros(B, T, H, K, device=k.device, dtype=k.dtype)
-            u_so = torch.zeros(B, T, H, V, device=k.device, dtype=k.dtype)
-
-            so_ops = GDNPrepOp.schedule(
-                k=k.contiguous(), v=v.contiguous(),
-                g=g.contiguous(), beta=beta.contiguous(),
-                g_cumsum=gc_so, w=w_so, u=u_so, page_size=page_size,
-            )
-            so_kernel = SingleOpKernel(so_ops)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-
-            funcs["single_op"] = so_kernel.bench_spec(
-                setup_fn=lambda gc=gc_so, w=w_so, u=u_so: (gc.zero_(), w.zero_(), u.zero_()),
-                keep_alive=[k, v, g, beta, gc_so, w_so, u_so],
-            )
-        except Exception:
-            pass
-
     return funcs
 
 
@@ -270,26 +247,6 @@ def bench_fused(B, T, H, K, V, page_size):
                 funcs["fused_op"] = mk_kernel.bench_spec(
                     setup_fn=lambda o=o_mk: o.zero_(),
                     keep_alive=[q, k, w, u, g_cumsum, o_mk],
-                )
-            except Exception:
-                pass
-
-            try:
-                o_so = torch.zeros(B, T, H, V, device=q.device, dtype=q.dtype)
-                so_ops = GDNFusedOp.schedule(
-                    q=q.contiguous(), k=k.contiguous(),
-                    w=w.contiguous(), u=u.contiguous(),
-                    g_cumsum=g_cumsum.contiguous(), o=o_so,
-                    scale=scale, page_size=page_size,
-                )
-                so_kernel = SingleOpKernel(so_ops)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    so_kernel.run()
-                torch.cuda.synchronize()
-
-                funcs["single_op"] = so_kernel.bench_spec(
-                    setup_fn=lambda o=o_so: o.zero_(),
-                    keep_alive=[q, k, w, u, g_cumsum, o_so],
                 )
             except Exception:
                 pass
@@ -408,13 +365,16 @@ def _build_5op_kernel(q_c, k_c, v_c, g_c, beta_c, scale, page_size):
     from machete.kernels.gated_delta_net.vnew_op import GDNVNewOp
     from machete.kernels.gated_delta_net.output_op import GDNOutputOp
 
+    from machete.kernels.gated_delta_net.chunk_size import auto_bt
+
     B, T, H, K = q_c.shape
     V = v_c.shape[-1]
-    NT = T // 64
+    BT = auto_bt(page_size)
+    NT = T // BT
     dtype = q_c.dtype
 
     gc = torch.zeros(B, T, H, device=q_c.device, dtype=torch.float32)
-    a_solved = torch.zeros(B, T, H, 64, device=q_c.device, dtype=dtype)
+    a_solved = torch.zeros(B, T, H, BT, device=q_c.device, dtype=dtype)
     w = torch.zeros(B, T, H, K, device=q_c.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
     v_new = torch.zeros(B, T, H, V, device=q_c.device, dtype=dtype)
@@ -518,7 +478,7 @@ if __name__ == "__main__":
     print("-" * 100)
     bench_prep._benchmark.run(
         mode="kernel", warmup=10, rep=100,
-        columns=["fla", "pytorch", "megakernel", "single_op"],
+        columns=["fla", "pytorch", "megakernel"],
     )
 
     print()
@@ -527,7 +487,7 @@ if __name__ == "__main__":
     print("-" * 100)
     bench_fused._benchmark.run(
         mode="kernel", warmup=10, rep=100,
-        columns=["fla_state+output", "fused_op", "single_op"],
+        columns=["fla_state+output", "fused_op"],
     )
 
     print()

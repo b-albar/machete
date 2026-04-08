@@ -4,7 +4,7 @@
 
 Compares strategies for computing y = RMSNorm(x @ W, weight):
   1. fused:      Megakernel(GEMM + RMSNormOp)   — single persistent kernel
-  2. sequential: Megakernel(GEMM) + SingleOp(RMSNormOp)  — 2 kernel launches
+  2. sequential: Megakernel(GEMM) + Megakernel(RMSNormOp)  — 2 kernel launches
 
 Usage:
     python benchmarks/kernels/benchmark_fusion_rmsnorm.py
@@ -67,7 +67,6 @@ def bench_gemm_rmsnorm(M, D):
 
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm import RMSNormOp
-    from machete.kernels.utils import SingleOpKernel
     import cuda.bindings.driver as cuda
 
     dtype = torch.bfloat16
@@ -108,7 +107,7 @@ def bench_gemm_rmsnorm(M, D):
     except Exception as e:
         print(f"  fused failed: {e}")
 
-    # --- 2. sequential: Megakernel(GEMM) + SingleOp(RMSNormOp) ---
+    # --- 2. sequential: Megakernel(GEMM) + Megakernel(RMSNormOp) ---
     try:
         x_sd = x.clone()
         h_sd = torch.zeros(B, M, D, dtype=dtype, device="cuda")
@@ -119,7 +118,7 @@ def bench_gemm_rmsnorm(M, D):
 
         dir_ops = RMSNormOp.schedule(x=h_sd, weight=rms_weight, y=y_sd)
         dir_config = RMSNormOp.kernel_config(dir_ops)
-        dir_kern = SingleOpKernel(dir_ops, config=dir_config)
+        dir_kern = Megakernel(dir_ops, config=dir_config)
         with contextlib.redirect_stdout(io.StringIO()):
             dir_kern.run()
         torch.cuda.synchronize()
@@ -162,7 +161,6 @@ def bench_rmsnorm_standalone(M, D):
 
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.rms_norm.ref import rmsnorm_pytorch, HAS_TRITON
-    from machete.kernels.utils import SingleOpKernel
 
     dtype = torch.bfloat16
     torch.manual_seed(42)
@@ -183,12 +181,12 @@ def bench_rmsnorm_standalone(M, D):
         torch.cuda.synchronize()
         funcs["triton"] = lambda: rmsnorm_triton(x_2d, weight)
 
-    # SingleOp
+    # Single-op megakernel
     try:
         y_dir = torch.empty_like(x)
         dir_ops = RMSNormOp.schedule(x=x, weight=weight, y=y_dir)
         dir_config = RMSNormOp.kernel_config(dir_ops)
-        dir_kern = SingleOpKernel(dir_ops, config=dir_config)
+        dir_kern = Megakernel(dir_ops, config=dir_config)
         with contextlib.redirect_stdout(io.StringIO()):
             dir_kern.run()
         torch.cuda.synchronize()
@@ -235,7 +233,7 @@ if __name__ == "__main__":
     print("-" * 100)
     print("2. GEMM + RMSNorm: Fused vs Sequential")
     print("   fused      = single Megakernel(GEMM + RMSNormOp)")
-    print("   sequential = Megakernel(GEMM) + SingleOp(RMSNormOp)")
+    print("   sequential = Megakernel(GEMM) + Megakernel(RMSNormOp)")
     print("-" * 100)
     bench_gemm_rmsnorm._benchmark.run(
         mode="kernel",

@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 # Copyright (c) 2025, Machete Authors
-"""Benchmark SM100 GEMM: Quack vs Machete Megakernel vs SingleOp vs cuBLAS.
+"""Benchmark SM100 GEMM: Quack vs Machete Megakernel vs cuBLAS.
 
 Compares GPU kernel execution time of:
   - cuBLAS (torch.matmul) — baseline
   - Quack GemmSm100 (persistent UMMA GEMM)
   - Machete GemmSm100Op (megakernel UMMA GEMM)
-  - Machete GemmSm100Op (single-op mode)
 
 Requires SM100+ (Blackwell) GPU and CUTLASS.
 
@@ -21,7 +20,6 @@ import torch
 
 from machete.megakernel import Megakernel
 from machete.kernels.gemm import GemmSm100Op
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -174,21 +172,6 @@ def bench_gemm_sm100(M, K, N, dtype, page_size):
     except Exception:
         pass
 
-    # Machete SingleOp GemmSm100Op
-    try:
-        c_so = torch.zeros(1, M, N, dtype=torch_dtype, device="cuda")
-        so_ops = GemmSm100Op.schedule(a=a, b=b_t, c=c_so, page_size=page_size)
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
-        funcs["single_op"] = so_kernel.bench_spec(
-            setup_fn=lambda c_so=c_so: c_so.zero_(),
-            keep_alive=[a, b_t, c_so],
-        )
-    except Exception:
-        pass
-
     return funcs
 
 
@@ -199,7 +182,7 @@ def bench_gemm_sm100(M, K, N, dtype, page_size):
 
 if __name__ == "__main__":
     print("=" * 100)
-    print("SM100 GEMM Benchmark: Quack vs Machete Megakernel vs SingleOp vs cuBLAS")
+    print("SM100 GEMM Benchmark: Quack vs Machete Megakernel vs cuBLAS")
     print("=" * 100)
 
     if torch.cuda.is_available():

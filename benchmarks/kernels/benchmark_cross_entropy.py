@@ -19,7 +19,6 @@ import torch.nn.functional as F
 
 from machete.megakernel import Megakernel
 from machete.kernels.cross_entropy import CrossEntropyOp
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -85,7 +84,7 @@ def benchmark_cross_entropy(BT, V, page_size):
 
         results["Liger"] = liger_ce
 
-    # --- Megakernel + SingleOp CrossEntropyOp ---
+    # --- Megakernel CrossEntropyOp ---
     try:
         loss_buf = torch.zeros(BT, dtype=torch.float32, device="cuda")
         grad_buf = torch.zeros_like(logits)
@@ -102,24 +101,6 @@ def benchmark_cross_entropy(BT, V, page_size):
             kernel.run()
         torch.cuda.synchronize()
         results["megakernel"] = kernel.bench_spec()
-    except Exception:
-        pass
-
-    try:
-        loss_so = torch.zeros(BT, dtype=torch.float32, device="cuda")
-        grad_so = torch.zeros_like(logits)
-        so_ops = CrossEntropyOp.schedule(
-            logits=logits,
-            targets=targets.int(),
-            loss=loss_so,
-            grad_logits=grad_so,
-            page_size=page_size,
-        )
-        so_kernel = SingleOpKernel(so_ops)
-        with contextlib.redirect_stdout(io.StringIO()):
-            so_kernel.run()
-        torch.cuda.synchronize()
-        results["single_op"] = so_kernel.bench_spec()
     except Exception:
         pass
 

@@ -16,16 +16,14 @@ Usage:
 
 import io
 import contextlib
-import torch
 from torch.autograd import Function
 
 from .megakernel import Megakernel, MegakernelConfig
-from .autograd_op import AutogradOp
 from .kernel_cache import KernelCache
 
 
 def _run_cached(scheduled_ops, mk_config):
-    """Run a megakernel with kernel caching. Executes exactly once.
+    """Run a megakernel with kernel caching.
 
     On cache hit: injects the cached compiled kernel and launches via run().
     On cache miss: compiles + executes via mk.run(), then caches the result.
@@ -61,6 +59,7 @@ class MegakernelFunction(Function):
 
     @staticmethod
     def forward(ctx, autograd_ops, mk_config, *flat_inputs):
+        """Execute forward kernels and save host-side autograd metadata."""
         # ---- Step 1: Unflatten inputs into per-op named dicts ----
         tensor_offset = 0
         per_op_tensors = []
@@ -117,6 +116,7 @@ class MegakernelFunction(Function):
 
     @staticmethod
     def backward(ctx, *grad_outputs):
+        """Execute backward kernels and map mutated outputs back to grads."""
         autograd_ops = ctx._autograd_ops
         mk_config = ctx._mk_config
         saved = ctx.saved_tensors
