@@ -284,8 +284,8 @@ def _build_phase_wrapper(
     call_args.extend(_tensor_call_args(method_params, tensor_param_names, tma_reverse))
     call_args.extend(_tma_call_args(method_params_ordered, tma_reverse))
 
-    # Check if method expects op_config_ptr
-    if "op_config_ptr" in method_params:
+    uses_op_config_ptr = "op_config_ptr" in method_params
+    if uses_op_config_ptr:
         call_args.append("op_config_ptr")
 
     # Check if method expects special framework params
@@ -350,7 +350,9 @@ def _build_phase_wrapper(
 
     code = compile(fn_source, unique_filename, "exec")
     exec(code, exec_globals)
-    return exec_globals["phase_fn"]
+    phase_fn = exec_globals["phase_fn"]
+    phase_fn._uses_op_config_ptr = uses_op_config_ptr
+    return phase_fn
 
 
 def compile_phase(instance, phase_name, tensor_param_names=None,

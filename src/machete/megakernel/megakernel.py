@@ -544,6 +544,7 @@ class Megakernel:
         communicate_fns = []
         inner_iters_list = []  # Per-op inner iteration count
         per_op_warps = []  # Per-op num_mma_warps for setmaxnreg transitions
+        per_op_compute_uses_config = []  # Per-op whether compute wrapper consumes op_config_ptr
         op_tensor_args = []  # Per-op list of canonical tensor arg names
         op_tma_args = {"load": [], "compute": [], "store": [], "communicate": []}
 
@@ -593,6 +594,7 @@ class Megakernel:
                         noinline=(self.config.noinline if phase_name == "compute" else False),
                     )
                 )
+            per_op_compute_uses_config.append(bool(getattr(compute_fns[-1], "_uses_op_config_ptr", True)))
 
         # Generate dispatch functions via exec() — each accepts ALL canonical
         # tensor and TMA names and routes the correct subset to each phase fn.
@@ -622,6 +624,7 @@ class Megakernel:
             inner_iters_list,
             has_communicate,
             per_op_warps,
+            per_op_compute_uses_config,
         )
 
     def _build_exec_dispatch_fn(
@@ -649,34 +652,32 @@ class Megakernel:
         # TMA params for signature
         tma_params = ", ".join(all_tma_canonical) if all_tma_canonical else ""
 
-        # Build dispatch branches (if/elif chain so only the matching op executes)
-        lines = []
-        for i, args in enumerate(op_tensor_args):
-            # Combine tensor args and TMA args for this op's phase function call.
-            # Deduplicate tensor args — in-place ops may map multiple local names
-            # (e.g., x and y) to the same canonical name.
-            all_args = list(dict.fromkeys(args))
-            if op_tma_args and i < len(op_tma_args):
-                all_args.extend(op_tma_args[i])
+        def _emit_dispatch(lo: int, hi: int, indent: str) -> List[str]:
+            if lo > hi:
+                return [f"{indent}pass"]
+            if lo == hi:
+                args = op_tensor_args[lo]
+                all_args = list(dict.fromkeys(args))
+                if op_tma_args and lo < len(op_tma_args):
+                    all_args.extend(op_tma_args[lo])
+                args_str = ", ".join(all_args)
+                if args_str:
+                    args_str = ", " + args_str
+                if is_load:
+                    return [
+                        f"{indent}_fn_{lo}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
+                        f"inner_iter_idx{args_str})"
+                    ]
+                return [f"{indent}_fn_{lo}(page_ptr, {tile_params}, op_config_ptr{args_str})"]
 
-            args_str = ", ".join(all_args)
-            if args_str:
-                args_str = ", " + args_str
+            mid = (lo + hi) // 2
+            lines = [f"{indent}if op_idx <= Int32({mid}):"]
+            lines.extend(_emit_dispatch(lo, mid, indent + "    "))
+            lines.append(f"{indent}else:")
+            lines.extend(_emit_dispatch(mid + 1, hi, indent + "    "))
+            return lines
 
-            keyword = "if" if i == 0 else "elif"
-            if is_load:
-                lines.append(
-                    f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr, work_mbar, "
-                    f"inner_iter_idx{args_str})"
-                )
-            else:
-                lines.append(
-                    f"    {keyword} op_idx == Int32({i}):\n"
-                    f"        _fn_{i}(page_ptr, {tile_params}, op_config_ptr{args_str})"
-                )
-
-        body = "\n".join(lines) if lines else "    pass"
+        body = "\n".join(_emit_dispatch(0, len(op_tensor_args) - 1, "    ")) if op_tensor_args else "    pass"
         fn_name = f"dispatch_{phase_name}"
         tensor_sig = f", {tensor_params}" if tensor_params else ""
         tma_sig = f", {tma_params}" if tma_params else ""
@@ -1068,6 +1069,7 @@ class Megakernel:
             inner_iters_list,
             has_communicate,
             per_op_warps,
+            per_op_compute_uses_config,
         ) = self._build_pipelined_dispatch_fns()
 
         from .tracing import get_trace_exec_globals
@@ -1113,6 +1115,8 @@ class Megakernel:
             "inner_iters_list": inner_iters_list,
             "has_communicate": has_communicate,
             "per_op_warps": per_op_warps,
+            "per_op_compute_uses_config": per_op_compute_uses_config,
+            "needs_op_config_load": any(per_op_compute_uses_config),
             "needs_warp_transition": any(w < kernel_cfg["num_mma_warps"] for w in per_op_warps),
             "max_waits": max(1, self._builder.max_wait_deps),
             "signal_barriers": signal_barriers,
@@ -1120,6 +1124,7 @@ class Megakernel:
             "trace_exec_globals": trace_exec_globals,
             "decompose_tile": self._builder.build_decompose_tile_fn(),
             "_get_inner_iters": self._build_inner_iters_fn(inner_iters_list),
+            "_op_uses_config": self._build_op_uses_config_fn(per_op_compute_uses_config),
             "_get_page_ptr": _get_page_ptr,
             "_work_notify_mbar": _work_notify_mbar,
             "_compute_done_mbar": _compute_done_mbar,
@@ -1150,6 +1155,7 @@ class Megakernel:
             "FLAG_STORE_IDX": FLAG_STORE_IDX,
             "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
             "_get_inner_iters": runtime["_get_inner_iters"],
+            "_op_uses_config": runtime["_op_uses_config"],
             "max_waits": runtime["max_waits"],
             "global_barrier_wait": global_barrier_wait,
             "ld_global_i32": ld_global_i32,
@@ -1159,10 +1165,32 @@ class Megakernel:
             "_peer_barriers_data_ptr": kernel_cfg["peer_barriers_data_ptr"],
             "needs_warp_transition": runtime["needs_warp_transition"],
             "per_op_warps": runtime["per_op_warps"],
+            "per_op_compute_uses_config": runtime["per_op_compute_uses_config"],
+            "needs_op_config_load": runtime["needs_op_config_load"],
             "MIN_IDLE_REGS": MIN_IDLE_REGS,
             "num_ops": len(self.ops),
             **runtime["trace_exec_globals"],
         }
+
+    def _build_op_uses_config_fn(self, uses_config_list):
+        """Build a small JIT function mapping op index to whether compute needs op_config_ptr."""
+        lines = []
+        for idx, uses in enumerate(uses_config_list):
+            keyword = "if" if idx == 0 else "elif"
+            value = 1 if uses else 0
+            lines.append(f"    {keyword} op_idx == Int32({idx}):\n        _r = Int32({value})")
+        body = "\n".join(lines) if lines else "    _r = Int32(0)"
+        source = (
+            "@cute.jit\n"
+            "def _op_uses_config(op_idx) -> Int32:\n"
+            "    _r = Int32(0)\n"
+            f"{body}\n"
+            "    return _r\n"
+        )
+        globs = {"cute": cute, "Int32": Int32}
+        exec_generated_source(source, "_op_uses_config", globs)
+        return globs["_op_uses_config"]
+
 
     def _build_ring_kernel_loop(self, kernel_cfg: Dict[str, Any], runtime: Dict[str, Any]):
         """Build the warp-specialized ring-buffer loop used by the persistent kernel.
@@ -1560,7 +1588,11 @@ class Megakernel:
 
                         page_ptr = _get_page_ptr(smem_base, slot)
                         if op_idx != _cached_op_idx:
-                            _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
+                            if const_expr(needs_op_config_load):
+                                if _op_uses_config(op_idx) != Int32(0):
+                                    _cached_op_config = ld_global_i64(op_configs_ptr, op_idx)
+                                else:
+                                    _cached_op_config = Int64(0)
                             _cached_op_idx = op_idx
 
                             if const_expr(needs_warp_transition):

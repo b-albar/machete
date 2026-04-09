@@ -87,6 +87,21 @@ def _combined_bench_spec(kernels, setup_fn=None, keep_alive=None):
         _keep_alive=(kernels, keep_alive),
     )
 
+
+def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
+    """Choose the fused forward thread geometry for the Qwen layer benchmark.
+
+    On SM120, the single-kernel path regresses in the low-batch, long-sequence
+    regime when it inherits the larger GEMM warp count. For higher-throughput
+    regimes the original GEMM-heavy geometry is still better.
+    """
+    if not torch.cuda.is_available():
+        return max(gemm_tpb, fa_tpb)
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12 and batch == 1 and seq_len >= 1024:
+        return fa_tpb
+    return max(gemm_tpb, fa_tpb)
+
 # =============================================================================
 # Qwen 3.5-0.8B Attention Layer Config
 # =============================================================================
@@ -320,7 +335,12 @@ def megakernel_forward_build(
     all_ops = pre_attn_ops + fa_ops + post_attn_ops
     gemm_config = GemmOp.kernel_config(pre_attn_ops + post_attn_ops)
     single_config = MegakernelConfig(
-        threads_per_block=max(gemm_config.threads_per_block, fa_config.threads_per_block),
+        threads_per_block=_pick_single_layer_forward_tpb(
+            B,
+            S,
+            gemm_config.threads_per_block,
+            fa_config.threads_per_block,
+        ),
         page_size=fa_page_size,
         num_pages=1,
     )
