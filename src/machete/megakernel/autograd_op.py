@@ -1,14 +1,14 @@
 # Copyright (c) 2025, Machete Authors
 """
-Host-side autograd protocol for megakernel Ops.
+Host-side autograd protocol for megakernel ops.
 
-AutogradOp is a companion to the GPU-side Op class. It describes the
-tensor-level contract for PyTorch autograd: which tensors are inputs/outputs,
-which need gradients, and what to save for backward.
+AutogradOp is a companion to the GPU-side ``Op`` class. It describes the
+tensor contract seen by PyTorch autograd: named inputs and outputs, which
+inputs require gradients, and which tensors should be preserved for backward.
 
-Subclasses must set ``op_cls`` and implement ``tensor_specs()``.
-Override ``prepare_tensors()`` if autograd tensors need reshaping
-before the Op (e.g., 4D → 3D).
+Subclasses must set ``op_cls`` and implement ``tensor_specs()``. Override
+``prepare_tensors()`` when host-side autograd tensors need reshaping before
+the GPU op is scheduled.
 
 Usage:
     class RopeAutogradOp(AutogradOp):
@@ -38,7 +38,7 @@ from .ops import Op
 
 @dataclass
 class TensorSpec:
-    """Declares a tensor's role in the autograd graph.
+    """Describe one named tensor in an autograd op contract.
 
     Attributes:
         name: Identifier (e.g., "q", "cos", "grad_q").
@@ -56,16 +56,12 @@ class TensorSpec:
 
 
 class AutogradOp(ABC):
-    """Host-side autograd contract for a megakernel Op.
+    """Host-side contract that wraps one GPU ``Op`` for autograd.
 
-    Pairs with a GPU-side Op class. Defines tensor I/O and
-    save-for-backward semantics. Does NOT modify the GPU Op.
-
-    Config packing and scheduling are handled by Op.schedule().
-
-    Subclasses must set ``op_cls`` and implement ``tensor_specs()``.
-    Override ``prepare_tensors()`` when autograd tensors have different
-    shapes than what the Op expects.
+    Subclasses declare named tensor inputs and outputs, select tensors to
+    retain for backward, and optionally reshape tensors before
+    ``Op.schedule()`` runs. The GPU op itself remains unaware of autograd
+    bookkeeping.
     """
 
     op_cls: ClassVar[Type[Op]]
@@ -89,7 +85,7 @@ class AutogradOp(ABC):
         ...
 
     def save_for_backward(self, **tensors) -> Dict[str, torch.Tensor]:
-        """Select which tensors to save for backward.
+        """Select tensors to keep for backward execution.
 
         Default: save all inputs that don't require grad (constants like
         cos, sin that are needed for the backward computation).
@@ -101,7 +97,7 @@ class AutogradOp(ABC):
         return result
 
     def prepare_tensors(self, **tensors) -> Dict[str, torch.Tensor]:
-        """Prepare tensors for the Op (e.g., reshape 4D → 3D).
+        """Normalize tensors into the layout expected by ``op_cls``.
 
         Returns a dict of tensors matching the Op's declared shapes,
         used by Op.schedule() for config packing and tile computation.
@@ -110,7 +106,7 @@ class AutogradOp(ABC):
         return tensors
 
     def get_tile_sizes(self) -> Optional[Dict[str, int]]:
-        """Return tile_sizes for Op.schedule().
+        """Return ``tile_sizes`` forwarded to ``Op.schedule()``.
 
         Subclasses should override to specify tile sizes.
         Default: None (all dims use full extent).

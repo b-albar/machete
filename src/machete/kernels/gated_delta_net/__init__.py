@@ -136,9 +136,12 @@ def _run_5op_megakernel(q, k, v, g, beta, scale, page_size=None):
     if page_size is None:
         page_size = DEFAULT_PAGE_SIZE
 
+    from machete.kernels.gated_delta_net.chunk_size import auto_bt
+
     B, T, H, K = q.shape
     V = v.shape[-1]
-    NT = T // 64
+    BT = auto_bt(page_size)
+    NT = T // BT
     dtype = q.dtype
 
     q = q.contiguous()
@@ -149,7 +152,7 @@ def _run_5op_megakernel(q, k, v, g, beta, scale, page_size=None):
 
     # Allocate intermediates and output
     g_cumsum = torch.zeros(B, T, H, device=q.device, dtype=torch.float32)
-    a_solved = torch.zeros(B, T, H, 64, device=q.device, dtype=dtype)
+    a_solved = torch.zeros(B, T, H, BT, device=q.device, dtype=dtype)
     w = torch.zeros(B, T, H, K, device=q.device, dtype=dtype)
     u = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)
     v_new = torch.zeros(B, T, H, V, device=q.device, dtype=dtype)

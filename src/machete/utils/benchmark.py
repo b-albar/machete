@@ -145,12 +145,15 @@ class Benchmark:
                 plt.close()
 
     def _bench_kernel_func(self, func_or_spec, warmup, rep):
-        """Benchmark via CUDA graph capture + replay.
+        """Benchmark a kernel callable or `KernelBenchSpec`.
 
-        Captures the callable (or KernelBenchSpec.launch_fn) into a CUDA graph,
-        then times graph replays with CUDA events. This eliminates host-side
-        overhead (Python calls, TMA descriptor creation) and measures pure GPU
-        execution time.
+        Kernel-mode benchmarks are timed directly with CUDA events on a
+        dedicated stream. `KernelBenchSpec` instances may also provide a
+        `setup_fn` that runs before each launch.
+
+        This avoids CUDA graph capture entirely for kernel benchmarks, which
+        is important for megakernels, dynamic launch sequences, and plain
+        callables that allocate outputs during execution.
 
         Args:
             func_or_spec: A callable or a KernelBenchSpec.
@@ -163,42 +166,31 @@ class Benchmark:
         if isinstance(func_or_spec, KernelBenchSpec):
             torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
+            setup = func_or_spec.setup_fn
         else:
             torch_stream = torch.cuda.Stream()
             launch = func_or_spec
+            setup = None
 
-        # Warmup
-        with torch.cuda.stream(torch_stream):
-            for _ in range(warmup):
-                launch()
-        torch_stream.synchronize()
-
-        # Capture
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(torch_stream):
-            with torch.cuda.graph(graph, stream=torch_stream):
-                launch()
-        torch_stream.synchronize()
-
-        # Warmup graph replay
-        with torch.cuda.stream(torch_stream):
-            for _ in range(warmup):
-                graph.replay()
-        torch_stream.synchronize()
-
-        # Timed replays
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []
         with torch.cuda.stream(torch_stream):
+            for _ in range(warmup):
+                if setup is not None:
+                    setup()
+                launch()
+            torch_stream.synchronize()
+
             for _ in range(rep):
+                if setup is not None:
+                    setup()
                 start.record(torch_stream)
-                graph.replay()
+                launch()
                 end.record(torch_stream)
                 torch_stream.synchronize()
                 times.append(start.elapsed_time(end))
 
-        del graph
         return sum(times) / len(times)
 
     def _print_kernel_summary(self, results, names, bytes_fn):

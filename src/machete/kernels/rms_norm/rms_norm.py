@@ -68,7 +68,7 @@ def _auto_tile_S(D, elem_bytes, page_size):
     return max(1, usable // (D * elem_bytes))
 
 
-def _tma_kernel_config(ops):
+def _tma_kernel_config(cls, ops):
     """Return config for TMA-mode RMSNorm.
 
     threads_per_block includes DMA warps (framework always reserves them).
@@ -150,7 +150,7 @@ class RMSNormOp(Op):
                 self.effective_threads = t
         self.effective_warps = self.effective_threads // 32
 
-    kernel_config = staticmethod(_tma_kernel_config)
+    kernel_config = classmethod(_tma_kernel_config)
 
     @classmethod
     def _fill_dummies(cls, tensors):
@@ -174,10 +174,14 @@ class RMSNormOp(Op):
         _expand_weight(tensors)
         has_residual, has_gate = cls._fill_dummies(tensors)
         tile_sizes = dict(tile_sizes or {})
+        D = tensors['x'].shape[-1]
+        elem_bytes = tensors['x'].element_size()
+        max_tile_S = _auto_tile_S(D, elem_bytes, page_size)
         if "S" not in tile_sizes:
-            D = tensors['x'].shape[-1]
-            elem_bytes = tensors['x'].element_size()
-            tile_sizes["S"] = _auto_tile_S(D, elem_bytes, page_size)
+            tile_sizes["S"] = max_tile_S
+        else:
+            # Clamp caller-specified tile_S so scratch fits in page
+            tile_sizes["S"] = min(tile_sizes["S"], max_tile_S)
         tile_sizes.setdefault("B", 1)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         if residual:
@@ -447,7 +451,7 @@ class RMSNormBwdOp(Op):
                 self.effective_threads = t
         self.effective_warps = self.effective_threads // 32
 
-    kernel_config = staticmethod(_tma_kernel_config)
+    kernel_config = classmethod(_tma_kernel_config)
 
     @classmethod
     def _fill_dummies(cls, tensors):
@@ -471,10 +475,14 @@ class RMSNormBwdOp(Op):
         _expand_weight(tensors)
         has_residual, has_gate = cls._fill_dummies(tensors)
         tile_sizes = dict(tile_sizes or {})
+        D = tensors['x'].shape[-1]
+        elem_bytes = tensors['x'].element_size()
+        max_tile_S = _auto_tile_S(D, elem_bytes, page_size)
         if "S" not in tile_sizes:
-            D = tensors['x'].shape[-1]
-            elem_bytes = tensors['x'].element_size()
-            tile_sizes["S"] = _auto_tile_S(D, elem_bytes, page_size)
+            tile_sizes["S"] = max_tile_S
+        else:
+            # Clamp caller-specified tile_S so scratch fits in page
+            tile_sizes["S"] = min(tile_sizes["S"], max_tile_S)
         tile_sizes.setdefault("B", 1)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         if residual:

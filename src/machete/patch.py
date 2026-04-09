@@ -1,17 +1,22 @@
 # Copyright (c) 2025, Machete Authors
-"""Main patching logic for HuggingFace models."""
+"""Patch and unpatch supported HuggingFace model families.
 
-from typing import Optional
+This module centralizes model-family detection and the host-side traversal
+that applies per-module Machete patches. Family-specific implementations
+live under ``machete.patching``.
+"""
+
 import logging
+from typing import Any, Dict, Optional
 
 from machete.patching import llama, qwen, glm4
-from machete.patching.ops import unpatch_rmsnorm, patch_cross_entropy_loss
+from machete.patching.ops import patch_cross_entropy_loss, patch_rmsnorm, unpatch_rmsnorm
 
 logger = logging.getLogger(__name__)
 
 
-# Mapping of model types to their patching modules and class names
-MODEL_TYPE_MODULES = {
+# Mapping of model types to their patching modules and class names.
+MODEL_TYPE_MODULES: Dict[str, Dict[str, Any]] = {
     "llama": {
         "module": llama,
         "attention": llama.ATTENTION_CLASSES,
@@ -38,27 +43,28 @@ MODEL_TYPE_MODULES = {
     },
 }
 
+SUPPORTED_MODEL_TYPES = tuple(MODEL_TYPE_MODULES)
+
+
+def _normalize_model_type(model_type: Optional[str]) -> Optional[str]:
+    """Map known aliases onto canonical model type keys."""
+    aliases = {
+        "llama3": "llama",
+        "qwen3": "qwen2",
+    }
+    if model_type in MODEL_TYPE_MODULES:
+        return model_type
+    return aliases.get(model_type)
+
 
 def _detect_model_type(model) -> Optional[str]:
-    """Detect the model type from the model's class name or config."""
-    # Try from config
+    """Detect the canonical Machete model type from config or class name."""
     if hasattr(model, "config"):
-        model_type = getattr(model.config, "model_type", None)
-        if model_type in MODEL_TYPE_MODULES:
-            return model_type
-        # Handle variations
-        if model_type in ("llama", "llama3"):
-            return "llama"
-        if model_type in ("qwen2", "qwen3"):
-            return "qwen2"
-        # GLM4 variants
-        if model_type == "glm4_moe":
-            return "glm4_moe"
-        if model_type == "glm4_moe_lite":
-            return "glm4_moe_lite"
+        normalized = _normalize_model_type(getattr(model.config, "model_type", None))
+        if normalized is not None:
+            return normalized
 
-    # Try from class name
-    class_name = model.__class__.__name__.lower()
+    class_name = type(model).__name__.lower()
     if "llama" in class_name:
         return "llama"
     if "qwen" in class_name:
@@ -71,9 +77,95 @@ def _detect_model_type(model) -> Optional[str]:
     return None
 
 
-def _get_module_class_name(module) -> str:
-    """Get the class name of a module."""
-    return module.__class__.__name__
+def _model_type_config(model_type: str) -> Dict[str, Any]:
+    """Return patch metadata for a supported model type."""
+    try:
+        return MODEL_TYPE_MODULES[model_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported model type: {model_type}. Supported: {list(SUPPORTED_MODEL_TYPES)}"
+        ) from exc
+
+
+def _iter_patchable_modules(model, type_config: Dict[str, Any]):
+    """Yield ``(module, class_name)`` pairs for modules relevant to a family."""
+    target_classes = (
+        set(type_config["attention"])
+        | set(type_config["rmsnorm"])
+        | set(type_config.get("mlp", ()))
+    )
+    for module in model.modules():
+        class_name = type(module).__name__
+        if class_name in target_classes:
+            yield module, class_name
+
+
+def _restore_original_forward(module) -> None:
+    """Restore ``module.forward`` from the Machete patch marker."""
+    module.forward = module._machete_original_forward
+    del module._machete_original_forward
+
+
+def _apply_module_patches(
+    model,
+    type_config: Dict[str, Any],
+    *,
+    patch_attention_layers: bool,
+    patch_rmsnorm_layers: bool,
+    patch_mlp_layers: bool,
+) -> Dict[str, int]:
+    """Apply enabled module patches and return patch counts by category."""
+    model_module = type_config["module"]
+    patched_counts = {"attention": 0, "rmsnorm": 0, "mlp": 0}
+
+    for module, class_name in _iter_patchable_modules(model, type_config):
+        if patch_attention_layers and class_name in type_config["attention"]:
+            model_module.patch_attention(module)
+            patched_counts["attention"] += 1
+            continue
+
+        if patch_rmsnorm_layers and class_name in type_config["rmsnorm"]:
+            patch_rmsnorm(module)
+            patched_counts["rmsnorm"] += 1
+            continue
+
+        if patch_mlp_layers and class_name in type_config.get("mlp", ()) and hasattr(model_module, "patch_mlp"):
+            model_module.patch_mlp(module)
+            patched_counts["mlp"] += 1
+
+    return patched_counts
+
+
+def _remove_module_patches(model, type_config: Dict[str, Any]) -> Dict[str, int]:
+    """Remove module-level patches and return unpatch counts by category."""
+    model_module = type_config.get("module")
+    unpatched_counts = {"attention": 0, "rmsnorm": 0, "mlp": 0}
+
+    for module, class_name in _iter_patchable_modules(model, type_config):
+        if not hasattr(module, "_machete_original_forward"):
+            continue
+
+        if class_name in type_config.get("attention", ()):
+            if model_module is not None:
+                model_module.unpatch_attention(module)
+            else:
+                _restore_original_forward(module)
+            unpatched_counts["attention"] += 1
+            continue
+
+        if class_name in type_config.get("rmsnorm", ()):
+            unpatch_rmsnorm(module)
+            unpatched_counts["rmsnorm"] += 1
+            continue
+
+        if class_name in type_config.get("mlp", ()):
+            if model_module is not None and hasattr(model_module, "unpatch_mlp"):
+                model_module.unpatch_mlp(module)
+            else:
+                _restore_original_forward(module)
+            unpatched_counts["mlp"] += 1
+
+    return unpatched_counts
 
 
 def patch(
@@ -85,36 +177,23 @@ def patch(
     patch_cross_entropy: bool = False,
     patch_fused_lm_head: bool = False,
 ) -> None:
-    """
-    Patch a HuggingFace model with Machete optimizations.
+    """Patch a supported HuggingFace model in place.
 
-    This function modifies the model in-place, replacing forward methods
-    with optimized versions using flash-attn-cute and quack.
+    The patch is reversible via :func:`unpatch`. Individual feature families
+    can be enabled or disabled independently.
 
     Args:
-        model: A HuggingFace model (e.g., from AutoModelForCausalLM)
-        model_type: Model type ("llama", "qwen2", "glm4_moe", "glm4_moe_lite").
-            Auto-detected if None.
-        patch_attention: Whether to patch attention layers
-        patch_rmsnorm: Whether to patch RMSNorm layers
-        patch_mlp: Whether to patch MLP layers (requires SM90+ GPU)
-        patch_cross_entropy: Whether to patch CrossEntropyLoss
-        patch_fused_lm_head: Whether to use fused linear + cross entropy for LM head
-            (requires SM90+ GPU, only applies when labels are passed)
+        model: HuggingFace model instance to patch.
+        model_type: Canonical model family key. If omitted, Machete inspects
+            ``model.config.model_type`` and then the model class name.
+        patch_attention: Patch attention modules for the detected family.
+        patch_rmsnorm: Patch RMSNorm layers.
+        patch_mlp: Patch family-specific MLP implementations when available.
+        patch_cross_entropy: Patch ``CrossEntropyLoss`` usage.
+        patch_fused_lm_head: Patch the model forward for fused LM head loss.
 
-    Example:
-        >>> from transformers import AutoModelForCausalLM
-        >>> import machete
-        >>>
-        >>> model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
-        >>> machete.patch(model)
-        >>>
-        >>> # Enable all optimizations including MLP and fused LM head
-        >>> machete.patch(model, patch_mlp=True, patch_fused_lm_head=True)
-        >>>
-        >>> # Works with LoRA
-        >>> from peft import get_peft_model, LoraConfig
-        >>> model = get_peft_model(model, LoraConfig(...))
+    Raises:
+        ValueError: If the model family cannot be detected or is unsupported.
     """
     if model_type is None:
         model_type = _detect_model_type(model)
@@ -124,30 +203,16 @@ def patch(
                 "Supported types: llama, qwen2, glm4_moe, glm4_moe_lite"
             )
 
-    if model_type not in MODEL_TYPE_MODULES:
-        raise ValueError(f"Unsupported model type: {model_type}. Supported: {list(MODEL_TYPE_MODULES.keys())}")
-
-    type_config = MODEL_TYPE_MODULES[model_type]
+    model_type = _normalize_model_type(model_type) or model_type
+    type_config = _model_type_config(model_type)
     model_module = type_config["module"]
-    patched_counts = {"attention": 0, "rmsnorm": 0, "mlp": 0}
-
-    for name, module in model.named_modules():
-        class_name = _get_module_class_name(module)
-
-        if patch_attention and class_name in type_config["attention"]:
-            model_module.patch_attention(module)
-            patched_counts["attention"] += 1
-
-        elif patch_rmsnorm and class_name in type_config["rmsnorm"]:
-            from machete.patching.ops import patch_rmsnorm as _patch_rmsnorm
-
-            _patch_rmsnorm(module)
-            patched_counts["rmsnorm"] += 1
-
-        elif patch_mlp and class_name in type_config.get("mlp", ()):
-            if hasattr(model_module, "patch_mlp"):
-                model_module.patch_mlp(module)
-                patched_counts["mlp"] += 1
+    patched_counts = _apply_module_patches(
+        model,
+        type_config,
+        patch_attention_layers=patch_attention,
+        patch_rmsnorm_layers=patch_rmsnorm,
+        patch_mlp_layers=patch_mlp,
+    )
 
     if patch_cross_entropy:
         patch_cross_entropy_loss(model)
@@ -164,7 +229,7 @@ def patch(
         f"{patched_counts['attention']} attention, "
         f"{patched_counts['rmsnorm']} RMSNorm, "
         f"{patched_counts['mlp']} MLP layers"
-        + (f", fused LM head" if patched_counts.get("fused_lm_head") else "")
+        + (", fused LM head" if patched_counts.get("fused_lm_head") else "")
     )
 
     # Mark model as patched
@@ -173,11 +238,10 @@ def patch(
 
 
 def unpatch(model) -> None:
-    """
-    Remove Machete patches from a model, restoring original forward methods.
+    """Remove Machete patches from a model in place.
 
     Args:
-        model: A Machete-patched HuggingFace model
+        model: Model previously patched by :func:`patch`.
     """
     if not getattr(model, "_machete_patched", False):
         logger.warning("Model does not appear to be patched by Machete")
@@ -194,33 +258,7 @@ def unpatch(model) -> None:
         type_config = MODEL_TYPE_MODULES[model_type]
 
     model_module = type_config.get("module")
-    unpatched_counts = {"attention": 0, "rmsnorm": 0, "mlp": 0}
-
-    for name, module in model.named_modules():
-        if hasattr(module, "_machete_original_forward"):
-            class_name = _get_module_class_name(module)
-
-            if class_name in type_config.get("attention", ()):
-                if model_module:
-                    model_module.unpatch_attention(module)
-                else:
-                    module.forward = module._machete_original_forward
-                    del module._machete_original_forward
-                unpatched_counts["attention"] += 1
-            elif class_name in type_config.get("rmsnorm", ()):
-                unpatch_rmsnorm(module)
-                unpatched_counts["rmsnorm"] += 1
-            elif class_name in type_config.get("mlp", ()):
-                if model_module and hasattr(model_module, "unpatch_mlp"):
-                    model_module.unpatch_mlp(module)
-                else:
-                    module.forward = module._machete_original_forward
-                    del module._machete_original_forward
-                unpatched_counts["mlp"] += 1
-            else:
-                # Generic unpatch
-                module.forward = module._machete_original_forward
-                del module._machete_original_forward
+    unpatched_counts = _remove_module_patches(model, type_config)
 
     # Unpatch fused LM head if present
     if hasattr(model, "_machete_original_forward"):
@@ -236,7 +274,7 @@ def unpatch(model) -> None:
         f"{unpatched_counts['attention']} attention, "
         f"{unpatched_counts['rmsnorm']} RMSNorm, "
         f"{unpatched_counts['mlp']} MLP layers"
-        + (f", fused LM head" if unpatched_counts.get("fused_lm_head") else "")
+        + (", fused LM head" if unpatched_counts.get("fused_lm_head") else "")
     )
 
     del model._machete_patched

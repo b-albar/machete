@@ -5,7 +5,6 @@ from .sm_100 import FlashAttentionSm100Op
 from .sm_120 import FlashAttentionSm120Op
 from .sm_120_bwd import FlashAttentionSm120BwdOp
 from .flash_decoding import FlashDecodingSplitOp, flash_decoding_schedule
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE
 
 import torch
 
@@ -27,7 +26,22 @@ def _get_flash_attention_op():
 FlashAttentionOp = _get_flash_attention_op()
 
 
-def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SIZE,
+def _max_attention_page_size(device=None):
+    """Max page_size for attention with num_pages=1 (full smem budget).
+
+    Attention ops do KV pipelining internally via cpasync, so the framework's
+    ring-buffer page pipeline provides no benefit. Using the full smem budget
+    as a single page maximizes the KV buffer size.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    max_smem = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    # Reserve 512 bytes for framework scratch (ring_state, flags, IQ, mbarriers).
+    # With num_pages=1, overhead is minimal.
+    return ((max_smem - 512) // 128) * 128
+
+
+def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
                              kv_group_size=1, lse=None):
     """Schedule attention with auto-dispatch between FA and FlashDecoding.
 
@@ -35,11 +49,28 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
     tiles to saturate the GPU (small BH × ceil(M/tile_M) vs SM count).
     Falls back to regular FlashAttention for prefill workloads.
 
+    Args:
+        page_size: Size of each smem page in bytes. None = auto-detect max
+            available smem (recommended for attention).
+
     Returns:
         (ops, config): ScheduledOps and MegakernelConfig.
     """
-    BH, M, D = q.shape
+    # 3D backward compat
+    if q.ndim == 3:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        o = o.unsqueeze(0)
+        if lse is not None:
+            lse = lse.unsqueeze(0)
+
+    B, H, M, D = q.shape
     elem = q.element_size()
+
+    # Auto-detect max page_size for attention
+    if page_size is None:
+        page_size = _max_attention_page_size(q.device)
 
     num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
 
@@ -52,13 +83,15 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
         nw *= 2
     tile_M = max(16, nw * 16)
 
-    total_tiles = BH * ((M + tile_M - 1) // tile_M)
+    total_tiles = B * H * ((M + tile_M - 1) // tile_M)
 
-    # Flash decoding constraints: Q must fit in a single page, M must be MMA-aligned
-    fd_possible = (M * D * elem <= page_size and M >= 16 and M % 16 == 0)
+    # Flash decoding constraints: Q must fit in page with room for KV, M must be MMA-aligned
+    fd_q_bytes = M * D * elem
+    fd_kv_min = 2 * 16 * D * elem  # 2 KV buffers × 16 rows minimum
+    fd_possible = (fd_q_bytes + fd_kv_min <= page_size and M >= 16 and M % 16 == 0)
 
     # Dispatch: use FD when too few tiles to saturate SMs.
-    # Exception: BH=1 with large M (>64) — combine overhead dominates.
+    # Exception: single head with large M (>64) — combine overhead dominates.
     use_fd = (fd_possible
               and total_tiles < num_SMs // 2
               and (total_tiles >= 2 or M <= 64))
@@ -68,11 +101,12 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=DEFAULT_PAGE_SI
         tensors["lse"] = lse
 
     if use_fd:
-        ops = FlashDecodingSplitOp.schedule(
-            causal=causal, page_size=page_size, kv_group_size=kv_group_size,
-            **tensors,
+        # flash_decoding_schedule creates its own lse internally
+        fd_tensors = {k: v for k, v in tensors.items() if k != "lse"}
+        ops, config = flash_decoding_schedule(
+            page_size=page_size, causal=causal, kv_group_size=kv_group_size,
+            **fd_tensors,
         )
-        config = FlashDecodingSplitOp.kernel_config(ops)
     else:
         ops = FlashAttentionOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,

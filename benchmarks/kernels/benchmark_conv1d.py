@@ -8,7 +8,6 @@ depthwise Conv1d implementations across realistic transformer shapes.
 Implementations:
 - PyTorch: Pure PyTorch reference (F.conv1d with causal padding)
 - Megakernel: Machete megakernel framework
-- SingleOp: Single-op kernel (no megakernel overhead)
 
 Usage:
     python benchmarks/kernels/benchmark_conv1d.py
@@ -22,7 +21,6 @@ import torch
 from machete.megakernel import Megakernel
 from machete.kernels.conv1d import Conv1dOp, Conv1dBwdOp
 from machete.kernels.conv1d.ref import causal_conv1d_ref, causal_conv1d_bwd_ref
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 try:
@@ -89,7 +87,7 @@ def bench_conv1d_fwd(kernel_size, hidden_dim, seq_len, batch):
     torch.cuda.synchronize()
     funcs["pytorch"] = pytorch_conv1d
 
-    # Megakernel + SingleOp
+    # Megakernel
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             y = torch.empty_like(x)
@@ -100,18 +98,6 @@ def bench_conv1d_fwd(kernel_size, hidden_dim, seq_len, batch):
                 kernel.run()
             torch.cuda.synchronize()
             funcs["megakernel"] = kernel.bench_spec(keep_alive=[x, w, y])
-        except Exception:
-            pass
-
-        try:
-            y_so = torch.empty_like(x)
-            so_ops = Conv1dOp.schedule(x=x, w=w, y=y_so)
-            so_config = Conv1dOp.kernel_config(so_ops)
-            so_kernel = SingleOpKernel(so_ops, config=so_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(keep_alive=[x, w, y_so])
         except Exception:
             pass
 
@@ -156,19 +142,6 @@ def bench_conv1d_bwd(kernel_size, hidden_dim, seq_len, batch):
             torch.cuda.synchronize()
             funcs["megakernel"] = kernel.bench_spec(
                 keep_alive=[dy, w, dx])
-        except Exception:
-            pass
-
-        try:
-            dx_so = torch.empty_like(dy)
-            so_ops = Conv1dBwdOp.schedule(dy=dy, w=w, dx=dx_so)
-            so_config = Conv1dBwdOp.kernel_config(so_ops)
-            so_kernel = SingleOpKernel(so_ops, config=so_config)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(
-                keep_alive=[dy, w, dx_so])
         except Exception:
             pass
 

@@ -17,10 +17,9 @@ BarrierFormula objects that get baked into op handlers at JIT compile time.
 import math
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from dataclasses import dataclass
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
-import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 
@@ -336,6 +335,25 @@ def _depth_sorted_instructions(
     ]
 
 
+def _decompose_linear_tile(linear_idx: int, tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Decompose a row-major linear tile index into tile coordinates."""
+    tile = []
+    remainder = linear_idx
+    for axis in range(len(tile_counts)):
+        stride = math.prod(tile_counts[axis + 1 :]) if axis + 1 < len(tile_counts) else 1
+        tile.append(remainder // stride)
+        remainder %= stride
+    return tuple(tile)
+
+
+def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]:
+    """Group dependency edges by consumer op index."""
+    consumer_deps: Dict[int, List[_DepEdge]] = {}
+    for edge in edges:
+        consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
+    return consumer_deps
+
+
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
 
@@ -356,6 +374,7 @@ class BackwardScheduler(TileScheduler):
         consumer_deps: Dict[int, List["_DepEdge"]],
         edges: List["_DepEdge"],
     ) -> List[TileInstruction]:
+        """Schedule tile instructions from the dependency graph."""
         if not op_records:
             return []
         depth = _compute_op_depths(len(op_records), edges)
@@ -401,6 +420,7 @@ class GroupedScheduler(TileScheduler):
         consumer_deps: Dict[int, List["_DepEdge"]],
         edges: List["_DepEdge"],
     ) -> List[TileInstruction]:
+        """Interleave tile groups that share common dependency dimensions."""
         if not op_records:
             return []
 
@@ -484,9 +504,15 @@ class InstructionStreamBuilder:
     """
 
     def __init__(self):
+        """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
         self._barrier_count: Optional[int] = None
+
+    def _invalidate_resolution_cache(self) -> None:
+        """Clear cached formulas after the op list changes."""
+        self._cached_formulas = None
+        self._barrier_count = None
 
     @property
     def ops(self) -> List[ScheduledOp]:
@@ -538,20 +564,10 @@ class InstructionStreamBuilder:
             if len(axes) != len(set(axes)):
                 raise ValueError(f"dim_names maps multiple dims to the same axis: {op.dim_names}")
 
-        # Pre-compute flat tile list using row-major linearization
-        tiles = []
-        counts = op.tile_counts
-        ndims = len(counts)
-        for linear_idx in range(op.total_tiles):
-            # Decompose linear index into multi-dim tile coordinates (row-major)
-            tile = []
-            remainder = linear_idx
-            for i in range(ndims):
-                # Stride for axis i = product of counts[i+1:]
-                stride = math.prod(counts[i + 1 :]) if i + 1 < ndims else 1
-                tile.append(remainder // stride)
-                remainder %= stride
-            tiles.append(tuple(tile))
+        tiles = [
+            _decompose_linear_tile(linear_idx, op.tile_counts)
+            for linear_idx in range(op.total_tiles)
+        ]
 
         record = _OpRecord(
             op_idx=len(self._op_records),
@@ -559,9 +575,7 @@ class InstructionStreamBuilder:
             tiles=tiles,
         )
         self._op_records.append(record)
-        # Invalidate cache
-        self._cached_formulas = None
-        self._barrier_count = None
+        self._invalidate_resolution_cache()
         return self
 
     def _has_named_buffers(self) -> bool:
@@ -699,6 +713,11 @@ class InstructionStreamBuilder:
 
         return edges
 
+    def _resolve_edges_and_consumers(self) -> Tuple[List["_DepEdge"], Dict[int, List["_DepEdge"]]]:
+        """Resolve dependency edges and the consumer-grouped view used by schedulers."""
+        edges = self._resolve_dep_edges()
+        return edges, _group_consumer_deps(edges)
+
     def _resolve(
         self,
     ) -> Tuple[
@@ -768,6 +787,143 @@ class InstructionStreamBuilder:
 
         return formulas, barrier_counter
 
+    def _canonical_dim_map(self, op: ScheduledOp) -> Dict[str, str]:
+        """Map canonical dimension names back to the op's original dim names."""
+        canon_to_orig = {}
+        for dim_name in op.dim_names:
+            canonical_name = op.dim_aliases.get(dim_name, dim_name)
+            canon_to_orig[canonical_name] = dim_name
+        return canon_to_orig
+
+    def _shared_dim_pairs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+    ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
+        """Resolve shared and producer-only dimensions between two ops."""
+        producer_dims = self._canonical_dim_map(producer)
+        consumer_dims = self._canonical_dim_map(consumer)
+        shared_canonical = set(producer_dims) & set(consumer_dims)
+        producer_only = set(producer_dims) - shared_canonical
+        shared_pairs = [
+            (canonical_name, producer_dims[canonical_name], consumer_dims[canonical_name])
+            for canonical_name in shared_canonical
+        ]
+        producer_only_dims = [producer_dims[canonical_name] for canonical_name in producer_only]
+        return shared_pairs, producer_only_dims
+
+    def _compatible_shared_dim_pairs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+    ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
+        """Filter shared dims down to those representable by BarrierFormula."""
+        incompatible_dims = []
+        compatible_pairs = []
+
+        for canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
+            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            producer_tiles = producer.tiles_for_axis(producer_axis)
+            consumer_tiles = consumer.tiles_for_axis(consumer_axis)
+
+            if (
+                producer_tile_size != consumer_tile_size
+                and producer_tile_size % consumer_tile_size != 0
+                and consumer_tile_size % producer_tile_size != 0
+            ):
+                incompatible_dims.append(producer_dim)
+            elif producer_tiles != consumer_tiles and producer_tile_size == consumer_tile_size:
+                incompatible_dims.append(producer_dim)
+            elif producer_tiles != consumer_tiles and producer_tile_size != consumer_tile_size:
+                if producer_tile_size > consumer_tile_size:
+                    ratio = producer_tile_size // consumer_tile_size
+                    consumer_effective_tiles = (consumer_tiles + ratio - 1) // ratio
+                    if consumer_effective_tiles != producer_tiles:
+                        incompatible_dims.append(producer_dim)
+                    else:
+                        compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+                else:
+                    ratio = consumer_tile_size // producer_tile_size
+                    producer_effective_tiles = (producer_tiles + ratio - 1) // ratio
+                    if producer_effective_tiles != consumer_tiles:
+                        incompatible_dims.append(producer_dim)
+                    else:
+                        compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+            else:
+                compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+
+        return compatible_pairs, incompatible_dims
+
+    def _barrier_formula_params(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+        producer_only_dims: List[str],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
+        """Compute divisor vectors plus expected/barrier counts for a dependency edge."""
+        producer_divs = [1] * MAX_TILE_DIMS
+        consumer_divs = [1] * MAX_TILE_DIMS
+        expected = 1
+
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
+            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            if producer_tile_size > consumer_tile_size:
+                consumer_divs[consumer_axis] = producer_tile_size // consumer_tile_size
+            elif consumer_tile_size > producer_tile_size:
+                producer_divs[producer_axis] = consumer_tile_size // producer_tile_size
+                expected *= consumer_tile_size // producer_tile_size
+
+        num_barriers = 1
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            num_barriers *= min(
+                producer.tiles_for_axis(producer_axis),
+                consumer.tiles_for_axis(consumer_axis),
+            )
+
+        if producer_only_dims:
+            collapsed = 1
+            for producer_dim in producer_only_dims:
+                collapsed *= producer.tiles_for_axis(producer.dim_names[producer_dim])
+            expected *= collapsed
+
+        return tuple(producer_divs), tuple(consumer_divs), expected, num_barriers
+
+    def _barrier_formula_coeffs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        """Compute producer/consumer barrier-index coefficients for shared dims."""
+        shared_pairs_sorted = sorted(shared_pairs, key=lambda item: item[0])
+        shared_strides: Dict[str, int] = {}
+        stride = 1
+        for canonical_name, producer_dim, consumer_dim in reversed(shared_pairs_sorted):
+            shared_strides[canonical_name] = stride
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            stride *= min(
+                producer.tiles_for_axis(producer_axis),
+                consumer.tiles_for_axis(consumer_axis),
+            )
+
+        producer_coeffs = [0] * MAX_TILE_DIMS
+        consumer_coeffs = [0] * MAX_TILE_DIMS
+        for canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_coeffs[producer.dim_names[producer_dim]] = shared_strides[canonical_name]
+            consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
+        return tuple(producer_coeffs), tuple(consumer_coeffs)
+
     def _resolve_named_formulas(
         self,
     ) -> Tuple[
@@ -803,131 +959,30 @@ class InstructionStreamBuilder:
                 p_op = producer.op
                 c_op = consumer.op
 
-                # Build canonical → original dim mappings (applying dim_aliases)
-                # E.g., if consumer has dims {"M","H"} with alias {"M":"S"},
-                # then canonical "S" maps to consumer's "M", matching producer's "S".
-                p_canon_to_orig = {}
-                for d in p_op.dim_names:
-                    canon = p_op.dim_aliases.get(d, d)
-                    p_canon_to_orig[canon] = d
-                c_canon_to_orig = {}
-                for d in c_op.dim_names:
-                    canon = c_op.dim_aliases.get(d, d)
-                    c_canon_to_orig[canon] = d
+                shared_pairs, producer_only_dims = self._shared_dim_pairs(p_op, c_op)
+                shared_pairs, incompatible_dims = self._compatible_shared_dim_pairs(
+                    p_op, c_op, shared_pairs
+                )
+                producer_only_dims.extend(incompatible_dims)
 
-                shared_canonical = set(p_canon_to_orig.keys()) & set(c_canon_to_orig.keys())
-                producer_only_canonical = set(p_canon_to_orig.keys()) - shared_canonical
-
-                # Build shared_pairs: [(canonical, p_orig, c_orig), ...]
-                shared_pairs = [
-                    (canon, p_canon_to_orig[canon], c_canon_to_orig[canon])
-                    for canon in shared_canonical
-                ]
-                producer_only_dims = [p_canon_to_orig[c] for c in producer_only_canonical]
-
-                # Validate tile sizes on shared dims are divisible.
-                # Non-divisible tile sizes cannot be expressed by BarrierFormula
-                # integer division. Move incompatible dims to producer_only
-                # for conservative many-to-one barriers.
-                incompatible = []
-                compatible_pairs = []
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_ts = p_op.tile_sizes.get(p_dim, 1)
-                    c_ts = c_op.tile_sizes.get(c_dim, 1)
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    p_tiles = p_op.tiles_for_axis(p_axis)
-                    c_tiles = c_op.tiles_for_axis(c_axis)
-                    if p_ts != c_ts and p_ts % c_ts != 0 and c_ts % p_ts != 0:
-                        # Incompatible tile sizes
-                        incompatible.append(p_dim)
-                    elif p_tiles != c_tiles and p_ts == c_ts:
-                        # Same tile size but different extents → different
-                        # semantics. E.g., GEMM_Q N=2048 vs GEMM_O N=1024
-                        # both with tile_N=64. Consumer likely reads
-                        # globally along this dim (reduction), so per-tile
-                        # barriers are unsafe. Fall back to many-to-one.
-                        incompatible.append(p_dim)
-                    else:
-                        compatible_pairs.append((canon, p_dim, c_dim))
-                shared_pairs = compatible_pairs
-                producer_only_dims.extend(incompatible)
-
-                # When named ops share no dimensions, all tiles map to the
-                # same barrier (all-or-nothing). This is correct but suboptimal.
-
-                # Determine target side and compute barrier count / expected
-                # Also compute divisors for tile size ratio handling
-                p_divs = [1] * MAX_TILE_DIMS  # Producer divisors
-                c_divs = [1] * MAX_TILE_DIMS  # Consumer divisors
-                expected = 1
-
-                # Handle tile size ratios on shared dims
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    p_ts = p_op.tile_sizes.get(p_dim, 1)
-                    c_ts = c_op.tile_sizes.get(c_dim, 1)
-                    if p_ts > c_ts:
-                        ratio = p_ts // c_ts
-                        c_divs[c_axis] = ratio
-                    elif c_ts > p_ts:
-                        ratio = c_ts // p_ts
-                        p_divs[p_axis] = ratio
-                        expected *= ratio
-
-                # Barrier count: product of min tile counts on shared dims
-                num_barriers = 1
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    num_barriers *= min(
-                        p_op.tiles_for_axis(p_axis),
-                        c_op.tiles_for_axis(c_axis),
-                    )
-
-                if producer_only_dims:
-                    # Many-to-one (or both-sides-extra): collapse
-                    # producer-only dims — all producer tiles on those dims
-                    # signal the same barrier, so consumer expects them all.
-                    collapsed = 1
-                    for dim in producer_only_dims:
-                        axis = p_op.dim_names[dim]
-                        collapsed *= p_op.tiles_for_axis(axis)
-                    expected *= collapsed
-
-                # Compute coefficients using dense shared strides.
-                # Extra dims (producer-only / consumer-only) get coefficient 0
-                # since they don't appear in shared_pairs. This correctly
-                # handles different axis orderings and tile size differences.
-                shared_pairs_sorted = sorted(shared_pairs, key=lambda t: t[0])
-                shared_strides: Dict[str, int] = {}
-                stride = 1
-                for canon, p_dim, c_dim in reversed(shared_pairs_sorted):
-                    shared_strides[canon] = stride
-                    p_axis = p_op.dim_names[p_dim]
-                    c_axis = c_op.dim_names[c_dim]
-                    stride *= min(
-                        p_op.tiles_for_axis(p_axis),
-                        c_op.tiles_for_axis(c_axis),
-                    )
-
-                p_coeffs_list = [0] * MAX_TILE_DIMS
-                for canon, p_dim, c_dim in shared_pairs:
-                    p_coeffs_list[p_op.dim_names[p_dim]] = shared_strides[canon]
-                p_coeffs = tuple(p_coeffs_list)
-
-                c_coeffs_list = [0] * MAX_TILE_DIMS
-                for canon, p_dim, c_dim in shared_pairs:
-                    c_coeffs_list[c_op.dim_names[c_dim]] = shared_strides[canon]
-                c_coeffs = tuple(c_coeffs_list)
+                producer_divs, consumer_divs, expected, num_barriers = self._barrier_formula_params(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                    producer_only_dims,
+                )
+                producer_coeffs, consumer_coeffs = self._barrier_formula_coeffs(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                )
 
                 # Producer signal formula
                 formulas[prod_idx][1].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeffs=p_coeffs,
-                        divs=tuple(p_divs),
+                        coeffs=producer_coeffs,
+                        divs=producer_divs,
                     )
                 )
 
@@ -935,8 +990,8 @@ class InstructionStreamBuilder:
                 formulas[rec.op_idx][0].append(
                     BarrierFormula(
                         base=barrier_counter,
-                        coeffs=c_coeffs,
-                        divs=tuple(c_divs),
+                        coeffs=consumer_coeffs,
+                        divs=consumer_divs,
                         expected=expected,
                     )
                 )
@@ -961,11 +1016,7 @@ class InstructionStreamBuilder:
         if not self._op_records:
             return [TileInstruction.end_instruction()]
 
-        # Resolve dependency edges and group by consumer
-        edges = self._resolve_dep_edges()
-        consumer_deps: Dict[int, List[_DepEdge]] = {}
-        for edge in edges:
-            consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
+        edges, consumer_deps = self._resolve_edges_and_consumers()
 
         # Use provided scheduler or default
         if scheduler is None:
@@ -1014,23 +1065,34 @@ class InstructionStreamBuilder:
         formulas, _ = self._resolve()
         max_waits = max(1, self.max_wait_deps)
 
-        wait_data = []
-        for instr in instructions:
-            entry = []
-            if instr.op_idx == TileInstruction.END_MARKER:
-                entry = [-1, 0] * max_waits
-            else:
-                wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
-                for wf in wait_formulas:
-                    if wf.has_guard and not wf.is_guarded(instr.tiles):
-                        entry.extend([-1, 0])
-                    else:
-                        entry.extend([wf.compute_index(instr.tiles), wf.expected])
-                while len(entry) < max_waits * 2:
-                    entry.extend([-1, 0])
-            wait_data.append(entry)
+        wait_data = [
+            self._build_wait_info_entry(instr, formulas, max_waits)
+            for instr in instructions
+        ]
 
         return torch.tensor(wait_data, dtype=torch.int32, device=device)
+
+    @staticmethod
+    def _build_wait_info_entry(
+        instr: TileInstruction,
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+        max_waits: int,
+    ) -> List[int]:
+        """Pack wait metadata for one instruction into `[barrier, expected, ...]`."""
+        if instr.op_idx == TileInstruction.END_MARKER:
+            return [-1, 0] * max_waits
+
+        entry: List[int] = []
+        wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
+        for formula in wait_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                entry.extend([-1, 0])
+            else:
+                entry.extend([formula.compute_index(instr.tiles), formula.expected])
+
+        while len(entry) < max_waits * 2:
+            entry.extend([-1, 0])
+        return entry
 
     def build_decompose_tile_fn(self):
         """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).

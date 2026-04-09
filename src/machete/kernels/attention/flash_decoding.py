@@ -64,15 +64,15 @@ class FlashDecodingSplitOp(Op):
     """
 
     reads = {
-        "q": (None, ("BH", "M", "D")),
-        "k": (None, ("BH_kv", "N", "D")),
-        "v": (None, ("BH_kv", "N", "D")),
+        "q": (None, ("B", "H", "M", "D")),
+        "k": (None, ("B", "H_kv", "N", "D")),
+        "v": (None, ("B", "H_kv", "N", "D")),
     }
     writes = {
-        "o_partial": (cutlass.Float32, ("BH", "SPLIT", "M", "D")),
-        "lse_partial": (cutlass.Float32, ("BH", "SPLIT", "M")),
+        "o_partial": (cutlass.Float32, ("B", "H", "SPLIT", "M", "D")),
+        "lse_partial": (cutlass.Float32, ("B", "H", "SPLIT", "M")),
     }
-    tile = ("BH", "SPLIT")
+    tile = ("B", "H", "SPLIT")
 
     # Q/K/V via TMA: Q loaded by DMA warp, K/V by compute warp 0
     tma_loads = {"q", "k", "v"}
@@ -82,14 +82,12 @@ class FlashDecodingSplitOp(Op):
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
         """Custom TMA tile shapes for K/V (n_block sub-tiling).
 
-        Returns shape in CuTe mode order (D, n_block, BH).
-        The framework permutes PyTorch (BH, N, D) → CuTe (D, N, BH),
-        so tile_shape[0] maps to D (contiguous), tile_shape[1] to N.
+        Returns shape in PyTorch dim order (B, H_kv, N, D) with sub-tiling on N.
         """
         if tensor_name in ("k", "v"):
             n_block = static_dims["n_block"]
             D = static_dims["D"]
-            return (1, n_block, D)
+            return (1, 1, n_block, D)
         return None  # Q uses defaults
 
     @classmethod
@@ -108,6 +106,9 @@ class FlashDecodingSplitOp(Op):
         self.causal = getattr(self, "causal", 0)
         self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
         self.kv_group_size = getattr(self, "kv_group_size", 1)
+
+        # 4D: store H for pointer arithmetic
+        self.H = getattr(self, 'H', self.tile_size_B * self.tile_size_H)
 
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashDecodingSplitOp requires fp16 or bf16, got {self.q_dtype}"
@@ -191,8 +192,18 @@ class FlashDecodingSplitOp(Op):
 
         q = tensors["q"]
         k = tensors["k"]
-        BH, M, D = q.shape
-        N = k.shape[1]
+
+        # 3D backward compat: (BH, M, D) → (1, BH, M, D)
+        if q.ndim == 3:
+            for name in ("q",):
+                tensors[name] = tensors[name].unsqueeze(0)
+            for name in ("k", "v"):
+                tensors[name] = tensors[name].unsqueeze(0)
+            q = tensors["q"]
+            k = tensors["k"]
+
+        B, H, M, D = q.shape
+        N = k.shape[2]
 
         assert q.element_size() == 2
 
@@ -211,18 +222,19 @@ class FlashDecodingSplitOp(Op):
                 n_block = max(16, (N // 16) * 16)
             num_n_blocks = (N + n_block - 1) // n_block
 
-            total_mblocks = BH  # 1 M-tile per head for decode
+            total_mblocks = B * H  # 1 M-tile per head for decode
             min_blocks_per_split = 2
             max_splits = max(1, num_n_blocks // min_blocks_per_split)
             num_splits = min(num_SMs // max(total_mblocks, 1), max_splits)
             num_splits = max(num_splits, 1)
 
         # Allocate intermediate buffers
-        o_partial = torch.empty(BH, num_splits, M, D, dtype=torch.float32, device=q.device)
-        lse_partial = torch.empty(BH, num_splits, M, dtype=torch.float32, device=q.device)
+        o_partial = torch.empty(B, H, num_splits, M, D, dtype=torch.float32, device=q.device)
+        lse_partial = torch.empty(B, H, num_splits, M, dtype=torch.float32, device=q.device)
 
         tile_sizes = dict(tile_sizes or {})
-        tile_sizes["BH"] = 1
+        tile_sizes["B"] = 1
+        tile_sizes["H"] = 1
         tile_sizes["SPLIT"] = 1
 
         tensors["o_partial"] = o_partial
@@ -243,6 +255,7 @@ class FlashDecodingSplitOp(Op):
 
         ops[0].static_dims["page_size"] = effective_page_size
         ops[0].static_dims["num_splits"] = num_splits
+        ops[0].static_dims["H"] = H
         if causal:
             ops[0].static_dims["causal"] = 1
         if kv_group_size > 1:
@@ -250,12 +263,34 @@ class FlashDecodingSplitOp(Op):
 
         return ops, o_partial, lse_partial
 
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for flash decoding ops."""
+        from machete.megakernel import MegakernelConfig
+        from machete.megakernel.megakernel import NUM_DMA_WARPS
+        import torch
+
+        num_mma_warps = 8
+        threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+
+        total_tiles = sum(op.total_tiles for op in ops)
+        num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        num_sms = min(num_sms, total_tiles)
+
+        return MegakernelConfig(
+            threads_per_block=threads_per_block,
+            page_size=page_size,
+            noinline=True,
+            num_sms=num_sms,
+        )
+
     # =========================================================================
     # Load (TMA Q + init mbarriers)
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_BH, tile_SPLIT, q_tma, q_tma_gmem, work_mbar):
+    def load(self, page_ptr, tile_B, tile_H, tile_SPLIT, q_tma, q_tma_gmem, work_mbar):
         """TMA Q load + init op-managed mbarriers for compute-driven K/V TMA.
 
         Mbarriers (initialized here, used by compute warp 0):
@@ -274,22 +309,22 @@ class FlashDecodingSplitOp(Op):
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         sQ = cute.make_tensor(
             cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_M, 1)),
+            cute.make_layout((self.D, self.tile_size_M, 1, 1)),
         )
         gQ = cute.local_tile(
             q_tma_gmem,
-            (self.D, self.tile_size_M, 1),
-            (None, None, None),
+            (self.D, self.tile_size_M, 1, 1),
+            (None, None, None, None),
         )
         tQsQ, tQgQ = cute.nvgpu.cpasync.tma_partition(
             q_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sQ, 0, 3),
-            cute.group_modes(gQ, 0, 3),
+            cute.group_modes(sQ, 0, 4),
+            cute.group_modes(gQ, 0, 4),
         )
         nbytes = Int32(self.q_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(q_tma, tQgQ[(None, Int32(0), Int32(0), tile_BH)], tQsQ, tma_bar_ptr=mbar_ptr)
+        cute.copy(q_tma, tQgQ[(None, Int32(0), Int32(0), tile_H, tile_B)], tQsQ, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # MMA Helpers
@@ -322,7 +357,7 @@ class FlashDecodingSplitOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute_mma(self, page_ptr, tile_BH, tile_SPLIT,
+    def compute_mma(self, page_ptr, tile_B, tile_H, tile_SPLIT,
                     q, k, v, o_partial, lse_partial,
                     k_tma, k_tma_gmem, v_tma, v_tma_gmem):
         """Compute-driven TMA split-KV flash attention.
@@ -334,7 +369,7 @@ class FlashDecodingSplitOp(Op):
         warp_idx = cute.arch.warp_idx()
 
         # GQA: map Q head index to KV head index
-        kv_bh = tile_BH // Int32(self.kv_group_size)
+        kv_h = tile_H // Int32(self.kv_group_size)
 
         # === TMA partition setup (must be at function top level — ===
         # === TMA atoms cannot cross MLIR SCF region boundaries)  ===
@@ -345,31 +380,31 @@ class FlashDecodingSplitOp(Op):
         sK_tma = cute.make_tensor(
             cute.make_ptr(self.q_dtype, _k_base, cute.AddressSpace.smem),
             cute.make_layout(
-                (self.D, self.n_block, 1),
-                stride=(1, self.D, self.D * self.n_block)),
+                (self.D, self.n_block, 1, 1),
+                stride=(1, self.D, self.D * self.n_block, self.D * self.n_block)),
         )
         gK_tma = cute.local_tile(
-            k_tma_gmem, (self.D, self.n_block, 1), (None, None, None),
+            k_tma_gmem, (self.D, self.n_block, 1, 1), (None, None, None, None),
         )
         tKsK_tma, tKgK_tma = cute.nvgpu.cpasync.tma_partition(
             k_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sK_tma, 0, 3),
-            cute.group_modes(gK_tma, 0, 3),
+            cute.group_modes(sK_tma, 0, 4),
+            cute.group_modes(gK_tma, 0, 4),
         )
 
         sV_tma = cute.make_tensor(
             cute.make_ptr(self.q_dtype, _v_base, cute.AddressSpace.smem),
             cute.make_layout(
-                (self.D, self.n_block, 1),
-                stride=(1, self.D, self.D * self.n_block)),
+                (self.D, self.n_block, 1, 1),
+                stride=(1, self.D, self.D * self.n_block, self.D * self.n_block)),
         )
         gV_tma = cute.local_tile(
-            v_tma_gmem, (self.D, self.n_block, 1), (None, None, None),
+            v_tma_gmem, (self.D, self.n_block, 1, 1), (None, None, None, None),
         )
         tVsV_tma, tVgV_tma = cute.nvgpu.cpasync.tma_partition(
             v_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sV_tma, 0, 3),
-            cute.group_modes(gV_tma, 0, 3),
+            cute.group_modes(sV_tma, 0, 4),
+            cute.group_modes(gV_tma, 0, 4),
         )
 
         # Op-managed mbarrier pointers
@@ -486,7 +521,7 @@ class FlashDecodingSplitOp(Op):
                 with cute.arch.elect_one():
                     mbarrier_arrive_expect_tx(_kr_K, nbytes_kv)
                 cute.copy(k_tma,
-                          tKgK_tma[(None, Int32(0), kv_idx, kv_bh)],
+                          tKgK_tma[(None, Int32(0), kv_idx, kv_h, tile_B)],
                           tKsK_tma, tma_bar_ptr=_kr_K_ptr)
 
             while kv_idx < kv_end_block:
@@ -500,7 +535,7 @@ class FlashDecodingSplitOp(Op):
                     with cute.arch.elect_one():
                         mbarrier_arrive_expect_tx(_kr_V, nbytes_kv)
                     cute.copy(v_tma,
-                              tVgV_tma[(None, Int32(0), kv_idx, kv_bh)],
+                              tVgV_tma[(None, Int32(0), kv_idx, kv_h, tile_B)],
                               tVsV_tma, tma_bar_ptr=_kr_V_ptr)
 
                 # --- S GEMM: Q_regs × K_smem ---
@@ -520,7 +555,7 @@ class FlashDecodingSplitOp(Op):
                         with cute.arch.elect_one():
                             mbarrier_arrive_expect_tx(_kr_K, nbytes_kv)
                         cute.copy(k_tma,
-                                  tKgK_tma[(None, Int32(0), kv_idx + Int32(1), kv_bh)],
+                                  tKgK_tma[(None, Int32(0), kv_idx + Int32(1), kv_h, tile_B)],
                                   tKsK_tma, tma_bar_ptr=_kr_K_ptr)
 
                 # --- Wait for V[i] (TMA from warp 0) ---
@@ -613,11 +648,12 @@ class FlashDecodingSplitOp(Op):
                 inv_sum = cute.arch.rcp_approx(row_sum[r])
                 acc_O_mn[r, None] = acc_O_mn[r, None].load() * inv_sum
 
-            # Write partial O to global: o_partial[BH, SPLIT, M, D]
+            # Write partial O to global: o_partial[B, H, SPLIT, M, D]
             lane_in_quad = tidx % Int32(4)
             o_partial_base = (
                 o_partial.iterator
-                + tile_BH * Int32(self.num_splits * self.M * self.D)
+                + tile_B * Int32(self.H * self.num_splits * self.M * self.D)
+                + tile_H * Int32(self.num_splits * self.M * self.D)
                 + tile_SPLIT * Int32(self.M * self.D)
             )
             g_o_partial = cute.make_tensor(
@@ -628,10 +664,11 @@ class FlashDecodingSplitOp(Op):
             for i in cutlass.range_constexpr(cute.size(acc_O)):
                 tCgO[i] = acc_O[i]
 
-            # Write LSE to global: lse_partial[BH, SPLIT, M]
+            # Write LSE to global: lse_partial[B, H, SPLIT, M]
             lse_base = (
                 lse_partial.iterator
-                + tile_BH * Int32(self.num_splits * self.M)
+                + tile_B * Int32(self.H * self.num_splits * self.M)
+                + tile_H * Int32(self.num_splits * self.M)
                 + tile_SPLIT * Int32(self.M)
             )
             g_lse = cute.make_tensor(lse_base, cute.make_layout(self.M))
@@ -659,14 +696,14 @@ class FlashDecodingCombineOp(Op):
     """
 
     reads = {
-        "o_partial": (cutlass.Float32, ("BH", "SPLIT", "M", "D")),
-        "lse_partial": (cutlass.Float32, ("BH", "SPLIT", "M")),
+        "o_partial": (cutlass.Float32, ("B", "H", "SPLIT", "M", "D")),
+        "lse_partial": (cutlass.Float32, ("B", "H", "SPLIT", "M")),
     }
     writes = {
-        "o": (None, ("BH", "M", "D")),
-        "lse": (cutlass.Float32, ("BH", "M")),
+        "o": (None, ("B", "H", "M", "D")),
+        "lse": (cutlass.Float32, ("B", "H", "M")),
     }
-    tile = ("BH",)
+    tile = ("B", "H")
     tma_loads = set()
     tma_stores = set()
 
@@ -681,12 +718,18 @@ class FlashDecodingCombineOp(Op):
     def schedule(cls, tile_sizes=None, **tensors):
         """Schedule combine op — one tile per head."""
         tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("BH", 1)
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("H", 1)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         return ops
 
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for combine ops."""
+        return FlashDecodingSplitOp.kernel_config(ops)
+
     @cute.jit
-    def compute(self, page_ptr, tile_BH, o_partial, lse_partial, o, lse):
+    def compute(self, page_ptr, tile_B, tile_H, o_partial, lse_partial, o, lse):
         """Reduce num_splits partial O/LSE into final output.
 
         All MMA warps participate. Each thread handles a strided subset
@@ -698,26 +741,46 @@ class FlashDecodingCombineOp(Op):
 
         if warp_idx < num_mma_warps:
             # Global memory tensors for this head
-            # o_partial: (BH, SPLIT, M, D) fp32
+            # o_partial: (B, H, SPLIT, M, D) fp32
+            _op_head = (
+                o_partial.iterator
+                + tile_B * Int32(self.H * self.num_splits * self.M * self.D)
+                + tile_H * Int32(self.num_splits * self.M * self.D)
+            )
             g_op = cute.make_tensor(
-                o_partial.iterator + tile_BH * Int32(self.num_splits * self.M * self.D),
+                _op_head,
                 cute.make_layout((self.num_splits, self.M, self.D),
                                  stride=(self.M * self.D, self.D, 1)),
             )
-            # lse_partial: (BH, SPLIT, M) fp32
+            # lse_partial: (B, H, SPLIT, M) fp32
+            _lp_head = (
+                lse_partial.iterator
+                + tile_B * Int32(self.H * self.num_splits * self.M)
+                + tile_H * Int32(self.num_splits * self.M)
+            )
             g_lp = cute.make_tensor(
-                lse_partial.iterator + tile_BH * Int32(self.num_splits * self.M),
+                _lp_head,
                 cute.make_layout((self.num_splits, self.M),
                                  stride=(self.M, 1)),
             )
-            # o: (BH, M, D) output
+            # o: (B, H, M, D) output
+            _o_head = (
+                o.iterator
+                + tile_B * Int32(self.H * self.M * self.D)
+                + tile_H * Int32(self.M * self.D)
+            )
             g_o = cute.make_tensor(
-                o.iterator + tile_BH * Int32(self.M * self.D),
+                _o_head,
                 cute.make_layout((self.M, self.D), stride=(self.D, 1)),
             )
-            # lse: (BH, M) output
+            # lse: (B, H, M) output
+            _lse_head = (
+                lse.iterator
+                + tile_B * Int32(self.H * self.M)
+                + tile_H * Int32(self.M)
+            )
             g_lse = cute.make_tensor(
-                lse.iterator + tile_BH * Int32(self.M),
+                _lse_head,
                 cute.make_layout(self.M),
             )
 
@@ -765,30 +828,6 @@ class FlashDecodingCombineOp(Op):
 # =============================================================================
 
 
-def flash_decoding_kernel_config(ops):
-    """Return recommended MegakernelConfig for flash decoding ops."""
-    from machete.megakernel import MegakernelConfig
-    from machete.megakernel.megakernel import NUM_DMA_WARPS
-    import torch
-
-    # Use 8 MMA warps: SplitOp uses M//16 (typically 1), CombineOp uses all 8
-    num_mma_warps = 8
-    threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
-    page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
-
-    total_tiles = sum(op.total_tiles for op in ops)
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    num_sms = min(num_sms, total_tiles)
-
-    return MegakernelConfig(
-        threads_per_block=threads_per_block,
-        page_size=page_size,
-        noinline=True,
-        num_pages=2,
-        num_sms=num_sms,
-    )
-
-
 def flash_decoding_schedule(q, k, v, o, num_splits=0,
                             page_size=DEFAULT_PAGE_SIZE,
                             causal=False, kv_group_size=1):
@@ -799,8 +838,17 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     """
     import torch
 
-    BH, M, D = q.shape
-    lse = torch.empty(BH, M, dtype=torch.float32, device=q.device)
+    # 3D backward compat
+    _unsqueezed = False
+    if q.ndim == 3:
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        o = o.unsqueeze(0)
+        _unsqueezed = True
+
+    B, H, M, D = q.shape
+    lse = torch.empty(B, H, M, dtype=torch.float32, device=q.device)
 
     # Schedule split ops (writes fp32 partials)
     split_ops, o_partial, lse_partial = FlashDecodingSplitOp.schedule(
@@ -815,7 +863,7 @@ def flash_decoding_schedule(q, k, v, o, num_splits=0,
     )
 
     ops = split_ops + combine_ops
-    config = flash_decoding_kernel_config(ops)
+    config = FlashDecodingSplitOp.kernel_config(ops)
     return ops, config
 
 

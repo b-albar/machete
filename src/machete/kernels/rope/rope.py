@@ -432,7 +432,12 @@ class RopeBwdOp(Op):
         ops[0].static_dims["page_size"] = page_size
         return ops
 
-    kernel_config = RopeOp.kernel_config
+    @classmethod
+    def kernel_config(cls, ops):
+        """Return recommended MegakernelConfig for scheduled RopeBwdOps."""
+        from machete.megakernel import MegakernelConfig
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+        return MegakernelConfig(page_size=page_size)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_NH):

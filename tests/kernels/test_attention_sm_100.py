@@ -14,11 +14,12 @@ import torch
 from machete.kernels.attention.ref import flash_attention_pytorch
 
 
-def is_hopper_or_newer():
+def is_hopper_sm100():
+    """SM100 attention requires Hopper (SM9x/10x), not Blackwell (SM12x)."""
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+    return 9 <= major <= 10
 
 
 try:
@@ -30,8 +31,8 @@ except ImportError:
 
 
 requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
+    not (is_hopper_sm100() and CUTLASS_AVAILABLE),
+    reason="Requires Hopper (SM100) GPU with CUTLASS — not supported on Blackwell",
 )
 
 

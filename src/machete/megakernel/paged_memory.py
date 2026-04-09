@@ -29,12 +29,18 @@ MAX_PAGES: int = 16  # Maximum number of pages
 IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
-# Used by load warp, store warp, and all load-warp threads for communication.
-FLAG_DISPATCH_LOAD: int = 4    # Load warp thread 0 → all load threads: page slot to dispatch
-FLAG_LOADER_ACK: int = 8       # Loader warp → controller: previous dispatch consumed (3-warp mode)
-FLAG_PRODUCE_IDX: int = 16     # Load warp's produce counter (written by load, read by store)
-FLAG_STORE_IDX: int = 20       # Store warp's store counter (written by store, read by load)
-FLAG_LOAD_DONE: int = 24       # Load warp signals completion (read by store warp + load warp)
+# Used by controller, loader, and store warps for inter-warp communication.
+#
+# Warp roles (see megakernel.py _kernel_loop_ring for full protocol):
+#   Controller (warp num_mma_warps):     Fetches instructions, manages barriers
+#   Loader     (warp num_mma_warps + 1): Dispatches TMA loads
+#   Store      (warp num_mma_warps + 2): Dispatches TMA stores after compute
+#
+# Offsets 0 and 8 are reserved (unused).
+FLAG_DISPATCH_LOAD: int = 4    # Controller → Loader: page slot to load next
+FLAG_PRODUCE_IDX: int = 16     # Controller: produce counter (read by store warp)
+FLAG_STORE_IDX: int = 20       # Store warp: store counter (read by controller)
+FLAG_LOAD_DONE: int = 24       # Controller: signals all instructions consumed
 
 
 # =============================================================================
@@ -253,8 +259,8 @@ class NPageLayout:
 
     def __post_init__(self):
         """Calculate layout offsets after initialization."""
-        if self.num_pages < 2:
-            raise ValueError(f"num_pages must be >= 2, got {self.num_pages}")
+        if self.num_pages < 1:
+            raise ValueError(f"num_pages must be >= 1, got {self.num_pages}")
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
 
@@ -263,10 +269,10 @@ class NPageLayout:
         self.flags_offset = self.num_pages * self._TILE_INFO_SIZE
         self.iq_offset = _align_up(self.flags_offset + self._FLAGS_SIZE, 8)
 
-        # mbarrier array layout:
-        #   work_notify:    N entries (tile-level DMA→MMA data ready, 1 arrive per tile)
-        #   compute_done:   N entries (MMA→DMA, num_mma_warps arrivals)
-        # Each mbarrier is 8 bytes and MUST be 8-byte aligned (PTX requirement).
+        # mbarrier array layout (each 8 bytes, MUST be 8-byte aligned per PTX):
+        #   work_notify[N]:  DMA→MMA signal: data loaded, ready to compute (1 arrive)
+        #   compute_done[N]: MMA→DMA signal: compute finished (num_mma_warps arrives)
+        # Phase alternates 0/1 per use (hardware auto-reset).
         self.mbarrier_offset = _align_up(
             self.iq_offset + IQ_DEPTH * self._IQ_ENTRY_SIZE, 8
         )
@@ -277,6 +283,7 @@ class NPageLayout:
             + num_mbarriers * self._MBARRIER_SIZE
         )
 
+        # 128-byte alignment: required for TMA base address alignment (PTX spec)
         self.scratch_size = _align_up(raw_scratch_size, 128)
 
         # Page layout - pages start right after scratch

@@ -31,7 +31,8 @@ from machete.megakernel.interpreter import (
 )
 
 
-_BT = 64
+from machete.kernels.gated_delta_net.chunk_size import auto_bt, _DEFAULT_BT
+
 _BK = 64
 _BV = 64
 _MBAR_BYTES = 32  # 4 mbarriers × 8 bytes (buf_free×2 + kblock_ready×2)
@@ -67,7 +68,8 @@ class GDNVNewOp(Op):
         if tensor_name != "w":
             return None
         BK = static_dims.get("BK", _BK)
-        return (_BT, tile_sizes.get("NH", 1), BK)
+        BT = static_dims.get("BT", _DEFAULT_BT)
+        return (BT, tile_sizes.get("NH", 1), BK)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -75,11 +77,12 @@ class GDNVNewOp(Op):
         if tensor_name != "w":
             return None
         BK = static_dims.get("BK", _BK)
+        BT = static_dims.get("BT", _DEFAULT_BT)
         swz_B = 3 if BK >= 64 else (2 if BK >= 32 else 1)
         return (
             f"cute.make_composed_layout("
             f"cute.make_swizzle({swz_B}, 4, 3), 0, "
-            f"cute.make_layout(({BK}, 1, {_BT}), "
+            f"cute.make_layout(({BK}, 1, {BT}), "
             f"stride=(1, {BK}, {BK})))"
         )
 
@@ -90,7 +93,7 @@ class GDNVNewOp(Op):
         assert self.w_dtype in (cutlass.Float16, cutlass.BFloat16)
         self.elem_bytes = 2
 
-        self.BT = _BT
+        self.BT = getattr(self, "BT", _DEFAULT_BT)
         self.BK = getattr(self, "BK", _BK)
         self.BV = getattr(self, "BV", _BV)
         self.NK = self.K // self.BK
@@ -141,9 +144,8 @@ class GDNVNewOp(Op):
     # =========================================================================
 
     @classmethod
-    def _auto_block_sizes(cls, page_size, K, V, elem_bytes=2):
+    def _auto_block_sizes(cls, page_size, K, V, BT, elem_bytes=2):
         """Compute largest (BK, BV) fitting in page_size."""
-        BT = _BT
         for BK in [128, 64, 32]:
             if K % BK != 0 or BK > BT:
                 continue
@@ -168,7 +170,9 @@ class GDNVNewOp(Op):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("NH", 1)
-        tile_sizes.setdefault("S", _BT)
+
+        BT = auto_bt(page_size)
+        tile_sizes.setdefault("S", BT)
         tile_sizes.setdefault("V", _BV)
 
         w = tensors.get("w")
@@ -178,10 +182,11 @@ class GDNVNewOp(Op):
         elem_bytes = w.element_size() if w is not None else 2
         S = w.shape[1] if w is not None else 64
 
-        BK, BV = cls._auto_block_sizes(page_size, K, V, elem_bytes)
+        BK, BV = cls._auto_block_sizes(page_size, K, V, BT, elem_bytes)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["BT"] = BT
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["BV"] = BV
         ops[0].static_dims["K"] = K
@@ -193,7 +198,8 @@ class GDNVNewOp(Op):
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        num_mma_warps = _BT // 16
+        BT = max(op.static_dims.get("BT", _DEFAULT_BT) for op in ops)
+        num_mma_warps = BT // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = max(
             op.static_dims.get("page_size", DEFAULT_PAGE_SIZE) for op in ops

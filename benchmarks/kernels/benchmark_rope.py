@@ -18,7 +18,6 @@ import torch
 from machete.megakernel import Megakernel
 from machete.kernels.rope import RopeOp, RopeBwdOp
 from machete.kernels.rope.ref import rope_pytorch, HAS_TRITON
-from machete.kernels.utils import SingleOpKernel
 from machete.utils.benchmark import Benchmark
 
 if HAS_TRITON:
@@ -89,7 +88,7 @@ def bench_rope_fwd(head_dim, n_heads, seq_len, batch, page_size):
 
         funcs["triton"] = triton_fn
 
-    # Megakernel + SingleOp
+    # Megakernel
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             q_mk = q.clone()
@@ -102,20 +101,6 @@ def bench_rope_fwd(head_dim, n_heads, seq_len, batch, page_size):
             funcs["megakernel"] = kernel.bench_spec(
                 setup_fn=lambda q_mk=q_mk: q_mk.copy_(q),
                 keep_alive=[q_mk, cos, sin],
-            )
-        except Exception:
-            pass
-
-        try:
-            q_so = q.clone()
-            so_ops = RopeOp.schedule(q=q_so, cos=cos, sin=sin, page_size=page_size)
-            so_kernel = SingleOpKernel(so_ops)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_kernel.bench_spec(
-                setup_fn=lambda q_so=q_so: q_so.copy_(q),
-                keep_alive=[q_so, cos, sin],
             )
         except Exception:
             pass
@@ -145,7 +130,7 @@ def bench_rope_bwd(head_dim, n_heads, seq_len, batch, page_size):
     # PyTorch (out-of-place, inverse rotation)
     funcs["pytorch"] = lambda: rope_pytorch(q, cos, -sin)
 
-    # Megakernel + SingleOp backward
+    # Megakernel backward
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         try:
             q_bwd = q.clone()
@@ -158,20 +143,6 @@ def bench_rope_bwd(head_dim, n_heads, seq_len, batch, page_size):
             funcs["megakernel"] = bwd_kernel.bench_spec(
                 setup_fn=lambda q_bwd=q_bwd: q_bwd.copy_(q),
                 keep_alive=[q_bwd, cos, sin],
-            )
-        except Exception:
-            pass
-
-        try:
-            q_so_bwd = q.clone()
-            so_bwd_ops = RopeBwdOp.schedule(q=q_so_bwd, cos=cos, sin=sin, page_size=page_size)
-            so_bwd_kernel = SingleOpKernel(so_bwd_ops)
-            with contextlib.redirect_stdout(io.StringIO()):
-                so_bwd_kernel.run()
-            torch.cuda.synchronize()
-            funcs["single_op"] = so_bwd_kernel.bench_spec(
-                setup_fn=lambda q_so_bwd=q_so_bwd: q_so_bwd.copy_(q),
-                keep_alive=[q_so_bwd, cos, sin],
             )
         except Exception:
             pass

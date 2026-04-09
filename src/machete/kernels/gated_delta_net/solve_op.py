@@ -33,7 +33,8 @@ from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import named_barrier_sync
 
 
-_BT = 64   # Chunk size (fixed by algorithm)
+from machete.kernels.gated_delta_net.chunk_size import auto_bt, _DEFAULT_BT
+
 _BK = 64   # Default K-block
 
 
@@ -48,7 +49,7 @@ class GDNSolveOp(Op):
         a_solved: (B, S, NH, BT)    -- output: solved matrix rows (fp16/bf16)
 
     Tiling:
-        tile_B=1, tile_NH=1, tile_S=BT=64.
+        tile_B=1, tile_NH=1, tile_S=BT (32 or 64 based on page_size).
         K is looped over in blocks of BK inside MMA (Phase 2).
     """
 
@@ -69,7 +70,8 @@ class GDNSolveOp(Op):
         if tensor_name != "k":
             return None
         BK = static_dims.get("BK", _BK)
-        return (_BT, tile_sizes.get("NH", 1), BK)
+        BT = static_dims.get("BT", _DEFAULT_BT)
+        return (BT, tile_sizes.get("NH", 1), BK)
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -77,11 +79,12 @@ class GDNSolveOp(Op):
         if tensor_name != "k":
             return None
         BK = static_dims.get("BK", _BK)
+        BT = static_dims.get("BT", _DEFAULT_BT)
         # SW128 swizzle for bank-conflict-free LdMatrix reads in Phase 2.
         return (
             f"cute.make_composed_layout("
             f"cute.make_swizzle(3, 4, 3), 0, "
-            f"cute.make_layout(({BK}, 1, {_BT}), "
+            f"cute.make_layout(({BK}, 1, {BT}), "
             f"stride=(1, {BK}, {BK})))"
         )
 
@@ -94,7 +97,7 @@ class GDNSolveOp(Op):
         )
         self.elem_bytes = 2
 
-        self.BT = _BT
+        self.BT = getattr(self, "BT", _DEFAULT_BT)
         self.BK = getattr(self, "BK", _BK)
         self.NK = self.K // self.BK
 
@@ -132,24 +135,23 @@ class GDNSolveOp(Op):
     # =========================================================================
 
     @classmethod
-    def _auto_block_sizes(cls, page_size, K, elem_bytes=2):
+    def _auto_block_sizes(cls, page_size, K, BT, elem_bytes=2):
         """Compute largest BK that fits in page_size.
 
         Binding constraints (phases reuse memory):
             Phase 1-2: 2 × [BT, BK] TMA bufs + scalars <= page_size
-            Phase 3:   [BT, BT] fp32 = 16KB <= page_size
+            Phase 3:   [BT, BT] fp32 <= page_size
         """
-        BT = _BT
         scalars = 3 * BT * 4  # g_buf + beta_buf + gc_buf
-        a_smem = BT * BT * 4  # 16KB fixed
+        a_smem = BT * BT * 4
 
         if a_smem > page_size:
             raise ValueError(
                 f"page_size={page_size} too small for a_smem ({a_smem}B). "
-                f"Minimum page_size for GDNSolveOp is {a_smem}B."
+                f"Minimum page_size for GDNSolveOp with BT={BT} is {a_smem}B."
             )
 
-        for BK in [128, 64]:
+        for BK in [128, 64, 32]:
             if K % BK != 0:
                 continue
             if BK > BT:
@@ -159,7 +161,7 @@ class GDNSolveOp(Op):
             if phase12 <= page_size:
                 return BK
         raise ValueError(
-            f"page_size={page_size} too small for GDNSolveOp (K={K})."
+            f"page_size={page_size} too small for GDNSolveOp (K={K}, BT={BT})."
         )
 
     @classmethod
@@ -168,16 +170,19 @@ class GDNSolveOp(Op):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("NH", 1)
-        tile_sizes.setdefault("S", _BT)
+
+        BT = auto_bt(page_size)
+        tile_sizes.setdefault("S", BT)
 
         k = tensors.get("k")
         K = k.shape[-1] if k is not None else 64
         elem_bytes = k.element_size() if k is not None else 2
-        BK = cls._auto_block_sizes(page_size, K, elem_bytes)
+        BK = cls._auto_block_sizes(page_size, K, BT, elem_bytes)
 
         S = k.shape[1] if k is not None else 64
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["BT"] = BT
         ops[0].static_dims["BK"] = BK
         ops[0].static_dims["K"] = K
         ops[0].static_dims["S"] = S
@@ -189,7 +194,8 @@ class GDNSolveOp(Op):
         from machete.megakernel import MegakernelConfig
         from machete.megakernel.megakernel import NUM_DMA_WARPS
 
-        num_mma_warps = _BT // 16
+        BT = max(op.static_dims.get("BT", _DEFAULT_BT) for op in ops)
+        num_mma_warps = BT // 16
         threads_per_block = (num_mma_warps + NUM_DMA_WARPS) * 32
         page_size = max(
             op.static_dims.get("page_size", DEFAULT_PAGE_SIZE) for op in ops

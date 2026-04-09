@@ -366,7 +366,7 @@ def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False,
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
 
-    ops = FlashAttentionSm120BwdOp.schedule_backward(
+    ops = FlashAttentionSm120BwdOp.schedule(
         k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
         dq=dq_accum, dk=dk, dv=dv, causal=causal,
         kv_group_size=kv_group_size,
