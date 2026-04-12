@@ -102,6 +102,16 @@ def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
         return fa_tpb
     return max(gemm_tpb, fa_tpb)
 
+
+def _pick_single_layer_forward_mma_reg_count(batch, seq_len, default_mma_regs=232):
+    """Tune the fused forward runtime MMA register budget on SM120."""
+    if not torch.cuda.is_available():
+        return default_mma_regs
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12 and batch == 1 and seq_len >= 1024:
+        return 224
+    return default_mma_regs
+
 # =============================================================================
 # Qwen 3.5-0.8B Attention Layer Config
 # =============================================================================
@@ -343,6 +353,7 @@ def megakernel_forward_build(
         ),
         page_size=fa_page_size,
         num_pages=1,
+        mma_reg_count=_pick_single_layer_forward_mma_reg_count(B, S),
     )
     single_kernel = Megakernel(all_ops, config=single_config)
 

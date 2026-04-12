@@ -647,15 +647,28 @@ class InstructionStreamBuilder:
 
         Checks buffer name match first (skipping false matches where tensor
         ptrs differ), then falls back to tensor pointer identity.
+        Named-buffer matching must only consider producers that appear
+        strictly before the consumer; re-used buffer names across layers
+        would otherwise create future-pointing edges and dependency cycles.
         Returns None for external inputs or true self-dependencies.
         """
-        prod_idx = buffer_producers.get(buf)
-        # Skip false name matches (same name, different tensor)
-        if prod_idx is not None and prod_idx != rec.op_idx:
-            prod_ptr = self._op_records[prod_idx].op.tensor_ptrs.get(buf)
-            cons_ptr = rec.op.tensor_ptrs.get(buf)
+        prod_idx = None
+        cons_ptr = rec.op.tensor_ptrs.get(buf)
+
+        # Search backwards so we pick the nearest prior producer of this
+        # named buffer, never a future writer. This is still cheap for the
+        # op counts we schedule, and it preserves correct chaining when the
+        # same buffer name is re-used for ping-pong activations across layers.
+        for cand_idx in range(rec.op_idx - 1, -1, -1):
+            cand_rec = self._op_records[cand_idx]
+            if buf not in cand_rec.op.op_cls.OUTPUTS:
+                continue
+            prod_ptr = cand_rec.op.tensor_ptrs.get(buf)
             if prod_ptr is not None and cons_ptr is not None and prod_ptr != cons_ptr:
-                prod_idx = None
+                continue
+            prod_idx = cand_idx
+            break
+
         # Fall back to tensor pointer identity for cross-buffer deps
         if prod_idx is None or prod_idx == rec.op_idx:
             ptr_prod = tensor_ptr_deps.get((rec.op_idx, buf))

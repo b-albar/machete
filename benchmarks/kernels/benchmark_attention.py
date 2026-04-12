@@ -16,7 +16,9 @@ Usage:
 
 import contextlib
 import io
+import os
 import sys
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +52,19 @@ if CUTLASS_AVAILABLE:
         CUTE_FA2_AVAILABLE = True
     except (ImportError, ModuleNotFoundError) as e:
         print(f"CuTe DSL FA2 not available: {e}")
+
+
+_DEBUG_BENCH = os.environ.get("MACHETE_BENCHMARK_DEBUG", "").lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _debug_skip(label, exc):
+    """Report why one benchmark implementation was skipped."""
+    if not _DEBUG_BENCH:
+        return
+    print(f"[benchmark_attention] skipped {label}: {type(exc).__name__}: {exc}")
+    traceback.print_exc()
 
 
 def is_hopper_or_newer():
@@ -177,7 +192,7 @@ def bench_attention(BH, M, N, D, page_size):
 
                 funcs["cute_fa2"] = _run_fa2
         except Exception:
-            pass
+            _debug_skip("cute_fa2 forward", sys.exc_info()[1])
 
     # Megakernel bf16
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
@@ -196,7 +211,7 @@ def bench_attention(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, o_mk],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel forward", sys.exc_info()[1])
 
     return funcs
 
@@ -253,7 +268,7 @@ def bench_attention_causal(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, o_mk],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel causal forward", sys.exc_info()[1])
 
     return funcs
 
@@ -336,7 +351,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel backward", sys.exc_info()[1])
 
     return funcs
 
@@ -410,7 +425,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel causal backward", sys.exc_info()[1])
 
     return funcs
 
