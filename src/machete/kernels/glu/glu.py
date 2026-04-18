@@ -50,6 +50,159 @@ ACT_MAP = {
 }
 
 
+@cute.jit
+def _glu_forward_core(page_ptr, tile_S,
+                      x_dtype, activation,
+                      D, N, S, tile_size_S,
+                      num_warps, max_rows_per_warp, threads_per_row):
+    """Shared forward GLU compute core."""
+    x_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
+
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    thr_layout = cute.make_layout(32)
+    row_start = tile_S * Int32(tile_size_S)
+
+    y_regs = []
+    for ri in cutlass.range_constexpr(max_rows_per_warp):
+        local_row = warp_idx + Int32(ri * num_warps)
+
+        dummy_row = cute.make_tensor(x_smem, cute.make_layout(D))
+        dummy_part = cute.local_partition(dummy_row, thr_layout, lane_idx)
+        y_reg = cute.make_fragment_like(dummy_part)
+        for i in range(cute.size(y_reg)):
+            y_reg[i] = Float32(0.0).to(x_dtype)
+
+        if local_row < Int32(tile_size_S):
+            row_idx = row_start + local_row
+            if row_idx < Int32(S):
+                gate_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N),
+                    cute.make_layout(D),
+                )
+                gate_part = cute.local_partition(
+                    gate_row, thr_layout, lane_idx)
+                gate_reg = cute.make_fragment_like(gate_part)
+                cute.autovec_copy(gate_part, gate_reg)
+
+                up_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N) + Int32(D),
+                    cute.make_layout(D),
+                )
+                up_part = cute.local_partition(
+                    up_row, thr_layout, lane_idx)
+                up_reg = cute.make_fragment_like(up_part)
+                cute.autovec_copy(up_part, up_reg)
+
+                for i in range(cute.size(gate_reg)):
+                    g = gate_reg[i].to(Float32)
+                    u = up_reg[i].to(Float32)
+
+                    act_val = g
+                    if activation == ACT_IDENTITY:
+                        act_val = g
+                    elif activation == ACT_RELU:
+                        act_val = g
+                        if g < Float32(0.0):
+                            act_val = Float32(0.0)
+                    elif activation == ACT_SILU:
+                        neg_g = Float32(0.0) - g
+                        exp_neg = cute.math.exp(neg_g, fastmath=True)
+                        act_val = g / (Float32(1.0) + exp_neg)
+
+                    y_reg[i] = (act_val * u).to(x_dtype)
+
+        y_regs.append(y_reg)
+
+    named_barrier_sync(Int32(2), Int32(threads_per_row))
+
+    y_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
+    for ri in cutlass.range_constexpr(max_rows_per_warp):
+        local_row = warp_idx + Int32(ri * num_warps)
+        if local_row < Int32(tile_size_S):
+            y_row = cute.make_tensor(
+                y_smem + local_row * Int32(D),
+                cute.make_layout(D),
+            )
+            y_part = cute.local_partition(y_row, thr_layout, lane_idx)
+            cute.autovec_copy(y_regs[ri], y_part)
+
+
+_glu_forward_core._noinline = True
+if getattr(_glu_forward_core, "__wrapped__", None) is not None:
+    _glu_forward_core.__wrapped__._noinline = True
+
+
+@cute.jit
+def _glu_forward_core_silu(page_ptr, tile_S,
+                           x_dtype,
+                           D, N, S, tile_size_S,
+                           num_warps, max_rows_per_warp, threads_per_row):
+    """Shared forward GLU core specialized for SiLU."""
+    x_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
+
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    thr_layout = cute.make_layout(32)
+    row_start = tile_S * Int32(tile_size_S)
+
+    y_regs = []
+    for ri in cutlass.range_constexpr(max_rows_per_warp):
+        local_row = warp_idx + Int32(ri * num_warps)
+
+        dummy_row = cute.make_tensor(x_smem, cute.make_layout(D))
+        dummy_part = cute.local_partition(dummy_row, thr_layout, lane_idx)
+        y_reg = cute.make_fragment_like(dummy_part)
+        for i in range(cute.size(y_reg)):
+            y_reg[i] = Float32(0.0).to(x_dtype)
+
+        if local_row < Int32(tile_size_S):
+            row_idx = row_start + local_row
+            if row_idx < Int32(S):
+                gate_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N),
+                    cute.make_layout(D),
+                )
+                gate_part = cute.local_partition(
+                    gate_row, thr_layout, lane_idx)
+                gate_reg = cute.make_fragment_like(gate_part)
+                cute.autovec_copy(gate_part, gate_reg)
+
+                up_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N) + Int32(D),
+                    cute.make_layout(D),
+                )
+                up_part = cute.local_partition(
+                    up_row, thr_layout, lane_idx)
+                up_reg = cute.make_fragment_like(up_part)
+                cute.autovec_copy(up_part, up_reg)
+
+                for i in range(cute.size(gate_reg)):
+                    g = gate_reg[i].to(Float32)
+                    u = up_reg[i].to(Float32)
+                    neg_g = Float32(0.0) - g
+                    exp_neg = cute.math.exp(neg_g, fastmath=True)
+                    act_val = g / (Float32(1.0) + exp_neg)
+                    y_reg[i] = (act_val * u).to(x_dtype)
+
+        y_regs.append(y_reg)
+
+    named_barrier_sync(Int32(2), Int32(threads_per_row))
+
+    y_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
+    for ri in cutlass.range_constexpr(max_rows_per_warp):
+        local_row = warp_idx + Int32(ri * num_warps)
+        if local_row < Int32(tile_size_S):
+            y_row = cute.make_tensor(
+                y_smem + local_row * Int32(D),
+                cute.make_layout(D),
+            )
+            y_part = cute.local_partition(y_row, thr_layout, lane_idx)
+            cute.autovec_copy(y_regs[ri], y_part)
+
+
+
+
 # =============================================================================
 # Forward Op
 # =============================================================================
@@ -103,6 +256,9 @@ class GLUOp(Op):
         self.max_rows_per_warp = (
             (self.tile_size_S + self.num_warps - 1) // self.num_warps
         )
+
+        if self.activation == ACT_SILU:
+            self.compute = self.compute_silu
 
     # =========================================================================
     # Scheduling
@@ -177,7 +333,7 @@ class GLUOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_D):
+    def compute(self, page_ptr, tile_S):
         """GLU forward: read gate+up from smem x, compute y, write y to smem.
 
         Phase 1: All warps read from smem x (N-stride per row), compute y in
@@ -185,84 +341,29 @@ class GLUOp(Op):
         Barrier: named_barrier_sync ensures all warps done reading x.
         Phase 2: Write y to smem at offset 0 with D-stride per row.
         """
-        x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
+        if self.activation == ACT_SILU:
+            _glu_forward_core_silu(
+                page_ptr, tile_S,
+                self.x_dtype,
+                self.D, self.N, self.S, self.tile_size_S,
+                self.num_warps, self.max_rows_per_warp, self.threads_per_row,
+            )
+        else:
+            _glu_forward_core(
+                page_ptr, tile_S,
+                self.x_dtype, self.activation,
+                self.D, self.N, self.S, self.tile_size_S,
+                self.num_warps, self.max_rows_per_warp, self.threads_per_row,
+            )
 
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        thr_layout = cute.make_layout(32)
-
-        row_start = tile_S * Int32(self.tile_size_S)
-
-        # Phase 1: compute y into registers for all rows assigned to this warp
-        y_regs = []
-        for ri in cutlass.range_constexpr(self.max_rows_per_warp):
-            local_row = warp_idx + Int32(ri * self.num_warps)
-
-            # Allocate register fragment (even for OOB rows — keeps list regular)
-            dummy_row = cute.make_tensor(x_smem, cute.make_layout(self.D))
-            dummy_part = cute.local_partition(dummy_row, thr_layout, lane_idx)
-            y_reg = cute.make_fragment_like(dummy_part)
-            for i in range(cute.size(y_reg)):
-                y_reg[i] = Float32(0.0).to(self.x_dtype)
-
-            if local_row < Int32(self.tile_size_S):
-                row_idx = row_start + local_row
-                if row_idx < Int32(self.S):
-                    # Read gate (first D elements of smem row, N-stride)
-                    gate_row = cute.make_tensor(
-                        x_smem + local_row * Int32(self.N),
-                        cute.make_layout(self.D),
-                    )
-                    gate_part = cute.local_partition(
-                        gate_row, thr_layout, lane_idx)
-                    gate_reg = cute.make_fragment_like(gate_part)
-                    cute.autovec_copy(gate_part, gate_reg)
-
-                    # Read up (last D elements of smem row, N-stride)
-                    up_row = cute.make_tensor(
-                        x_smem + local_row * Int32(self.N) + Int32(self.D),
-                        cute.make_layout(self.D),
-                    )
-                    up_part = cute.local_partition(
-                        up_row, thr_layout, lane_idx)
-                    up_reg = cute.make_fragment_like(up_part)
-                    cute.autovec_copy(up_part, up_reg)
-
-                    # y = act(gate) * up in float32
-                    for i in range(cute.size(gate_reg)):
-                        g = gate_reg[i].to(Float32)
-                        u = up_reg[i].to(Float32)
-
-                        act_val = g  # CuTe DSL: must init before dynamic if
-                        if self.activation == ACT_IDENTITY:
-                            act_val = g
-                        elif self.activation == ACT_RELU:
-                            act_val = g
-                            if g < Float32(0.0):
-                                act_val = Float32(0.0)
-                        elif self.activation == ACT_SILU:
-                            neg_g = Float32(0.0) - g
-                            exp_neg = cute.math.exp(neg_g, fastmath=True)
-                            act_val = g / (Float32(1.0) + exp_neg)
-
-                        y_reg[i] = (act_val * u).to(self.x_dtype)
-
-            y_regs.append(y_reg)
-
-        # Barrier: all warps done reading x from smem
-        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
-
-        # Phase 2: write y to smem at offset 0, D-stride per row
-        y_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
-        for ri in cutlass.range_constexpr(self.max_rows_per_warp):
-            local_row = warp_idx + Int32(ri * self.num_warps)
-            if local_row < Int32(self.tile_size_S):
-                y_row = cute.make_tensor(
-                    y_smem + local_row * Int32(self.D),
-                    cute.make_layout(self.D),
-                )
-                y_part = cute.local_partition(y_row, thr_layout, lane_idx)
-                cute.autovec_copy(y_regs[ri], y_part)
+    @cute.jit
+    def compute_silu(self, page_ptr, tile_S):
+        _glu_forward_core_silu(
+            page_ptr, tile_S,
+            self.x_dtype,
+            self.D, self.N, self.S, self.tile_size_S,
+            self.num_warps, self.max_rows_per_warp, self.threads_per_row,
+        )
 
     # =========================================================================
     # Forward Store (TMA S->G)
@@ -412,7 +513,7 @@ class GLUBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_D, dy, x, dx):
+    def compute(self, page_ptr, tile_B, tile_S, dy):
         """GLU backward: read x from smem, dy from global, write dx to smem.
 
         dx overwrites x in smem (same N-stride per row, no barrier needed).

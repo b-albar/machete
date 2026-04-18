@@ -234,7 +234,7 @@ class QKNormRopeOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin):
+    def compute(self, page_ptr, norm_weight):
         """Per-head RMSNorm then RoPE rotation."""
         q_smem = cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem)
         cos_smem = cute.make_ptr(

@@ -239,6 +239,7 @@ def _build_phase_wrapper(
     tma_param_names=None,
     tma_local_mapping=None,
     tma_inline_infos=None,
+    tensor_reconstruction_specs=None,
 ):
     """Build a @cute.jit wrapper that delegates to an Op instance method.
 
@@ -318,8 +319,9 @@ def _build_phase_wrapper(
     else:
         call_args.extend(_tma_call_args(method_params_ordered, tma_reverse))
 
-    uses_op_config_ptr = "op_config_ptr" in method_params
-    if uses_op_config_ptr:
+    method_uses_op_config_ptr = "op_config_ptr" in method_params
+    uses_op_config_ptr = method_uses_op_config_ptr or bool(tensor_reconstruction_specs)
+    if method_uses_op_config_ptr:
         call_args.append("op_config_ptr")
 
     # Check if method expects special framework params
@@ -340,7 +342,7 @@ def _build_phase_wrapper(
     signature_suffix = _wrapper_signature_suffix(
         is_load_phase,
         extra_params,
-        tensor_param_names,
+        [] if tensor_reconstruction_specs else tensor_param_names,
         tma_param_names,
     )
 
@@ -367,10 +369,30 @@ def _build_phase_wrapper(
         body = tma_preamble + body
     needs_fence = phase_name == "compute" or phase_name in ("store", "communicate")
 
+    tensor_preamble = ""
+    if tensor_reconstruction_specs:
+        for spec in tensor_reconstruction_specs:
+            canonical_name = spec["canonical_name"]
+            ptr_index = spec["ptr_index"]
+            dtype_expr = spec["dtype_expr"]
+            shape = spec["shape"]
+            strides = spec["strides"]
+            shape_expr = "(" + ", ".join(str(int(v)) for v in shape) + ("," if len(shape) == 1 else "") + ")"
+            stride_expr = "(" + ", ".join(str(int(v)) for v in strides) + ("," if len(strides) == 1 else "") + ")"
+            tensor_preamble += (
+                f"    _ptr_{canonical_name} = ld_global_i64(op_config_ptr, Int32({ptr_index}))\n"
+                f"    {canonical_name} = cute.make_tensor(\n"
+                f"        cute.make_ptr({dtype_expr}, _ptr_{canonical_name}, cute.AddressSpace.gmem, assumed_align=16),\n"
+                f"        cute.make_layout({shape_expr}, stride={stride_expr}),\n"
+                "    )\n"
+                f"    {canonical_name}.mark_layout_dynamic(leading_dim={len(shape) - 1})\n"
+            )
+
     fn_source = (
         "@cute.jit\n"
         f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
         f"{signature_suffix}):\n"
+        f"{tensor_preamble}"
         f"{body}"
     )
 
@@ -395,6 +417,15 @@ def _build_phase_wrapper(
         from .interpreter import mbarrier_arrive
 
         exec_globals["mbarrier_arrive"] = mbarrier_arrive
+    if tensor_reconstruction_specs:
+        from .interpreter import ld_global_i64
+
+        exec_globals["ld_global_i64"] = ld_global_i64
+        for spec in tensor_reconstruction_specs:
+            dtype_obj = spec.get("dtype_obj")
+            dtype_expr = spec.get("dtype_expr")
+            if dtype_obj is not None and dtype_expr is not None and dtype_expr.isidentifier():
+                exec_globals[dtype_expr] = dtype_obj
     if needs_fence:
         from .interpreter import nanosleep
 
@@ -410,13 +441,21 @@ def _build_phase_wrapper(
     code = compile(fn_source, unique_filename, "exec")
     exec(code, exec_globals)
     phase_fn = exec_globals["phase_fn"]
-    phase_fn._uses_op_config_ptr = uses_op_config_ptr
+    phase_targets = [phase_fn]
+    wrapped = getattr(phase_fn, "__wrapped__", None)
+    if wrapped is not None and wrapped is not phase_fn:
+        phase_targets.append(wrapped)
+    for target in phase_targets:
+        target._uses_op_config_ptr = uses_op_config_ptr
+        target._machete_phase_name = phase_name
+        target._machete_phase_owner = instance.__class__.__name__
     return phase_fn
 
 
 def compile_phase(instance, phase_name, tensor_param_names=None,
                   tma_param_names=None, tma_local_mapping=None,
-                  noinline=False, tma_inline_infos=None):
+                  noinline=False, tma_inline_infos=None,
+                  tensor_reconstruction_specs=None):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
     For load phases, detects async vs sync from method
@@ -442,6 +481,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
             tma_inline_infos=tma_inline_infos,
+            tensor_reconstruction_specs=tensor_reconstruction_specs,
         )
     else:
         fn = _build_phase_wrapper(
@@ -452,10 +492,16 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
             tma_inline_infos=tma_inline_infos,
+            tensor_reconstruction_specs=tensor_reconstruction_specs,
         )
 
-    if noinline and hasattr(fn, "__wrapped__"):
-        fn.__wrapped__._noinline = True
+    if noinline:
+        noinline_targets = [fn]
+        wrapped = getattr(fn, "__wrapped__", None)
+        if wrapped is not None and wrapped is not fn:
+            noinline_targets.append(wrapped)
+        for target in noinline_targets:
+            target._noinline = True
 
     return fn
 

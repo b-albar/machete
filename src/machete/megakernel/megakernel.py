@@ -49,6 +49,7 @@ from .scheduling import (
     TileScheduler,
 )
 from .compile import compile_phase, exec_generated_source
+from .backend import build_handler_backend_ir, HandlerBackend
 from .interpreter import (
     global_barrier_signal,
     global_barrier_signal_gpu,
@@ -106,7 +107,9 @@ _OP_META_COUNT_1 = 12
 _OP_META_COUNT_2 = 13
 _OP_META_COUNT_3 = 14
 _OP_META_COUNT_4 = 15
-_OP_META_STRIDE = 16
+_OP_META_HANDLER_IDX = 16
+_OP_META_HANDLER_LOCAL_IDX = 17
+_OP_META_STRIDE = 18
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -159,6 +162,7 @@ class MegakernelConfig:
     mma_reg_count: int = 232
     noinline: bool = True
     opt_level: int = 2
+    backend: str = "handler"
 
     # Multi-GPU communication
     peer_buffers: Optional[Dict[str, List[Any]]] = None
@@ -309,6 +313,8 @@ class Megakernel:
             self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
             self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
         self._peer_tma_cute_tensors: Optional[List] = None
+        self._backend_ir = build_handler_backend_ir(self)
+        self._backend = HandlerBackend(self._backend_ir)
         self._launch_state: Optional[_LaunchState] = None
         self._cached_cu_stream = None
         self._cached_torch_stream_id = None
@@ -405,6 +411,8 @@ class Megakernel:
         signal_meta = []
         peer_signal_offsets = []
         peer_barrier_offset = 0
+        op_handler_indices = self._backend.handler_indices()
+        op_handler_local_indices = self._backend.handler_local_indices()
 
         for op_idx, op in enumerate(self.ops):
             kernel_config = {"threads_per_row": num_compute_threads}
@@ -423,6 +431,8 @@ class Megakernel:
                     int(getattr(instance, "num_mma_warps", default_num_mma_warps)),
                     *tile_strides,
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
+                    int(op_handler_indices[op_idx]),
+                    int(op_handler_local_indices[op_idx]),
                 ]
             )
 
@@ -644,135 +654,21 @@ class Megakernel:
         Returns:
             (dispatch_load, dispatch_compute, dispatch_store)
         """
-        ops = self.ops
-        tma_registry = self._tma_registry
-        peer_tma_registry = self._peer_tma_registry
-        dispatch_info = self._collect_dispatch_signatures()
-        all_canonical = dispatch_info["all_canonical"]
-        all_tma_canonical = dispatch_info["all_tma_canonical"]
-
-        load_fns = []
-        compute_fns = []
-        store_fns = []
-        communicate_fns = []
-        inner_iters_list = []  # Per-op inner iteration count
-        per_op_warps = []  # Per-op num_mma_warps for setmaxnreg transitions
-        per_op_load_uses_config = []  # Per-op whether load wrapper consumes op_config_ptr
-        per_op_compute_uses_config = []  # Per-op whether compute wrapper consumes op_config_ptr
-        per_op_store_uses_config = []  # Per-op whether store wrapper consumes op_config_ptr
-        per_op_communicate_uses_config = []  # Per-op whether communicate wrapper consumes op_config_ptr
-        op_tensor_args = dispatch_info["op_tensor_args"]
-        op_tma_args = dispatch_info["op_tma_args"]
-        op_weights = dispatch_info["op_weights"]
-        compile_keys = dispatch_info["compile_keys"]
-
-        # Warp-specialized mode: DMA warps are last warps, compute threads = rest
-        threads_per_block = self.config.threads_per_block
-        num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32  # Exclude load + store warps
-        num_mma_warps = num_compute_threads // 32
-
-        # Phase function cache: ops with identical (op_cls, config) share compiled
-        # wrappers. The dispatch tree still has per-op branches (for tensor routing)
-        # but branches with the same op type call the SAME @cute.jit function.
-        # This reduces CuTe DSL tracing from O(total_ops) to O(unique_op_types).
-        _phase_fn_cache: Dict[Tuple, Dict[str, Any]] = {}
-
-        for i, op in enumerate(ops):
-            tensor_args = op_tensor_args[i]
-
-            kernel_config = {"threads_per_row": num_compute_threads}
-
-            # Create Op instance with compile-time config, wrap its methods.
-            config = build_op_config(op, kernel_config=kernel_config)
-            instance = op.op_cls(**config)
-            inner_iters_list.append(getattr(instance, "inner_iters", 1))
-            per_op_warps.append(getattr(instance, "num_mma_warps", num_mma_warps))
-
-            # Build compile key from everything that affects the generated code.
-            # Ops with the same key produce identical JIT traces.
-            # Include param counts so that ops with different tensor/TMA
-            # aliasing patterns (and thus different wrapper signatures) are
-            # not incorrectly deduped.
-            compile_key = compile_keys[i]
-
-            # Compile all four phases (reuse from cache if same compile_key)
-            phase_fn_lists = {
-                "load": load_fns, "compute": compute_fns,
-                "store": store_fns, "communicate": communicate_fns,
-            }
-
-            if compile_key in _phase_fn_cache:
-                # Reuse previously compiled phase functions — same op type
-                # with same config produces identical JIT code.  The dispatch
-                # tree passes different canonical tensor/TMA args to each call
-                # site, which bind positionally to the wrapper's parameters.
-                cached = _phase_fn_cache[compile_key]
-                for phase_name, fn_list in phase_fn_lists.items():
-                    fn_list.append(cached[phase_name])
-            else:
-                for phase_name, fn_list in phase_fn_lists.items():
-                    if phase_name in ("load", "compute", "store"):
-                        tma_args = tma_registry.get_op_tma_args(i, phase_name)
-                        tma_mapping = tma_registry.op_mappings.get((i, phase_name), {})
-                    else:
-                        tma_args = op_tma_args["communicate"][-1]
-                        tma_mapping = peer_tma_registry.op_mappings.get((i, "communicate"), {})
-
-                    fn_list.append(
-                        compile_phase(
-                            instance,
-                            phase_name,
-                            tensor_param_names=tensor_args,
-                            tma_param_names=tma_args,
-                            tma_local_mapping=tma_mapping,
-                            noinline=bool(self.config.noinline),
-                        )
-                    )
-                _phase_fn_cache[compile_key] = {
-                    phase_name: fn_list[-1]
-                    for phase_name, fn_list in phase_fn_lists.items()
-                }
-
-            per_op_load_uses_config.append(bool(getattr(load_fns[-1], "_uses_op_config_ptr", True)))
-            per_op_compute_uses_config.append(bool(getattr(compute_fns[-1], "_uses_op_config_ptr", True)))
-            per_op_store_uses_config.append(bool(getattr(store_fns[-1], "_uses_op_config_ptr", True)))
-            per_op_communicate_uses_config.append(
-                bool(getattr(communicate_fns[-1], "_uses_op_config_ptr", True))
-            )
-
-        # Generate dispatch functions via exec() — each accepts ALL canonical
-        # tensor and TMA names and routes the correct subset to each phase fn.
-        def _build_dispatch(phase_fns, phase_name):
-            """Build the per-phase dispatch wrapper with canonical tensor/TMA params."""
-            return self._build_exec_dispatch_fn(
-                phase_fns,
-                phase_name,
-                op_tensor_args,
-                all_canonical,
-                op_tma_args=op_tma_args.get(phase_name),
-                all_tma_canonical=all_tma_canonical,
-                op_weights=op_weights,
-            )
-
-        dispatch_load = _build_dispatch(load_fns, "load")
-        dispatch_compute = _build_dispatch(compute_fns, "compute")
-        dispatch_store = _build_dispatch(store_fns, "store")
-        dispatch_communicate = _build_dispatch(communicate_fns, "communicate")
-
-        has_communicate = peer_tma_registry.has_peer_tma
-
+        dispatch_inputs = self._backend.compile_phase_dispatch_inputs(self)
         return (
-            dispatch_load,
-            dispatch_compute,
-            dispatch_store,
-            dispatch_communicate,
-            inner_iters_list,
-            has_communicate,
-            per_op_warps,
-            per_op_load_uses_config,
-            per_op_compute_uses_config,
-            per_op_store_uses_config,
-            per_op_communicate_uses_config,
+            dispatch_inputs["dispatch_load"],
+            dispatch_inputs["dispatch_compute"],
+            dispatch_inputs["dispatch_store"],
+            dispatch_inputs["dispatch_communicate"],
+            dispatch_inputs["inner_iters_list"],
+            dispatch_inputs["has_communicate"],
+            dispatch_inputs["per_op_warps"],
+            dispatch_inputs["per_op_load_uses_config"],
+            dispatch_inputs["per_op_compute_uses_config"],
+            dispatch_inputs["per_op_store_uses_config"],
+            dispatch_inputs["per_op_communicate_uses_config"],
+            dispatch_inputs["phase_tensor_names"],
+            dispatch_inputs["phase_tma_names"],
         )
 
     def _collect_dispatch_signatures(self) -> Dict[str, Any]:
@@ -941,23 +837,25 @@ class Megakernel:
         tensor_sig: str,
         tma_sig: str,
         peer_tma_sig: str,
-        extra_dispatch_params: str,
+        dispatch_extra_params: Dict[str, str],
     ) -> str:
         """Render the generated `_kernel_loop` source."""
         from .compile import _extract_body
 
         body = _extract_body(kernel_loop_fn)
-        if extra_dispatch_params:
+        if dispatch_extra_params:
+            def _rewrite_dispatch(match):
+                fn_name = match.group(1)
+                call_args = match.group(2).rstrip().rstrip(",")
+                phase_name = fn_name.removeprefix("dispatch_")
+                extra_params = dispatch_extra_params.get(phase_name, "")
+                if not extra_params:
+                    return f"{fn_name}({call_args})"
+                return f"{fn_name}({call_args}, {extra_params})"
+
             body = re.sub(
                 r"(dispatch_(?:load|compute|store|communicate))\(([^)]*)\)",
-                lambda m: (
-                    m.group(1)
-                    + "("
-                    + m.group(2).rstrip().rstrip(",")
-                    + ", "
-                    + extra_dispatch_params
-                    + ")"
-                ),
+                _rewrite_dispatch,
                 body,
             )
 
@@ -1126,7 +1024,6 @@ class Megakernel:
         """Assemble the TMA-specific signature fragments and descriptor setup code."""
         tma_tensor_names = self._collect_tma_tensor_names(tma_registry)
         peer_tma_tensor_names = self._collect_peer_tma_tensor_names(peer_tma_registry)
-
         tma_creation_lines: List[str] = []
         tma_kernel_args: List[str] = []
 
@@ -1208,7 +1105,7 @@ class Megakernel:
             "        _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             "                     op_meta_ptr, signal_meta_ptr, peer_signal_ptr,\n"
             "                     num_instructions, tidx, block_id, num_blocks,\n"
-            f"                     smem_base, trace_buffer_ptr, wait_info_ptr{tensor_sig}{tma_components['combined_tma_sig']})\n"
+             f"                     smem_base, trace_buffer_ptr, wait_info_ptr{tensor_sig}{tma_components['combined_tma_sig']})\n"
         )
 
     def _build_persistent_kernel_globals(self, tma_registry, peer_tma_registry, kernel_loop) -> Dict[str, Any]:
@@ -1359,6 +1256,8 @@ class Megakernel:
             per_op_compute_uses_config,
             per_op_store_uses_config,
             per_op_communicate_uses_config,
+            phase_tensor_names,
+            phase_tma_names,
         ) = self._build_pipelined_dispatch_fns()
 
         from .tracing import get_trace_exec_globals
@@ -1529,6 +1428,8 @@ class Megakernel:
             "_get_page_ptr": _get_page_ptr,
             "_work_notify_mbar": _work_notify_mbar,
             "_compute_done_mbar": _compute_done_mbar,
+            "phase_tensor_names": phase_tensor_names,
+            "phase_tma_names": phase_tma_names,
         }
 
     def _kernel_extra_exec_globals(
@@ -1576,6 +1477,8 @@ class Megakernel:
             "_OP_META_STORE_USES_CONFIG": _OP_META_STORE_USES_CONFIG,
             "_OP_META_COMMUNICATE_USES_CONFIG": _OP_META_COMMUNICATE_USES_CONFIG,
             "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
+            "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
+            "_OP_META_HANDLER_LOCAL_IDX": _OP_META_HANDLER_LOCAL_IDX,
             **runtime["trace_exec_globals"],
         }
 
@@ -1771,6 +1674,8 @@ class Megakernel:
                     if _dl_slot != Int32(-1):
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
                         _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
+                        _dl_handler = _op_meta_i32(op_meta_ptr, _dl_op, Int32(_OP_META_HANDLER_IDX))
+                        _dl_handler_local = _op_meta_i32(op_meta_ptr, _dl_op, Int32(_OP_META_HANDLER_LOCAL_IDX))
                         _dl_0, _dl_1, _dl_2, _dl_3, _dl_4 = decompose_tile(op_meta_ptr, _dl_op, _dl_lin)
                         _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                         if _dl_op != _dl_cached_op_idx:
@@ -1787,7 +1692,8 @@ class Megakernel:
                         if const_expr(tracing):
                             _tl = trace_start()
                         dispatch_load(
-                            _dl_op,
+                            _dl_handler,
+                            _dl_handler_local,
                             _dl_pp,
                             _dl_0,
                             _dl_1,
@@ -1851,6 +1757,8 @@ class Megakernel:
 
                         _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                         _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
+                        _ds_handler = _op_meta_i32(op_meta_ptr, _ds_op, Int32(_OP_META_HANDLER_IDX))
+                        _ds_handler_local = _op_meta_i32(op_meta_ptr, _ds_op, Int32(_OP_META_HANDLER_LOCAL_IDX))
                         _ds_0, _ds_1, _ds_2, _ds_3, _ds_4 = decompose_tile(op_meta_ptr, _ds_op, _ds_lin)
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
                         if _ds_op != _ds_cached_op_idx:
@@ -1873,7 +1781,8 @@ class Megakernel:
                         _iter_idx = Int32(1)
                         while _iter_idx < _n_iters:
                             dispatch_load(
-                                _ds_op,
+                                _ds_handler,
+                                _ds_handler_local,
                                 _ds_pp,
                                 _ds_0,
                                 _ds_1,
@@ -1902,7 +1811,8 @@ class Megakernel:
                         if const_expr(tracing):
                             _tss = trace_start()
                         dispatch_store(
-                            _ds_op,
+                            _ds_handler,
+                            _ds_handler_local,
                             _ds_pp,
                             _ds_0,
                             _ds_1,
@@ -1913,7 +1823,8 @@ class Megakernel:
                         )
                         if const_expr(has_communicate):
                             dispatch_communicate(
-                                _ds_op,
+                                _ds_handler,
+                                _ds_handler_local,
                                 _ds_pp,
                                 _ds_0,
                                 _ds_1,
@@ -2012,7 +1923,8 @@ class Megakernel:
                             )
 
                         tile_0, tile_1, tile_2, tile_3, tile_4 = decompose_tile(op_meta_ptr, op_idx, _mma_lin)
-
+                        _handler_idx = _op_meta_i32(op_meta_ptr, op_idx, Int32(_OP_META_HANDLER_IDX))
+                        _handler_local_idx = _op_meta_i32(op_meta_ptr, op_idx, Int32(_OP_META_HANDLER_LOCAL_IDX))
                         page_ptr = _get_page_ptr(smem_base, slot)
                         if op_idx != _cached_op_idx:
                             if const_expr(needs_op_config_load):
@@ -2035,7 +1947,8 @@ class Megakernel:
                             _tc = trace_start()
 
                         dispatch_compute(
-                            op_idx,
+                            _handler_idx,
+                            _handler_local_idx,
                             page_ptr,
                             tile_0,
                             tile_1,
@@ -2084,6 +1997,8 @@ class Megakernel:
         iq_offset,
         flags_offset,
         ring_state_offset,
+        phase_tensor_names,
+        phase_tma_names,
         extra_exec_globals=None,
     ):
         """Build the PersistentKernel via source transformation.
@@ -2092,11 +2007,11 @@ class Megakernel:
         call sites (if any), and exec-generates the PersistentKernel class
         with all params threaded through __call__ -> kernel -> _kernel_loop.
         """
-        all_canonical = self._tensor_registry.canonical_names
+        all_canonical = self._backend.all_canonical(self)
         tensor_params = ", ".join(all_canonical)
         tensor_sig = self._signature_suffix(all_canonical)
 
-        # TMA params that flow through kernel -> loop -> dispatch
+        # TMA params threaded into dispatch calls.
         tma_registry = self._tma_registry
         all_tma_canonical = tma_registry.all_canonical_names
         tma_params = ", ".join(all_tma_canonical)
@@ -2108,14 +2023,19 @@ class Megakernel:
         peer_tma_params = ", ".join(all_peer_tma_canonical)
         peer_tma_sig = self._signature_suffix(all_peer_tma_canonical)
 
-        # Combined extra params for dispatch calls (tensor + TMA + peer TMA)
-        extra_dispatch_params = ", ".join(filter(None, [tensor_params, tma_params, peer_tma_params]))
+        dispatch_extra_params = {}
+        for phase in ("load", "compute", "store", "communicate"):
+            phase_tensor_params = ", ".join(phase_tensor_names.get(phase, []))
+            phase_tma_params = ", ".join(phase_tma_names.get(phase, []))
+            dispatch_extra_params[phase] = ", ".join(
+                filter(None, [phase_tensor_params, phase_tma_params])
+            )
         fn_source = self._build_kernel_loop_source(
             kernel_loop_fn,
             tensor_sig=tensor_sig,
             tma_sig=tma_sig,
             peer_tma_sig=peer_tma_sig,
-            extra_dispatch_params=extra_dispatch_params,
+            dispatch_extra_params=dispatch_extra_params,
         )
 
         exec_globals = self._build_kernel_exec_globals(
@@ -2286,6 +2206,8 @@ class Megakernel:
             kernel_cfg["iq_offset"],
             kernel_cfg["flags_offset"],
             kernel_cfg["ring_state_offset"],
+            runtime["phase_tensor_names"],
+            runtime["phase_tma_names"],
             extra_exec_globals=self._kernel_extra_exec_globals(kernel_cfg, runtime),
         )
 
@@ -2328,6 +2250,7 @@ class Megakernel:
             )
 
         config_key = (
+            self.config.backend,
             self.config.num_sms,
             self.config.threads_per_block,
             self.config.page_size,
@@ -2476,6 +2399,12 @@ class Megakernel:
 
     def _build_launch_state(self) -> _LaunchState:
         """Build stable launch arguments shared by run() and bench_spec()."""
+        selected_tensor_names = set(self._backend.all_canonical(self))
+        selected_cute_tensors = []
+        if self._cute_tensors:
+            for canonical_name, cute_tensor in zip(self._tensor_registry.canonical_names, self._cute_tensors):
+                if canonical_name in selected_tensor_names:
+                    selected_cute_tensors.append(cute_tensor)
         return _LaunchState(
             instructions_ptr=Int64(self._instructions_tensor.data_ptr()),
             barriers_ptr=Int64(self._barriers_tensor.data_ptr()),
@@ -2485,7 +2414,7 @@ class Megakernel:
             signal_meta_ptr=Int64(self._signal_metadata_tensor.data_ptr()),
             peer_signal_ptr=Int64(self._peer_signal_tensor.data_ptr()),
             trace_buffer_ptr=Int64(0),
-            cute_tensors=list(self._cute_tensors) if self._cute_tensors else [],
+            cute_tensors=selected_cute_tensors,
             tma_tensor_args=[ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else [],
             peer_tma_tensor_args=(
                 [ct for _, _, ct in self._peer_tma_cute_tensors]

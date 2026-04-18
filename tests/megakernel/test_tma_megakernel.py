@@ -141,3 +141,24 @@ class TestTMAMegakernel:
         ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         Megakernel(ops).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_repeated_identical_ops_share_handler_but_keep_distinct_bindings(self):
+        """Shared handlers must still dispatch per-op tensor bindings correctly."""
+        torch.manual_seed(42)
+        x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        x1 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y1 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+
+        ops = (
+            TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M})
+            + TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M})
+        )
+        kernel = Megakernel(ops)
+
+        assert len(kernel._backend_ir.handler_specs) == 1
+
+        kernel.run()
+
+        torch.testing.assert_close(y0, x0 + 1.0, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)

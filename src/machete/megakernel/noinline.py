@@ -53,11 +53,25 @@ _noinline_counter = 0
 _orig_func = None
 _noinline_func_cache = {}
 _last_noinline_stats = {}
+_noinline_name_map = {}
 
 # TMA atom field names for atom_set_value (from CuTe DSL copy.py).
 _TMA_MBAR_PTR_FIELD = "tma_bar"
 _TMA_DESC_PTR_FIELD = "tma_descriptor_ptr"
 _TMA_CACHE_POLICY_FIELD = "cache_policy"
+
+
+def _non_mlir_cache_key(value):
+    """Return a stable cache key for non-MLIR noinline arguments."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return ("lit", value)
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_non_mlir_cache_key(v) for v in value))
+    if isinstance(value, list):
+        return ("list", tuple(_non_mlir_cache_key(v) for v in value))
+    if isinstance(value, type):
+        return ("type", value.__module__, value.__qualname__)
+    return ("obj", type(value).__name__, id(value))
 
 
 class _PreExecTMATrait(Trait):
@@ -108,6 +122,8 @@ def _flatten_ir_values(obj):
     _ComposedLayout) mixed with ir.Values, this function guarantees every
     element in the returned list is a raw ``ir.Value``.
     """
+    if isinstance(obj, type):
+        return []
     if isinstance(obj, ir.Value):
         return [obj]
     values = extract_mlir_values(obj)
@@ -219,7 +235,7 @@ def _emit_noinline_call(funcBody, args, kwargs):
         id(funcBody),
         tuple(str(t) for t in mlir_types),
         tuple(
-            ("non_mlir", type(mapping[1]).__name__, id(mapping[1]))
+            ("non_mlir", _non_mlir_cache_key(mapping[1]))
             if mapping[0] == "non_mlir"
             else ("mlir", mapping[1], mapping[2])
             for mapping in arg_mapping
@@ -232,6 +248,12 @@ def _emit_noinline_call(funcBody, args, kwargs):
         global _noinline_counter
         _noinline_counter += 1
         fn_name = f"_noinline_{funcBody.__name__}_{_noinline_counter}"
+        _noinline_name_map[fn_name] = {
+            "phase": getattr(funcBody, "_machete_phase_name", None),
+            "owner": getattr(funcBody, "_machete_phase_owner", None),
+            "handler_idx": getattr(funcBody, "_machete_handler_idx", None),
+            "compile_key": getattr(funcBody, "_machete_compile_key", None),
+        }
         func_type = ir.FunctionType.get(mlir_types, [])
 
         with ir.InsertionPoint.at_block_begin(gpu_body_block):
@@ -287,7 +309,7 @@ def install():
 
 def uninstall():
     """Restore the original ``BaseDSL._func``."""
-    global _orig_func, _noinline_func_cache, _last_noinline_stats
+    global _orig_func, _noinline_func_cache, _last_noinline_stats, _noinline_name_map
     if _orig_func is None:
         return
     per_func_body = {}
@@ -298,7 +320,9 @@ def uninstall():
         "cache_entries": len(_noinline_func_cache),
         "unique_func_bodies": len(per_func_body),
         "per_func_body": per_func_body,
+        "name_map": dict(_noinline_name_map),
     }
     BaseDSL._func = _orig_func
     _orig_func = None
     _noinline_func_cache = {}
+    _noinline_name_map = {}

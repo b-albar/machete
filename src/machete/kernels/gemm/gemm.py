@@ -51,6 +51,198 @@ from machete.megakernel.interpreter import (
 )
 
 
+@cute.jit
+def _gemm_epilogue_store_helper(page_ptr, tidx, tiled_mma, acc,
+                                _bf_0, _bf_1, _kr_0, _kr_1,
+                                num_mma_threads,
+                                swz_B_c,
+                                c_dtype,
+                                tile_size_S,
+                                tile_size_N,
+                                activation):
+    """Finalize GEMM accumulators into swizzled shared memory."""
+    named_barrier_sync(Int32(2), Int32(num_mma_threads))
+
+    if tidx == Int32(0):
+        mbarrier_inval(_bf_0)
+        mbarrier_inval(_bf_1)
+        mbarrier_inval(_kr_0)
+        mbarrier_inval(_kr_1)
+
+    swz_c = cute.make_swizzle(swz_B_c, 4, 3)
+    sC = cute.make_tensor(
+        cute.recast_ptr(
+            cute.make_ptr(c_dtype, page_ptr,
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz_c, dtype=c_dtype),
+        cute.make_layout((tile_size_S, tile_size_N),
+                         stride=(tile_size_N, 1)),
+    )
+
+    acc_out = cute.make_fragment_like(acc, c_dtype)
+    for ci in cutlass.range_constexpr(cute.size(acc)):
+        val = acc[ci]
+        if activation == 1:
+            val = val if val >= Float32(0.0) else Float32(0.0)
+        elif activation == 2:
+            neg_val = Float32(0.0) - val
+            exp_neg = cute.math.exp(neg_val, fastmath=True)
+            val = val / (Float32(1.0) + exp_neg)
+        acc_out[ci] = val.to(c_dtype)
+
+    r2s_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), c_dtype)
+    r2s_copy = cute.make_tiled_copy_C(r2s_atom, tiled_mma)
+    r2s_thr = r2s_copy.get_slice(tidx)
+    tCrC = r2s_thr.retile(acc_out)
+    tCsC = r2s_thr.partition_D(sC)
+    cute.copy(r2s_copy, tCrC, tCsC)
+
+
+@cute.jit
+def _gemm_compute_unscaled_core(page_ptr, tidx,
+                                a_dtype, b_dtype, c_dtype,
+                                num_mma_warps, num_mma_threads,
+                                tile_size_S, tile_size_N, tile_K,
+                                buf_stride, b_offset, mbar_offset,
+                                swz_B_ab, swz_B_c,
+                                activation, num_k_blocks_i32):
+    """Shared unscaled GEMM compute core for forward decode-style paths."""
+    mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+        a_dtype, Float32, (16, 8, 16))
+    tiled_mma = cute.make_tiled_mma(
+        mma_op,
+        cute.make_layout((num_mma_warps, 1, 1)),
+        permutation_mnk=(num_mma_warps * 16, 16, 16),
+    )
+    thr_mma = tiled_mma.get_slice(tidx)
+
+    swz = cute.make_swizzle(swz_B_ab, 4, 3)
+
+    smem_copy_atom_A = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(
+            transpose=False, num_matrices=4), a_dtype)
+    smem_tiled_copy_A = cute.make_tiled_copy_A(
+        smem_copy_atom_A, tiled_mma)
+    smem_thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
+
+    smem_copy_atom_B = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(
+            transpose=False, num_matrices=4), b_dtype)
+    smem_tiled_copy_B = cute.make_tiled_copy_B(
+        smem_copy_atom_B, tiled_mma)
+    smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
+
+    sA_0 = cute.make_tensor(
+        cute.recast_ptr(
+            cute.make_ptr(a_dtype, page_ptr,
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=a_dtype),
+        cute.make_layout((tile_size_S, tile_K),
+                         stride=(tile_K, 1)),
+    )
+    sB_0 = cute.make_tensor(
+        cute.recast_ptr(
+            cute.make_ptr(b_dtype,
+                          page_ptr + Int32(b_offset),
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=b_dtype),
+        cute.make_layout((tile_size_N, tile_K),
+                         stride=(tile_K, 1)),
+    )
+    sA_1 = cute.make_tensor(
+        cute.recast_ptr(
+            cute.make_ptr(a_dtype,
+                          page_ptr + Int32(buf_stride),
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=a_dtype),
+        cute.make_layout((tile_size_S, tile_K),
+                         stride=(tile_K, 1)),
+    )
+    sB_1 = cute.make_tensor(
+        cute.recast_ptr(
+            cute.make_ptr(b_dtype,
+                          page_ptr + Int32(buf_stride + b_offset),
+                          cute.AddressSpace.smem, assumed_align=128),
+            swz, dtype=b_dtype),
+        cute.make_layout((tile_size_N, tile_K),
+                         stride=(tile_K, 1)),
+    )
+
+    tCsA = thr_mma.partition_A(sA_0)
+    tCsB = thr_mma.partition_B(sB_0)
+    tCrA = tiled_mma.make_fragment_A(tCsA)
+    tCrB = tiled_mma.make_fragment_B(tCsB)
+    tCrA_ld = smem_thr_copy_A.retile(tCrA)
+    tCrB_ld = smem_thr_copy_B.retile(tCrB)
+
+    tAsA_ld_0 = smem_thr_copy_A.partition_S(sA_0)
+    tBsB_ld_0 = smem_thr_copy_B.partition_S(sB_0)
+    tAsA_ld_1 = smem_thr_copy_A.partition_S(sA_1)
+    tBsB_ld_1 = smem_thr_copy_B.partition_S(sB_1)
+
+    _bf_0 = page_ptr + Int32(mbar_offset)
+    _bf_1 = page_ptr + Int32(mbar_offset + 8)
+    _kr_0 = page_ptr + Int32(mbar_offset + 16)
+    _kr_1 = page_ptr + Int32(mbar_offset + 24)
+
+    acc = cute.make_fragment(
+        tiled_mma.partition_shape_C((tile_size_S, tile_size_N)),
+        Float32,
+    )
+    acc.fill(0.0)
+
+    _kr_phase_0 = Int32(0)
+    _kr_phase_1 = Int32(0)
+    k_idx = Int32(0)
+    while k_idx < num_k_blocks_i32:
+        if k_idx >= Int32(2):
+            if k_idx % Int32(2) == Int32(0):
+                mbarrier_wait(_kr_0, _kr_phase_0)
+                _kr_phase_0 = _kr_phase_0 ^ Int32(1)
+            if k_idx % Int32(2) == Int32(1):
+                mbarrier_wait(_kr_1, _kr_phase_1)
+                _kr_phase_1 = _kr_phase_1 ^ Int32(1)
+
+        if k_idx % Int32(2) == Int32(0):
+            for k_block in cutlass.range_constexpr(tile_K // 16):
+                cute.copy(smem_tiled_copy_A,
+                          tAsA_ld_0[None, None, k_block],
+                          tCrA_ld[None, None, k_block])
+                cute.copy(smem_tiled_copy_B,
+                          tBsB_ld_0[None, None, k_block],
+                          tCrB_ld[None, None, k_block])
+                cute.gemm(tiled_mma, acc,
+                          tCrA[None, None, k_block],
+                          tCrB[None, None, k_block], acc)
+        if k_idx % Int32(2) == Int32(1):
+            for k_block in cutlass.range_constexpr(tile_K // 16):
+                cute.copy(smem_tiled_copy_A,
+                          tAsA_ld_1[None, None, k_block],
+                          tCrA_ld[None, None, k_block])
+                cute.copy(smem_tiled_copy_B,
+                          tBsB_ld_1[None, None, k_block],
+                          tCrB_ld[None, None, k_block])
+                cute.gemm(tiled_mma, acc,
+                          tCrA[None, None, k_block],
+                          tCrB[None, None, k_block], acc)
+
+        if tidx % Int32(32) == Int32(0):
+            if k_idx % Int32(2) == Int32(0):
+                mbarrier_arrive(_bf_0)
+            if k_idx % Int32(2) == Int32(1):
+                mbarrier_arrive(_bf_1)
+
+        k_idx = k_idx + Int32(1)
+
+    _gemm_epilogue_store_helper(
+        page_ptr, tidx, tiled_mma, acc,
+        _bf_0, _bf_1, _kr_0, _kr_1,
+        num_mma_threads, swz_B_c, c_dtype,
+        tile_size_S, tile_size_N, activation,
+    )
+
+
 class GemmOp(Op):
     """GEMM operation for the megakernel framework.
 
@@ -165,6 +357,13 @@ class GemmOp(Op):
             f"tile_S={self.tile_size_S}, tile_N={self.tile_size_N}, "
             f"tile_K={self.tile_K}"
         )
+
+        # The outlined unscaled compute path is useful for decode-style kernels
+        # where S tiles are very small and compile scaling matters more than the
+        # extra device-call boundary. For larger standalone GEMMs it is a pure
+        # runtime cost, so keep the original direct compute path there.
+        if not self.has_a_scale and self.tile_size_S <= 16:
+            self.compute = self.compute_unscaled
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -418,7 +617,7 @@ class GemmOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_N):
+    def compute(self, page_ptr):
         """GEMM compute with double-buffered K-block processing.
 
         K-blocks 0-1: TMA-loaded by load warp (in buf 0 and buf 1).
@@ -553,161 +752,126 @@ class GemmOp(Op):
         acc.fill(0.0)
 
         # =====================================================================
-        # Process K-block 0 from buf 0 (TMA loaded by load warp)
-        # =====================================================================
-        for k_block in cutlass.range_constexpr(self.tile_K // 16):
-            cute.copy(smem_tiled_copy_A,
-                      tAsA_ld_0[None, None, k_block],
-                      tCrA_ld[None, None, k_block])
-            if self.has_a_scale:
-                cute.copy(smem_tiled_copy_Scale,
-                          tScaleS_ld_0[None, None, k_block],
-                          tCrScale_ld[None, None, k_block])
-                for si in cutlass.range_constexpr(cute.size(tCrA[None, None, k_block])):
-                    tCrA[None, None, k_block][si] = (
-                        tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
-            cute.copy(smem_tiled_copy_B,
-                      tBsB_ld_0[None, None, k_block],
-                      tCrB_ld[None, None, k_block])
-            cute.gemm(tiled_mma, acc,
-                      tCrA[None, None, k_block],
-                      tCrB[None, None, k_block], acc)
-
-        # Per-warp signal: buf 0 read complete (no cross-warp sync needed)
-        if tidx % Int32(32) == Int32(0):
-            mbarrier_arrive(_bf_0)
-
-        # =====================================================================
-        # Process K-block 1 from buf 1 (TMA loaded by load warp, if exists)
-        # =====================================================================
-        if self.num_k_blocks >= 2:
-            for k_block in cutlass.range_constexpr(self.tile_K // 16):
-                cute.copy(smem_tiled_copy_A,
-                          tAsA_ld_1[None, None, k_block],
-                          tCrA_ld[None, None, k_block])
-                if self.has_a_scale:
-                    cute.copy(smem_tiled_copy_Scale,
-                              tScaleS_ld_1[None, None, k_block],
-                              tCrScale_ld[None, None, k_block])
-                    for si in cutlass.range_constexpr(cute.size(tCrA[None, None, k_block])):
-                        tCrA[None, None, k_block][si] = (
-                            tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
-                cute.copy(smem_tiled_copy_B,
-                          tBsB_ld_1[None, None, k_block],
-                          tCrB_ld[None, None, k_block])
-                cute.gemm(tiled_mma, acc,
-                          tCrA[None, None, k_block],
-                          tCrB[None, None, k_block], acc)
-
-            # Per-warp signal: buf 1 read complete
-            if tidx % Int32(32) == Int32(0):
-                mbarrier_arrive(_bf_1)
-
-        # =====================================================================
-        # K-blocks 2+ — wait for kblock_ready, process, signal buf_free
+        # Process all K-blocks through one dynamic loop.
+        # K-blocks 0-1 were loaded by the load warp; K-blocks 2+ wait on the
+        # store warp's compute-local TMA pipeline.
         # =====================================================================
         _kr_phase_0 = Int32(0)
         _kr_phase_1 = Int32(0)
-        k_idx = Int32(2)
-        while k_idx < Int32(self.num_k_blocks):
-            # Wait for store warp's TMA to deliver this K-block
-            if k_idx % Int32(2) == Int32(0):
-                mbarrier_wait(_kr_0, _kr_phase_0)
-                _kr_phase_0 = _kr_phase_0 ^ Int32(1)
-            if k_idx % Int32(2) == Int32(1):
-                mbarrier_wait(_kr_1, _kr_phase_1)
-                _kr_phase_1 = _kr_phase_1 ^ Int32(1)
+        k_idx = Int32(0)
+        if self.has_a_scale:
+            while k_idx < Int32(self.num_k_blocks):
+                if k_idx >= Int32(2):
+                    if k_idx % Int32(2) == Int32(0):
+                        mbarrier_wait(_kr_0, _kr_phase_0)
+                        _kr_phase_0 = _kr_phase_0 ^ Int32(1)
+                    if k_idx % Int32(2) == Int32(1):
+                        mbarrier_wait(_kr_1, _kr_phase_1)
+                        _kr_phase_1 = _kr_phase_1 ^ Int32(1)
 
-            # Process current K-block (dynamic buffer selection)
-            if k_idx % Int32(2) == Int32(0):
-                for k_block in cutlass.range_constexpr(self.tile_K // 16):
-                    cute.copy(smem_tiled_copy_A,
-                              tAsA_ld_0[None, None, k_block],
-                              tCrA_ld[None, None, k_block])
-                    if self.has_a_scale:
+                if k_idx % Int32(2) == Int32(0):
+                    for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                        cute.copy(smem_tiled_copy_A,
+                                  tAsA_ld_0[None, None, k_block],
+                                  tCrA_ld[None, None, k_block])
                         cute.copy(smem_tiled_copy_Scale,
                                   tScaleS_ld_0[None, None, k_block],
                                   tCrScale_ld[None, None, k_block])
                         for si in cutlass.range_constexpr(cute.size(tCrA[None, None, k_block])):
                             tCrA[None, None, k_block][si] = (
-                        tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
-                    cute.copy(smem_tiled_copy_B,
-                              tBsB_ld_0[None, None, k_block],
-                              tCrB_ld[None, None, k_block])
-                    cute.gemm(tiled_mma, acc,
-                              tCrA[None, None, k_block],
-                              tCrB[None, None, k_block], acc)
-            if k_idx % Int32(2) == Int32(1):
-                for k_block in cutlass.range_constexpr(self.tile_K // 16):
-                    cute.copy(smem_tiled_copy_A,
-                              tAsA_ld_1[None, None, k_block],
-                              tCrA_ld[None, None, k_block])
-                    if self.has_a_scale:
+                                tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
+                        cute.copy(smem_tiled_copy_B,
+                                  tBsB_ld_0[None, None, k_block],
+                                  tCrB_ld[None, None, k_block])
+                        cute.gemm(tiled_mma, acc,
+                                  tCrA[None, None, k_block],
+                                  tCrB[None, None, k_block], acc)
+                if k_idx % Int32(2) == Int32(1):
+                    for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                        cute.copy(smem_tiled_copy_A,
+                                  tAsA_ld_1[None, None, k_block],
+                                  tCrA_ld[None, None, k_block])
                         cute.copy(smem_tiled_copy_Scale,
                                   tScaleS_ld_1[None, None, k_block],
                                   tCrScale_ld[None, None, k_block])
                         for si in cutlass.range_constexpr(cute.size(tCrA[None, None, k_block])):
                             tCrA[None, None, k_block][si] = (
-                        tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
-                    cute.copy(smem_tiled_copy_B,
-                              tBsB_ld_1[None, None, k_block],
-                              tCrB_ld[None, None, k_block])
-                    cute.gemm(tiled_mma, acc,
-                              tCrA[None, None, k_block],
-                              tCrB[None, None, k_block], acc)
+                                tCrA[None, None, k_block][si] * tCrScale[None, None, k_block][si])
+                        cute.copy(smem_tiled_copy_B,
+                                  tBsB_ld_1[None, None, k_block],
+                                  tCrB_ld[None, None, k_block])
+                        cute.gemm(tiled_mma, acc,
+                                  tCrA[None, None, k_block],
+                                  tCrB[None, None, k_block], acc)
 
-            # Per-warp signal: buffer read complete
-            if tidx % Int32(32) == Int32(0):
+                if tidx % Int32(32) == Int32(0):
+                    if k_idx % Int32(2) == Int32(0):
+                        mbarrier_arrive(_bf_0)
+                    if k_idx % Int32(2) == Int32(1):
+                        mbarrier_arrive(_bf_1)
+
+                k_idx = k_idx + Int32(1)
+        else:
+            while k_idx < Int32(self.num_k_blocks):
+                if k_idx >= Int32(2):
+                    if k_idx % Int32(2) == Int32(0):
+                        mbarrier_wait(_kr_0, _kr_phase_0)
+                        _kr_phase_0 = _kr_phase_0 ^ Int32(1)
+                    if k_idx % Int32(2) == Int32(1):
+                        mbarrier_wait(_kr_1, _kr_phase_1)
+                        _kr_phase_1 = _kr_phase_1 ^ Int32(1)
+
                 if k_idx % Int32(2) == Int32(0):
-                    mbarrier_arrive(_bf_0)
+                    for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                        cute.copy(smem_tiled_copy_A,
+                                  tAsA_ld_0[None, None, k_block],
+                                  tCrA_ld[None, None, k_block])
+                        cute.copy(smem_tiled_copy_B,
+                                  tBsB_ld_0[None, None, k_block],
+                                  tCrB_ld[None, None, k_block])
+                        cute.gemm(tiled_mma, acc,
+                                  tCrA[None, None, k_block],
+                                  tCrB[None, None, k_block], acc)
                 if k_idx % Int32(2) == Int32(1):
-                    mbarrier_arrive(_bf_1)
+                    for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                        cute.copy(smem_tiled_copy_A,
+                                  tAsA_ld_1[None, None, k_block],
+                                  tCrA_ld[None, None, k_block])
+                        cute.copy(smem_tiled_copy_B,
+                                  tBsB_ld_1[None, None, k_block],
+                                  tCrB_ld[None, None, k_block])
+                        cute.gemm(tiled_mma, acc,
+                                  tCrA[None, None, k_block],
+                                  tCrB[None, None, k_block], acc)
 
-            k_idx = k_idx + Int32(1)
+                if tidx % Int32(32) == Int32(0):
+                    if k_idx % Int32(2) == Int32(0):
+                        mbarrier_arrive(_bf_0)
+                    if k_idx % Int32(2) == Int32(1):
+                        mbarrier_arrive(_bf_1)
 
-        # --- Epilogue: R->S (write final C to swizzled smem for TMA store) ---
-        named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+                k_idx = k_idx + Int32(1)
 
-        # Invalidate op-managed mbarriers before the page is reused.
-        # Without this, a subsequent op's TMA load (e.g. GLU with large tiles)
-        # can overwrite these addresses with regular data, corrupting the
-        # mbarrier hardware state and causing undefined behavior on SM_120+.
-        if tidx == Int32(0):
-            mbarrier_inval(_bf_0)
-            mbarrier_inval(_bf_1)
-            mbarrier_inval(_kr_0)
-            mbarrier_inval(_kr_1)
-
-        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
-        sC = cute.make_tensor(
-            cute.recast_ptr(
-                cute.make_ptr(self.c_dtype, page_ptr,
-                              cute.AddressSpace.smem, assumed_align=128),
-                swz_c, dtype=self.c_dtype),
-            cute.make_layout((self.tile_size_S, self.tile_size_N),
-                             stride=(self.tile_size_N, 1)),
+        _gemm_epilogue_store_helper(
+            page_ptr, tidx, tiled_mma, acc,
+            _bf_0, _bf_1, _kr_0, _kr_1,
+            self.num_mma_threads, self.swz_B_c, self.c_dtype,
+            self.tile_size_S, self.tile_size_N, self.activation,
         )
 
-        # Apply activation + convert FP32 acc to output dtype in registers
-        acc_out = cute.make_fragment_like(acc, self.c_dtype)
-        for ci in cutlass.range_constexpr(cute.size(acc)):
-            val = acc[ci]
-            if self.activation == 1:  # ReLU
-                val = val if val >= Float32(0.0) else Float32(0.0)
-            elif self.activation == 2:  # SiLU
-                neg_val = Float32(0.0) - val
-                exp_neg = cute.math.exp(neg_val, fastmath=True)
-                val = val / (Float32(1.0) + exp_neg)
-            acc_out[ci] = val.to(self.c_dtype)
-
-        # Use tiled copy C to write to swizzled smem (bank-conflict-free)
-        r2s_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.c_dtype)
-        r2s_copy = cute.make_tiled_copy_C(r2s_atom, tiled_mma)
-        r2s_thr = r2s_copy.get_slice(tidx)
-        tCrC = r2s_thr.retile(acc_out)
-        tCsC = r2s_thr.partition_D(sC)
-        cute.copy(r2s_copy, tCrC, tCsC)
+    @cute.jit
+    def compute_unscaled(self, page_ptr, tile_B, tile_S, tile_N):
+        """GEMM compute path specialized for the common unscaled forward case."""
+        _gemm_compute_unscaled_core(
+            page_ptr,
+            cute.arch.thread_idx()[0],
+            self.a_dtype, self.b_dtype, self.c_dtype,
+            self.num_mma_warps, self.num_mma_threads,
+            self.tile_size_S, self.tile_size_N, self.tile_K,
+            self.buf_stride, self.b_offset, self.mbar_offset,
+            self.swz_B_ab, self.swz_B_c,
+            self.activation, Int32(self.num_k_blocks),
+        )
 
     # =========================================================================
     # Forward Store (S->G): Regular TMA store of C

@@ -427,6 +427,30 @@ def _append_tma_descriptor(
     )
 
 
+def _local_tma_desc_key(
+    *,
+    tensor_canonical: str,
+    direction: str,
+    tile_shape: Tuple[int, ...],
+    dtype: Any,
+    tensor_shape: Tuple[int, ...],
+    original_tensor: Any,
+    smem_layout_src: Optional[str],
+    dim_perm: Tuple[int, ...],
+) -> Tuple[Any, ...]:
+    """Return a stable dedup key for one local TMA descriptor."""
+    return (
+        tensor_canonical,
+        direction,
+        tuple(tile_shape),
+        getattr(dtype, "__name__", str(dtype)),
+        tuple(tensor_shape),
+        original_tensor.data_ptr() if original_tensor is not None else None,
+        smem_layout_src,
+        tuple(dim_perm),
+    )
+
+
 def _append_peer_tma_descriptor(
     descriptors: List["PeerTMADescriptorInfo"],
     op_mappings: Dict[Tuple[int, str], Dict[str, str]],
@@ -462,6 +486,26 @@ def _append_peer_tma_descriptor(
         peer_idx,
         canonical_atom,
         canonical_gmem,
+    )
+
+
+def _peer_tma_desc_key(
+    *,
+    tensor_canonical: str,
+    peer_idx: int,
+    direction: str,
+    tile_shape: Tuple[int, ...],
+    dtype: Any,
+    smem_layout_src: Optional[str],
+) -> Tuple[Any, ...]:
+    """Return a stable dedup key for one peer TMA descriptor."""
+    return (
+        tensor_canonical,
+        peer_idx,
+        direction,
+        tuple(tile_shape),
+        getattr(dtype, "__name__", str(dtype)),
+        smem_layout_src,
     )
 
 
@@ -531,6 +575,7 @@ class TMARegistry:
         descriptors: List[TMADescriptorInfo] = []
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
         counter = 0
+        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
 
         for i, op in enumerate(ops):
             op_cls = op.op_cls
@@ -548,30 +593,49 @@ class TMARegistry:
                     tma_tile_shape = _compute_tma_tile_shape(
                         op_cls, tensor_name, op, dim_perm=dim_perm)
                     dtype = _resolve_tma_dtype(op, tensor_name)
-
-                    canonical_atom = f"tma{counter}_atom"
-                    canonical_gmem = f"tma{counter}_gmem"
                     smem_layout_src = _resolve_tma_smem_layout_src(
                         op_cls, tensor_name, tma_tile_shape, op
                     )
-                    _append_tma_descriptor(
-                        descriptors,
-                        op_mappings,
-                        op_idx=i,
-                        phase=phase,
-                        tensor_name=tensor_name,
+                    desc_key = _local_tma_desc_key(
                         tensor_canonical=tensor_canonical,
                         direction=direction,
                         tile_shape=tma_tile_shape,
                         dtype=dtype,
-                        canonical_atom=canonical_atom,
-                        canonical_gmem=canonical_gmem,
                         tensor_shape=tuple(original_ref.shape),
                         original_tensor=original_ref,
                         smem_layout_src=smem_layout_src,
                         dim_perm=dim_perm,
                     )
-                    counter += 1
+                    if desc_key in desc_name_cache:
+                        canonical_atom, canonical_gmem = desc_name_cache[desc_key]
+                        _set_tma_mapping(
+                            op_mappings[(i, phase)],
+                            tensor_name,
+                            canonical_atom,
+                            canonical_gmem,
+                        )
+                    else:
+                        canonical_atom = f"tma{counter}_atom"
+                        canonical_gmem = f"tma{counter}_gmem"
+                        desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
+                        _append_tma_descriptor(
+                            descriptors,
+                            op_mappings,
+                            op_idx=i,
+                            phase=phase,
+                            tensor_name=tensor_name,
+                            tensor_canonical=tensor_canonical,
+                            direction=direction,
+                            tile_shape=tma_tile_shape,
+                            dtype=dtype,
+                            canonical_atom=canonical_atom,
+                            canonical_gmem=canonical_gmem,
+                            tensor_shape=tuple(original_ref.shape),
+                            original_tensor=original_ref,
+                            smem_layout_src=smem_layout_src,
+                            dim_perm=dim_perm,
+                        )
+                        counter += 1
 
             # Compute phase can use TMA load descriptors + reduce store descriptors
             op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
@@ -677,6 +741,7 @@ class PeerTMARegistry:
         descriptors: List[PeerTMADescriptorInfo] = []
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
         counter = 0
+        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
         num_peers = peer_buffer_registry.num_peers
 
         for i, op in enumerate(ops):
@@ -700,22 +765,41 @@ class PeerTMARegistry:
                 )
 
                 for peer_idx in range(num_peers):
-                    canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
-                    canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
-                    _append_peer_tma_descriptor(
-                        descriptors,
-                        op_mappings,
-                        op_idx=i,
-                        tensor_name=tensor_name,
+                    desc_key = _peer_tma_desc_key(
                         tensor_canonical=tensor_canonical,
                         peer_idx=peer_idx,
                         direction=direction,
                         tile_shape=tma_tile_shape,
                         dtype=dtype,
-                        canonical_atom=canonical_atom,
-                        canonical_gmem=canonical_gmem,
                         smem_layout_src=smem_layout_src,
                     )
+                    if desc_key in desc_name_cache:
+                        canonical_atom, canonical_gmem = desc_name_cache[desc_key]
+                        _set_peer_tma_mapping(
+                            op_mappings[(i, "communicate")],
+                            tensor_name,
+                            peer_idx,
+                            canonical_atom,
+                            canonical_gmem,
+                        )
+                    else:
+                        canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
+                        canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
+                        desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
+                        _append_peer_tma_descriptor(
+                            descriptors,
+                            op_mappings,
+                            op_idx=i,
+                            tensor_name=tensor_name,
+                            tensor_canonical=tensor_canonical,
+                            peer_idx=peer_idx,
+                            direction=direction,
+                            tile_shape=tma_tile_shape,
+                            dtype=dtype,
+                            canonical_atom=canonical_atom,
+                            canonical_gmem=canonical_gmem,
+                            smem_layout_src=smem_layout_src,
+                        )
 
                 counter += 1
 
