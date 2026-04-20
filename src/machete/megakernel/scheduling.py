@@ -678,6 +678,55 @@ class InstructionStreamBuilder:
             return None
         return prod_idx
 
+    def _resolve_named_dep_pairs(
+        self,
+        buffer_producers: Dict[str, int],
+        tensor_ptr_deps: Dict[Tuple[int, str], int],
+    ) -> List[Tuple[int, int]]:
+        """Resolve ordered op pairs for RAW plus shared-storage anti-dependencies."""
+        pairs: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
+
+        # RAW edges from declared inputs.
+        for rec in self._op_records:
+            for buf in rec.op.op_cls.INPUTS:
+                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
+                if prod_idx is None:
+                    continue
+                pair = (prod_idx, rec.op_idx)
+                if pair not in seen:
+                    seen.add(pair)
+                    pairs.append(pair)
+
+        # Shared-storage anti-dependencies: a later writer must wait until all
+        # earlier readers/writers of the same underlying tensor have finished,
+        # even when the logical buffer names differ (e.g. q/c/o scratch reuse
+        # across different op classes and layers).
+        for rec in self._op_records:
+            for out_name in rec.op.op_cls.OUTPUTS:
+                out_ptr = rec.op.tensor_ptrs.get(out_name)
+                if out_ptr is None:
+                    continue
+                for cand_idx in range(rec.op_idx - 1, -1, -1):
+                    cand = self._op_records[cand_idx]
+                    matched = False
+                    for cand_name in cand.op.op_cls.INPUTS:
+                        if cand.op.tensor_ptrs.get(cand_name) == out_ptr:
+                            matched = True
+                            break
+                    if not matched:
+                        for cand_name in cand.op.op_cls.OUTPUTS:
+                            if cand.op.tensor_ptrs.get(cand_name) == out_ptr:
+                                matched = True
+                                break
+                    if matched:
+                        pair = (cand_idx, rec.op_idx)
+                        if pair not in seen:
+                            seen.add(pair)
+                            pairs.append(pair)
+
+        return pairs
+
     def _resolve_dep_edges(self) -> List[_DepEdge]:
         """Resolve op-level dependency edges for tile scheduling.
 
@@ -694,35 +743,26 @@ class InstructionStreamBuilder:
         tensor_ptr_deps = self._build_tensor_ptr_deps()
 
         edges: List[_DepEdge] = []
-        seen: Set[Tuple[int, int]] = set()
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.INPUTS:
-                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
-                if prod_idx is None:
-                    continue
-                pair = (prod_idx, rec.op_idx)
-                if pair in seen:
-                    continue
-                seen.add(pair)
+        for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+            producer = self._op_records[prod_idx]
+            consumer = self._op_records[cons_idx]
+            p_dims = set(producer.op.dim_names.keys())
+            c_dims = set(consumer.op.dim_names.keys())
+            producer_only = p_dims - c_dims
+            consumer_only = c_dims - p_dims
 
-                producer = self._op_records[prod_idx]
-                p_dims = set(producer.op.dim_names.keys())
-                c_dims = set(rec.op.dim_names.keys())
-                producer_only = p_dims - c_dims
-                consumer_only = c_dims - p_dims
+            if producer_only:
+                kind = "many_to_one"
+            elif consumer_only:
+                kind = "one_to_many"
+            else:
+                kind = "one_to_one"
 
-                if producer_only:
-                    kind = "many_to_one"
-                elif consumer_only:
-                    kind = "one_to_many"
-                else:
-                    kind = "one_to_one"
-
-                edges.append(_DepEdge(
-                    producer_idx=prod_idx,
-                    consumer_idx=rec.op_idx,
-                    kind=kind,
-                ))
+            edges.append(_DepEdge(
+                producer_idx=prod_idx,
+                consumer_idx=cons_idx,
+                kind=kind,
+            ))
 
         return edges
 
@@ -961,13 +1001,9 @@ class InstructionStreamBuilder:
         }
         barrier_counter = 0
 
-        for rec in self._op_records:
-            for buf in rec.op.op_cls.INPUTS:
-                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
-                if prod_idx is None:
-                    continue
+        for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
                 producer = self._op_records[prod_idx]
-                consumer = rec
+                consumer = self._op_records[cons_idx]
 
                 p_op = producer.op
                 c_op = consumer.op
@@ -1000,7 +1036,7 @@ class InstructionStreamBuilder:
                 )
 
                 # Consumer wait formula
-                formulas[rec.op_idx][0].append(
+                formulas[cons_idx][0].append(
                     BarrierFormula(
                         base=barrier_counter,
                         coeffs=consumer_coeffs,

@@ -228,10 +228,15 @@ class FlashAttentionSm120Op(Op):
             max_n_block = self.page_size // (2 * self.smem_stride * self.elem_bytes)
 
         # Dynamic-N path uses a fixed KV block size so one compiled kernel can
-        # be reused across sequence lengths safely. 16 is the smallest legal
-        # block for the MMA/cpasync pipeline and avoids the small-N hazards
-        # from choosing a larger block from runtime N.
-        self.n_block = min(16, max_n_block)
+        # be reused across sequence lengths safely. Keep it static, but use a
+        # less conservative tile when page budget allows it: 32 rows halves the
+        # KV-loop trip count versus 16 without making the shape runtime-
+        # dependent. Round down to the legal cpasync/MMA granularity.
+        n_block_granularity = max(16, self.copy_dim0)
+        max_fixed_n_block = min(32, max_n_block)
+        self.n_block = (max_fixed_n_block // n_block_granularity) * n_block_granularity
+        if self.n_block < 16:
+            self.n_block = 16
         self.kv_tile_bytes = self.n_block * self.smem_stride * self.elem_bytes
         total_kv_smem = 2 * self.kv_tile_bytes
         if self.q_in_smem:
@@ -480,9 +485,6 @@ class FlashAttentionSm120Op(Op):
         Q preload to registers frees the full page for KV double-buffering,
         doubling n_block vs the Q-persistent layout.
 
-        Note: q and o are unused here (loaded/stored by TMA) but must be in
-        the signature because the framework passes all tensors when
-        expects_tensors=True (all-or-none).
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()

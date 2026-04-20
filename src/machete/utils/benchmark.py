@@ -1,6 +1,8 @@
 import itertools
+import math
 from typing import Any, List, Callable, Optional
 import copy
+import time
 import matplotlib.pyplot as plt
 import os
 import numpy as np
@@ -144,7 +146,7 @@ class Benchmark:
                 plt.savefig(filename)
                 plt.close()
 
-    def _bench_kernel_func(self, func_or_spec, warmup, rep):
+    def _bench_kernel_func(self, func_or_spec, warmup, rep, force_host_timer: bool = False):
         """Benchmark a kernel callable or `KernelBenchSpec`.
 
         Kernel-mode benchmarks are timed directly with CUDA events on a
@@ -167,14 +169,50 @@ class Benchmark:
             torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
             setup = func_or_spec.setup_fn
+            use_host_timer = func_or_spec.use_host_timer
         else:
             torch_stream = torch.cuda.Stream()
             launch = func_or_spec
             setup = None
+            use_host_timer = False
+
+        use_host_timer = use_host_timer or force_host_timer
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         times = []
+        if use_host_timer:
+            # Host timing is too noisy for very small kernels if we only time
+            # one launch per sample. Probe once, then batch multiple launches
+            # into each timed sample and divide back down.
+            if setup is not None:
+                setup()
+            t0 = time.perf_counter()
+            launch()
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            probe_ms = max((t1 - t0) * 1000.0, 1e-3)
+            inner_repeats = max(1, min(128, int(math.ceil(5.0 / probe_ms))))
+
+            for _ in range(warmup):
+                for _ in range(inner_repeats):
+                    if setup is not None:
+                        setup()
+                    launch()
+                torch.cuda.synchronize()
+
+            for _ in range(rep):
+                t0 = time.perf_counter()
+                for _ in range(inner_repeats):
+                    if setup is not None:
+                        setup()
+                    launch()
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                times.append(((t1 - t0) * 1000.0) / inner_repeats)
+
+            return sum(times) / len(times)
+
         with torch.cuda.stream(torch_stream):
             for _ in range(warmup):
                 if setup is not None:
@@ -246,8 +284,8 @@ class Benchmark:
                 else:
                     line += f" {time_ms:>14.3f}"
 
-                if name != baseline_name and baseline_ms and baseline_ms > 0:
-                    speedup = baseline_ms / time_ms if time_ms > 0 else float("inf")
+                if name != baseline_name and baseline_ms and baseline_ms > 0 and time_ms > 0:
+                    speedup = baseline_ms / time_ms
                     line += f" {speedup:>7.2f}x"
 
             print(line)
@@ -314,8 +352,8 @@ class Benchmark:
             else:
                 line += f" {time_ms:>14.3f}"
 
-            if name != baseline_name and baseline_ms and baseline_ms > 0:
-                speedup = baseline_ms / time_ms if time_ms > 0 else float("inf")
+            if name != baseline_name and baseline_ms and baseline_ms > 0 and time_ms > 0:
+                speedup = baseline_ms / time_ms
                 line += f" {speedup:>7.2f}x"
 
         print(line, flush=True)
@@ -378,7 +416,13 @@ class Benchmark:
 
                 try:
                     if mode == "kernel":
-                        time_ms = self._bench_kernel_func(func, warmup, rep)
+                        row_use_host_timer = any(
+                            isinstance(candidate, KernelBenchSpec) and candidate.use_host_timer
+                            for candidate in funcs.values()
+                        )
+                        time_ms = self._bench_kernel_func(
+                            func, warmup, rep, force_host_timer=row_use_host_timer
+                        )
                         results[str(params)][func_name]["time_ms"] = time_ms
                         if bytes_fn is not None:
                             total_bytes = bytes_fn(**params)

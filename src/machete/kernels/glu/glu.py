@@ -31,6 +31,8 @@ from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_arrive_expect_tx,
     named_barrier_sync,
+    ld_global_i32,
+    ld_global_i64,
 )
 
 
@@ -48,6 +50,11 @@ ACT_MAP = {
     'silu': ACT_SILU,
     'swish': ACT_SILU,
 }
+
+
+@cute.jit
+def _config_dim_i32(op_config_ptr, dim_name: str, cls):
+    return ld_global_i32(op_config_ptr, Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]))
 
 
 @cute.jit
@@ -515,13 +522,22 @@ class GLUBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, dy):
+    def compute(self, page_ptr, tile_B, tile_S, op_config_ptr):
         """GLU backward: read x from smem, dy from global, write dx to smem.
 
         dx overwrites x in smem (same N-stride per row, no barrier needed).
         Each warp processes disjoint rows.
         """
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
+        batch_size = _config_dim_i32(op_config_ptr, "B", type(self))
+        dy_ptr = ld_global_i64(op_config_ptr, Int32(type(self)._CONFIG_PTR_I64_INDEX["dy"]))
+        dy = cute.make_tensor(
+            cute.make_ptr(self.dy_dtype, dy_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (batch_size, self.S, self.D),
+                stride=(self.dy_stride_B, self.dy_stride_S, self.dy_stride_D),
+            ),
+        )
 
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()

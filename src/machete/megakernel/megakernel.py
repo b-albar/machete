@@ -1,27 +1,18 @@
 # Copyright (c) 2025, Machete Authors
-"""
-Persistent Megakernel with Instruction Stream, Paged Memory, and Op Dispatch.
+"""Persistent megakernel runtime and launch plumbing.
 
-This module implements a "No Bubbles" megakernel architecture:
+The current implementation is handler-based:
+- blocks stay resident and pull work from a global instruction stream
+- op scheduling and barrier formulas are prepared on the host
+- load/store/compute/communicate dispatch uses handler indices plus compact
+  runtime metadata tables
+- shared memory is managed as a paged circular buffer
 
-1. All blocks are persistent (launched once, process entire computation)
-2. Each block fetches instructions from a global instruction stream
-3. Fine-grained barriers at TILE level enable pipeline overlap between ops
-4. Shared memory is managed via a paged memory system (circular buffer)
-5. Ops are dispatched at compile time (inlined branches per op index)
-6. Barrier wait/signal logic is baked into op handlers at compile time
-
-Usage:
-    from machete.megakernel import Megakernel
-    from machete.kernels.rms_norm import RMSNormOp
-
-    ops = RMSNormOp.schedule(x=x, weight=w, y=y)
-    kernel = Megakernel(ops)
-    kernel.run()
+This file owns host-side runtime state, launch caching, and the generated
+persistent kernel shell. It does not define individual op math.
 """
 
 from dataclasses import dataclass
-import inspect
 import re
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -107,8 +98,7 @@ _OP_META_COUNT_2 = 10
 _OP_META_COUNT_3 = 11
 _OP_META_COUNT_4 = 12
 _OP_META_HANDLER_IDX = 13
-_OP_META_HANDLER_LOCAL_IDX = 14
-_OP_META_STRIDE = 15
+_OP_META_STRIDE = 14
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -121,7 +111,6 @@ _SIGNAL_META_STRIDE = 12
 _TILE_INFO_OP_IDX = 0
 _TILE_INFO_LINEAR_IDX = 1
 _TILE_INFO_HANDLER_IDX = 2
-_TILE_INFO_HANDLER_LOCAL_IDX = 3
 _TILE_INFO_TILE_0 = 4
 _TILE_INFO_TILE_1 = 5
 _TILE_INFO_TILE_2 = 6
@@ -198,6 +187,10 @@ class _LaunchState:
     op_configs_ptr: Int64
     wait_info_ptr: Int64
     op_meta_ptr: Int64
+    load_local_idx_ptr: Int64
+    compute_local_idx_ptr: Int64
+    store_local_idx_ptr: Int64
+    communicate_local_idx_ptr: Int64
     signal_meta_ptr: Int64
     peer_signal_ptr: Int64
     trace_buffer_ptr: Int64
@@ -220,12 +213,11 @@ class Megakernel:
         The cache key is based on: (op_classes, static_dims, config_params).
 
     Architecture:
-    - All SMs launched as persistent blocks
-    - Each block fetches instructions from global memory in a strided pattern
-    - Fine-grained barriers enable tile-level dependencies between operations
-    - Barrier wait/signal logic is baked into op handlers at compile time
-    - Shared memory is divided into pages managed by a circular buffer
-    - Ops are dispatched via compile-time inlined branches
+    - all SMs launch persistent blocks
+    - each block fetches instructions from global memory in a strided pattern
+    - fine-grained barriers enable tile-level dependencies between ops
+    - shared memory is divided into pages managed by a circular buffer
+    - phase dispatch uses the handler backend plus runtime metadata tables
 
     Work Distribution:
         Block 0: instr 0 -> instr num_sms -> instr 2*num_sms -> ...
@@ -257,12 +249,19 @@ class Megakernel:
         self.device = device
         self._scheduler = scheduler
 
-        # Detect SM count if not specified
+        # Detect resident block count if not specified.
+        #
+        # Occupying every SM is wasteful for small workloads: the persistent
+        # shell cost scales with resident blocks even when there are only a few
+        # tiles to process. Cap the default grid by available work so short
+        # sequences and small fused graphs do not launch dozens of idle
+        # persistent blocks.
         if self.config.num_sms is None:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is not available. Megakernel requires a CUDA GPU.")
             props = torch.cuda.get_device_properties(device)
-            self.config.num_sms = props.multi_processor_count
+            total_tiles = max(1, sum(op.total_tiles for op in ops))
+            self.config.num_sms = min(props.multi_processor_count, total_tiles)
 
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
@@ -304,6 +303,12 @@ class Megakernel:
         self._compiled_kernel = None
         self._op_metadata_tensor: Optional[torch.Tensor] = None
         self._signal_metadata_tensor: Optional[torch.Tensor] = None
+        self._phase_local_idx_tensors: Dict[str, Optional[torch.Tensor]] = {
+            "load": None,
+            "compute": None,
+            "store": None,
+            "communicate": None,
+        }
         self._peer_signal_tensor: Optional[torch.Tensor] = None
         self._max_signal_formulas: int = 1
 
@@ -426,7 +431,26 @@ class Megakernel:
         peer_signal_offsets = [] if has_communicate else None
         peer_barrier_offset = 0
         op_handler_indices = self._backend.handler_indices()
-        op_handler_local_indices = self._backend.handler_local_indices()
+        op_phase_local_indices = {
+            phase: self._backend.phase_local_indices(phase)
+            for phase in ("load", "compute", "store", "communicate")
+        }
+        from .backend_dispatch import group_uses_handler_local_idx
+        op_phase_tma_args = self._backend.op_tma_args()
+        phase_uses_local_idx = {}
+        for phase in ("load", "compute", "store", "communicate"):
+            by_handler: Dict[int, List[int]] = {}
+            for op_idx, handler_idx in enumerate(op_handler_indices):
+                by_handler.setdefault(handler_idx, []).append(op_idx)
+            phase_uses_local_idx[phase] = any(
+                group_uses_handler_local_idx(
+                    handler_local_ids=[op_phase_local_indices[phase][op_idx] for op_idx in op_indices],
+                    op_indices=op_indices,
+                    op_phase_tensor_args=[[] for _ in self.ops],
+                    op_phase_tma_args=op_phase_tma_args[phase],
+                )
+                for op_indices in by_handler.values()
+            )
 
         for op_idx, op in enumerate(self.ops):
             kernel_config = {"threads_per_row": num_compute_threads}
@@ -434,13 +458,18 @@ class Megakernel:
             instance = op.op_cls(**config)
             tile_strides = self._tile_linear_strides(op.tile_counts)
             _wait_formulas, signal_formulas = formulas.get(op_idx, ([], []))
-            load_uses = int("op_config_ptr" in inspect.signature(instance.load).parameters)
-            compute_uses = int("op_config_ptr" in inspect.signature(instance.compute).parameters)
-            store_uses = int("op_config_ptr" in inspect.signature(instance.store).parameters)
-            communicate_uses = (
-                int("op_config_ptr" in inspect.signature(instance.communicate).parameters)
-                if has_communicate else 0
-            )
+            # Keep op_config_ptr live for every phase.
+            #
+            # Phase wrappers may reconstruct tensors from op_config_ptr even
+            # when the original op method signature does not mention it.
+            # Inferring "uses config" from the raw method signature is
+            # therefore not stable once wrapper generation changes. Always
+            # materializing the config pointer keeps the runtime contract
+            # simple and avoids null-config bugs in load/store wrappers.
+            load_uses = 1
+            compute_uses = 1
+            store_uses = 1
+            communicate_uses = 1 if has_communicate else 0
             uses_mask = (
                 load_uses
                 + compute_uses * 2
@@ -456,7 +485,6 @@ class Megakernel:
                     *tile_strides,
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
                     int(op_handler_indices[op_idx]),
-                    int(op_handler_local_indices[op_idx]),
                 ]
             )
 
@@ -487,6 +515,13 @@ class Megakernel:
         self._signal_metadata_tensor = torch.tensor(
             signal_meta, dtype=torch.int32, device=self.device
         )
+        for phase in ("load", "compute", "store", "communicate"):
+            if phase_uses_local_idx.get(phase, False):
+                self._phase_local_idx_tensors[phase] = torch.tensor(
+                    op_phase_local_indices[phase], dtype=torch.int32, device=self.device
+                )
+            else:
+                self._phase_local_idx_tensors[phase] = None
         if has_communicate:
             self._peer_signal_tensor = torch.tensor(
                 peer_signal_offsets, dtype=torch.int32, device=self.device
@@ -707,11 +742,13 @@ class Megakernel:
             dispatch_inputs["dispatch_compute"],
             dispatch_inputs["dispatch_store"],
             dispatch_inputs["dispatch_communicate"],
+            dispatch_inputs["phase_uses_handler_local_idx"],
             dispatch_inputs["inner_iters_list"],
             dispatch_inputs["has_communicate"],
             dispatch_inputs["per_op_warps"],
             dispatch_inputs["phase_tensor_names"],
             dispatch_inputs["phase_tma_names"],
+            dispatch_inputs["all_tma_canonical"],
         )
 
     def _collect_dispatch_signatures(self) -> Dict[str, Any]:
@@ -882,6 +919,7 @@ class Megakernel:
         peer_tma_sig: str,
         has_communicate: bool,
         tracing: bool,
+        phase_uses_handler_local_idx: Dict[str, bool],
         dispatch_extra_params: Dict[str, str],
     ) -> str:
         """Render the generated `_kernel_loop` source."""
@@ -908,13 +946,23 @@ class Megakernel:
         peer_signal_init = "" if has_communicate else "    peer_signal_ptr = Int64(0)\n"
         trace_sig = ", trace_buffer_ptr" if tracing else ""
         trace_init = "" if tracing else "    trace_buffer_ptr = Int64(0)\n"
+        local_sig_parts = []
+        local_init = ""
+        for phase in ("load", "compute", "store", "communicate"):
+            ptr_name = f"{phase}_local_idx_ptr"
+            if phase_uses_handler_local_idx.get(phase, False):
+                local_sig_parts.append(ptr_name)
+            else:
+                local_init += f"    {ptr_name} = Int64(0)\n"
+        local_sig = f", {', '.join(local_sig_parts)}" if local_sig_parts else ""
 
         return (
             "@cute.jit\n"
             "def _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                  op_meta_ptr, signal_meta_ptr{peer_signal_sig},\n"
+            f"                  op_meta_ptr{local_sig}, signal_meta_ptr{peer_signal_sig},\n"
             "                  num_instructions, tidx, block_id, num_blocks,\n"
             f"                  smem_base{trace_sig}, wait_info_ptr{tensor_sig}{tma_sig}{peer_tma_sig}):\n"
+            f"{local_init}"
             f"{peer_signal_init}"
             f"{trace_init}"
             + textwrap.indent(body, "    ")
@@ -1020,51 +1068,13 @@ class Megakernel:
             "    )"
         )
 
-    def _build_phase_tma_inline_infos(self, descriptors, tma_mapping):
-        """Return `(inline_infos, source_param_names)` for one phase."""
-        if not tma_mapping:
-            return None, []
-
-        relevant_canonical_gmems = {
-            canonical_name
-            for local_name, canonical_name in tma_mapping.items()
-            if local_name.endswith("_gmem")
-        }
-        if not relevant_canonical_gmems:
-            return None, []
-
-        inline_infos = []
-        source_param_names = []
-        for desc in descriptors:
-            if desc.canonical_gmem not in relevant_canonical_gmems:
-                continue
-            source_param = self._phase_tma_source_param_name(desc)
-            inline_infos.append(
-                (
-                    desc.canonical_atom,
-                    desc.canonical_gmem,
-                    source_param,
-                    self._render_tma_creation_expr(desc, "{gmem}"),
-                )
-            )
-            source_param_names.append(source_param)
-
-        source_param_names = list(dict.fromkeys(source_param_names))
-        if len(inline_infos) != len(relevant_canonical_gmems):
-            raise ValueError(
-                "Failed to build inline TMA metadata for all phase gmem params: "
-                f"expected {len(relevant_canonical_gmems)}, got {len(inline_infos)}"
-            )
-        return inline_infos, source_param_names
-
-    @staticmethod
-    def _phase_tma_source_param_name(desc) -> str:
-        """Return the raw static-layout tensor param used to recreate one TMA descriptor."""
-        if hasattr(desc, "peer_idx"):
-            return f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}"
-        return f"tma_{desc.tensor_canonical}_{len(desc.tile_shape)}d"
-
-    def _append_tma_descriptor_code(self, tma_creation_lines, tma_kernel_args, desc, tensor_source: str) -> None:
+    def _append_tma_descriptor_code(
+        self,
+        tma_creation_lines,
+        tma_kernel_args,
+        desc,
+        tensor_source: str,
+    ) -> None:
         """Append source that constructs one TMA descriptor pair."""
         tma_creation_lines.append(
             f"        {desc.canonical_atom}, {desc.canonical_gmem} = "
@@ -1077,13 +1087,12 @@ class Megakernel:
         tma_tensor_names = self._collect_tma_tensor_names(tma_registry)
         peer_tma_tensor_names = self._collect_peer_tma_tensor_names(peer_tma_registry)
         tma_creation_lines: List[str] = []
-        tma_kernel_args: List[str] = []
 
         for desc in tma_registry.descriptors:
             ndim = len(desc.tile_shape)
             self._append_tma_descriptor_code(
                 tma_creation_lines,
-                tma_kernel_args,
+                [],
                 desc,
                 f"tma_{desc.tensor_canonical}_{ndim}d",
             )
@@ -1091,7 +1100,7 @@ class Megakernel:
         for desc in peer_tma_registry.descriptors:
             self._append_tma_descriptor_code(
                 tma_creation_lines,
-                tma_kernel_args,
+                [],
                 desc,
                 f"ptma_{desc.tensor_canonical}_p{desc.peer_idx}",
             )
@@ -1100,15 +1109,9 @@ class Megakernel:
         if tma_creation_code:
             tma_creation_code = "\n" + tma_creation_code + "\n"
 
-        combined_tma_names = [
-            *tma_registry.all_canonical_names,
-            *peer_tma_registry.all_canonical_names,
-        ]
         return {
             "tma_tensor_sig": self._signature_suffix(tma_tensor_names),
             "peer_tma_tensor_input_sig": self._signature_suffix(peer_tma_tensor_names),
-            "tma_kernel_args_sig": self._signature_suffix(tma_kernel_args),
-            "combined_tma_sig": self._signature_suffix(combined_tma_names),
             "tma_creation_code": tma_creation_code,
         }
 
@@ -1119,9 +1122,11 @@ class Megakernel:
         threads_per_block: int,
         smem_size: int,
         tensor_sig: str,
+        kernel_tma_sig: str,
         tma_components: Dict[str, Any],
         has_communicate: bool,
         tracing: bool,
+        phase_uses_handler_local_idx: Dict[str, bool],
     ) -> str:
         """Render the `PersistentKernel` class source."""
         peer_signal_sig = ", peer_signal_ptr" if has_communicate else ""
@@ -1130,6 +1135,18 @@ class Megakernel:
         trace_sig = ", trace_buffer_ptr" if tracing else ""
         trace_arg = ", trace_buffer_ptr" if tracing else ""
         trace_init = "" if tracing else "        trace_buffer_ptr = Int64(0)\n"
+        local_sig_parts = []
+        local_arg_parts = []
+        local_init = ""
+        for phase in ("load", "compute", "store", "communicate"):
+            ptr_name = f"{phase}_local_idx_ptr"
+            if phase_uses_handler_local_idx.get(phase, False):
+                local_sig_parts.append(ptr_name)
+                local_arg_parts.append(ptr_name)
+            else:
+                local_init += f"        {ptr_name} = Int64(0)\n"
+        local_sig = f", {', '.join(local_sig_parts)}" if local_sig_parts else ""
+        local_arg = f", {', '.join(local_arg_parts)}" if local_arg_parts else ""
         return (
             "class PersistentKernel:\n"
             "    def __init__(self):\n"
@@ -1139,16 +1156,17 @@ class Megakernel:
             "\n"
             "    @cute.jit\n"
             "    def __call__(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                 op_meta_ptr, signal_meta_ptr{peer_signal_sig},\n"
+            f"                 op_meta_ptr{local_sig}, signal_meta_ptr{peer_signal_sig},\n"
             f"                 wait_info_ptr, num_instructions{trace_sig}"
             f"{tensor_sig}{tma_components['tma_tensor_sig']}{tma_components['peer_tma_tensor_input_sig']}, stream):\n"
+            f"{local_init}"
             f"{peer_signal_init}"
             f"{trace_init}"
             f"{tma_components['tma_creation_code']}"
             "        self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                    op_meta_ptr, signal_meta_ptr{peer_signal_arg},\n"
+            f"                    op_meta_ptr{local_arg}, signal_meta_ptr{peer_signal_arg},\n"
             f"                    wait_info_ptr{trace_arg},\n"
-            f"                    num_instructions{tensor_sig}{tma_components['tma_kernel_args_sig']}).launch(\n"
+            f"                    num_instructions{tensor_sig}{kernel_tma_sig}).launch(\n"
             "            grid=[self.num_sms, 1, 1],\n"
             "            block=[self.threads_per_block, 1, 1],\n"
             "            smem=self.smem_size,\n"
@@ -1158,16 +1176,17 @@ class Megakernel:
             "\n"
             "    @cute.kernel\n"
             "    def kernel(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"               op_meta_ptr, signal_meta_ptr{peer_signal_sig},\n"
-            f"               wait_info_ptr, num_instructions{trace_sig}{tensor_sig}{tma_components['combined_tma_sig']}):\n"
+            f"               op_meta_ptr{local_sig}, signal_meta_ptr{peer_signal_sig},\n"
+            f"               wait_info_ptr, num_instructions{trace_sig}{tensor_sig}{kernel_tma_sig}):\n"
+            f"{local_init}"
             "        tidx = cute.arch.thread_idx()[0]\n"
             "        block_id = cute.arch.block_idx()[0]\n"
             "        num_blocks = cute.arch.grid_dim()[0]\n"
             "        smem_base = get_smem_base_ptr()\n"
             "        _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                     op_meta_ptr, signal_meta_ptr{peer_signal_arg},\n"
+            f"                     op_meta_ptr{local_arg}, signal_meta_ptr{peer_signal_arg},\n"
             "                     num_instructions, tidx, block_id, num_blocks,\n"
-             f"                     smem_base{trace_arg}, wait_info_ptr{tensor_sig}{tma_components['combined_tma_sig']})\n"
+             f"                     smem_base{trace_arg}, wait_info_ptr{tensor_sig}{kernel_tma_sig})\n"
         )
 
     def _build_persistent_kernel_globals(self, tma_registry, peer_tma_registry, kernel_loop) -> Dict[str, Any]:
@@ -1311,11 +1330,13 @@ class Megakernel:
             dispatch_compute,
             dispatch_store,
             dispatch_communicate,
+            phase_uses_handler_local_idx,
             inner_iters_list,
             has_communicate,
             per_op_warps,
             phase_tensor_names,
             phase_tma_names,
+            all_tma_canonical,
         ) = self._build_pipelined_dispatch_fns()
 
         if self.config.tracing:
@@ -1485,6 +1506,7 @@ class Megakernel:
             "dispatch_compute": dispatch_compute,
             "dispatch_store": dispatch_store,
             "dispatch_communicate": dispatch_communicate,
+            "phase_uses_handler_local_idx": phase_uses_handler_local_idx,
             "has_communicate": has_communicate,
             "needs_warp_transition": any(w < kernel_cfg["num_mma_warps"] for w in per_op_warps),
             "max_waits": max(1, self._builder.max_wait_deps),
@@ -1500,6 +1522,7 @@ class Megakernel:
             "_compute_done_mbar": _compute_done_mbar,
             "phase_tensor_names": phase_tensor_names,
             "phase_tma_names": phase_tma_names,
+            "all_tma_canonical": all_tma_canonical,
         }
 
     def _kernel_extra_exec_globals(
@@ -1536,15 +1559,17 @@ class Megakernel:
             "ld_global_i32": ld_global_i32,
             "has_communicate": runtime["has_communicate"],
             "needs_warp_transition": runtime["needs_warp_transition"],
+            "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
+            "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
+            "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
+            "dispatch_communicate_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["communicate"],
             "MIN_IDLE_REGS": MIN_IDLE_REGS,
             "num_ops": len(self.ops),
             "_OP_META_INNER_ITERS": _OP_META_INNER_ITERS,
             "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
             "_OP_META_USES_CONFIG_MASK": _OP_META_USES_CONFIG_MASK,
             "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
-            "_OP_META_HANDLER_LOCAL_IDX": _OP_META_HANDLER_LOCAL_IDX,
             "_TILE_INFO_HANDLER_IDX": _TILE_INFO_HANDLER_IDX,
-            "_TILE_INFO_HANDLER_LOCAL_IDX": _TILE_INFO_HANDLER_LOCAL_IDX,
             "_TILE_INFO_TILE_0": _TILE_INFO_TILE_0,
             "_TILE_INFO_TILE_1": _TILE_INFO_TILE_1,
             "_TILE_INFO_TILE_2": _TILE_INFO_TILE_2,
@@ -1652,7 +1677,6 @@ class Megakernel:
                 _ctrl_cached_op_idx = Int32(-1)
                 _ctrl_cached_meta_base = Int32(0)
                 _ctrl_cached_handler = Int32(0)
-                _ctrl_cached_handler_local = Int32(0)
                 _ctrl_cached_inner_iters = Int32(1)
                 _ctrl_cached_uses_mask = Int32(0)
                 _ctrl_cached_config = Int64(0)
@@ -1708,9 +1732,6 @@ class Megakernel:
                                 _ctrl_cached_handler = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_IDX)
                                 )
-                                _ctrl_cached_handler_local = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_LOCAL_IDX)
-                                )
                                 _ctrl_cached_inner_iters = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_INNER_ITERS)
                                 )
@@ -1733,9 +1754,6 @@ class Megakernel:
                             )
                             st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_HANDLER_IDX), _ctrl_cached_handler)
-                            st_shared_i32(
-                                _p_ti + Int32(4 * _TILE_INFO_HANDLER_LOCAL_IDX), _ctrl_cached_handler_local
-                            )
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_0), _p_t0)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_1), _p_t1)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_2), _p_t2)
@@ -1790,9 +1808,9 @@ class Megakernel:
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
                         _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
                         _dl_handler = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
-                        _dl_handler_local = ld_shared_i32(
-                            _dl_ti + Int32(4 * _TILE_INFO_HANDLER_LOCAL_IDX)
-                        )
+                        _dl_handler_local = Int32(0)
+                        if const_expr(dispatch_load_uses_handler_local_idx):
+                            _dl_handler_local = ld_global_i32(load_local_idx_ptr, _dl_op)
                         _dl_0 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_0))
                         _dl_1 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_1))
                         _dl_2 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_2))
@@ -1804,19 +1822,33 @@ class Megakernel:
                         _dl_iter = Int32(0)
                         if const_expr(tracing):
                             _tl = trace_start()
-                        dispatch_load(
-                            _dl_handler,
-                            _dl_handler_local,
-                            _dl_pp,
-                            _dl_0,
-                            _dl_1,
-                            _dl_2,
-                            _dl_3,
-                            _dl_4,
-                            _dl_config,
-                            _dl_mbar,
-                            _dl_iter,
-                        )
+                        if const_expr(dispatch_load_uses_handler_local_idx):
+                            dispatch_load(
+                                _dl_handler,
+                                _dl_handler_local,
+                                _dl_pp,
+                                _dl_0,
+                                _dl_1,
+                                _dl_2,
+                                _dl_3,
+                                _dl_4,
+                                _dl_config,
+                                _dl_mbar,
+                                _dl_iter,
+                            )
+                        else:
+                            dispatch_load(
+                                _dl_handler,
+                                _dl_pp,
+                                _dl_0,
+                                _dl_1,
+                                _dl_2,
+                                _dl_3,
+                                _dl_4,
+                                _dl_config,
+                                _dl_mbar,
+                                _dl_iter,
+                            )
                         if const_expr(tracing):
                             for _i in range_constexpr(num_ops):
                                 if _dl_op == Int32(_i):
@@ -1868,9 +1900,15 @@ class Megakernel:
                         _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                         _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
                         _ds_handler = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
-                        _ds_handler_local = ld_shared_i32(
-                            _ds_ti + Int32(4 * _TILE_INFO_HANDLER_LOCAL_IDX)
-                        )
+                        _dl_store_handler_local = Int32(0)
+                        if const_expr(dispatch_load_uses_handler_local_idx):
+                            _dl_store_handler_local = ld_global_i32(load_local_idx_ptr, _ds_op)
+                        _ds_handler_local = Int32(0)
+                        if const_expr(dispatch_store_uses_handler_local_idx):
+                            _ds_handler_local = ld_global_i32(store_local_idx_ptr, _ds_op)
+                        _dc_handler_local = Int32(0)
+                        if const_expr(dispatch_communicate_uses_handler_local_idx):
+                            _dc_handler_local = ld_global_i32(communicate_local_idx_ptr, _ds_op)
                         _ds_0 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_0))
                         _ds_1 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_1))
                         _ds_2 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_2))
@@ -1886,19 +1924,33 @@ class Megakernel:
                             mbarrier_wait(_ds_mbar, _s_phase)
                         _iter_idx = Int32(1)
                         while _iter_idx < _n_iters:
-                            dispatch_load(
-                                _ds_handler,
-                                _ds_handler_local,
-                                _ds_pp,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_4,
-                                _ds_config,
-                                _ds_mbar,
-                                _iter_idx,
-                            )
+                            if const_expr(dispatch_load_uses_handler_local_idx):
+                                dispatch_load(
+                                    _ds_handler,
+                                    _dl_store_handler_local,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_4,
+                                    _ds_config,
+                                    _ds_mbar,
+                                    _iter_idx,
+                                )
+                            else:
+                                dispatch_load(
+                                    _ds_handler,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_4,
+                                    _ds_config,
+                                    _ds_mbar,
+                                    _iter_idx,
+                                )
                             _iter_idx = _iter_idx + Int32(1)
 
                         if const_expr(tracing):
@@ -1916,19 +1968,8 @@ class Megakernel:
 
                         if const_expr(tracing):
                             _tss = trace_start()
-                        dispatch_store(
-                            _ds_handler,
-                            _ds_handler_local,
-                            _ds_pp,
-                            _ds_0,
-                            _ds_1,
-                            _ds_2,
-                            _ds_3,
-                            _ds_4,
-                            _ds_config,
-                        )
-                        if const_expr(has_communicate):
-                            dispatch_communicate(
+                        if const_expr(dispatch_store_uses_handler_local_idx):
+                            dispatch_store(
                                 _ds_handler,
                                 _ds_handler_local,
                                 _ds_pp,
@@ -1939,6 +1980,41 @@ class Megakernel:
                                 _ds_4,
                                 _ds_config,
                             )
+                        else:
+                            dispatch_store(
+                                _ds_handler,
+                                _ds_pp,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_4,
+                                _ds_config,
+                            )
+                        if const_expr(has_communicate):
+                            if const_expr(dispatch_communicate_uses_handler_local_idx):
+                                dispatch_communicate(
+                                    _ds_handler,
+                                    _dc_handler_local,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_4,
+                                    _ds_config,
+                                )
+                            else:
+                                dispatch_communicate(
+                                    _ds_handler,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_4,
+                                    _ds_config,
+                                )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         if const_expr(tracing):
@@ -2033,9 +2109,9 @@ class Megakernel:
                         tile_3 = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_TILE_3))
                         tile_4 = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_TILE_4))
                         _handler_idx = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_HANDLER_IDX))
-                        _handler_local_idx = ld_shared_i32(
-                            tile_info_ptr + Int32(4 * _TILE_INFO_HANDLER_LOCAL_IDX)
-                        )
+                        _handler_local_idx = Int32(0)
+                        if const_expr(dispatch_compute_uses_handler_local_idx):
+                            _handler_local_idx = ld_global_i32(compute_local_idx_ptr, op_idx)
                         _op_config = ld_shared_i64(tile_info_ptr + Int32(4 * _TILE_INFO_OP_CONFIG))
                         page_ptr = _get_page_ptr(smem_base, slot)
                         if op_idx != _cached_op_idx:
@@ -2053,17 +2129,29 @@ class Megakernel:
                         if const_expr(tracing):
                             _tc = trace_start()
 
-                        dispatch_compute(
-                            _handler_idx,
-                            _handler_local_idx,
-                            page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
-                            tile_4,
-                            _op_config,
-                        )
+                        if const_expr(dispatch_compute_uses_handler_local_idx):
+                            dispatch_compute(
+                                _handler_idx,
+                                _handler_local_idx,
+                                page_ptr,
+                                tile_0,
+                                tile_1,
+                                tile_2,
+                                tile_3,
+                                tile_4,
+                                _op_config,
+                            )
+                        else:
+                            dispatch_compute(
+                                _handler_idx,
+                                page_ptr,
+                                tile_0,
+                                tile_1,
+                                tile_2,
+                                tile_3,
+                                tile_4,
+                                _op_config,
+                            )
 
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
@@ -2106,6 +2194,7 @@ class Megakernel:
         ring_state_offset,
         phase_tensor_names,
         phase_tma_names,
+        phase_uses_handler_local_idx,
         extra_exec_globals=None,
     ):
         """Build the PersistentKernel via source transformation.
@@ -2120,15 +2209,20 @@ class Megakernel:
 
         # TMA params threaded into dispatch calls.
         tma_registry = self._tma_registry
-        all_tma_canonical = tma_registry.all_canonical_names
+        all_tma_canonical: List[str] = []
+        seen_tma = set()
+        for phase in ("load", "compute", "store", "communicate"):
+            for name in phase_tma_names.get(phase, []):
+                if name in seen_tma:
+                    continue
+                seen_tma.add(name)
+                all_tma_canonical.append(name)
         tma_params = ", ".join(all_tma_canonical)
         tma_sig = self._signature_suffix(all_tma_canonical)
 
         # Peer TMA params for multi-GPU communication
         peer_tma_registry = self._peer_tma_registry
-        all_peer_tma_canonical = peer_tma_registry.all_canonical_names
-        peer_tma_params = ", ".join(all_peer_tma_canonical)
-        peer_tma_sig = self._signature_suffix(all_peer_tma_canonical)
+        peer_tma_sig = ""
 
         dispatch_extra_params = {}
         for phase in ("load", "compute", "store", "communicate"):
@@ -2144,6 +2238,7 @@ class Megakernel:
             peer_tma_sig=peer_tma_sig,
             has_communicate=bool(peer_tma_registry.has_peer_tma),
             tracing=bool(self.config.tracing),
+            phase_uses_handler_local_idx=phase_uses_handler_local_idx,
             dispatch_extra_params=dispatch_extra_params,
         )
 
@@ -2168,9 +2263,11 @@ class Megakernel:
             threads_per_block=threads_per_block,
             smem_size=smem_size,
             tensor_sig=tensor_sig,
+            kernel_tma_sig=tma_sig,
             tma_components=tma_components,
             has_communicate=bool(peer_tma_registry.has_peer_tma),
             tracing=bool(self.config.tracing),
+            phase_uses_handler_local_idx=phase_uses_handler_local_idx,
         )
         pk_globals = self._build_persistent_kernel_globals(
             tma_registry,
@@ -2319,6 +2416,7 @@ class Megakernel:
             kernel_cfg["ring_state_offset"],
             runtime["phase_tensor_names"],
             runtime["phase_tma_names"],
+            runtime["phase_uses_handler_local_idx"],
             extra_exec_globals=self._kernel_extra_exec_globals(kernel_cfg, runtime),
         )
 
@@ -2434,7 +2532,6 @@ class Megakernel:
         self._prepare_cute_tensors()
         self._prepare_tma_tensors()
         self._prepare_peer_tma_tensors()
-
         if self._compiled_kernel is None:
             # Check class-level cache first
             cache_key = self._make_cache_key()
@@ -2492,6 +2589,7 @@ class Megakernel:
                     launch_state.barriers_ptr,
                     launch_state.op_configs_ptr,
                     launch_state.op_meta_ptr,
+                    *self._phase_local_idx_launch_args(launch_state),
                     launch_state.signal_meta_ptr,
                 ]
                 if self._peer_tma_registry.has_peer_tma:
@@ -2558,12 +2656,24 @@ class Megakernel:
             selected_cute_tensors = [
                 cute_tensor_by_name[name] for name in selected_tensor_names
             ]
+
+        phase_local_idx_ptrs = {
+            phase: (
+                Int64(self._phase_local_idx_tensors[phase].data_ptr())
+                if self._phase_local_idx_tensors[phase] is not None else Int64(0)
+            )
+            for phase in ("load", "compute", "store", "communicate")
+        }
         return _LaunchState(
             instructions_ptr=Int64(self._instructions_tensor.data_ptr()),
             barriers_ptr=Int64(self._barriers_tensor.data_ptr()),
             op_configs_ptr=Int64(self._op_configs_tensor.data_ptr()),
             wait_info_ptr=Int64(self._wait_info.data_ptr()),
             op_meta_ptr=Int64(self._op_metadata_tensor.data_ptr()),
+            load_local_idx_ptr=phase_local_idx_ptrs["load"],
+            compute_local_idx_ptr=phase_local_idx_ptrs["compute"],
+            store_local_idx_ptr=phase_local_idx_ptrs["store"],
+            communicate_local_idx_ptr=phase_local_idx_ptrs["communicate"],
             signal_meta_ptr=Int64(self._signal_metadata_tensor.data_ptr()),
             peer_signal_ptr=Int64(self._peer_signal_tensor.data_ptr()) if self._peer_signal_tensor is not None else Int64(0),
             trace_buffer_ptr=Int64(0),
@@ -2574,6 +2684,19 @@ class Megakernel:
                 if self._peer_tma_cute_tensors else []
             ),
         )
+
+    def _phase_local_idx_launch_args(self, launch_state: _LaunchState) -> List[Int64]:
+        """Return phase-local index table pointers in kernel ABI order."""
+        args: List[Int64] = []
+        if self._phase_local_idx_tensors["load"] is not None:
+            args.append(launch_state.load_local_idx_ptr)
+        if self._phase_local_idx_tensors["compute"] is not None:
+            args.append(launch_state.compute_local_idx_ptr)
+        if self._phase_local_idx_tensors["store"] is not None:
+            args.append(launch_state.store_local_idx_ptr)
+        if self._phase_local_idx_tensors["communicate"] is not None:
+            args.append(launch_state.communicate_local_idx_ptr)
+        return args
 
     def _cache_launch_state(self) -> None:
         """Cache stable launch arguments to avoid per-run Python overhead.
@@ -2611,6 +2734,7 @@ class Megakernel:
             launch_state.barriers_ptr,
             launch_state.op_configs_ptr,
             launch_state.op_meta_ptr,
+            *self._phase_local_idx_launch_args(launch_state),
             launch_state.signal_meta_ptr,
         ]
         if self._peer_tma_registry.has_peer_tma:
@@ -2626,9 +2750,9 @@ class Megakernel:
                 *launch_state.cute_tensors,
                 *launch_state.tma_tensor_args,
                 *launch_state.peer_tma_tensor_args,
-                stream,
             ]
         )
+        launch_args.append(stream)
         self._compiled_kernel(*launch_args)
 
     def run(self, stream=None, sync: bool = True, validate: bool = True) -> None:
@@ -2703,32 +2827,25 @@ class Megakernel:
 
             spec = kernel.bench_spec(setup_fn=reset, keep_alive=[q, cos, sin])
         """
-        import cuda.bindings.driver as cuda
         from machete.utils.benchmark_utils import KernelBenchSpec
 
         self.compile()
-
-        bench_stream = torch.cuda.Stream()
-        cu_stream = cuda.CUstream(bench_stream.cuda_stream)
-
-        # Capture references to internal state (stable after compile)
-        launch_state = self._build_launch_state()
-        barriers_tensor = self._barriers_tensor
+        bench_stream = torch.cuda.current_stream()
 
         def _setup():
             """Reset benchmark-visible runtime state before each launch."""
             if setup_fn is not None:
                 setup_fn()
-            barriers_tensor.zero_()
 
         def _launch():
-            """Launch the already-compiled kernel on the benchmark stream."""
-            self._launch_compiled_kernel(launch_state, cu_stream)
+            """Benchmark the same launch path used by normal execution."""
+            self.run(sync=True, validate=False)
 
         return KernelBenchSpec(
             launch_fn=_launch,
             setup_fn=_setup,
-            stream=(bench_stream, cu_stream),
+            stream=(bench_stream, None),
+            use_host_timer=True,
             _keep_alive=(self, keep_alive),  # prevent GC from freeing GPU memory
         )
 

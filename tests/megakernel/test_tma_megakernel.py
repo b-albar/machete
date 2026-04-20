@@ -14,7 +14,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
-from machete.megakernel.megakernel import Megakernel
+from machete.megakernel.megakernel import Megakernel, MegakernelConfig
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 from machete.utils.testing import is_hopper_available
@@ -140,6 +140,15 @@ class TestTMAMegakernel:
         y = torch.full((M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
         ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         Megakernel(ops).run()
+        torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_add_one_single_tile_noinline(self):
+        """Noinline path should rebuild exec TMA from runtime desc pointers."""
+        torch.manual_seed(42)
+        x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(ops, config=MegakernelConfig(noinline=True)).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
     def test_repeated_identical_ops_share_handler_but_keep_distinct_bindings(self):

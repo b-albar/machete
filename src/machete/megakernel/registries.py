@@ -23,13 +23,29 @@ from .ops import (
     TensorMeta,
 )
 
+TMA_PHASE_SPECS = (
+    ("load", "_TMA_LOADS", "g2s"),
+    ("store", "_TMA_STORES", "s2g"),
+    ("store", "_TMA_REDUCE_STORES", "s2g_reduce"),
+)
+
+PEER_TMA_DIRECTION_SPECS = (
+    ("_PEER_STORES", "s2g"),
+    ("_PEER_REDUCE_STORES", "s2g_reduce"),
+)
+
 
 def _canonical_name_list(descriptors) -> List[str]:
     """Flatten descriptor atom/gmem names in declaration order."""
     names = []
+    seen = set()
     for descriptor in descriptors:
-        names.append(descriptor.canonical_atom)
-        names.append(descriptor.canonical_gmem)
+        if descriptor.canonical_atom not in seen:
+            seen.add(descriptor.canonical_atom)
+            names.append(descriptor.canonical_atom)
+        if descriptor.canonical_gmem not in seen:
+            seen.add(descriptor.canonical_gmem)
+            names.append(descriptor.canonical_gmem)
     return names
 
 
@@ -40,17 +56,15 @@ def _sorted_mapping_values(mapping: Dict[str, str]) -> List[str]:
 
 def _iter_tma_phase_specs(op_cls):
     """Yield `(phase, tensor_names, direction)` triples for TMA declarations."""
-    yield "load", getattr(op_cls, "_TMA_LOADS", set()), "g2s"
-    yield "store", getattr(op_cls, "_TMA_STORES", set()), "s2g"
-    yield "store", getattr(op_cls, "_TMA_REDUCE_STORES", set()), "s2g_reduce"
+    for phase, attr_name, direction in TMA_PHASE_SPECS:
+        yield phase, getattr(op_cls, attr_name, set()), direction
 
 
 def _iter_peer_tma_specs(op_cls):
     """Yield `(tensor_name, direction)` pairs for peer TMA declarations."""
-    for tensor_name in getattr(op_cls, "_PEER_STORES", set()):
-        yield tensor_name, "s2g"
-    for tensor_name in getattr(op_cls, "_PEER_REDUCE_STORES", set()):
-        yield tensor_name, "s2g_reduce"
+    for attr_name, direction in PEER_TMA_DIRECTION_SPECS:
+        for tensor_name in getattr(op_cls, attr_name, set()):
+            yield tensor_name, direction
 
 
 def _tensor_dim_permutation(tensor) -> Tuple[int, ...]:
@@ -67,6 +81,11 @@ def _resolve_tensor_canonical_name(
         if tensor_name in mapping:
             return mapping[tensor_name]
     return None
+
+
+def _mapping_values(mapping_store: Dict[Tuple[int, str], Dict[str, str]], op_idx: int, phase: str) -> List[str]:
+    """Return canonical names for one `(op_idx, phase)` mapping in stable order."""
+    return _sorted_mapping_values(mapping_store.get((op_idx, phase), {}))
 
 
 # =============================================================================
@@ -451,6 +470,28 @@ def _local_tma_desc_key(
     )
 
 
+def _local_tma_atom_key(
+    *,
+    tensor_canonical: str,
+    direction: str,
+    tile_shape: Tuple[int, ...],
+    dtype: Any,
+    tensor_shape: Tuple[int, ...],
+    smem_layout_src: Optional[str],
+    dim_perm: Tuple[int, ...],
+) -> Tuple[Any, ...]:
+    """Return a structural dedup key for a reusable local TMA atom."""
+    return (
+        tensor_canonical,
+        direction,
+        tuple(tile_shape),
+        getattr(dtype, "__name__", str(dtype)),
+        tuple(tensor_shape),
+        smem_layout_src,
+        tuple(dim_perm),
+    )
+
+
 def _append_peer_tma_descriptor(
     descriptors: List["PeerTMADescriptorInfo"],
     op_mappings: Dict[Tuple[int, str], Dict[str, str]],
@@ -574,8 +615,11 @@ class TMARegistry:
         """
         descriptors: List[TMADescriptorInfo] = []
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
-        counter = 0
+        atom_counter = 0
+        gmem_counter = 0
         desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
+        atom_name_cache: Dict[Tuple[Any, ...], str] = {}
+        gmem_name_cache: Dict[Tuple[Any, ...], str] = {}
 
         for i, op in enumerate(ops):
             op_cls = op.op_cls
@@ -615,8 +659,51 @@ class TMARegistry:
                             canonical_gmem,
                         )
                     else:
-                        canonical_atom = f"tma{counter}_atom"
-                        canonical_gmem = f"tma{counter}_gmem"
+                        share_atom = (
+                            op_cls.__name__ in {"GemmOp", "GemmSm100Op"}
+                            and op.static_dims.get("activation", 0) == 0
+                            and op.static_dims.get("has_a_scale", 0) == 0
+                        )
+                        canonical_atom = None
+                        if share_atom:
+                            atom_key = _local_tma_atom_key(
+                                tensor_canonical=tensor_canonical,
+                                direction=direction,
+                                tile_shape=tma_tile_shape,
+                                dtype=dtype,
+                                tensor_shape=tuple(original_ref.shape),
+                                smem_layout_src=smem_layout_src,
+                                dim_perm=dim_perm,
+                            )
+                            canonical_atom = atom_name_cache.get(atom_key)
+                        if canonical_atom is None:
+                            canonical_atom = f"tma{atom_counter}_atom"
+                            if share_atom:
+                                atom_name_cache[atom_key] = canonical_atom
+                            atom_counter += 1
+                        gmem_key = None
+                        canonical_gmem = None
+                        if share_atom:
+                            # Reusing the atom is safe because it only depends on
+                            # structural transport state. Reusing the gmem-side
+                            # transport object across different tensors is not:
+                            # it carries the concrete source/destination tensor
+                            # binding. Keep one gmem handle per canonical tensor.
+                            gmem_key = (
+                                tensor_canonical,
+                                direction,
+                                tuple(tma_tile_shape),
+                                getattr(dtype, "__name__", str(dtype)),
+                                tuple(original_ref.shape),
+                                smem_layout_src,
+                                tuple(dim_perm),
+                            )
+                            canonical_gmem = gmem_name_cache.get(gmem_key)
+                        if canonical_gmem is None:
+                            canonical_gmem = f"tma{gmem_counter}_gmem"
+                            if share_atom:
+                                gmem_name_cache[gmem_key] = canonical_gmem
+                            gmem_counter += 1
                         desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
                         _append_tma_descriptor(
                             descriptors,
@@ -635,7 +722,6 @@ class TMARegistry:
                             smem_layout_src=smem_layout_src,
                             dim_perm=dim_perm,
                         )
-                        counter += 1
 
             # Compute phase can use TMA load descriptors + reduce store descriptors
             op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
@@ -669,7 +755,7 @@ class TMARegistry:
         Returns:
             List of canonical names in order: [atom, gmem, atom, gmem, ...]
         """
-        return _sorted_mapping_values(self.op_mappings.get((op_idx, phase), {}))
+        return _mapping_values(self.op_mappings, op_idx, phase)
 
 
 # =============================================================================
@@ -821,7 +907,7 @@ class PeerTMARegistry:
 
     def get_op_peer_tma_args(self, op_idx: int, phase: str = "communicate") -> List[str]:
         """Get canonical peer TMA param names for an op's communicate phase."""
-        return _sorted_mapping_values(self.op_mappings.get((op_idx, phase), {}))
+        return _mapping_values(self.op_mappings, op_idx, phase)
 
 
 # =============================================================================

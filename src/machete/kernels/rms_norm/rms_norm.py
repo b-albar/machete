@@ -99,7 +99,12 @@ def _tma_kernel_config(cls, ops):
     D = ops[0].static_dims.get('D', 4096)
     page_size = ops[0].static_dims.get('page_size', DEFAULT_PAGE_SIZE)
     compute_threads = 64
-    for ct in [256, 128, 64]:
+    # 256 compute threads overprovision RMSNorm on this backend more often
+    # than they help: the extra warps increase cross-warp/barrier overhead
+    # and persistent-shell pressure, especially on small and medium sequence
+    # lengths. Capping at 128 keeps enough parallelism for D up to 4096 while
+    # improving the common decode/inference shapes.
+    for ct in [128, 64]:
         if D % ct == 0:
             compute_threads = ct
             break

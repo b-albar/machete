@@ -22,7 +22,7 @@ import ast
 import inspect
 import linecache
 import textwrap
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import cutlass.cute as cute
 from cutlass import Int32, Int64
@@ -178,6 +178,82 @@ def _wrapper_signature_suffix(is_load_phase, extra_params, tensor_param_names, t
     return f", {', '.join(parts)}" if parts else ""
 
 
+def _tensor_reconstruction_preamble(instance, tensor_names: List[str]) -> Tuple[str, List[str]]:
+    """Build wrapper source that reconstructs tensors from ``op_config_ptr``.
+
+    Returns:
+        A tuple of:
+        - source preamble lines
+        - tensor names that must remain in the wrapper signature because they
+          could not be reconstructed generically
+    """
+    if not tensor_names:
+        return "", []
+
+    op_cls = instance.__class__
+    unique_tensors = {
+        name: dims for name, _dtype, dims in getattr(op_cls, "_UNIQUE_TENSORS", ())
+    }
+    ptr_slots = getattr(op_cls, "_CONFIG_PTR_I64_INDEX", {})
+    dynamic_offsets = getattr(op_cls, "_CONFIG_DYNAMIC_I32_OFFSET", {})
+
+    preamble_lines: List[str] = []
+    fallback_names: List[str] = []
+    loaded_dims = set()
+
+    def _shape_expr(dim_name: str) -> str | None:
+        if dim_name in dynamic_offsets:
+            local_name = f"_dim_{dim_name}"
+            if dim_name not in loaded_dims:
+                preamble_lines.append(
+                    f"    {local_name} = ld_global_i32(op_config_ptr, Int32({dynamic_offsets[dim_name]}))"
+                )
+                loaded_dims.add(dim_name)
+            return local_name
+        if hasattr(instance, dim_name):
+            return f"_instance.{dim_name}"
+        return None
+
+    for tensor_name in tensor_names:
+        dims = unique_tensors.get(tensor_name)
+        ptr_slot = ptr_slots.get(tensor_name)
+        dtype_attr = f"{tensor_name}_dtype"
+        if dims is None or ptr_slot is None or not hasattr(instance, dtype_attr):
+            fallback_names.append(tensor_name)
+            continue
+
+        shape_exprs = []
+        stride_exprs = []
+        missing_dim = False
+        for dim_name in dims:
+            shape_expr = _shape_expr(dim_name)
+            stride_attr = f"{tensor_name}_stride_{dim_name}"
+            if shape_expr is None or not hasattr(instance, stride_attr):
+                missing_dim = True
+                break
+            shape_exprs.append(shape_expr)
+            stride_exprs.append(f"_instance.{stride_attr}")
+
+        if missing_dim:
+            fallback_names.append(tensor_name)
+            continue
+
+        shape_src = "(" + ", ".join(shape_exprs) + ("," if len(shape_exprs) == 1 else "") + ")"
+        stride_src = "(" + ", ".join(stride_exprs) + ("," if len(stride_exprs) == 1 else "") + ")"
+        tensor_src = (
+            f"cute.make_tensor("
+            f"cute.make_ptr(_instance.{dtype_attr}, ld_global_i64(op_config_ptr, Int32({ptr_slot})), "
+            f"cute.AddressSpace.gmem, assumed_align=16), "
+            f"cute.make_layout({shape_src}, stride={stride_src})"
+            f")"
+        )
+        preamble_lines.append(f"    {tensor_name} = {tensor_src}")
+
+    if not preamble_lines:
+        return "", fallback_names
+    return "\n".join(preamble_lines) + "\n", fallback_names
+
+
 def _wrapper_body(phase_name, call_str, append_mbar: bool, has_tma: bool) -> str:
     """Build the wrapper body for one phase method."""
     is_load_phase = phase_name == "load"
@@ -213,7 +289,8 @@ def _build_phase_wrapper(
     filename="<compile_phase>",
     tma_param_names=None,
     tma_local_mapping=None,
-    tma_inline_infos=None,
+    reconstruct_tensors=False,
+    extra_reconstruct_tensor_names=None,
 ):
     """Build a @cute.jit wrapper that delegates to an Op instance method.
 
@@ -221,11 +298,6 @@ def _build_phase_wrapper(
     op_config_ptr, [work_mbar,] t0, t1, ..., tma0_atom, tma0_gmem, ...)
     and maps positional tile indices, canonical tensor names, and canonical
     TMA names to the instance method's named parameters.
-
-    When ``tma_inline_infos`` is provided, TMA descriptors are created
-    INSIDE the wrapper body instead of being passed as parameters.  This
-    allows the wrapper to be ``noinline`` because no TMA type crosses the
-    function boundary — only plain CuTe gmem tensors are parameters.
 
     The instance method signature convention:
         def phase(self, page_ptr, tile_M, [tile_D, ...], x, [weight, ...], y,
@@ -244,11 +316,6 @@ def _build_phase_wrapper(
         tma_param_names: Canonical TMA parameter names for dispatch signature.
         tma_local_mapping: Dict mapping local TMA names (e.g., 'x_tma') to
             canonical names (e.g., 'tma0_atom'). Used to map method params.
-        tma_inline_infos: Optional list of
-            (canonical_atom_name, canonical_gmem_name, source_param_name,
-            creation_code_str) for creating TMA inside the wrapper body.
-            When set, ``tma_param_names`` should contain only the plain
-            source tensor params (no atom params).
     """
     global _compile_counter
     _compile_counter += 1
@@ -267,6 +334,25 @@ def _build_phase_wrapper(
     call_args = ["page_ptr"]
     tma_reverse = tma_local_mapping or {}
     call_args.extend(_tile_call_args(op_cls, method_params))
+    reconstruct_preamble = ""
+    wrapper_tensor_param_names = list(tensor_param_names or [])
+    reconstructed_tensor_names: List[str] = []
+    reconstruct_names = list(tensor_param_names or [])
+    for name in extra_reconstruct_tensor_names or []:
+        if name not in reconstruct_names:
+            reconstruct_names.append(name)
+    if reconstruct_names and reconstruct_tensors:
+        reconstruct_preamble, remaining_tensor_names = _tensor_reconstruction_preamble(
+            instance,
+            reconstruct_names,
+        )
+        wrapper_tensor_param_names = [
+            name for name in wrapper_tensor_param_names if name in set(remaining_tensor_names)
+        ]
+        reconstructed_tensor_names = [
+            name for name in reconstruct_names if name not in set(remaining_tensor_names)
+        ]
+
     if tensor_param_names:
         known_special = {
             "page_ptr",
@@ -282,31 +368,15 @@ def _build_phase_wrapper(
             for param in method_params
         )
         if expects_tensors:
-            call_args.extend(list(tensor_param_names))
+            wrapper_tensor_param_name_set = set(wrapper_tensor_param_names)
+            reconstructed_tensor_name_set = set(reconstructed_tensor_names)
+            call_args.extend(
+                name
+                for name in tensor_param_names
+                if name in wrapper_tensor_param_name_set or name in reconstructed_tensor_name_set
+            )
 
-    if tma_inline_infos:
-        # TMA created inside body — map method params to local variable names
-        # The tma_local_mapping maps e.g. x_tma → tma0_atom, x_tma_gmem → tma0_gmem.
-        # With inlining, both canonical TMA values are recreated locally from
-        # the gmem tensor parameter passed through the wrapper signature.
-        inline_atom_map = {}  # canonical_atom → local var name
-        inline_gmem_map = {}  # canonical_gmem → local var name
-        for canonical_atom, canonical_gmem, _source_param, _ in tma_inline_infos:
-            inline_atom_map[canonical_atom] = f"_tma_local_{canonical_atom}"
-            inline_gmem_map[canonical_gmem] = f"_tma_local_{canonical_gmem}"
-
-        # Remap: method params that map to TMA canonical names → local vars
-        for param in method_params_ordered:
-            if param in tma_reverse:
-                canonical = tma_reverse[param]
-                if canonical in inline_atom_map:
-                    call_args.append(inline_atom_map[canonical])
-                elif canonical in inline_gmem_map:
-                    call_args.append(inline_gmem_map[canonical])
-                else:
-                    call_args.append(canonical)  # fallback
-    else:
-        call_args.extend(_tma_call_args(method_params_ordered, tma_reverse))
+    call_args.extend(_tma_call_args(method_params_ordered, tma_reverse))
 
     method_uses_op_config_ptr = "op_config_ptr" in method_params
     uses_op_config_ptr = method_uses_op_config_ptr
@@ -331,7 +401,7 @@ def _build_phase_wrapper(
     signature_suffix = _wrapper_signature_suffix(
         is_load_phase,
         extra_params,
-        tensor_param_names,
+        wrapper_tensor_param_names,
         tma_param_names,
     )
 
@@ -342,20 +412,9 @@ def _build_phase_wrapper(
     # cute.copy outside for warp-convergent TMA copy).
     has_tma = bool(tma_local_mapping)
 
-    # Build TMA creation preamble if inlining
-    tma_preamble = ""
-    if tma_inline_infos:
-        for canonical_atom, canonical_gmem, source_param, creation_code in tma_inline_infos:
-            local_atom_var = f"_tma_local_{canonical_atom}"
-            local_gmem_var = f"_tma_local_{canonical_gmem}"
-            tma_preamble += (
-                f"    {local_atom_var}, {local_gmem_var} = "
-                f"{creation_code.format(gmem=source_param)}\n"
-            )
-
     body = _wrapper_body(phase_name, call_str, append_mbar, has_tma)
-    if tma_preamble:
-        body = tma_preamble + body
+    if reconstruct_preamble:
+        body = reconstruct_preamble + body
     needs_fence = phase_name == "compute" or phase_name in ("store", "communicate")
 
     fn_source = (
@@ -371,17 +430,11 @@ def _build_phase_wrapper(
         "Int64": Int64,
         "_instance": instance,
     }
-    if tma_inline_infos:
-        from cutlass.cute.nvgpu import cpasync
-        exec_globals["CopyBulkTensorTileG2SOp"] = cpasync.CopyBulkTensorTileG2SOp
-        exec_globals["CopyBulkTensorTileS2GOp"] = cpasync.CopyBulkTensorTileS2GOp
-        try:
-            from cutlass.cute.nvgpu.cpasync import CopyReduceBulkTensorTileS2GOp
-            from cutlass._mlir.dialects._nvvm_enum_gen import ReductionOp
-            exec_globals["CopyReduceBulkTensorTileS2GOp"] = CopyReduceBulkTensorTileS2GOp
-            exec_globals["ReductionOp"] = ReductionOp
-        except ImportError:
-            pass
+    if reconstruct_preamble:
+        from .interpreter import ld_global_i32, ld_global_i64
+
+        exec_globals["ld_global_i32"] = ld_global_i32
+        exec_globals["ld_global_i64"] = ld_global_i64
     if append_mbar:
         from .interpreter import mbarrier_arrive
 
@@ -409,12 +462,16 @@ def _build_phase_wrapper(
         target._uses_op_config_ptr = uses_op_config_ptr
         target._machete_phase_name = phase_name
         target._machete_phase_owner = instance.__class__.__name__
+        target._machete_wrapper_tensor_params = tuple(wrapper_tensor_param_names)
+        target._machete_reconstructed_tensor_params = tuple(reconstructed_tensor_names)
     return phase_fn
 
 
 def compile_phase(instance, phase_name, tensor_param_names=None,
                   tma_param_names=None, tma_local_mapping=None,
-                  noinline=False, tma_inline_infos=None):
+                  noinline=False,
+                  reconstruct_tensors=False,
+                  extra_reconstruct_tensor_names=None):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
     For load phases, detects async vs sync from method
@@ -439,7 +496,8 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             filename=f"<compile_{phase_name}>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
-            tma_inline_infos=tma_inline_infos,
+            reconstruct_tensors=reconstruct_tensors,
+            extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
         )
     else:
         fn = _build_phase_wrapper(
@@ -449,7 +507,8 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             filename=f"<compile_{phase_name}>",
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
-            tma_inline_infos=tma_inline_infos,
+            reconstruct_tensors=reconstruct_tensors,
+            extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
         )
 
     if noinline:

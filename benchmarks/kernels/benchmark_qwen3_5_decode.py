@@ -208,59 +208,6 @@ def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights):
 # Multi-kernel helper
 # =============================================================================
 
-def _combined_bench_spec(kernels, setup_fn=None, keep_alive=None):
-    """KernelBenchSpec that launches multiple megakernels on one shared stream."""
-    import cuda.bindings.driver as cuda
-    from machete.utils.benchmark_utils import KernelBenchSpec
-    from cutlass import Int64
-
-    bench_stream = torch.cuda.Stream()
-    cu_stream = cuda.CUstream(bench_stream.cuda_stream)
-
-    launch_data = []
-    for mk in kernels:
-        mk.compile()
-        launch_data.append({
-            "compiled": mk._compiled_kernel,
-            "instructions_ptr": Int64(mk._instructions_tensor.data_ptr()),
-            "barriers_ptr": Int64(mk._barriers_tensor.data_ptr()),
-            "barriers_tensor": mk._barriers_tensor,
-            "op_configs_ptr": Int64(mk._op_configs_tensor.data_ptr()),
-            "wait_info_ptr": Int64(mk._wait_info.data_ptr()),
-            "op_meta_ptr": Int64(mk._op_metadata_tensor.data_ptr()),
-            "signal_meta_ptr": Int64(mk._signal_metadata_tensor.data_ptr()),
-            "peer_signal_ptr": Int64(mk._peer_signal_tensor.data_ptr()),
-            "trace_ptr": Int64(0),
-            "num_instructions": mk._num_instructions_i32,
-            "cute_tensors": list(mk._cute_tensors) if mk._cute_tensors else [],
-            "tma_args": [ct for _, ct in mk._tma_cute_tensors] if mk._tma_cute_tensors else [],
-            "peer_tma_args": [ct for _, _, ct in mk._peer_tma_cute_tensors] if mk._peer_tma_cute_tensors else [],
-        })
-
-    def _setup():
-        if setup_fn is not None:
-            setup_fn()
-        for ld in launch_data:
-            ld["barriers_tensor"].zero_()
-
-    def _launch():
-        for ld in launch_data:
-                ld["compiled"](
-                ld["instructions_ptr"], ld["barriers_ptr"],
-                ld["op_configs_ptr"], ld["op_meta_ptr"], ld["signal_meta_ptr"], ld["peer_signal_ptr"],
-                ld["trace_ptr"], ld["wait_info_ptr"],
-                ld["num_instructions"],
-                *ld["cute_tensors"], *ld["tma_args"], *ld["peer_tma_args"],
-                cu_stream,
-            )
-
-    return KernelBenchSpec(
-        launch_fn=_launch, setup_fn=_setup,
-        stream=(bench_stream, cu_stream),
-        _keep_alive=(kernels, keep_alive),
-    )
-
-
 # =============================================================================
 # Single-megakernel decode builder
 # =============================================================================

@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from machete.utils.benchmark import Benchmark
+from machete.utils.benchmark_utils import combine_megakernel_bench_spec
 
 try:
     import cutlass  # noqa: F401
@@ -38,54 +39,12 @@ except ImportError:
     CUTLASS_AVAILABLE = False
 
 
-def _combined_bench_spec(kernels, setup_fn=None, keep_alive=None):
-    """Create a KernelBenchSpec that launches multiple megakernels on one shared stream."""
-    import cuda.bindings.driver as cuda
-    from machete.utils.benchmark_utils import KernelBenchSpec
-    from cutlass import Int64
-
-    bench_stream = torch.cuda.Stream()
-    cu_stream = cuda.CUstream(bench_stream.cuda_stream)
-
-    # Compile all kernels and capture their launch state
-    launch_data = []
-    for mk in kernels:
-        mk.compile()
-        launch_data.append({
-            "compiled": mk._compiled_kernel,
-            "instructions_ptr": Int64(mk._instructions_tensor.data_ptr()),
-            "barriers_ptr": Int64(mk._barriers_tensor.data_ptr()),
-            "barriers_tensor": mk._barriers_tensor,
-            "op_configs_ptr": Int64(mk._op_configs_tensor.data_ptr()),
-            "wait_info_ptr": Int64(mk._wait_info.data_ptr()),
-            "trace_ptr": Int64(0),
-            "num_instructions": mk._num_instructions_i32,
-            "cute_tensors": list(mk._cute_tensors) if mk._cute_tensors else [],
-            "tma_args": [ct for _, ct in mk._tma_cute_tensors] if mk._tma_cute_tensors else [],
-            "peer_tma_args": [ct for _, _, ct in mk._peer_tma_cute_tensors] if mk._peer_tma_cute_tensors else [],
-        })
-
-    def _setup():
-        if setup_fn is not None:
-            setup_fn()
-        for ld in launch_data:
-            ld["barriers_tensor"].zero_()
-
-    def _launch():
-        for ld in launch_data:
-            ld["compiled"](
-                ld["instructions_ptr"], ld["barriers_ptr"],
-                ld["op_configs_ptr"], ld["trace_ptr"], ld["wait_info_ptr"],
-                ld["num_instructions"],
-                *ld["cute_tensors"], *ld["tma_args"], *ld["peer_tma_args"],
-                cu_stream,
-            )
-
-    return KernelBenchSpec(
-        launch_fn=_launch, setup_fn=_setup,
-        stream=(bench_stream, cu_stream),
-        _keep_alive=(kernels, keep_alive),
-    )
+def _is_sm120_single_batch_long_seq(batch, seq_len, threshold):
+    """Return whether the current run is on the SM120 long-sequence regime."""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major == 12 and batch == 1 and seq_len >= threshold
 
 
 def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
@@ -95,21 +54,31 @@ def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
     regime when it inherits the larger GEMM warp count. For higher-throughput
     regimes the original GEMM-heavy geometry is still better.
     """
-    if not torch.cuda.is_available():
-        return max(gemm_tpb, fa_tpb)
-    major, _ = torch.cuda.get_device_capability()
-    if major == 12 and batch == 1 and seq_len >= 1024:
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
         return fa_tpb
     return max(gemm_tpb, fa_tpb)
 
 
 def _pick_single_layer_forward_mma_reg_count(batch, seq_len, default_mma_regs=232):
     """Tune the fused forward runtime MMA register budget on SM120."""
-    if not torch.cuda.is_available():
-        return default_mma_regs
-    major, _ = torch.cuda.get_device_capability()
-    if major == 12 and batch == 1 and seq_len >= 1024:
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
         return 224
+    return default_mma_regs
+
+
+def _pick_single_layer_backward_tpb(batch, seq_len, gemm_tpb, fa_bwd_tpb):
+    """Choose the fused backward thread geometry for the Qwen layer benchmark."""
+    # On SM120, the larger GEMM-driven geometry helps short sequences by
+    # keeping more of the MLP-side work resident, but once sequence length
+    # grows the FA backward slice becomes dominant and the extra shell/warp
+    # overhead of the wider fused kernel loses.
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=512):
+        return fa_bwd_tpb
+    return max(gemm_tpb, fa_bwd_tpb)
+
+
+def _pick_single_layer_backward_mma_reg_count(batch, seq_len, default_mma_regs=232):
+    """Tune the fused backward runtime MMA register budget."""
     return default_mma_regs
 
 # =============================================================================
@@ -360,6 +329,8 @@ def megakernel_forward_build(
     with contextlib.redirect_stdout(io.StringIO()):
         single_kernel.run()
     torch.cuda.synchronize()
+    out_1k = out.clone()
+    residual_out2_1k = residual_out2.clone()
 
     spec_1k = single_kernel.bench_spec(keep_alive=keep_alive)
 
@@ -378,11 +349,11 @@ def megakernel_forward_build(
         post_kernel.run()
     torch.cuda.synchronize()
 
-    spec_3k = _combined_bench_spec(
+    spec_3k = combine_megakernel_bench_spec(
         [pre_kernel, fa_kernel, post_kernel],
         keep_alive=keep_alive,
     )
-    return spec_1k, spec_3k, out, residual_out2
+    return spec_1k, spec_3k, out_1k, residual_out2_1k
 
 
 # =============================================================================
@@ -606,9 +577,15 @@ def megakernel_layer_bwd_build(
     all_bwd_ops = mlp_ops + fa_bwd_ops
     gemm_config = GemmOp.kernel_config(mlp_ops)
     single_config = MegakernelConfig(
-        threads_per_block=max(gemm_config.threads_per_block, fa_bwd_config.threads_per_block),
+        threads_per_block=_pick_single_layer_backward_tpb(
+            B,
+            S,
+            gemm_config.threads_per_block,
+            fa_bwd_config.threads_per_block,
+        ),
         page_size=fa_bwd_config.page_size,
         num_pages=1,
+        mma_reg_count=_pick_single_layer_backward_mma_reg_count(B, S),
     )
     single_kernel = Megakernel(all_bwd_ops, config=single_config)
 
@@ -637,7 +614,7 @@ def megakernel_layer_bwd_build(
         fa_kernel.run()
     torch.cuda.synchronize()
 
-    spec_2k = _combined_bench_spec(
+    spec_2k = combine_megakernel_bench_spec(
         [mlp_kernel, fa_kernel],
         setup_fn=setup_fn,
         keep_alive=keep_alive,

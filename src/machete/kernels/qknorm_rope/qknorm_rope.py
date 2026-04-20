@@ -169,10 +169,6 @@ class QKNormRopeOp(Op):
     def load(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin,
              op_config_ptr, work_mbar):
         """Load q/cos/sin tile from global to shared memory.
-
-        norm_weight is in the signature because the framework passes all
-        tensors when expects_tensors=True, but it's read from global in
-        compute — not loaded to smem.
         """
         runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
         pos_start = tile_M * self.tile_size_M

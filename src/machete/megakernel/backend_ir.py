@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+PHASE_NAMES = ("load", "compute", "store", "communicate")
+
 
 @dataclass(frozen=True)
 class OpCompileSpec:
@@ -36,10 +38,11 @@ class BackendIR:
     op_specs: Tuple[OpCompileSpec, ...]
     handler_specs: Tuple[HandlerSpec, ...]
     op_handler_indices: Tuple[int, ...]
-    op_handler_local_indices: Tuple[int, ...]
+    op_phase_local_indices: Dict[str, Tuple[int, ...]]
 
 
 __all__ = [
+    "PHASE_NAMES",
     "OpCompileSpec",
     "HandlerSpec",
     "BackendIR",
