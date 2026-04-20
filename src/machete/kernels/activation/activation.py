@@ -63,6 +63,7 @@ class ActivationOp(Op):
     reads = {"x": (None, ("B", "S", "N"))}
     writes = {"y": (None, ("B", "S", "N"))}
     tile = ("B", "S", "N")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"y"}

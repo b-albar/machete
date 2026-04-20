@@ -59,33 +59,6 @@ def _get_local_tma_args(op_obj, phase_name: str, tma_mapping: Dict[str, str]) ->
     )
 
 
-def _tensor_reconstruction_specs(op, local_tensor_names: Tuple[str, ...]) -> List[Dict[str, Any]]:
-    """Describe how to rebuild local CuTe tensor views from op_config_ptr."""
-    if not local_tensor_names:
-        return []
-
-    ptr_index_by_name = {
-        name: idx
-        for idx, (name, _dtype, _dims) in enumerate(getattr(op.op_cls, "_UNIQUE_TENSORS", ()))
-    }
-    specs: List[Dict[str, Any]] = []
-    for local_name in local_tensor_names:
-        meta = op.tensor_metas.get(local_name)
-        if meta is None or local_name not in ptr_index_by_name:
-            continue
-        specs.append(
-            {
-                "canonical_name": local_name,
-                "ptr_index": ptr_index_by_name[local_name],
-                "dtype_expr": f"_dtype_{local_name}",
-                "dtype_obj": meta.dtype,
-                "shape": meta.shape,
-                "strides": meta.strides,
-            }
-        )
-    return specs
-
-
 def _make_switch_dispatch_callable(
     *,
     fn_name: str,
@@ -140,9 +113,6 @@ def _make_local_switch_binder(
     all_arg_names = list(phase_tensor_names) + list(phase_tma_names)
 
     def _binder(*args):
-        if ir.InsertionPoint.current is None:
-            return None
-
         handler_local_idx = args[0]
         page_ptr = args[1]
         tile_vals = args[2:7]
@@ -356,7 +326,7 @@ class HandlerBackend:
             for phase in ("load", "compute", "store", "communicate")
         }
 
-    def phase_tensor_names(self) -> Dict[str, List[str]]:
+    def phase_tensor_names(self, kernel) -> Dict[str, List[str]]:
         """Return the canonical tensor names actually used by each phase."""
         phase_names: Dict[str, List[str]] = {}
         for phase in ("load", "compute", "store", "communicate"):
@@ -395,10 +365,11 @@ class HandlerBackend:
 
         all_canonical = self.all_canonical(kernel)
         all_tma_canonical = self.all_tma_canonical(kernel)
-        phase_tensor_names = self.phase_tensor_names()
+        phase_tensor_names = self.phase_tensor_names(kernel)
         phase_tma_names = self.phase_tma_names()
         phase_op_tensor_args = self.phase_op_tensor_args()
         op_tma_args = self.op_tma_args()
+        has_communicate = kernel._peer_tma_registry.has_peer_tma
         op_weights = [spec.weight for spec in self.ir.op_specs]
         compile_keys = self.compile_keys()
         op_handler_indices = self.handler_indices()
@@ -410,17 +381,14 @@ class HandlerBackend:
         communicate_fns: List[Any] = [None] * len(self.ir.handler_specs)
         inner_iters_by_handler: List[int] = [1] * len(self.ir.handler_specs)
         handler_warps: List[int] = [num_mma_warps] * len(self.ir.handler_specs)
-        per_op_load_uses_config: List[bool] = []
-        per_op_compute_uses_config: List[bool] = []
-        per_op_store_uses_config: List[bool] = []
-        per_op_communicate_uses_config: List[bool] = []
 
         phase_fn_lists = {
             "load": load_fns,
             "compute": compute_fns,
             "store": store_fns,
-            "communicate": communicate_fns,
         }
+        if has_communicate:
+            phase_fn_lists["communicate"] = communicate_fns
 
         for i, op in enumerate(ops):
             handler_idx = op_handler_indices[i]
@@ -504,18 +472,10 @@ class HandlerBackend:
                         phase_name == "compute"
                         and type(instance).__name__ == "QKNormRopeOp"
                     ):
-                        # QKNormRope is another small compute phase whose
-                        # noinline function boundary becomes the next NVVM
-                        # blocker in larger decode megakernels.
-                        phase_noinline = False
-                    if (
-                        phase_name == "compute"
-                        and type(instance).__name__ == "RMSNormOp"
-                    ):
-                        # RMSNorm compute is the current noinline compile wall
-                        # on larger single-kernel decode graphs. Keep the phase
-                        # inline for now; unlike the failed tensor-ABI
-                        # compaction attempt, this does not change semantics.
+                        # After making QKNormRope batch/sequence dynamic, its
+                        # compute wrapper is again the large-decode compile
+                        # blocker at 36 layers. Keep it inline like the other
+                        # thin decode wrappers.
                         phase_noinline = False
                     if (
                         phase_name == "store"
@@ -575,13 +535,6 @@ class HandlerBackend:
                         target.__name__ = debug_name
                     fn_list[handler_idx] = compiled_fn
 
-            per_op_load_uses_config.append(bool(getattr(load_fns[handler_idx], "_uses_op_config_ptr", True)))
-            per_op_compute_uses_config.append(bool(getattr(compute_fns[handler_idx], "_uses_op_config_ptr", True)))
-            per_op_store_uses_config.append(bool(getattr(store_fns[handler_idx], "_uses_op_config_ptr", True)))
-            per_op_communicate_uses_config.append(
-                bool(getattr(communicate_fns[handler_idx], "_uses_op_config_ptr", True))
-            )
-
         def _build_dispatch(phase_fns, phase_name):
             return self._build_exec_dispatch_fn(
                 phase_fns,
@@ -599,14 +552,10 @@ class HandlerBackend:
             "dispatch_load": _build_dispatch(load_fns, "load"),
             "dispatch_compute": _build_dispatch(compute_fns, "compute"),
             "dispatch_store": _build_dispatch(store_fns, "store"),
-            "dispatch_communicate": _build_dispatch(communicate_fns, "communicate"),
+            "dispatch_communicate": _build_dispatch(communicate_fns, "communicate") if has_communicate else None,
             "inner_iters_list": [inner_iters_by_handler[h] for h in op_handler_indices],
-            "has_communicate": kernel._peer_tma_registry.has_peer_tma,
+            "has_communicate": has_communicate,
             "per_op_warps": [handler_warps[h] for h in op_handler_indices],
-            "per_op_load_uses_config": per_op_load_uses_config,
-            "per_op_compute_uses_config": per_op_compute_uses_config,
-            "per_op_store_uses_config": per_op_store_uses_config,
-            "per_op_communicate_uses_config": per_op_communicate_uses_config,
             "op_tensor_args": phase_op_tensor_args,
             "op_tma_args": op_tma_args,
             "op_weights": op_weights,
@@ -633,16 +582,10 @@ class HandlerBackend:
     ):
         """Build a two-level dispatch: handler tree + per-handler op binder."""
         is_load = phase_name == "load"
-        tensor_params = ", ".join(all_canonical)
-        tile_params = ", ".join(f"tile_{i}" for i in range(5))
-        tma_params = ", ".join(all_tma_canonical) if all_tma_canonical else ""
 
         handler_to_ops: Dict[int, List[int]] = {}
         for op_idx_const, handler_idx in enumerate(op_handler_indices):
             handler_to_ops.setdefault(handler_idx, []).append(op_idx_const)
-
-        tensor_sig = f", {tensor_params}" if tensor_params else ""
-        tma_sig = f", {tma_params}" if tma_params else ""
 
         fn_name = f"dispatch_{phase_name}_switch"
         handler_ids = list(range(len(phase_fns)))

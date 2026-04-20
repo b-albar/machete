@@ -59,6 +59,7 @@ class GDNOutputOp(Op):
         "o": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = set()
 
     def __init__(self, **config):

@@ -162,3 +162,22 @@ class TestTMAMegakernel:
 
         torch.testing.assert_close(y0, x0 + 1.0, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_kernel_cache_reuse_across_same_shape_allocations(self):
+        """Compiled TMA kernels should be reusable across same-shape reallocations."""
+        torch.manual_seed(42)
+
+        x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        k0 = Megakernel(TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M}))
+        k0.compile()
+
+        x1 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y1 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        k1 = Megakernel(TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M}))
+        k1.compile()
+
+        assert k0._compiled_kernel is k1._compiled_kernel
+
+        k1.run()
+        torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)

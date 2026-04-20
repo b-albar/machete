@@ -214,6 +214,7 @@ class GDNFusedOp(Op):
         "o": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"q"}
 
     @classmethod
@@ -820,6 +821,7 @@ class GDNFusedBwdOp(Op):
         "dv": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"do"}
 
     @classmethod

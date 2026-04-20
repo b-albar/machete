@@ -61,6 +61,7 @@ class GDNVNewOp(Op):
         "v_new":    (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "S", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"w"}
 
     @classmethod

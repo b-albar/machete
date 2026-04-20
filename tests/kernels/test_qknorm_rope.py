@@ -67,6 +67,26 @@ def mk_qknorm_rope(q, norm_weight, cos, sin):
     return q_out
 
 
+def build_qknorm_rope_kernel(q, norm_weight, cos, sin, eps=1e-6, num_sms=2):
+    """Build and run a QKNormRope megakernel, returning the kernel and output."""
+    b, s, h, d = q.shape
+    q_flat = q.detach().clone().float().view(b * s, h, d).contiguous()
+    cos_f32 = cos.float().contiguous()
+    sin_f32 = sin.float().contiguous()
+    nw_f32 = norm_weight.float().contiguous()
+
+    ops = QKNormRopeOp.schedule(
+        q=q_flat,
+        norm_weight=nw_f32,
+        cos=cos_f32,
+        sin=sin_f32,
+        eps=eps,
+    )
+    kernel = Megakernel(ops, config=MegakernelConfig(num_sms=num_sms))
+    kernel.run()
+    return kernel, q_flat.view(b, s, h, d).to(q.dtype).clone()
+
+
 def ref_qknorm_rope(q, norm_weight, cos, sin):
     """PyTorch reference wrapper with same signature."""
     return qknorm_rope_pytorch(q, norm_weight, cos, sin)
@@ -184,6 +204,25 @@ class TestQKNormRopeGPU:
         out = mk_qknorm_rope(q, norm_weight, cos, sin)
         assert not torch.isnan(out).any(), "NaN in output with tiny inputs"
         assert not torch.isinf(out).any(), "Inf in output with tiny inputs"
+
+    def test_batch_dynamic_reuses_compiled_kernel(self):
+        """Changing batch should not force recompilation for QKNormRope."""
+        torch.manual_seed(0)
+        s, h, d, d2 = 16, 8, 256, 32
+        norm_weight = torch.randn(d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+
+        q1 = torch.randn(1, s, h, d, dtype=torch.float32, device="cuda")
+        k1, out1 = build_qknorm_rope_kernel(q1, norm_weight, cos, sin)
+
+        q2 = torch.randn(2, s, h, d, dtype=torch.float32, device="cuda")
+        k2, out2 = build_qknorm_rope_kernel(q2, norm_weight, cos, sin)
+
+        assert k1._make_cache_key() == k2._make_cache_key()
+        assert k1._compiled_kernel is k2._compiled_kernel
+        torch.testing.assert_close(out1, ref_qknorm_rope(q1, norm_weight, cos, sin), atol=2e-1, rtol=0)
+        torch.testing.assert_close(out2, ref_qknorm_rope(q2, norm_weight, cos, sin), atol=2e-1, rtol=0)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,31 @@ def _run_attention_coop_forward(q, k, v, tile_m=None, causal=False,
     return o
 
 
+def _build_attention_coop_kernel(q, k, v, tile_m=None, causal=False, kv_group_size=1):
+    """Build and run FlashAttentionSm120Op, returning kernel and output."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.attention import FlashAttentionSm120Op
+
+    tile_sizes = {}
+    if tile_m is not None:
+        tile_sizes["M"] = tile_m
+    o = torch.zeros_like(q)
+    ops = FlashAttentionSm120Op.schedule(
+        q=q, k=k, v=v, o=o,
+        tile_sizes=tile_sizes,
+        causal=causal,
+        kv_group_size=kv_group_size,
+    )
+    config = FlashAttentionSm120Op.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+
+    torch.cuda.synchronize()
+    return kernel, o
+
+
 # =============================================================================
 # fp16 MMA Tests (tensor core path)
 # =============================================================================
@@ -256,6 +281,27 @@ class TestFlashAttentionCoopMultiWarp:
             q.float(), k.float(), v.float()).half()
 
         torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
+
+    @requires_gpu
+    def test_sequence_dynamic_reuses_compiled_kernel(self):
+        """Different N should reuse the same compiled FlashAttention kernel."""
+        torch.manual_seed(0)
+        BH, M, D = 1, 16, 256
+
+        q1 = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k1 = torch.randn(BH, 144, D, dtype=torch.float16, device="cuda")
+        v1 = torch.randn(BH, 144, D, dtype=torch.float16, device="cuda")
+        kfa1, o1 = _build_attention_coop_kernel(q1, k1, v1, tile_m=16)
+
+        q2 = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k2 = torch.randn(BH, 272, D, dtype=torch.float16, device="cuda")
+        v2 = torch.randn(BH, 272, D, dtype=torch.float16, device="cuda")
+        kfa2, o2 = _build_attention_coop_kernel(q2, k2, v2, tile_m=16)
+
+        assert kfa1._make_cache_key() == kfa2._make_cache_key()
+        assert kfa1._compiled_kernel is kfa2._compiled_kernel
+        torch.testing.assert_close(o1, flash_attention_pytorch(q1.float(), k1.float(), v1.float()).half(), atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(o2, flash_attention_pytorch(q2.float(), k2.float(), v2.float()).half(), atol=5e-2, rtol=5e-2)
 
 
 # =============================================================================

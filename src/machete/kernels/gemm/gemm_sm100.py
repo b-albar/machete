@@ -70,6 +70,7 @@ class GemmSm100Op(Op):
     }
     writes = {"c": (None, ("B", "S", "N"))}
     tile = ("B", "S", "N")
+    dynamic_dims = ("B",)
 
     tma_loads = {"a", "b"}
     tma_stores = {"c"}

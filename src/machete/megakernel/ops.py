@@ -162,12 +162,22 @@ def _gen_pack_config(cls, unique_tensors, unique_dims, reads, writes, dynamic_di
     are baked into the compiled kernel as compile-time constants.
     """
     num_unique = len(unique_tensors)
+    cls._CONFIG_PTR_I64_INDEX = {
+        name: i for i, (name, _dtype, _dims) in enumerate(unique_tensors)
+    }
+    cls._CONFIG_PTR_I32_OFFSET = {
+        name: 2 * i for i, (name, _dtype, _dims) in enumerate(unique_tensors)
+    }
     # Only pack dynamic dims
     if dynamic_dim_names is None:
         dynamic_dim_names = {d for d, _, _ in unique_dims}
     dynamic_dims = [(d, t, a) for d, t, a in unique_dims if d in dynamic_dim_names]
     num_dynamic = len(dynamic_dims)
     config_size = 2 * num_unique + num_dynamic
+    cls._CONFIG_DYNAMIC_I32_OFFSET = {
+        dim_name: 2 * num_unique + j
+        for j, (dim_name, _tensor_name, _axis_idx) in enumerate(dynamic_dims)
+    }
 
     def pack_config(**tensors):
         """Pack tensor pointers and dynamic dimensions into the runtime config tensor."""
@@ -204,19 +214,19 @@ def _validate_declared_tensor_ranks(cls, unique_tensors, tensors):
             )
 
 
-def _extract_static_dims(cls, unique_dims, tensors):
-    """Extract compile-time dimension sizes from scheduled tensors."""
-    static_dims = {}
+def _extract_dim_values(cls, unique_dims, tensors):
+    """Extract dimension sizes from scheduled tensors."""
+    dim_values = {}
     for dim_name, tensor_name, axis_idx in unique_dims:
         value = int(tensors[tensor_name].shape[axis_idx])
-        if dim_name in static_dims and static_dims[dim_name] != value:
+        if dim_name in dim_values and dim_values[dim_name] != value:
             raise ValueError(
                 f"{cls.__name__}: dim '{dim_name}' conflict: "
-                f"expected {static_dims[dim_name]} but tensor '{tensor_name}' "
+                f"expected {dim_values[dim_name]} but tensor '{tensor_name}' "
                 f"axis {axis_idx} has {value}"
             )
-        static_dims[dim_name] = value
-    return static_dims
+        dim_values[dim_name] = value
+    return dim_values
 
 
 def _resolve_schedule_tile_sizes(tile_dim_names, tile_sizes, static_dims):
@@ -442,15 +452,22 @@ def _process_op_declarations(cls):
 
         _validate_declared_tensor_ranks(cls, unique_tensors, tensors)
 
-        # Extract ALL dim values from actual tensor shapes (compile-time constants).
-        # The cache key includes static_dims, so different values trigger recompilation.
-        static_dims = _extract_static_dims(cls, unique_dims, tensors)
+        # Extract all runtime dimension values from scheduled tensors.
+        # Explicit dynamic-dim overrides are excluded from static_dims so they
+        # do not participate in the compile key, but still drive tile-count
+        # computation and are packed into op_config.
+        dim_values = _extract_dim_values(cls, unique_dims, tensors)
+        static_dims = {
+            dim_name: value
+            for dim_name, value in dim_values.items()
+            if dim_name not in cls._DYNAMIC_DIM_OVERRIDES
+        }
 
-        # Compute tile_counts from tile_sizes and static_dims
+        # Compute tile_counts from tile_sizes and full runtime dimension values.
         resolved_tile_sizes, tile_counts = _resolve_schedule_tile_sizes(
             cls._TILE_DIM_NAMES_ORDERED,
             tile_sizes,
-            static_dims,
+            dim_values,
         )
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)

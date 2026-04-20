@@ -68,6 +68,7 @@ class GDNPrepOp(Op):
         "u":        (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "S")
+    dynamic_dims = ("B",)
     tma_loads = {"k"}
 
     @classmethod

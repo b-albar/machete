@@ -225,6 +225,7 @@ class GLUOp(Op):
         "y": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -371,7 +372,7 @@ class GLUOp(Op):
 
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_D,
-              y_tma, y_tma_gmem):
+             y_tma, y_tma_gmem):
         """TMA store y (D × tile_S × 1) from smem[0] to global."""
         sY = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
@@ -415,6 +416,7 @@ class GLUBwdOp(Op):
         "dx": (None, ("B", "S", "N")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"dx"}
@@ -614,7 +616,7 @@ class GLUBwdOp(Op):
 
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_D,
-              dx_tma, dx_tma_gmem):
+             dx_tma, dx_tma_gmem):
         """TMA store dx (N × tile_S × 1) from smem to global."""
         sDX = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),

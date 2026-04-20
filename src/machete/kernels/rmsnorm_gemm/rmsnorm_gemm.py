@@ -50,6 +50,7 @@ class RMSNormGemmOp(GemmOp):
 
     Inherits load/store/TMA from GemmOp. Only compute is overridden.
     """
+    dynamic_dims = ("B",)
 
     def __init__(self, **config):
         super().__init__(**config)

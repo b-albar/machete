@@ -63,6 +63,7 @@ class GDNSolveOp(Op):
         "a_solved": (None, ("B", "S", "NH", "BT_DIM")),
     }
     tile = ("B", "NH", "S")
+    dynamic_dims = ("B",)
     tma_loads = {"k"}
 
     @classmethod

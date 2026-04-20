@@ -16,7 +16,7 @@ With N pages, up to N-1 loads can overlap with compute.
 from dataclasses import dataclass
 from typing import Tuple
 
-from cutlass import Int32
+from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -198,6 +198,50 @@ def st_shared_v2_b32(
     )
 
 
+@dsl_user_op
+def st_shared_i64(
+    smem_addr: Int32,
+    value: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store a 64-bit integer to shared memory."""
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "st.shared.b64 [$0], $1;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_shared_i64(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int64:
+    """Load a 64-bit integer from shared memory."""
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(64),
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.b64 $0, [$1];",
+        "=l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
 # =============================================================================
 # N-Page Buffer Layout (Generalized Pipelined Execution)
 # =============================================================================
@@ -247,12 +291,14 @@ class NPageLayout:
     page_size: int = 16384
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 8 bytes [op_idx, linear_tile_idx] per page
+    # - Per-page tile info: num_pages * 56 bytes
+    #   [op_idx, linear_tile_idx, handler_idx, handler_local_idx,
+    #    tile_0..tile_4, inner_iters, reserved pad, num_warps, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 8   # Per-page: op_idx + linear_tile_idx (2 int32s)
+    _TILE_INFO_SIZE: int = 56  # Per-page tile metadata (12 int32 slots incl. pad + 1 int64)
     _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
     _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)

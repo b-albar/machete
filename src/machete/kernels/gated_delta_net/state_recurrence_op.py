@@ -59,6 +59,7 @@ class GDNStateRecurrenceOp(Op):
         "h_states": (None, ("B", "NT", "NH", "K", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = set()
 
     def __init__(self, **config):

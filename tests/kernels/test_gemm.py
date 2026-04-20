@@ -73,6 +73,29 @@ def _run_gemm(a, b_t, tile_m=64, tile_n=32, tile_k=32):
     return c.squeeze(0)
 
 
+def _run_gemm_batched(a_3d, b_t, tile_sizes=None, page_size=32768):
+    """Run GemmOp on a batched 3D input and return output tensor C."""
+    from machete.megakernel import Megakernel
+    from machete.kernels.gemm import GemmOp
+
+    B, M, K = a_3d.shape
+    N = b_t.shape[0]
+    c = torch.zeros(B, M, N, dtype=a_3d.dtype, device=a_3d.device)
+
+    ops = GemmOp.schedule(
+        a=a_3d, b=b_t, c=c,
+        tile_sizes=tile_sizes,
+        page_size=page_size,
+    )
+    config = GemmOp.kernel_config(ops)
+    kernel = Megakernel(ops, config=config)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        kernel.run()
+
+    return c
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -158,6 +181,21 @@ class TestGemmForward:
     def test_multi_mn_tiles(self, dtype):
         """Multiple tiles along both M and N (4x4 tile grid)."""
         _gemm_case(256, 128, 128, dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16])
+    def test_auto_tiles_large_batch_compile_and_run(self, dtype):
+        """Auto-tiled large batched GEMM compiles and matches PyTorch."""
+        torch.manual_seed(42)
+        B, M, K, N = 8, 128, 4096, 4096
+
+        a = torch.randn(B, M, K, dtype=dtype, device="cuda")
+        b = torch.randn(K, N, dtype=dtype, device="cuda")
+        b_t = b.t().contiguous()
+
+        c = _run_gemm_batched(a, b_t, tile_sizes=None, page_size=32768)
+        ref = torch.matmul(a.float(), b.float()).to(dtype)
+
+        torch.testing.assert_close(c, ref, atol=2e-1, rtol=2e-2)
 
     # ----- Edge cases -----
 

@@ -77,6 +77,7 @@ class RopeOp(Op):
     }
     writes = {"q": (None, ("B", "S", "NH", "HD"))}
     tile = ("B", "S", "NH")
+    dynamic_dims = ("B",)
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -386,6 +387,7 @@ class RopeBwdOp(Op):
     }
     writes = {"q": (None, ("B", "S", "NH", "HD"))}
     tile = ("B", "S", "NH")
+    dynamic_dims = ("B",)
 
     def __init__(self, **config):
         super().__init__(**config)

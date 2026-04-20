@@ -153,6 +153,37 @@ class TestActivationStandalone:
             x[x_ref >= 0], x_ref[x_ref >= 0], rtol=1e-3, atol=1e-3,
         )
 
+    @requires_gpu
+    def test_batch_dynamic_reuses_compiled_tma_kernel(self):
+        """Same op should reuse the compiled kernel across batch sizes."""
+        from machete.megakernel import Megakernel, MegakernelConfig
+        from machete.kernels.activation import ActivationOp
+
+        torch.manual_seed(42)
+
+        def _build(B):
+            x = torch.randn(B, 32, 128, dtype=torch.float16, device="cuda")
+            y = torch.empty_like(x)
+            tile_s = _tile_size_S(128, 2)
+            ops = ActivationOp.schedule(x=x, y=y, activation='silu', tile_sizes={"S": tile_s})
+            mk = Megakernel(ops, config=MegakernelConfig())
+            with contextlib.redirect_stdout(io.StringIO()):
+                mk.compile()
+            return mk, x, y
+
+        k1, x1, y1 = _build(1)
+        k8, x8, y8 = _build(8)
+
+        assert k1._compiled_kernel is k8._compiled_kernel
+
+        k1.run()
+        k8.run()
+
+        ref1 = activation_pytorch(x1, activation='silu')
+        ref8 = activation_pytorch(x8, activation='silu')
+        torch.testing.assert_close(y1, ref1, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(y8, ref8, rtol=1e-3, atol=1e-3)
+
 
 # =============================================================================
 # Fused GEMM + Activation Tests

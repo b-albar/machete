@@ -73,6 +73,7 @@ class FlashDecodingSplitOp(Op):
         "lse_partial": (cutlass.Float32, ("B", "H", "SPLIT", "M")),
     }
     tile = ("B", "H", "SPLIT")
+    dynamic_dims = ("B",)
 
     # Q/K/V via TMA: Q loaded by DMA warp, K/V by compute warp 0
     tma_loads = {"q", "k", "v"}
@@ -704,6 +705,7 @@ class FlashDecodingCombineOp(Op):
         "lse": (cutlass.Float32, ("B", "H", "M")),
     }
     tile = ("B", "H")
+    dynamic_dims = ("B",)
     tma_loads = set()
     tma_stores = set()
 

@@ -159,31 +159,6 @@ def _tile_call_args(op_cls, method_params: set) -> List[str]:
     return call_args
 
 
-def _tensor_call_args(
-    method_params: set,
-    tensor_param_names,
-    tma_local_mapping: Dict[str, str],
-) -> List[str]:
-    """Build wrapper tensor arguments if the phase method actually expects tensors."""
-    if not tensor_param_names:
-        return []
-
-    known_special = {
-        "page_ptr",
-        "op_config_ptr",
-        "work_mbar",
-        "inner_iter_idx",
-    }
-    tma_local_names = set(tma_local_mapping)
-    expects_tensors = any(
-        param not in known_special
-        and not param.startswith("tile_")
-        and param not in tma_local_names
-        for param in method_params
-    )
-    return list(tensor_param_names) if expects_tensors else []
-
-
 def _tma_call_args(method_params_ordered: List[str], tma_local_mapping: Dict[str, str]) -> List[str]:
     """Map local TMA method parameters back to canonical wrapper parameter names."""
     return [tma_local_mapping[param] for param in method_params_ordered if param in tma_local_mapping]
@@ -239,7 +214,6 @@ def _build_phase_wrapper(
     tma_param_names=None,
     tma_local_mapping=None,
     tma_inline_infos=None,
-    tensor_reconstruction_specs=None,
 ):
     """Build a @cute.jit wrapper that delegates to an Op instance method.
 
@@ -293,7 +267,22 @@ def _build_phase_wrapper(
     call_args = ["page_ptr"]
     tma_reverse = tma_local_mapping or {}
     call_args.extend(_tile_call_args(op_cls, method_params))
-    call_args.extend(_tensor_call_args(method_params, tensor_param_names, tma_reverse))
+    if tensor_param_names:
+        known_special = {
+            "page_ptr",
+            "op_config_ptr",
+            "work_mbar",
+            "inner_iter_idx",
+        }
+        tma_local_names = set(tma_reverse)
+        expects_tensors = any(
+            param not in known_special
+            and not param.startswith("tile_")
+            and param not in tma_local_names
+            for param in method_params
+        )
+        if expects_tensors:
+            call_args.extend(list(tensor_param_names))
 
     if tma_inline_infos:
         # TMA created inside body — map method params to local variable names
@@ -320,7 +309,7 @@ def _build_phase_wrapper(
         call_args.extend(_tma_call_args(method_params_ordered, tma_reverse))
 
     method_uses_op_config_ptr = "op_config_ptr" in method_params
-    uses_op_config_ptr = method_uses_op_config_ptr or bool(tensor_reconstruction_specs)
+    uses_op_config_ptr = method_uses_op_config_ptr
     if method_uses_op_config_ptr:
         call_args.append("op_config_ptr")
 
@@ -342,7 +331,7 @@ def _build_phase_wrapper(
     signature_suffix = _wrapper_signature_suffix(
         is_load_phase,
         extra_params,
-        [] if tensor_reconstruction_specs else tensor_param_names,
+        tensor_param_names,
         tma_param_names,
     )
 
@@ -369,30 +358,10 @@ def _build_phase_wrapper(
         body = tma_preamble + body
     needs_fence = phase_name == "compute" or phase_name in ("store", "communicate")
 
-    tensor_preamble = ""
-    if tensor_reconstruction_specs:
-        for spec in tensor_reconstruction_specs:
-            canonical_name = spec["canonical_name"]
-            ptr_index = spec["ptr_index"]
-            dtype_expr = spec["dtype_expr"]
-            shape = spec["shape"]
-            strides = spec["strides"]
-            shape_expr = "(" + ", ".join(str(int(v)) for v in shape) + ("," if len(shape) == 1 else "") + ")"
-            stride_expr = "(" + ", ".join(str(int(v)) for v in strides) + ("," if len(strides) == 1 else "") + ")"
-            tensor_preamble += (
-                f"    _ptr_{canonical_name} = ld_global_i64(op_config_ptr, Int32({ptr_index}))\n"
-                f"    {canonical_name} = cute.make_tensor(\n"
-                f"        cute.make_ptr({dtype_expr}, _ptr_{canonical_name}, cute.AddressSpace.gmem, assumed_align=16),\n"
-                f"        cute.make_layout({shape_expr}, stride={stride_expr}),\n"
-                "    )\n"
-                f"    {canonical_name}.mark_layout_dynamic(leading_dim={len(shape) - 1})\n"
-            )
-
     fn_source = (
         "@cute.jit\n"
         f"def phase_fn(page_ptr, {tile_params}, op_config_ptr"
         f"{signature_suffix}):\n"
-        f"{tensor_preamble}"
         f"{body}"
     )
 
@@ -417,15 +386,6 @@ def _build_phase_wrapper(
         from .interpreter import mbarrier_arrive
 
         exec_globals["mbarrier_arrive"] = mbarrier_arrive
-    if tensor_reconstruction_specs:
-        from .interpreter import ld_global_i64
-
-        exec_globals["ld_global_i64"] = ld_global_i64
-        for spec in tensor_reconstruction_specs:
-            dtype_obj = spec.get("dtype_obj")
-            dtype_expr = spec.get("dtype_expr")
-            if dtype_obj is not None and dtype_expr is not None and dtype_expr.isidentifier():
-                exec_globals[dtype_expr] = dtype_obj
     if needs_fence:
         from .interpreter import nanosleep
 
@@ -454,8 +414,7 @@ def _build_phase_wrapper(
 
 def compile_phase(instance, phase_name, tensor_param_names=None,
                   tma_param_names=None, tma_local_mapping=None,
-                  noinline=False, tma_inline_infos=None,
-                  tensor_reconstruction_specs=None):
+                  noinline=False, tma_inline_infos=None):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
     For load phases, detects async vs sync from method
@@ -481,7 +440,6 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
             tma_inline_infos=tma_inline_infos,
-            tensor_reconstruction_specs=tensor_reconstruction_specs,
         )
     else:
         fn = _build_phase_wrapper(
@@ -492,7 +450,6 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
             tma_inline_infos=tma_inline_infos,
-            tensor_reconstruction_specs=tensor_reconstruction_specs,
         )
 
     if noinline:

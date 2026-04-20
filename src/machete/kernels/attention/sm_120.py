@@ -48,8 +48,17 @@ from cutlass.cute.nvgpu import warp
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
+    ld_global_i32,
     named_barrier_sync,
 )
+
+
+def _config_dim_i32(op_config_ptr, dim_name: str, cls):
+    """Load one packed dynamic dimension from the op config."""
+    return ld_global_i32(
+        op_config_ptr,
+        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
+    )
 
 
 class FlashAttentionSm120Op(Op):
@@ -75,6 +84,7 @@ class FlashAttentionSm120Op(Op):
     }
     writes = {"o": (None, ("B", "H", "M", "D")), "lse": (cutlass.Float32, ("B", "H", "M"))}
     tile = ("B", "H", "M", "D")
+    dynamic_dims = ("B", "N")
 
     # Only Q via TMA (DMA warp), K/V loaded by cpasync in compute
     tma_loads = {"q"}
@@ -124,11 +134,11 @@ class FlashAttentionSm120Op(Op):
 
         # Stride overrides for strided K/V (e.g., view+permute of GEMM output).
         # Defaults assume contiguous (B, H_kv, N, D) layout.
-        self.k_b_stride = getattr(self, "k_b_stride", self.H_kv * self.N * self.D)
-        self.k_h_stride = getattr(self, "k_h_stride", self.N * self.D)
+        self.k_b_stride = getattr(self, "k_b_stride", None)
+        self.k_h_stride = getattr(self, "k_h_stride", None)
         self.k_n_stride = getattr(self, "k_n_stride", self.D)
-        self.v_b_stride = getattr(self, "v_b_stride", self.H_kv * self.N * self.D)
-        self.v_h_stride = getattr(self, "v_h_stride", self.N * self.D)
+        self.v_b_stride = getattr(self, "v_b_stride", None)
+        self.v_h_stride = getattr(self, "v_h_stride", None)
         self.v_n_stride = getattr(self, "v_n_stride", self.D)
 
         # TMA coordinate order flag: when Q/O are strided (from view+permute),
@@ -217,14 +227,11 @@ class FlashAttentionSm120Op(Op):
             # Q preloaded to registers: full page available for KV
             max_n_block = self.page_size // (2 * self.smem_stride * self.elem_bytes)
 
-        # Power-of-2 rounding: ensures n_block divides most practical N values,
-        # avoiding OOB reads in cpasync for partial last blocks.
-        self.n_block = 1 << int(math.log2(max(16, max_n_block)))
-        if self.N < self.n_block:
-            # Small N: fall back to multiple-of-16 rounding
-            self.n_block = max(16, (self.N // 16) * 16)
-        self.num_kv_blocks = (self.N + self.n_block - 1) // self.n_block
-
+        # Dynamic-N path uses a fixed KV block size so one compiled kernel can
+        # be reused across sequence lengths safely. 16 is the smallest legal
+        # block for the MMA/cpasync pipeline and avoids the small-N hazards
+        # from choosing a larger block from runtime N.
+        self.n_block = min(16, max_n_block)
         self.kv_tile_bytes = self.n_block * self.smem_stride * self.elem_bytes
         total_kv_smem = 2 * self.kv_tile_bytes
         if self.q_in_smem:
@@ -461,7 +468,8 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @cute.jit
-    def compute_mma(self, page_ptr, tile_B, tile_H, tile_M, tile_D, q, k, v, o, lse):
+    def compute_mma(self, page_ptr, tile_B, tile_H, tile_M, tile_D, q, k, v, o, lse,
+                    op_config_ptr):
         """Cooperative flash attention: MMA warps do both cpasync loads and MMA.
 
         Smem layout phases:
@@ -478,6 +486,13 @@ class FlashAttentionSm120Op(Op):
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
+
+        runtime_N = _config_dim_i32(op_config_ptr, "N", type(self))
+        runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
+        runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
+        runtime_v_b_stride = Int32(self.v_b_stride) if self.v_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
+        runtime_v_h_stride = Int32(self.v_h_stride) if self.v_h_stride is not None else runtime_N * Int32(self.D)
+        runtime_num_kv_blocks = (runtime_N + Int32(self.n_block - 1)) // Int32(self.n_block)
 
         if warp_idx < Int32(self.num_mma_warps):
             # === MMA setup (multi-warp) ===
@@ -590,10 +605,10 @@ class FlashAttentionSm120Op(Op):
 
             # cpasync global sources: K and V for current head
             kv_h = tile_H // Int32(self.kv_group_size)
-            k_head_ptr = (k.iterator + tile_B * Int32(self.k_b_stride) + kv_h * Int32(self.k_h_stride)).align(16)
-            v_head_ptr = (v.iterator + tile_B * Int32(self.v_b_stride) + kv_h * Int32(self.v_h_stride)).align(16)
-            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((self.N, self.D), stride=(self.k_n_stride, 1)))
-            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((self.N, self.D), stride=(self.v_n_stride, 1)))
+            k_head_ptr = (k.iterator + tile_B * runtime_k_b_stride + kv_h * runtime_k_h_stride).align(16)
+            v_head_ptr = (v.iterator + tile_B * runtime_v_b_stride + kv_h * runtime_v_h_stride).align(16)
+            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((runtime_N, self.D), stride=(self.k_n_stride, 1)))
+            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((runtime_N, self.D), stride=(self.v_n_stride, 1)))
 
             # P register fragment + MMA view (pre-allocated)
             acc_S = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.n_block)), Float32)
@@ -630,13 +645,13 @@ class FlashAttentionSm120Op(Op):
             # Causal block skipping: compute effective number of KV blocks
             # for this M-tile. Row i can attend to columns 0..(i + N - M),
             # so we only need KV blocks up to the last attending column.
-            num_kv_blocks_eff = Int32(self.num_kv_blocks)
+            num_kv_blocks_eff = runtime_num_kv_blocks
             if self.causal:
                 _last_row = tile_M * Int32(self.tile_size_M) + Int32(self.tile_size_M - 1)
-                _max_col = _last_row + Int32(self.N - self.M)
+                _max_col = _last_row + (runtime_N - Int32(self.M))
                 num_kv_blocks_eff = (_max_col + Int32(self.n_block)) // Int32(self.n_block)
-                if num_kv_blocks_eff > Int32(self.num_kv_blocks):
-                    num_kv_blocks_eff = Int32(self.num_kv_blocks)
+                if num_kv_blocks_eff > runtime_num_kv_blocks:
+                    num_kv_blocks_eff = runtime_num_kv_blocks
 
             # Prologue: cpasync K[0] → buf0
             gK_block0 = cute.local_tile(gK_head, (self.n_block, self.D), (Int32(0), Int32(0)))
@@ -696,26 +711,26 @@ class FlashAttentionSm120Op(Op):
                 acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
 
                 # N-boundary mask (only last KV block)
-                if kv_start + Int32(self.n_block) > Int32(self.N):
+                if kv_start + Int32(self.n_block) > runtime_N:
                     for r in cutlass.range_constexpr(num_rows):
                         for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                             col_idx = tScS_mn[0, c][1]
                             global_col = kv_start + Int32(col_idx)
-                            if global_col >= Int32(self.N):
+                            if global_col >= runtime_N:
                                 acc_S_mn[r, c] = Float32(-1e30)
 
                 # Causal mask (only blocks near diagonal)
                 if self.causal:
                     last_blk_col = kv_start + Int32(self.n_block - 1)
                     first_row = tile_M * Int32(self.tile_size_M)
-                    if last_blk_col > first_row + Int32(self.N - self.M):
+                    if last_blk_col > first_row + (runtime_N - Int32(self.M)):
                         for r in cutlass.range_constexpr(num_rows):
                             row_idx = tScS_mn[r, 0][0]
                             global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
                             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                                 col_idx = tScS_mn[0, c][1]
                                 global_col = kv_start + Int32(col_idx)
-                                if global_col > global_row + Int32(self.N - self.M):
+                                if global_col > global_row + (runtime_N - Int32(self.M)):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---
@@ -824,7 +839,8 @@ class FlashAttentionSm120Op(Op):
     # =========================================================================
 
     @cute.jit
-    def compute_mma_q_smem(self, page_ptr, tile_B, tile_H, tile_M, tile_D, q, k, v, o, lse):
+    def compute_mma_q_smem(self, page_ptr, tile_B, tile_H, tile_M, tile_D, q, k, v, o, lse,
+                           op_config_ptr):
         """Cooperative flash attention with Q persistent in smem (m_reps > 1).
 
         Smem layout (persistent throughout compute):
@@ -839,6 +855,13 @@ class FlashAttentionSm120Op(Op):
         """
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
+
+        runtime_N = _config_dim_i32(op_config_ptr, "N", type(self))
+        runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
+        runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
+        runtime_v_b_stride = Int32(self.v_b_stride) if self.v_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
+        runtime_v_h_stride = Int32(self.v_h_stride) if self.v_h_stride is not None else runtime_N * Int32(self.D)
+        runtime_num_kv_blocks = (runtime_N + Int32(self.n_block - 1)) // Int32(self.n_block)
 
         if warp_idx < Int32(self.num_mma_warps):
             # === MMA setup (multi-warp, m_reps > 1) ===
@@ -938,10 +961,10 @@ class FlashAttentionSm120Op(Op):
 
             # cpasync global sources
             kv_h = tile_H // Int32(self.kv_group_size)
-            k_head_ptr = (k.iterator + tile_B * Int32(self.k_b_stride) + kv_h * Int32(self.k_h_stride)).align(16)
-            v_head_ptr = (v.iterator + tile_B * Int32(self.v_b_stride) + kv_h * Int32(self.v_h_stride)).align(16)
-            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((self.N, self.D), stride=(self.k_n_stride, 1)))
-            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((self.N, self.D), stride=(self.v_n_stride, 1)))
+            k_head_ptr = (k.iterator + tile_B * runtime_k_b_stride + kv_h * runtime_k_h_stride).align(16)
+            v_head_ptr = (v.iterator + tile_B * runtime_v_b_stride + kv_h * runtime_v_h_stride).align(16)
+            gK_head = cute.make_tensor(k_head_ptr, cute.make_layout((runtime_N, self.D), stride=(self.k_n_stride, 1)))
+            gV_head = cute.make_tensor(v_head_ptr, cute.make_layout((runtime_N, self.D), stride=(self.v_n_stride, 1)))
 
             # P register fragment + MMA view
             acc_S = cute.make_fragment(tiled_mma.partition_shape_C((self.tile_size_M, self.n_block)), Float32)
@@ -975,13 +998,13 @@ class FlashAttentionSm120Op(Op):
             # Pipelined KV loop (Q read from smem each k-block)
             # =============================================================
 
-            num_kv_blocks_eff = Int32(self.num_kv_blocks)
+            num_kv_blocks_eff = runtime_num_kv_blocks
             if self.causal:
                 _last_row = tile_M * Int32(self.tile_size_M) + Int32(self.tile_size_M - 1)
-                _max_col = _last_row + Int32(self.N - self.M)
+                _max_col = _last_row + (runtime_N - Int32(self.M))
                 num_kv_blocks_eff = (_max_col + Int32(self.n_block)) // Int32(self.n_block)
-                if num_kv_blocks_eff > Int32(self.num_kv_blocks):
-                    num_kv_blocks_eff = Int32(self.num_kv_blocks)
+                if num_kv_blocks_eff > runtime_num_kv_blocks:
+                    num_kv_blocks_eff = runtime_num_kv_blocks
 
             # Prologue: cpasync K[0] → buf0
             gK_block0 = cute.local_tile(gK_head, (self.n_block, self.D), (Int32(0), Int32(0)))
@@ -1031,25 +1054,25 @@ class FlashAttentionSm120Op(Op):
                 acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
                 acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
 
-                if kv_start + Int32(self.n_block) > Int32(self.N):
+                if kv_start + Int32(self.n_block) > runtime_N:
                     for r in cutlass.range_constexpr(num_rows):
                         for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                             col_idx = tScS_mn[0, c][1]
                             global_col = kv_start + Int32(col_idx)
-                            if global_col >= Int32(self.N):
+                            if global_col >= runtime_N:
                                 acc_S_mn[r, c] = Float32(-1e30)
 
                 if self.causal:
                     last_blk_col = kv_start + Int32(self.n_block - 1)
                     first_row = tile_M * Int32(self.tile_size_M)
-                    if last_blk_col > first_row + Int32(self.N - self.M):
+                    if last_blk_col > first_row + (runtime_N - Int32(self.M)):
                         for r in cutlass.range_constexpr(num_rows):
                             row_idx = tScS_mn[r, 0][0]
                             global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
                             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                                 col_idx = tScS_mn[0, c][1]
                                 global_col = kv_start + Int32(col_idx)
-                                if global_col > global_row + Int32(self.N - self.M):
+                                if global_col > global_row + (runtime_N - Int32(self.M)):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---

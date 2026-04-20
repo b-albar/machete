@@ -80,6 +80,7 @@ class FlashAttentionSm120BwdOp(Op):
         "dq": (None, ("B", "H", "M", "D")),
     }
     tile = ("B", "H_kv", "N", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"k", "v"}
     tma_stores = {"dk", "dv"}

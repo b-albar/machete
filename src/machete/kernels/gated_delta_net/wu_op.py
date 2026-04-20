@@ -78,6 +78,7 @@ class GDNWUOp(Op):
         "u": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "S")
+    dynamic_dims = ("B",)
     tma_loads = {"a_solved", "k"}
 
     @classmethod

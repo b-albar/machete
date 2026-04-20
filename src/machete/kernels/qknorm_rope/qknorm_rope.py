@@ -33,7 +33,29 @@ from cutlass.cute.nvgpu.cpasync import (
 )
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
-from machete.megakernel.interpreter import mbarrier_arrive_expect_tx, named_barrier_sync
+from machete.megakernel.interpreter import (
+    ld_global_i32,
+    ld_global_i64,
+    mbarrier_arrive_expect_tx,
+    named_barrier_sync,
+)
+
+
+def _config_flat_tensor(op_config_ptr, slot: int, dtype, size: int):
+    """Build a flat global tensor view from a packed config pointer slot."""
+    ptr = ld_global_i64(op_config_ptr, Int32(slot))
+    return cute.make_tensor(
+        cute.make_ptr(dtype, ptr, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_layout(size),
+    )
+
+
+def _config_dim_i32(op_config_ptr, dim_name: str, cls):
+    """Load a dynamic dimension value from the packed config."""
+    return ld_global_i32(
+        op_config_ptr,
+        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
+    )
 
 
 class QKNormRopeOp(Op):
@@ -64,6 +86,7 @@ class QKNormRopeOp(Op):
     }
     writes = {"q": (None, ("M", "H", "D"))}
     tile = ("M", "H")
+    dynamic_dims = ("M",)
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -144,20 +167,21 @@ class QKNormRopeOp(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin,
-             work_mbar):
+             op_config_ptr, work_mbar):
         """Load q/cos/sin tile from global to shared memory.
 
         norm_weight is in the signature because the framework passes all
         tensors when expects_tensors=True, but it's read from global in
         compute — not loaded to smem.
         """
+        runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
         pos_start = tile_M * self.tile_size_M
         head_start = tile_H * self.tile_size_H
 
         q_per_pos_bytes = Int32(self.q_row_elems * self.elem_bytes)
         cs_per_pos_bytes = Int32(2 * self.D2 * self.elem_bytes)
         actual_rows = Int32(self.tile_size_M)
-        remaining = Int32(self.M) - pos_start
+        remaining = runtime_M - pos_start
         if remaining < Int32(self.tile_size_M):
             actual_rows = remaining
         total_bytes = actual_rows * (q_per_pos_bytes + cs_per_pos_bytes)
@@ -181,7 +205,7 @@ class QKNormRopeOp(Op):
 
         for local_pos in range(self.tile_size_M):
             pos = pos_start + local_pos
-            if pos < self.M:
+            if pos < runtime_M:
                 s = pos % self.S
 
                 g_q = cute.make_tensor(
@@ -234,7 +258,7 @@ class QKNormRopeOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, norm_weight):
+    def compute(self, page_ptr, op_config_ptr):
         """Per-head RMSNorm then RoPE rotation."""
         q_smem = cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem)
         cos_smem = cute.make_ptr(
@@ -252,6 +276,13 @@ class QKNormRopeOp(Op):
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
         thr_layout_D = cute.make_layout(32)
+
+        norm_weight = _config_flat_tensor(
+            op_config_ptr,
+            type(self)._CONFIG_PTR_I64_INDEX["norm_weight"],
+            self.norm_weight_dtype,
+            self.D,
+        )
 
         # Load norm_weight from global → regs (once, reused for all pos/heads)
         w_row = cute.make_tensor(
@@ -434,8 +465,10 @@ class QKNormRopeOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin):
+    def store(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin,
+              op_config_ptr):
         """Store modified q from shared to global memory."""
+        runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
         s2g = cute.make_copy_atom(
             CopyBulkS2GOp(),
             self.q_dtype,
@@ -446,7 +479,7 @@ class QKNormRopeOp(Op):
 
         for local_pos in range(self.tile_size_M):
             pos = pos_start + local_pos
-            if pos < self.M:
+            if pos < runtime_M:
                 s_tile = cute.make_tensor(
                     cute.make_ptr(
                         self.q_dtype,

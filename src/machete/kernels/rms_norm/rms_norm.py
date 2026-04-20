@@ -34,6 +34,8 @@ from cutlass import Int32, Float32, const_expr
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
+    ld_global_i32,
+    ld_global_i64,
     mbarrier_arrive_expect_tx,
     named_barrier_sync,
 )
@@ -66,6 +68,23 @@ def _auto_tile_S(D, elem_bytes, page_size):
     """Compute tile_size_S from page budget minus scratch."""
     usable = page_size - SCRATCH_BYTES
     return max(1, usable // (D * elem_bytes))
+
+
+def _config_flat_tensor(op_config_ptr, slot: int, dtype, size: int):
+    """Build a flat global tensor view from a packed config pointer slot."""
+    ptr = ld_global_i64(op_config_ptr, Int32(slot))
+    return cute.make_tensor(
+        cute.make_ptr(dtype, ptr, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_layout(size),
+    )
+
+
+def _config_dim_i32(op_config_ptr, dim_name: str, cls):
+    """Load one packed dynamic dimension from the op config."""
+    return ld_global_i32(
+        op_config_ptr,
+        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
+    )
 
 
 def _tma_kernel_config(cls, ops):
@@ -120,6 +139,7 @@ class RMSNormOp(Op):
         "residual_out": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -232,8 +252,7 @@ class RMSNormOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_D,
-                x, weight, residual_in, gate, y, residual_out):
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, op_config_ptr):
         """RMSNorm forward: read x from smem, write y to smem (overwrite x).
 
         Phase 1: Read x from smem, apply fused-add if needed, cross-warp
@@ -255,6 +274,34 @@ class RMSNormOp(Op):
         lane_idx = cute.arch.lane_idx()
         tidx = warp_idx * 32 + lane_idx
         thr_layout = cute.make_layout(self.effective_threads)
+        batch_size = _config_dim_i32(op_config_ptr, "B", type(self))
+        flat_size = batch_size * Int32(self.S * self.D)
+        weight = _config_flat_tensor(
+            op_config_ptr,
+            type(self)._CONFIG_PTR_I64_INDEX["weight"],
+            self.weight_dtype,
+            flat_size,
+        )
+        if const_expr(self.has_residual):
+            residual_in = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["residual_in"],
+                self.residual_in_dtype,
+                flat_size,
+            )
+            residual_out = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["residual_out"],
+                self.residual_out_dtype,
+                flat_size,
+            )
+        if const_expr(self.has_gate):
+            gate = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["gate"],
+                self.gate_dtype,
+                flat_size,
+            )
 
         if tidx < self.effective_threads:
             row_start = tile_S * Int32(self.tile_size_S)
@@ -422,6 +469,7 @@ class RMSNormBwdOp(Op):
         "dgate": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"dx"}
@@ -533,8 +581,7 @@ class RMSNormBwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_D,
-                dout, x, weight, gate, dx, d_residual, dgate):
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, op_config_ptr):
         """RMSNorm backward: read x from smem, dout/weight/gate from global.
 
         Two cross-warp reductions per row (sum_sq, sum_grad).
@@ -554,6 +601,40 @@ class RMSNormBwdOp(Op):
         lane_idx = cute.arch.lane_idx()
         tidx = warp_idx * 32 + lane_idx
         thr_layout = cute.make_layout(self.effective_threads)
+        batch_size = _config_dim_i32(op_config_ptr, "B", type(self))
+        flat_size = batch_size * Int32(self.S * self.D)
+        dout = _config_flat_tensor(
+            op_config_ptr,
+            type(self)._CONFIG_PTR_I64_INDEX["dout"],
+            self.dout_dtype,
+            flat_size,
+        )
+        weight = _config_flat_tensor(
+            op_config_ptr,
+            type(self)._CONFIG_PTR_I64_INDEX["weight"],
+            self.weight_dtype,
+            flat_size,
+        )
+        if const_expr(self.has_gate):
+            gate = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["gate"],
+                self.gate_dtype,
+                flat_size,
+            )
+            dgate = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["dgate"],
+                self.dgate_dtype,
+                flat_size,
+            )
+        if const_expr(self.has_residual):
+            d_residual = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["d_residual"],
+                self.d_residual_dtype,
+                flat_size,
+            )
 
         if tidx < self.effective_threads:
             row_start = tile_S * Int32(self.tile_size_S)
