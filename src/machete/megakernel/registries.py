@@ -386,10 +386,17 @@ def _resolve_tma_smem_layout_src(
     )
 
 
-def _set_tma_mapping(mapping: Dict[str, str], tensor_name: str, canonical_atom: str, canonical_gmem: str) -> None:
+def _set_tma_mapping(
+    mapping: Dict[str, str],
+    tensor_name: str,
+    canonical_atom: str,
+    canonical_gmem: str,
+    canonical_desc: str,
+) -> None:
     """Store op-local TMA parameter names for a tensor."""
     mapping[f"{tensor_name}_tma"] = canonical_atom
     mapping[f"{tensor_name}_tma_gmem"] = canonical_gmem
+    mapping[f"{tensor_name}_tma_desc"] = canonical_desc
 
 
 def _set_peer_tma_mapping(
@@ -398,10 +405,12 @@ def _set_peer_tma_mapping(
     peer_idx: int,
     canonical_atom: str,
     canonical_gmem: str,
+    canonical_desc: str,
 ) -> None:
     """Store op-local peer TMA parameter names for a tensor/peer pair."""
     mapping[f"{tensor_name}_p{peer_idx}_tma"] = canonical_atom
     mapping[f"{tensor_name}_p{peer_idx}_tma_gmem"] = canonical_gmem
+    mapping[f"{tensor_name}_p{peer_idx}_tma_desc"] = canonical_desc
 
 
 def _append_tma_descriptor(
@@ -417,6 +426,7 @@ def _append_tma_descriptor(
     dtype: Any,
     canonical_atom: str,
     canonical_gmem: str,
+    canonical_desc: str,
     tensor_shape: Tuple[int, ...],
     original_tensor: Any,
     smem_layout_src: Optional[str],
@@ -427,6 +437,7 @@ def _append_tma_descriptor(
         TMADescriptorInfo(
             canonical_atom=canonical_atom,
             canonical_gmem=canonical_gmem,
+            canonical_desc=canonical_desc,
             tensor_canonical=tensor_canonical,
             direction=direction,
             tile_shape=tile_shape,
@@ -443,6 +454,7 @@ def _append_tma_descriptor(
         tensor_name,
         canonical_atom,
         canonical_gmem,
+        canonical_desc,
     )
 
 
@@ -472,7 +484,6 @@ def _local_tma_desc_key(
 
 def _local_tma_atom_key(
     *,
-    tensor_canonical: str,
     direction: str,
     tile_shape: Tuple[int, ...],
     dtype: Any,
@@ -481,6 +492,27 @@ def _local_tma_atom_key(
     dim_perm: Tuple[int, ...],
 ) -> Tuple[Any, ...]:
     """Return a structural dedup key for a reusable local TMA atom."""
+    return (
+        direction,
+        tuple(tile_shape),
+        getattr(dtype, "__name__", str(dtype)),
+        tuple(tensor_shape),
+        smem_layout_src,
+        tuple(dim_perm),
+    )
+
+
+def _local_tma_gmem_key(
+    *,
+    tensor_canonical: str,
+    direction: str,
+    tile_shape: Tuple[int, ...],
+    dtype: Any,
+    tensor_shape: Tuple[int, ...],
+    smem_layout_src: Optional[str],
+    dim_perm: Tuple[int, ...],
+) -> Tuple[Any, ...]:
+    """Return a structural dedup key for a reusable TMA tensor template."""
     return (
         tensor_canonical,
         direction,
@@ -505,6 +537,7 @@ def _append_peer_tma_descriptor(
     dtype: Any,
     canonical_atom: str,
     canonical_gmem: str,
+    canonical_desc: str,
     smem_layout_src: Optional[str],
 ) -> None:
     """Append one peer TMA descriptor and update the communicate mapping."""
@@ -512,6 +545,7 @@ def _append_peer_tma_descriptor(
         PeerTMADescriptorInfo(
             canonical_atom=canonical_atom,
             canonical_gmem=canonical_gmem,
+            canonical_desc=canonical_desc,
             tensor_canonical=tensor_canonical,
             peer_idx=peer_idx,
             tile_shape=tile_shape,
@@ -527,6 +561,7 @@ def _append_peer_tma_descriptor(
         peer_idx,
         canonical_atom,
         canonical_gmem,
+        canonical_desc,
     )
 
 
@@ -574,6 +609,7 @@ class TMADescriptorInfo:
 
     canonical_atom: str
     canonical_gmem: str
+    canonical_desc: str
     tensor_canonical: str
     direction: str  # "g2s" or "s2g"
     tile_shape: Tuple[int, ...]
@@ -617,6 +653,7 @@ class TMARegistry:
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
         atom_counter = 0
         gmem_counter = 0
+        desc_counter = 0
         desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
         atom_name_cache: Dict[Tuple[Any, ...], str] = {}
         gmem_name_cache: Dict[Tuple[Any, ...], str] = {}
@@ -657,53 +694,46 @@ class TMARegistry:
                             tensor_name,
                             canonical_atom,
                             canonical_gmem,
+                            next(
+                                desc.canonical_desc
+                                for desc in descriptors
+                                if desc.canonical_atom == canonical_atom
+                                and desc.canonical_gmem == canonical_gmem
+                                and desc.tensor_canonical == tensor_canonical
+                                and desc.direction == direction
+                                and desc.original_tensor is original_ref
+                            ),
                         )
                     else:
-                        share_atom = (
-                            op_cls.__name__ in {"GemmOp", "GemmSm100Op"}
-                            and op.static_dims.get("activation", 0) == 0
-                            and op.static_dims.get("has_a_scale", 0) == 0
+                        atom_key = _local_tma_atom_key(
+                            direction=direction,
+                            tile_shape=tma_tile_shape,
+                            dtype=dtype,
+                            tensor_shape=tuple(original_ref.shape),
+                            smem_layout_src=smem_layout_src,
+                            dim_perm=dim_perm,
                         )
-                        canonical_atom = None
-                        if share_atom:
-                            atom_key = _local_tma_atom_key(
-                                tensor_canonical=tensor_canonical,
-                                direction=direction,
-                                tile_shape=tma_tile_shape,
-                                dtype=dtype,
-                                tensor_shape=tuple(original_ref.shape),
-                                smem_layout_src=smem_layout_src,
-                                dim_perm=dim_perm,
-                            )
-                            canonical_atom = atom_name_cache.get(atom_key)
+                        canonical_atom = atom_name_cache.get(atom_key)
                         if canonical_atom is None:
                             canonical_atom = f"tma{atom_counter}_atom"
-                            if share_atom:
-                                atom_name_cache[atom_key] = canonical_atom
+                            atom_name_cache[atom_key] = canonical_atom
                             atom_counter += 1
-                        gmem_key = None
-                        canonical_gmem = None
-                        if share_atom:
-                            # Reusing the atom is safe because it only depends on
-                            # structural transport state. Reusing the gmem-side
-                            # transport object across different tensors is not:
-                            # it carries the concrete source/destination tensor
-                            # binding. Keep one gmem handle per canonical tensor.
-                            gmem_key = (
-                                tensor_canonical,
-                                direction,
-                                tuple(tma_tile_shape),
-                                getattr(dtype, "__name__", str(dtype)),
-                                tuple(original_ref.shape),
-                                smem_layout_src,
-                                tuple(dim_perm),
-                            )
-                            canonical_gmem = gmem_name_cache.get(gmem_key)
+                        gmem_key = _local_tma_gmem_key(
+                            tensor_canonical=tensor_canonical,
+                            direction=direction,
+                            tile_shape=tma_tile_shape,
+                            dtype=dtype,
+                            tensor_shape=tuple(original_ref.shape),
+                            smem_layout_src=smem_layout_src,
+                            dim_perm=dim_perm,
+                        )
+                        canonical_gmem = gmem_name_cache.get(gmem_key)
                         if canonical_gmem is None:
                             canonical_gmem = f"tma{gmem_counter}_gmem"
-                            if share_atom:
-                                gmem_name_cache[gmem_key] = canonical_gmem
+                            gmem_name_cache[gmem_key] = canonical_gmem
                             gmem_counter += 1
+                        canonical_desc = f"tma{desc_counter}_desc"
+                        desc_counter += 1
                         desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
                         _append_tma_descriptor(
                             descriptors,
@@ -717,21 +747,16 @@ class TMARegistry:
                             dtype=dtype,
                             canonical_atom=canonical_atom,
                             canonical_gmem=canonical_gmem,
+                            canonical_desc=canonical_desc,
                             tensor_shape=tuple(original_ref.shape),
                             original_tensor=original_ref,
                             smem_layout_src=smem_layout_src,
                             dim_perm=dim_perm,
                         )
 
-            # Compute phase can use TMA load descriptors + reduce store descriptors
-            op_mappings[(i, "compute")] = dict(op_mappings[(i, "load")])
-            for key, val in op_mappings[(i, "store")].items():
-                if any(
-                    d.direction == "s2g_reduce"
-                    and (d.canonical_atom == val or d.canonical_gmem == val)
-                    for d in descriptors
-                ):
-                    op_mappings[(i, "compute")][key] = val
+            # Compute phases operate on local math views only. TMA transport is
+            # owned by load/store/communicate and should not inflate compute ABI.
+            op_mappings[(i, "compute")] = {}
 
         return cls(descriptors=descriptors, op_mappings=op_mappings)
 
@@ -783,6 +808,7 @@ class PeerTMADescriptorInfo:
 
     canonical_atom: str
     canonical_gmem: str
+    canonical_desc: str
     tensor_canonical: str
     peer_idx: int
     tile_shape: Tuple[int, ...]
@@ -827,6 +853,7 @@ class PeerTMARegistry:
         descriptors: List[PeerTMADescriptorInfo] = []
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
         counter = 0
+        desc_counter = 0
         desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
         num_peers = peer_buffer_registry.num_peers
 
@@ -867,10 +894,21 @@ class PeerTMARegistry:
                             peer_idx,
                             canonical_atom,
                             canonical_gmem,
+                            next(
+                                desc.canonical_desc
+                                for desc in descriptors
+                                if desc.canonical_atom == canonical_atom
+                                and desc.canonical_gmem == canonical_gmem
+                                and desc.tensor_canonical == tensor_canonical
+                                and desc.peer_idx == peer_idx
+                                and desc.direction == direction
+                            ),
                         )
                     else:
                         canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
                         canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
+                        canonical_desc = f"ptma{desc_counter}_desc"
+                        desc_counter += 1
                         desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
                         _append_peer_tma_descriptor(
                             descriptors,
@@ -884,6 +922,7 @@ class PeerTMARegistry:
                             dtype=dtype,
                             canonical_atom=canonical_atom,
                             canonical_gmem=canonical_gmem,
+                            canonical_desc=canonical_desc,
                             smem_layout_src=smem_layout_src,
                         )
 

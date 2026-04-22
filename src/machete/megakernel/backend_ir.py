@@ -39,6 +39,9 @@ class BackendIR:
     handler_specs: Tuple[HandlerSpec, ...]
     op_handler_indices: Tuple[int, ...]
     op_phase_local_indices: Dict[str, Tuple[int, ...]]
+    op_phase_transport_indices: Dict[str, Tuple[int, ...]]
+    phase_transport_records: Dict[str, Tuple[Tuple[str, ...], ...]]
+    phase_local_transport_positions: Dict[str, Tuple[Tuple[Tuple[int, ...], ...], ...]]
 
 
 __all__ = [

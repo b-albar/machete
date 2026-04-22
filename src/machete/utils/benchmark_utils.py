@@ -73,9 +73,6 @@ def combine_megakernel_bench_spec(
     if not CUTLASS_AVAILABLE:
         raise RuntimeError("CUTLASS is not available")
 
-    torch_stream = torch.cuda.current_stream()
-    cu_stream = cuda.CUstream(torch_stream.cuda_stream)
-
     for kernel in kernels:
         kernel.compile()
         kernel._cache_launch_state()
@@ -83,17 +80,19 @@ def combine_megakernel_bench_spec(
     def _setup():
         if setup_fn is not None:
             setup_fn()
-        for kernel in kernels:
-            kernel._barriers_tensor.zero_()
+        # Each kernel resets its own barriers in run(). Keep the benchmark
+        # setup free of kernel-specific launch plumbing.
 
     def _launch():
         for kernel in kernels:
-            kernel._launch_compiled_kernel(kernel._launch_state, cu_stream)
+            kernel.run(sync=False, validate=False)
+
+    torch_stream = torch.cuda.current_stream()
 
     return KernelBenchSpec(
         launch_fn=_launch,
         setup_fn=_setup,
-        stream=(torch_stream, cu_stream),
+        stream=(torch_stream, None),
         use_host_timer=True,
         _keep_alive=(kernels, keep_alive),
     )

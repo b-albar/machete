@@ -29,9 +29,14 @@ def _run_cached(scheduled_ops, mk_config):
     On cache miss: compiles + executes via mk.run(), then caches the result.
     """
     cache = KernelCache.get()
-    compiled_kernel = cache.lookup(scheduled_ops, mk_config)
-
     mk = Megakernel(scheduled_ops, config=mk_config)
+    mk._prepare_tensors()
+    mk._prepare_cute_tensors()
+    mk._prepare_tma_tensors()
+    mk._prepare_peer_tma_tensors()
+
+    cache_key = mk._make_cache_key()
+    compiled_kernel = cache.lookup_key(cache_key)
 
     if compiled_kernel is not None:
         # Cache hit: inject cached kernel, then use public run()
@@ -41,7 +46,7 @@ def _run_cached(scheduled_ops, mk_config):
         # Cache miss: compile + execute once
         with contextlib.redirect_stdout(io.StringIO()):
             mk.run()
-        cache.store(scheduled_ops, mk_config, mk._compiled_kernel)
+        cache.store_key(cache_key, mk._compiled_kernel)
 
 
 class MegakernelFunction(Function):

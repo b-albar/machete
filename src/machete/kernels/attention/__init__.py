@@ -2,9 +2,15 @@
 """Flash Attention kernels for the megakernel framework."""
 
 from .sm_100 import FlashAttentionSm100Op
-from .sm_120 import FlashAttentionSm120Op
-from .sm_120_bwd import FlashAttentionSm120BwdOp
-from .flash_decoding import FlashDecodingSplitOp, flash_decoding_schedule
+from .sm_120 import FlashAttentionSm120Op as FlashAttentionSm120BHSDOp
+from .sm_120_bwd import FlashAttentionSm120BwdOp as FlashAttentionSm120BHSDBwdOp
+from .sm_120_bshd import FlashAttentionSm120BSHDOp
+from .sm_120_bwd_bshd import FlashAttentionSm120BSHDBwdOp
+from .dpsum import AttentionDPSumOp
+from .flash_decoding import (
+    FlashDecodingSplitOp,
+    flash_decoding_schedule,
+)
 
 import torch
 
@@ -15,7 +21,7 @@ def _get_flash_attention_op():
     major, _ = torch.cuda.get_device_capability()
     match major:
         case m if m == 12:
-            return FlashAttentionSm120Op
+            return FlashAttentionSm120BSHDOp
         case m if m == 10:
             return FlashAttentionSm100Op
         case _:
@@ -24,6 +30,8 @@ def _get_flash_attention_op():
 
 
 FlashAttentionOp = _get_flash_attention_op()
+FlashAttentionSm120Op = FlashAttentionSm120BSHDOp
+FlashAttentionSm120BwdOp = FlashAttentionSm120BSHDBwdOp
 
 
 def _max_attention_page_size(device=None):
@@ -65,7 +73,10 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
         if lse is not None:
             lse = lse.unsqueeze(0)
 
-    B, H, M, D = q.shape
+    if FlashAttentionOp is FlashAttentionSm120BSHDOp and q.ndim == 4:
+        B, M, H, D = q.shape
+    else:
+        B, H, M, D = q.shape
     elem = q.element_size()
 
     # Auto-detect max page_size for attention
@@ -119,6 +130,9 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
 __all__ = [
     "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120BwdOp",
+    "FlashAttentionSm120BHSDOp", "FlashAttentionSm120BHSDBwdOp",
+    "FlashAttentionSm120BSHDOp", "FlashAttentionSm120BSHDBwdOp",
+    "AttentionDPSumOp",
     "FlashDecodingSplitOp", "flash_decoding_schedule",
     "flash_attention_schedule",
 ]

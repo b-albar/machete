@@ -88,7 +88,7 @@ def bench_flash_decoding(BH, M, N, D, page_size):
         except Exception as e:
             print(f"  FA megakernel failed: {e}")
 
-        # Flash Decoding (split-KV, multi-CTA)
+        # Flash Decoding (split-KV, multi-CTA, cp.async K/V)
         try:
             o_fd = torch.zeros_like(q)
             fd_ops, fd_config = flash_decoding_schedule(

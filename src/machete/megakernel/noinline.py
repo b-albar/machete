@@ -13,10 +13,8 @@ kernels.
 """
 
 import copy as copy_mod
-import re
 
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute as cute_ir
 from cutlass._mlir.dialects import cute_nvgpu as cn
 from cutlass._mlir.dialects import func as func_dialect
 from cutlass.cutlass_dsl import dsl_user_op
@@ -26,22 +24,21 @@ from cutlass.base_dsl.dsl import (
     extract_mlir_values,
     new_from_mlir_values,
 )
-from cutlass.cute import atom, core
-from cutlass.cute.atom import Trait
+from cutlass.cute import atom
 from cutlass.cute.nvgpu.cpasync.copy import (
-    CopyBulkTensorTileG2SOp,
-    CopyBulkTensorTileG2SMulticastOp,
     CopyBulkTensorTileG2SNonExecTrait,
     CopyBulkTensorTileG2SMulticastNonExecTrait,
-    CopyBulkTensorTileS2GOp,
     CopyBulkTensorTileS2GNonExecTrait,
-    CopyReduceBulkTensorTileS2GOp,
     CopyReduceBulkTensorTileS2GNonExecTrait,
 )
-from cutlass.cute.typing import NumericMeta
 from cutlass._mlir.dialects._cute_nvgpu_ops_gen import (
     atom_make_exec_tma,
     atom_set_value,
+)
+from .transport import (
+    RuntimeDescTMATrait,
+    make_runtime_desc_tma_atom,
+    runtime_desc_ptr_type,
 )
 
 _noinline_counter = 0
@@ -68,7 +65,7 @@ def _non_mlir_cache_key(value):
     return ("obj", type(value).__name__, id(value))
 
 
-class _PreExecTMATrait(Trait):
+class _PreExecTMATrait(atom.Trait):
     """TMA trait wrapping a pre-exec'd value.
 
     ``make_exec_tma`` was already called in the caller scope (inside
@@ -108,136 +105,6 @@ class _PreExecTMATrait(Trait):
                 exec_value, attr, cache_policy.value, loc=loc, ip=ip)
         return exec_value
 
-
-def _parse_exec_tma_type(nonexec_type, field_namespace: str):
-    """Build the exec-TMA type corresponding to a non-exec TMA atom type.
-
-    CuTe currently requires ``make_exec_tma`` to legalize inside ``gpu.func``,
-    but the resulting exec atom is expensive to thread through ``func.call``.
-    We instead pass the non-exec atom plus a typed descriptor pointer and
-    rebuild the exec atom in the noinline callee with raw NVGPU ops.
-    """
-    type_str = str(nonexec_type)
-
-    if field_namespace == "tmaload":
-        match = re.match(
-            r'!cute_nvgpu\.atom\.non_exec_tiled_tma_load<([^,]+),\s*([^,]+),\s*copy_bits = ([0-9]+),\s*tma_gbasis = <"([^"]+)">,\s*tma_format = ([^>]+)>',
-            type_str,
-        )
-        if not match:
-            raise ValueError(f"unsupported non-exec TMA load type: {type_str}")
-        arch, dtype, copy_bits, gbasis, _fmt = match.groups()
-        num_cta = 2 if "2sm" in arch else 1
-        return ir.Type.parse(
-            f'!cute_nvgpu.atom.tma_load<{dtype}, copy_bits = {copy_bits}, mode = tiled, '
-            f'num_cta = {num_cta}, g_stride = <"()"> tma_gbasis = <"{gbasis}">>'
-        )
-
-    if field_namespace == "tmastore":
-        match = re.match(
-            r'!cute_nvgpu\.atom\.non_exec_tiled_tma_store<([^,]+),\s*copy_bits = ([0-9]+),\s*tma_gbasis = <"([^"]+)">,\s*tma_format = ([^>]+)>',
-            type_str,
-        )
-        if not match:
-            raise ValueError(f"unsupported non-exec TMA store type: {type_str}")
-        dtype, copy_bits, gbasis, _fmt = match.groups()
-        return ir.Type.parse(
-            f'!cute_nvgpu.atom.tma_store<{dtype}, copy_bits = {copy_bits}, mode = tiled, '
-            f'g_stride = <"()"> tma_gbasis = <"{gbasis}">>'
-        )
-
-    if field_namespace == "tmareduce":
-        match = re.match(
-            r'!cute_nvgpu\.atom\.non_exec_tiled_tma_reduce<([^,]+),\s*([^,]+),\s*copy_bits = ([0-9]+),\s*tma_gbasis = <"([^"]+)">,\s*tma_format = ([^>]+),\s*op = ([^>]+)>',
-            type_str,
-        )
-        if not match:
-            raise ValueError(f"unsupported non-exec TMA reduce type: {type_str}")
-        op, dtype, copy_bits, gbasis, _fmt, red = match.groups()
-        return ir.Type.parse(
-            f'!cute_nvgpu.atom.tma_reduce<{op}, {dtype}, copy_bits = {copy_bits}, mode = tiled, '
-            f'g_stride = <"()"> tma_gbasis = <"{gbasis}">, op = {red}>'
-        )
-
-    raise ValueError(f"unsupported TMA field namespace: {field_namespace}")
-
-
-class _RuntimeDescTMATrait(Trait):
-    """TMA trait carrying a non-exec atom plus runtime descriptor pointer.
-
-    This keeps ``tma_partition`` legal across the ``func.call`` boundary by
-    threading the non-exec atom itself, while rebuilding the exec TMA atom in
-    the callee with ``atom_make_tma_*`` from a typed descriptor pointer.
-    """
-
-    def __init__(self, value, desc_ptr, *, field_namespace: str, supports_mbar: bool):
-        self.value = value
-        self.desc_ptr = desc_ptr
-        self.field_namespace = field_namespace
-        self.supports_mbar = supports_mbar
-
-    def __extract_mlir_values__(self):
-        return [self.value] + extract_mlir_values(self.desc_ptr)
-
-    def __new_from_mlir_values__(self, values):
-        desc_template_vals = extract_mlir_values(self.desc_ptr)
-        desc_vals = values[1:1 + len(desc_template_vals)]
-        desc_ptr = new_from_mlir_values(self.desc_ptr, desc_vals)
-        return self.__class__(
-            values[0],
-            desc_ptr,
-            field_namespace=self.field_namespace,
-            supports_mbar=self.supports_mbar,
-        )
-
-    def unpack(self, *, tma_bar_ptr=None, tma_desc_ptr=None,
-               cache_policy=None, loc=None, ip=None, **kwargs):
-        desc_value = extract_mlir_values(self.desc_ptr)[0]
-        g_stride = cute_ir.make_stride(
-            ir.Type.parse('!cute.stride<"()">'),
-            [],
-            loc=loc,
-            ip=ip,
-        )
-        exec_type = _parse_exec_tma_type(self.value.type, self.field_namespace)
-
-        if self.field_namespace == "tmaload":
-            return cn.atom_make_tma_load(
-                exec_type,
-                desc_value,
-                tma_bar_ptr.value,
-                g_stride,
-                cache_policy=cache_policy.value if cache_policy is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        if self.field_namespace == "tmastore":
-            return cn.atom_make_tma_store(
-                exec_type,
-                desc_value,
-                g_stride,
-                cache_policy=cache_policy.value if cache_policy is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        if self.field_namespace == "tmareduce":
-            return cn.atom_make_tma_reduce(
-                exec_type,
-                desc_value,
-                g_stride,
-                cache_policy=cache_policy.value if cache_policy is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        raise ValueError(f"unsupported TMA field namespace: {self.field_namespace}")
-
-
-def _runtime_desc_ptr_type():
-    return cute_ir.PtrType.get(cn.TmaDescriptorTiledType.get(), 0, 64)
-
-
-
-
 @dsl_user_op
 def _patched_make_tiled_tma_atom(
     op,
@@ -261,184 +128,19 @@ def _patched_make_tiled_tma_atom(
     `cute_nvgpu.make_tma_desc_tiled`. The returned trait can then build
     `atom_make_tma_*` directly without ever invoking `atom_make_exec_tma`.
     """
-    cta_v_map = core.composition(
-        core.make_identity_layout(gmem_tensor.shape, loc=loc, ip=ip),
-        cta_tiler,
-        loc=loc,
-        ip=ip,
-    )
-
-    if isinstance(smem_layout, core._ComposedLayout):
-        smem_layout = smem_layout.value
-
-    op.smem_layout = (
-        smem_layout.value
-        if isinstance(smem_layout, core._ComposedLayout)
-        else smem_layout
-    )
-
-    tma_format = None
-    if internal_type is not None:
-        if not isinstance(internal_type, NumericMeta):
-            raise TypeError(f"internal_type must be a Numeric, but got {internal_type}")
-        use_unpack = (
-            internal_type.width == 8
-            and isinstance(gmem_tensor.element_type, NumericMeta)
-            and gmem_tensor.element_type.width < 8
-        )
-        internal_mlir_type = (
-            gmem_tensor.element_type.mlir_type
-            if use_unpack
-            else internal_type.mlir_type
-        )
-        tma_format = cn.TmaDataFormat(
-            cn.get_default_tma_format(internal_mlir_type, use_unpack)
-        )
-
-    desc_ptr_type = _runtime_desc_ptr_type()
-
-    if isinstance(op, CopyBulkTensorTileG2SOp):
-        if num_multicast != 1:
-            raise ValueError(
-                f"expects num_multicast to be 1 for non multicast G2S copies, got {num_multicast}"
-            )
-        atom_res, gmem_res = cn.atom_make_non_exec_tiled_tma_load(
-            gmem_tensor.value,
+    try:
+        return make_runtime_desc_tma_atom(
+            op,
+            gmem_tensor,
             smem_layout,
-            cta_v_map,
-            op._to_ir(),
+            cta_tiler,
             num_multicast=num_multicast,
-            tma_format=tma_format,
+            internal_type=internal_type,
             loc=loc,
             ip=ip,
         )
-        desc_ptr = cn.make_tma_desc_tiled(
-            desc_ptr_type,
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            cn.TmaLoadMode.tiled,
-            num_multicast=num_multicast,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        return (
-            atom.CopyAtom(
-                op,
-                _RuntimeDescTMATrait(
-                    atom_res,
-                    desc_ptr,
-                    field_namespace="tmaload",
-                    supports_mbar=True,
-                ),
-            ),
-            gmem_res,
-        )
-
-    if isinstance(op, CopyBulkTensorTileG2SMulticastOp):
-        if num_multicast < 1:
-            raise ValueError(
-                f"expects num_multicast to be >= 1 for multicast G2S copies, got {num_multicast}"
-            )
-        atom_res, gmem_res = cn.atom_make_non_exec_tiled_tma_load(
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            op._to_ir(),
-            num_multicast=num_multicast,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        desc_ptr = cn.make_tma_desc_tiled(
-            desc_ptr_type,
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            cn.TmaLoadMode.tiled,
-            num_multicast=num_multicast,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        return (
-            atom.CopyAtom(
-                op,
-                _RuntimeDescTMATrait(
-                    atom_res,
-                    desc_ptr,
-                    field_namespace="tmaload",
-                    supports_mbar=True,
-                ),
-            ),
-            gmem_res,
-        )
-
-    if isinstance(op, CopyBulkTensorTileS2GOp):
-        atom_res, gmem_res = cn.atom_make_non_exec_tiled_tma_store(
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        desc_ptr = cn.make_tma_desc_tiled(
-            desc_ptr_type,
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            cn.TmaStoreMode.tiled,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        return (
-            atom.CopyAtom(
-                op,
-                _RuntimeDescTMATrait(
-                    atom_res,
-                    desc_ptr,
-                    field_namespace="tmastore",
-                    supports_mbar=False,
-                ),
-            ),
-            gmem_res,
-        )
-
-    if isinstance(op, CopyReduceBulkTensorTileS2GOp):
-        atom_res, gmem_res = cn.atom_make_non_exec_tiled_tma_reduce(
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            op._to_ir(),
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        desc_ptr = cn.make_tma_desc_tiled(
-            desc_ptr_type,
-            gmem_tensor.value,
-            smem_layout,
-            cta_v_map,
-            cn.TmaStoreMode.tiled,
-            tma_format=tma_format,
-            loc=loc,
-            ip=ip,
-        )
-        return (
-            atom.CopyAtom(
-                op,
-                _RuntimeDescTMATrait(
-                    atom_res,
-                    desc_ptr,
-                    field_namespace="tmareduce",
-                    supports_mbar=False,
-                ),
-            ),
-            gmem_res,
-        )
+    except TypeError:
+        pass
 
     return _orig_make_tiled_tma_atom(
         op,
@@ -541,16 +243,15 @@ def _pre_exec_tma_args(args):
 
         if field_namespace is not None:
             exec_value = atom_make_exec_tma(trait.value)
-            desc_type = cn.TmaDescriptorTiledType.get()
             # Use a generic typed pointer here. Lowering from a byval kernel
             # argument-backed descriptor field to addrspace(1) leaves an
             # unrealized conversion cast in LLVM translation, while generic
             # typed descriptor pointers lower cleanly and are accepted by the
             # raw NVGPU ``atom_make_tma_*`` ops.
-            ptr_type = cute_ir.PtrType.get(desc_type, 0, 64)
+            ptr_type = runtime_desc_ptr_type()
             desc_ptr = cn.get_tma_desc_addr(ptr_type, exec_value)
             new_atom = copy_mod.copy(a)
-            new_atom._trait = _RuntimeDescTMATrait(
+            new_atom._trait = RuntimeDescTMATrait(
                 trait.value,
                 desc_ptr,
                 field_namespace=field_namespace,

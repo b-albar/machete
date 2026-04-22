@@ -14,6 +14,8 @@ import math
 from dataclasses import dataclass, field
 from typing import List
 
+import torch
+
 
 @dataclass
 class TracingState:
@@ -28,9 +30,12 @@ class TracingState:
     dep_wait_fmt: int = 0
     data_wait_fmt: int = 0
     compute_wait_fmt: int = 0
+    load_fmts_tensor: object = None
+    compute_fmts_tensor: object = None
+    store_fmts_tensor: object = None
 
 
-def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
+def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
     """Set up cutedsl-trace builder and trace types.
 
     Creates per-(op_class, phase) TraceTypes so load/compute/store events
@@ -114,6 +119,16 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
     state.builder.set_track_type(load_track, lane=0)
     state.builder.set_track_type(mma_track, lane=1)
     state.builder.set_track_type(store_track, lane=2)
+
+    state.load_fmts_tensor = torch.tensor(
+        state.load_fmts, dtype=torch.int32, device=device
+    )
+    state.compute_fmts_tensor = torch.tensor(
+        state.compute_fmts, dtype=torch.int32, device=device
+    )
+    state.store_fmts_tensor = torch.tensor(
+        state.store_fmts, dtype=torch.int32, device=device
+    )
 
     return state
 
@@ -206,7 +221,7 @@ def get_trace_exec_globals(state: TracingState) -> dict:
     code has been stripped from the source by resolve_tracing_blocks).
     """
     if state is not None:
-        import cutlass
+        from cutlass import Int64
         from cutedsl_trace.device import (
             start as trace_start,
             begin_lane_dynamic_raw,
@@ -214,16 +229,14 @@ def get_trace_exec_globals(state: TracingState) -> dict:
             finish_lane_dynamic_raw,
         )
         return {
-            "num_ops": len(state.load_fmts),
-            "range_constexpr": cutlass.range_constexpr,
             "trace_start": trace_start,
             "begin_lane_dynamic_raw": begin_lane_dynamic_raw,
             "end_event_dynamic_raw_1": end_event_dynamic_raw_1,
             "finish_lane_dynamic_raw": finish_lane_dynamic_raw,
             "trace_row_stride": state.builder.row_stride_bytes,
-            "trace_load_fmts": state.load_fmts,
-            "trace_compute_fmts": state.compute_fmts,
-            "trace_store_fmts": state.store_fmts,
+            "trace_load_fmt_ptr": Int64(state.load_fmts_tensor.data_ptr()),
+            "trace_compute_fmt_ptr": Int64(state.compute_fmts_tensor.data_ptr()),
+            "trace_store_fmt_ptr": Int64(state.store_fmts_tensor.data_ptr()),
             "trace_dep_wait_fmt": state.dep_wait_fmt,
             "trace_data_wait_fmt": state.data_wait_fmt,
             "trace_compute_wait_fmt": state.compute_wait_fmt,

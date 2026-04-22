@@ -61,6 +61,19 @@ class TestMegakernelHost:
 
         assert kernel.num_sms == 4
 
+    def test_runtime_cache_key_ignores_tile_counts(self):
+        """Runtime metadata should absorb tile-count changes for the shell key."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+
+        config = MegakernelConfig(num_sms=1, num_pages=1)
+        k0 = Megakernel([ScheduledOp(_NOPOp, tile_counts=(4,))], config=config, device="cpu")
+        k1 = Megakernel([ScheduledOp(_NOPOp, tile_counts=(9,))], config=config, device="cpu")
+
+        k0._prepare_tensors()
+        k1._prepare_tensors()
+
+        assert k0._make_cache_key() == k1._make_cache_key()
+
 
 # =============================================================================
 # GPU Tests (Require Hopper)

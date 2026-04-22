@@ -116,6 +116,18 @@ class TestFlashDecodingBasic:
 
         torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
 
+    def test_long_decode_path(self):
+        torch.manual_seed(42)
+        BH, M, N, D = 1, 16, 2048, 128
+        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+
+        o = _run_flash_decoding(q, k, v)
+        o_ref = _ref_attention(q, k, v)
+
+        torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
+
 
 @requires_gpu
 class TestFlashDecodingCausal:

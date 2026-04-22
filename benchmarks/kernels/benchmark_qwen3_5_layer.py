@@ -249,13 +249,13 @@ def megakernel_forward_build(
     q_4d = q_3d.view(B * S, NUM_Q_HEADS, HEAD_DIM)
     k_4d = k_3d.view(B * S, NUM_KV_HEADS, HEAD_DIM)
 
-    # 4D FA views sharing memory with GEMM outputs: (B, H, S, D)
-    q_fa = q_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    k_fa = k_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    # 4D FA views sharing memory with GEMM outputs: (B, S, H, D)
+    q_fa = q_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM)
+    k_fa = k_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM)
+    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM)
 
     attn_out_3d = torch.empty(B, S, Q_DIM, dtype=dtype, device=device)
-    o_fa = attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    o_fa = attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM)
     lse = torch.empty(B, NUM_Q_HEADS, S, dtype=torch.float32, device=device)
 
     proj = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
@@ -417,6 +417,7 @@ def sequential_attn_bwd(q, k, v, dout, causal=True):
 def megakernel_layer_bwd_build(
     B, S, x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
     cos, sin, W_o, w_mlp_norm, W_gate_up, W_down, page_size=32768,
+    d_out=None, return_state=False,
 ):
     """Build megakernel for full layer backward.
 
@@ -426,11 +427,16 @@ def megakernel_layer_bwd_build(
         → GEMM(Q/K/V) bwd → RMSNorm1 bwd
     """
     from machete.megakernel import Megakernel, MegakernelConfig
-    from machete.kernels.gemm import GemmOp
+    from machete.kernels.gemm import GemmOp, GemmRowParallelOp
     from machete.kernels.rms_norm.rms_norm import RMSNormBwdOp
     from machete.kernels.glu.glu import GLUBwdOp
-    from machete.kernels.attention import FlashAttentionSm120Op
-    from machete.kernels.attention.sm_120_bwd import FlashAttentionSm120BwdOp
+    from machete.kernels.activation import AddOp
+    from machete.kernels.attention import (
+        FlashAttentionSm120Op,
+        FlashAttentionSm120BwdOp,
+        AttentionDPSumOp,
+    )
+    from machete.kernels.qknorm_rope import QKNormRopeBwdOp
 
     dtype = x.dtype
     device = x.device
@@ -443,11 +449,11 @@ def megakernel_layer_bwd_build(
     q_3d = torch.empty(B, S, Q_DIM, dtype=dtype, device=device)
     k_3d = torch.empty(B, S, KV_DIM, dtype=dtype, device=device)
     v_3d = torch.empty(B, S, KV_DIM, dtype=dtype, device=device)
-    q_fa = q_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
-    k_fa = k_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
-    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
+    q_fa = q_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).contiguous()
+    k_fa = k_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).contiguous()
+    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).contiguous()
     attn_out_3d = torch.empty(B, S, Q_DIM, dtype=dtype, device=device)
-    o_fa = attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
+    o_fa = attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).contiguous()
     lse = torch.empty(B, NUM_Q_HEADS, S, dtype=torch.float32, device=device)
     proj = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     residual_out2 = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
@@ -475,9 +481,9 @@ def megakernel_layer_bwd_build(
     k_normed = _per_head_rmsnorm(k_3d, w_k_norm, NUM_KV_HEADS, HEAD_DIM)
     q_roped = _apply_rope(q_normed, cos, sin, NUM_Q_HEADS, HEAD_DIM, ROTARY_DIM)
     k_roped = _apply_rope(k_normed, cos, sin, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM)
-    q_fa[:] = q_roped.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3).to(dtype)
-    k_fa[:] = k_roped.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).to(dtype)
-    v_fa[:] = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).to(dtype)
+    q_fa[:] = q_roped.view(B, S, NUM_Q_HEADS, HEAD_DIM).to(dtype)
+    k_fa[:] = k_roped.view(B, S, NUM_KV_HEADS, HEAD_DIM).to(dtype)
+    v_fa[:] = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).to(dtype)
     # Run FA forward to get o and lse
     fwd_ops = FlashAttentionSm120Op.schedule(
         q=q_fa, k=k_fa, v=v_fa, o=o_fa, lse=lse,
@@ -488,7 +494,7 @@ def megakernel_layer_bwd_build(
     with contextlib.redirect_stdout(io.StringIO()):
         fwd_kernel.run()
     torch.cuda.synchronize()
-    attn_out_3d[:] = o_fa.permute(0, 2, 1, 3).contiguous().view(B, S, Q_DIM)
+    attn_out_3d[:] = o_fa.view(B, S, Q_DIM)
     proj[:] = torch.matmul(attn_out_3d.float(), W_o.float().t()).to(dtype)
     residual_out[:] = res_add
     residual_out2[:] = (proj + residual_out).to(dtype)
@@ -500,7 +506,8 @@ def megakernel_layer_bwd_build(
     # =========================================================================
     # Backward pass — schedule all ops
     # =========================================================================
-    d_out = torch.randn(B, S, HIDDEN, dtype=dtype, device=device)
+    if d_out is None:
+        d_out = torch.randn(B, S, HIDDEN, dtype=dtype, device=device)
 
     # 11'. GEMM(down) bwd: d_mlp_h = d_out @ W_down, d_W_down = mlp_h.T @ d_out
     d_mlp_h = torch.empty(B, S, INTERMEDIATE, dtype=dtype, device=device)
@@ -522,8 +529,8 @@ def megakernel_layer_bwd_build(
     d_proj = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     d_res2 = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     rmsnorm2_bwd_ops = RMSNormBwdOp.schedule(
-        dout=d_h2, x=proj, weight=w_mlp_norm, dx=d_proj,
-        d_residual=d_res2, residual=True,
+        dout=d_h2, x=residual_out2, weight=w_mlp_norm, dx=d_proj,
+        d_residual=d_res2,
         tile_sizes={"S": 16}, page_size=page_size)
 
     # 7'. GEMM(O) bwd: d_attn_out = d_proj @ W_o
@@ -535,14 +542,18 @@ def megakernel_layer_bwd_build(
         page_size=page_size)
 
     # 6'. FA bwd: dQ, dK, dV from d_attn_out
-    d_attn_fa = d_attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(
-        0, 2, 1, 3).contiguous()
+    d_attn_fa = d_attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM)
     dpsum = torch.empty(B, NUM_Q_HEADS, S, dtype=torch.float32, device=device)
-    dq_fa = torch.zeros(B, NUM_Q_HEADS, S, HEAD_DIM, dtype=torch.float32, device=device)
-    dk_fa = torch.zeros(B, NUM_KV_HEADS, S, HEAD_DIM, dtype=dtype, device=device)
-    dv_fa = torch.zeros(B, NUM_KV_HEADS, S, HEAD_DIM, dtype=dtype, device=device)
-    # dpsum must be computed at runtime: dpsum = rowsum(dout_attn * o)
-    dpsum[:] = (d_attn_fa.float() * o_fa.float()).sum(dim=-1)
+    dq_fa = torch.zeros(B, S, NUM_Q_HEADS, HEAD_DIM, dtype=torch.float32, device=device)
+    dk_fa = torch.zeros(B, S, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    dv_fa = torch.zeros(B, S, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    dpsum_ops = AttentionDPSumOp.schedule(
+        dout=d_attn_fa,
+        o=o_fa,
+        dpsum=dpsum,
+        tile_sizes={"S": 16, "H": 1},
+        page_size=page_size,
+    )
 
     fa_bwd_ops = FlashAttentionSm120BwdOp.schedule(
         k=k_fa, v=v_fa, q=q_fa, dout=d_attn_fa, lse=lse, dpsum=dpsum,
@@ -552,29 +563,96 @@ def megakernel_layer_bwd_build(
     for op in fa_bwd_ops:
         op.dim_aliases["M"] = "seq"
 
-    # 5'-2'. QKNormRope bwd + GEMM(Q/K/V) bwd + RMSNorm1 bwd
-    # TODO: QKNormRope backward not yet implemented — skip for now.
-    # These ops would complete the chain but are not benchmarked yet.
+    # 5'. QKNormRope bwd on Q/K activation path.
+    q_prenorm_4d = q_prenorm.view(B * S, NUM_Q_HEADS, HEAD_DIM).contiguous()
+    k_prenorm_4d = k_prenorm.view(B * S, NUM_KV_HEADS, HEAD_DIM).contiguous()
+    dq_fa_flat = dq_fa.view(B * S, NUM_Q_HEADS, HEAD_DIM).contiguous()
+    dk_fa_flat = dk_fa.view(B * S, NUM_KV_HEADS, HEAD_DIM).contiguous()
+    dq_qnr_q_flat = torch.empty_like(q_prenorm_4d)
+    dq_qnr_k_flat = torch.empty_like(k_prenorm_4d)
+    qknorm_q_bwd_ops = QKNormRopeBwdOp.schedule(
+        q=q_prenorm_4d,
+        dout=dq_fa_flat,
+        dq=dq_qnr_q_flat,
+        norm_weight=w_q_norm,
+        cos=cos,
+        sin=sin,
+        page_size=page_size,
+    )
+    qknorm_k_bwd_ops = QKNormRopeBwdOp.schedule(
+        q=k_prenorm_4d,
+        dout=dk_fa_flat,
+        dq=dq_qnr_k_flat,
+        norm_weight=w_k_norm,
+        cos=cos,
+        sin=sin,
+        page_size=page_size,
+    )
+    for op in qknorm_q_bwd_ops + qknorm_k_bwd_ops:
+        op.dim_aliases["M"] = "seq"
+
+    # 4'. GEMM(Q/K/V) bwd: accumulate into d_h1, the gradient wrt the first
+    # RMSNorm output h. The residual-path gradient d_res2 stays separate and
+    # is added after RMSNorm1 backward.
+    dq_qnr_q = dq_qnr_q_flat.view(B, S, Q_DIM)
+    dq_qnr_k = dq_qnr_k_flat.view(B, S, KV_DIM)
+    dv_3d = dv_fa.view(B, S, KV_DIM)
+    d_h1 = torch.zeros(B, S, HIDDEN, dtype=dtype, device=device)
+    W_q_t = W_q.t().contiguous()
+    W_k_t = W_k.t().contiguous()
+    W_v_t = W_v.t().contiguous()
+    gemm_q_bwd_ops = GemmRowParallelOp.schedule(a=dq_qnr_q, b=W_q_t, c=d_h1, page_size=page_size)
+    gemm_k_bwd_ops = GemmRowParallelOp.schedule(a=dq_qnr_k, b=W_k_t, c=d_h1, page_size=page_size)
+    gemm_v_bwd_ops = GemmRowParallelOp.schedule(a=dv_3d, b=W_v_t, c=d_h1, page_size=page_size)
+
+    # 3'. RMSNorm1 bwd: consume only d_h1, then merge in the later residual path.
+    dx = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
+    d_res1 = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
+    rmsnorm1_bwd_ops = RMSNormBwdOp.schedule(
+        dout=d_h1,
+        x=residual_out,
+        weight=w_attn_norm,
+        dx=dx,
+        d_residual=d_res1,
+        add=d_res2,
+        tile_sizes={"S": 16},
+        page_size=page_size,
+    )
 
     # =========================================================================
     # Build kernels: single-kernel + 2-kernel split (reference)
     # =========================================================================
     mlp_ops = (gemm_down_bwd_ops + glu_bwd_ops + gemm_gu_bwd_ops
                + rmsnorm2_bwd_ops + gemm_o_bwd_ops)
+    tail_ops = (
+        qknorm_q_bwd_ops
+        + qknorm_k_bwd_ops
+        + gemm_q_bwd_ops
+        + gemm_k_bwd_ops
+        + gemm_v_bwd_ops
+        + rmsnorm1_bwd_ops
+    )
     fa_bwd_config = FlashAttentionSm120BwdOp.kernel_config(fa_bwd_ops)
 
     keep_alive = [
         x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
         cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
-        h, q_3d, k_3d, v_3d, q_fa, k_fa, v_fa, o_fa, lse,
+        h, q_3d, k_3d, v_3d, q_prenorm, k_prenorm, q_fa, k_fa, v_fa, o_fa, lse,
         attn_out_3d, proj, residual_out, residual_out2, h2, gate_up, mlp_h,
         d_out, d_mlp_h, d_gate_up, d_h2, d_proj, d_res2,
         d_attn_out_3d, d_attn_fa, dpsum, dq_fa, dk_fa, dv_fa,
+        d_h1,
+        W_q_t, W_k_t, W_v_t,
+        q_prenorm_4d, k_prenorm_4d, dq_fa_flat, dk_fa_flat, dq_qnr_q_flat, dq_qnr_k_flat,
+        dq_qnr_q, dq_qnr_k, dv_3d, dx, d_res1,
     ]
-    setup_fn = lambda: (dq_fa.zero_(), dk_fa.zero_(), dv_fa.zero_())
+    setup_fn = lambda: (
+        dq_fa.zero_(), dk_fa.zero_(), dv_fa.zero_(),
+        d_res2.zero_(), d_h1.zero_(), dx.zero_(), d_res1.zero_(),
+    )
 
     # --- Single kernel: all backward ops in one megakernel ---
-    all_bwd_ops = mlp_ops + fa_bwd_ops
+    all_bwd_ops = mlp_ops + dpsum_ops + fa_bwd_ops + tail_ops
     gemm_config = GemmOp.kernel_config(mlp_ops)
     single_config = MegakernelConfig(
         threads_per_block=_pick_single_layer_backward_tpb(
@@ -592,33 +670,68 @@ def megakernel_layer_bwd_build(
     dq_fa.zero_()
     dk_fa.zero_()
     dv_fa.zero_()
+    d_res2.zero_()
+    d_h1.zero_()
+    dx.zero_()
+    d_res1.zero_()
     with contextlib.redirect_stdout(io.StringIO()):
         single_kernel.run()
     torch.cuda.synchronize()
+
+    single_state = None
+    if return_state:
+        single_state = {
+            "d_out": d_out.clone(),
+            "d_mlp_h": d_mlp_h.clone(),
+            "d_gate_up": d_gate_up.clone(),
+            "d_h2": d_h2.clone(),
+            "d_proj": d_proj.clone(),
+            "d_res2": d_res2.clone(),
+            "d_attn_out_3d": d_attn_out_3d.clone(),
+            "d_h1": d_h1.clone(),
+            "dq_fa": dq_fa.clone(),
+            "dk_fa": dk_fa.clone(),
+            "dv_fa": dv_fa.clone(),
+            "dq_qnr_q": dq_qnr_q.clone(),
+            "dq_qnr_k": dq_qnr_k.clone(),
+            "dx": dx.clone(),
+            "d_res1": d_res1.clone(),
+        }
 
     spec_1k = single_kernel.bench_spec(
         setup_fn=setup_fn, keep_alive=keep_alive,
     )
 
-    # --- 2-kernel split: MLP chain + FA bwd (reference) ---
+    # --- 2-kernel split: MLP chain + FA bwd + tail ---
     mlp_kernel = Megakernel(mlp_ops, config=GemmOp.kernel_config(mlp_ops))
     fa_kernel = Megakernel(fa_bwd_ops, config=fa_bwd_config)
+    tail_kernel = Megakernel(tail_ops, config=GemmOp.kernel_config(gemm_q_bwd_ops + gemm_k_bwd_ops + gemm_v_bwd_ops))
 
     with contextlib.redirect_stdout(io.StringIO()):
         mlp_kernel.run()
     torch.cuda.synchronize()
+    dpsum[:] = (d_attn_fa.float() * o_fa.float()).sum(dim=-1).permute(0, 2, 1)
     dq_fa.zero_()
     dk_fa.zero_()
     dv_fa.zero_()
+    d_res2.zero_()
+    d_h1.zero_()
+    dx.zero_()
+    d_res1.zero_()
     with contextlib.redirect_stdout(io.StringIO()):
         fa_kernel.run()
     torch.cuda.synchronize()
+    with contextlib.redirect_stdout(io.StringIO()):
+        tail_kernel.run()
+    torch.cuda.synchronize()
 
     spec_2k = combine_megakernel_bench_spec(
-        [mlp_kernel, fa_kernel],
+        [mlp_kernel, fa_kernel, tail_kernel],
         setup_fn=setup_fn,
         keep_alive=keep_alive,
     )
+    if return_state:
+        return spec_1k, spec_2k, d_out, single_state
     return spec_1k, spec_2k, d_out
 
 
@@ -650,8 +763,7 @@ def verify_layer_backward(B, S):
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm.rms_norm import RMSNormBwdOp
     from machete.kernels.glu.glu import GLUBwdOp
-    from machete.kernels.attention import FlashAttentionSm120Op
-    from machete.kernels.attention.sm_120_bwd import FlashAttentionSm120BwdOp
+    from machete.kernels.attention import FlashAttentionSm120Op, FlashAttentionSm120BwdOp
 
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -674,7 +786,6 @@ def verify_layer_backward(B, S):
     W_down = torch.randn(HIDDEN, INTERMEDIATE, dtype=dtype, device=device) * 0.02
     d_out = torch.randn(B, S, HIDDEN, dtype=dtype, device=device)
 
-    # --- Reference: full autograd backward ---
     # Compute forward intermediates for the ops we can check
     res_add = (x + residual).to(dtype)
     h = _rmsnorm(res_add, w_attn_norm).to(dtype)
@@ -687,9 +798,9 @@ def verify_layer_backward(B, S):
     k_roped = _apply_rope(k_normed, cos, sin, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM)
 
     # FA forward via megakernel (to get o + lse)
-    q_fa = q_roped.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
-    k_fa = k_roped.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
-    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
+    q_fa = q_roped.view(B, S, NUM_Q_HEADS, HEAD_DIM).contiguous()
+    k_fa = k_roped.view(B, S, NUM_KV_HEADS, HEAD_DIM).contiguous()
+    v_fa = v_3d.view(B, S, NUM_KV_HEADS, HEAD_DIM).contiguous()
     o_fa = torch.zeros_like(q_fa)
     lse = torch.empty(B, NUM_Q_HEADS, S, dtype=torch.float32, device=device)
     fwd_ops = FlashAttentionSm120Op.schedule(
@@ -701,7 +812,7 @@ def verify_layer_backward(B, S):
         fwd_kernel.run()
     torch.cuda.synchronize()
 
-    attn_out_3d = o_fa.permute(0, 2, 1, 3).contiguous().view(B, S, Q_DIM)
+    attn_out_3d = o_fa.view(B, S, Q_DIM)
     proj = torch.matmul(attn_out_3d.float(), W_o.float().t()).to(dtype)
     residual_out2 = (proj + res_add).to(dtype)
     h2 = _rmsnorm(residual_out2, w_mlp_norm).to(dtype)
@@ -736,8 +847,8 @@ def verify_layer_backward(B, S):
     d_proj = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     d_res2 = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     rmsnorm2_bwd = RMSNormBwdOp.schedule(
-        dout=d_h2, x=proj, weight=w_mlp_norm, dx=d_proj,
-        d_residual=d_res2, residual=True, tile_sizes={"S": 16}, page_size=page_size)
+        dout=d_h2, x=residual_out2, weight=w_mlp_norm, dx=d_proj,
+        d_residual=d_res2, tile_sizes={"S": 16}, page_size=page_size)
 
     # GEMM(O) bwd: d_attn_out = d_proj @ W_o
     d_attn_out_3d = torch.empty(B, S, Q_DIM, dtype=dtype, device=device)
@@ -745,11 +856,11 @@ def verify_layer_backward(B, S):
         dout=d_proj, a=attn_out_3d, b=W_o, da=d_attn_out_3d, page_size=page_size)
 
     # FA bwd
-    d_attn_fa = d_attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3).contiguous()
-    dpsum = (d_attn_fa.float() * o_fa.float()).sum(dim=-1).contiguous()
-    dq_fa = torch.zeros(B, NUM_Q_HEADS, S, HEAD_DIM, dtype=torch.float32, device=device)
-    dk_fa = torch.zeros(B, NUM_KV_HEADS, S, HEAD_DIM, dtype=dtype, device=device)
-    dv_fa = torch.zeros(B, NUM_KV_HEADS, S, HEAD_DIM, dtype=dtype, device=device)
+    d_attn_fa = d_attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM)
+    dpsum = (d_attn_fa.float() * o_fa.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
+    dq_fa = torch.zeros(B, S, NUM_Q_HEADS, HEAD_DIM, dtype=torch.float32, device=device)
+    dk_fa = torch.zeros(B, S, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    dv_fa = torch.zeros(B, S, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
 
     fa_bwd = FlashAttentionSm120BwdOp.schedule(
         k=k_fa, v=v_fa, q=q_fa, dout=d_attn_fa, lse=lse, dpsum=dpsum,
@@ -769,8 +880,7 @@ def verify_layer_backward(B, S):
     torch.cuda.synchronize()
 
     # Now d_attn_out_3d is populated → recompute dpsum and run FA bwd
-    d_attn_fa[:] = d_attn_out_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    dpsum[:] = (d_attn_fa.float() * o_fa.float()).sum(dim=-1)
+    dpsum[:] = (d_attn_fa.float() * o_fa.float()).sum(dim=-1).permute(0, 2, 1)
     dq_fa.zero_()
     dk_fa.zero_()
     dv_fa.zero_()
@@ -786,19 +896,41 @@ def verify_layer_backward(B, S):
     q_ref = q_fa.detach().requires_grad_(True)
     k_ref = k_fa.detach().requires_grad_(True)
     v_ref = v_fa.detach().requires_grad_(True)
-    k_exp = k_ref.repeat_interleave(KV_GROUP_SIZE, dim=1)
-    v_exp = v_ref.repeat_interleave(KV_GROUP_SIZE, dim=1)
-    o_ref = F.scaled_dot_product_attention(q_ref, k_exp, v_exp, is_causal=True)
-    o_ref.backward(d_attn_fa.float())
+    q_ref_bhsd = q_ref.permute(0, 2, 1, 3)
+    k_ref_bhsd = k_ref.repeat_interleave(KV_GROUP_SIZE, dim=2).permute(0, 2, 1, 3)
+    v_ref_bhsd = v_ref.repeat_interleave(KV_GROUP_SIZE, dim=2).permute(0, 2, 1, 3)
+    o_ref = F.scaled_dot_product_attention(q_ref_bhsd, k_ref_bhsd, v_ref_bhsd, is_causal=True)
+    o_ref.backward(d_attn_fa.float().permute(0, 2, 1, 3))
     dq_err = (dq_fa.float() - q_ref.grad.float()).abs().mean() / q_ref.grad.float().abs().mean()
     dk_err = (dk_fa.float() - k_ref.grad.float()).abs().mean() / k_ref.grad.float().abs().mean()
     dv_err = (dv_fa.float() - v_ref.grad.float()).abs().mean() / v_ref.grad.float().abs().mean()
+
+    # --- Compare final activation-side grads now that the full tail is wired ---
+    ref_dx, ref_dresidual, *_ = sequential_layer_bwd(
+        x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
+        cos, sin, W_o, w_mlp_norm, W_gate_up, W_down, d_out,
+    )
+    _, _, _, single_state = megakernel_layer_bwd_build(
+        B, S, x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
+        cos, sin, W_o, w_mlp_norm, W_gate_up, W_down, page_size=page_size,
+        d_out=d_out, return_state=True,
+    )
+    dx_err = (
+        (single_state["dx"].float() - ref_dx.float()).abs().mean()
+        / ref_dx.float().abs().mean()
+    )
+    dres_err = (
+        (single_state["d_res1"].float() - ref_dresidual.float()).abs().mean()
+        / ref_dresidual.float().abs().mean()
+    )
 
     return {
         "d_mlp_h": d_mlp_h_err.item(),
         "dQ": dq_err.item(),
         "dK": dk_err.item(),
         "dV": dv_err.item(),
+        "dx": dx_err.item(),
+        "d_res1": dres_err.item(),
     }
 
 

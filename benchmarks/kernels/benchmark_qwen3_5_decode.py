@@ -223,7 +223,7 @@ def _schedule_layer_ops(
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.glu import GLUOp
     from machete.kernels.qknorm_rope import QKNormRopeOp
-    from machete.kernels.attention import FlashAttentionOp
+    from machete.kernels.attention import flash_attention_schedule
 
     cos, sin = weights["cos"], weights["sin"]
     pfx = f"layer.{i}"
@@ -253,20 +253,21 @@ def _schedule_layer_ops(
         cos=cos, sin=sin, page_size=page_size,
     )
 
-    # 6. FlashAttention (reads from pre-filled cache)
-    # Same view pattern as benchmark_qwen3_5_layer.py: (B,S,Q_DIM) storage,
-    # viewed as (B,S,H,D) then permuted to (B,H,S,D) for FA.
-    # FA writes through the strided view; GEMM(O) reads attn_out_buf directly.
-    q_fa = q_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    k_full = k_caches[i][:, :, :pos + S, :]
-    v_full = v_caches[i][:, :, :pos + S, :]
-    o_fa = attn_out_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    # 6. Attention over the pre-filled cache.
+    # Use the shared scheduler so decode-like workloads can pick
+    # FlashDecoding on Blackwell/Hopper instead of forcing the prefill FA path.
+    # On SM120 the attention scheduler expects BSHD tensors, so keep the
+    # logical decode views in (B, S, H, D) form and permute the cache from
+    # its stored (B, H_kv, S, D) layout.
+    q_fa = q_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
+    k_full = k_caches[i][:, :, :pos + S, :].permute(0, 2, 1, 3)
+    v_full = v_caches[i][:, :, :pos + S, :].permute(0, 2, 1, 3)
+    o_fa = attn_out_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
 
-    fa_ops = FlashAttentionOp.schedule(
+    fa_ops, fa_config = flash_attention_schedule(
         q=q_fa, k=k_full, v=v_full, o=o_fa,
         kv_group_size=KV_GROUP_SIZE,
     )
-    fa_config = FlashAttentionOp.kernel_config(fa_ops)
     for op in fa_ops:
         op.dim_aliases["M"] = f"fa_M_{i}"
     ops += fa_ops

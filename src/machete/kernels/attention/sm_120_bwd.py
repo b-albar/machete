@@ -122,8 +122,14 @@ class FlashAttentionSm120BwdOp(Op):
         self.H_kv = getattr(self, 'H_kv', self.H // self.kv_group_size)
         self.q_b_stride = getattr(self, 'q_b_stride', self.H * self.M * self.D)
         self.q_h_stride = getattr(self, 'q_h_stride', self.M * self.D)
+        self.q_m_stride = getattr(self, 'q_m_stride', self.D)
         self.dq_b_stride = getattr(self, 'dq_b_stride', self.H * self.M * self.D)
         self.dq_h_stride = getattr(self, 'dq_h_stride', self.M * self.D)
+        self.dq_m_stride = getattr(self, 'dq_m_stride', self.D)
+        self.k_tma_permuted = bool(getattr(self, "k_tma_permuted", 0))
+        self.v_tma_permuted = bool(getattr(self, "v_tma_permuted", 0))
+        self.dk_tma_permuted = bool(getattr(self, "dk_tma_permuted", 0))
+        self.dv_tma_permuted = bool(getattr(self, "dv_tma_permuted", 0))
 
         assert self.k_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120BwdOp requires fp16 or bf16, got {self.k_dtype}"
@@ -135,6 +141,10 @@ class FlashAttentionSm120BwdOp(Op):
         self.scale_log2e = self.scale_val * 1.4426950408889634074
 
         self._init_mma()
+        self._k_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.k_tma_permuted else (self.D, self.tile_size_N, 1, 1)
+        self._v_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.v_tma_permuted else (self.D, self.tile_size_N, 1, 1)
+        self._dk_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.dk_tma_permuted else (self.D, self.tile_size_N, 1, 1)
+        self._dv_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.dv_tma_permuted else (self.D, self.tile_size_N, 1, 1)
 
     def _init_mma(self):
         """Init tile sizes, smem offsets, and cpasync layout."""
@@ -287,13 +297,26 @@ class FlashAttentionSm120BwdOp(Op):
         if k is not None:
             ops[0].static_dims["H"] = H
             ops[0].static_dims["H_kv"] = H_kv
+            if not k.is_contiguous():
+                ops[0].static_dims["k_tma_permuted"] = 1
+            v = tensors.get("v")
+            if v is not None and not v.is_contiguous():
+                ops[0].static_dims["v_tma_permuted"] = 1
+            dk = tensors.get("dk")
+            if dk is not None and not dk.is_contiguous():
+                ops[0].static_dims["dk_tma_permuted"] = 1
+            dv = tensors.get("dv")
+            if dv is not None and not dv.is_contiguous():
+                ops[0].static_dims["dv_tma_permuted"] = 1
             if q is not None:
                 ops[0].static_dims["q_b_stride"] = q.stride(0)
                 ops[0].static_dims["q_h_stride"] = q.stride(1)
+                ops[0].static_dims["q_m_stride"] = q.stride(2)
                 dq = tensors.get("dq")
                 if dq is not None:
                     ops[0].static_dims["dq_b_stride"] = dq.stride(0)
                     ops[0].static_dims["dq_h_stride"] = dq.stride(1)
+                    ops[0].static_dims["dq_m_stride"] = dq.stride(2)
 
         return ops
 
@@ -327,10 +350,10 @@ class FlashAttentionSm120BwdOp(Op):
         # K at page start
         sK = cute.make_tensor(
             cute.make_ptr(self.dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
+            cute.make_layout(self._k_tma_smem_shape),
         )
         gK = cute.local_tile(
-            k_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
+            k_tma_gmem, self._k_tma_smem_shape, (None, None, None, None),
         )
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
             k_tma, Int32(0), cute.make_layout(1),
@@ -341,10 +364,10 @@ class FlashAttentionSm120BwdOp(Op):
         v_base = page_ptr + Int32(self.kv_tile_bytes)
         sV = cute.make_tensor(
             cute.make_ptr(self.dtype, v_base, cute.AddressSpace.smem),
-            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
+            cute.make_layout(self._v_tma_smem_shape),
         )
         gV = cute.local_tile(
-            v_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
+            v_tma_gmem, self._v_tma_smem_shape, (None, None, None, None),
         )
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             v_tma, Int32(0), cute.make_layout(1),
@@ -354,8 +377,14 @@ class FlashAttentionSm120BwdOp(Op):
         nbytes = Int32(2 * self.kv_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(k_tma, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
-        cute.copy(v_tma, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
+        if self.k_tma_permuted:
+            cute.copy(k_tma, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
+        else:
+            cute.copy(k_tma, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
+        if self.v_tma_permuted:
+            cute.copy(v_tma, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
+        else:
+            cute.copy(v_tma, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # MMA Helpers
@@ -372,6 +401,7 @@ class FlashAttentionSm120BwdOp(Op):
         )
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
+
 
     # =========================================================================
     # Backward Compute -- M-block loop with 5 GEMMs per block
@@ -507,29 +537,6 @@ class FlashAttentionSm120BwdOp(Op):
             tQrQt_B_v = thr_copy_Qt_B.retile(tCrQt_B)
             tQsQt_B = thr_copy_Qt_B.partition_S(_sQt_B)
 
-            # -- dQ GEMM: C(m_block, D) = dS(m_block, tile_N) @ K(tile_N, D)
-            #    A = dS from dS_buf, non-transposed, row-padded. K-dim = tile_N.
-            #    B = K^T(D, tile_N) from K smem, TMA swizzle.
-            _sdS_dQ_A = cute.make_tensor(
-                cute.make_ptr(self.dtype, ds_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
-                cute.make_layout((self.m_block, self.tile_size_N), stride=(self.p_stride, 1)),
-            )
-            smem_copy_dS_dQ_A = cute.make_tiled_copy_A(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype), tiled_mma)
-            thr_copy_dS_dQ_A = smem_copy_dS_dQ_A.get_slice(tidx)
-            tCrdS_dQ_A = tiled_mma.make_fragment_A(thr_mma.partition_A(_sdS_dQ_A))
-            tdSrdS_dQ_A_v = thr_copy_dS_dQ_A.retile(tCrdS_dQ_A)
-            tdSsdS_dQ_A = thr_copy_dS_dQ_A.partition_S(_sdS_dQ_A)
-
-            _sKt_dQ_B = cute.make_tensor(
-                cute.recast_ptr(cute.make_ptr(self.dtype, k_smem_ptr, cute.AddressSpace.smem, assumed_align=128), kv_swz, dtype=self.dtype),
-                cute.make_layout((self.D, self.tile_size_N), stride=(1, self.D)),
-            )
-            smem_copy_Kt_dQ_B = cute.make_tiled_copy_B(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype), tiled_mma)
-            thr_copy_Kt_dQ_B = smem_copy_Kt_dQ_B.get_slice(tidx)
-            tCrKt_dQ_B = tiled_mma.make_fragment_B(thr_mma.partition_B(_sKt_dQ_B))
-            tKrKt_dQ_B_v = thr_copy_Kt_dQ_B.retile(tCrKt_dQ_B)
-            tKsKt_dQ_B = thr_copy_Kt_dQ_B.partition_S(_sKt_dQ_B)
-
             # -- CopyUniversal for R→S (P and dS accumulators to smem, row-padded) --
             smem_copy_C = cute.make_tiled_copy_C(
                 cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.dtype), tiled_mma
@@ -572,21 +579,12 @@ class FlashAttentionSm120BwdOp(Op):
             acc_dV.fill(0.0)
             acc_S = cute.make_fragment(tiled_mma.partition_shape_C((self.m_block, self.tile_size_N)), Float32)
             acc_dP = cute.make_fragment(tiled_mma.partition_shape_C((self.m_block, self.tile_size_N)), Float32)
-            acc_dQ = cute.make_fragment(tiled_mma.partition_shape_C((self.m_block, self.D)), Float32)
-
             # Identity tensor for S masking
             mcS = cute.make_identity_tensor((self.m_block, self.tile_size_N))
             tScS = thr_mma.partition_C(mcS)
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
             acc_S_shape = tiled_mma.partition_shape_C((self.m_block, self.tile_size_N))
             num_rows_S = acc_S_shape[0][1] * acc_S_shape[1]
-
-            # Identity for dQ atomicAdd
-            mc_dQ = cute.make_identity_tensor((self.m_block, self.D))
-            tSc_dQ = thr_mma.partition_C(mc_dQ)
-            tSc_dQ_mn = self._make_acc_tensor_mn_view(tSc_dQ)
-            dq_shape = tiled_mma.partition_shape_C((self.m_block, self.D))
-            num_rows_dQ = dq_shape[0][1] * dq_shape[1]
 
             # P and dS register fragments for R→S copy
             rP = cute.make_fragment_like(acc_S, self.dtype)
@@ -603,8 +601,14 @@ class FlashAttentionSm120BwdOp(Op):
                 # Global Q and dO pointers for current Q head
                 q_head_ptr = (q.iterator + tile_B * Int32(self.q_b_stride) + q_h * Int32(self.q_h_stride)).align(16)
                 do_head_ptr = (dout.iterator + tile_B * Int32(self.q_b_stride) + q_h * Int32(self.q_h_stride)).align(16)
-                gQ_head = cute.make_tensor(q_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1)))
-                gdO_head = cute.make_tensor(do_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1)))
+                gQ_head = cute.make_tensor(
+                    q_head_ptr,
+                    cute.make_layout((self.M, self.D), stride=(self.q_m_stride, 1)),
+                )
+                gdO_head = cute.make_tensor(
+                    do_head_ptr,
+                    cute.make_layout((self.M, self.D), stride=(self.q_m_stride, 1)),
+                )
 
                 # Global LSE, dPsum, dQ for current Q head
                 lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + q_h) * Int32(self.M)
@@ -613,8 +617,47 @@ class FlashAttentionSm120BwdOp(Op):
                 g_dpsum = cute.make_tensor(dpsum_head_ptr, cute.make_layout(self.M))
                 dqa_head_ptr = dq.iterator + tile_B * Int32(self.dq_b_stride) + q_h * Int32(self.dq_h_stride)
                 g_dq = cute.make_tensor(
-                    dqa_head_ptr, cute.make_layout((self.M, self.D), stride=(self.D, 1))
+                    dqa_head_ptr,
+                    cute.make_layout((self.M, self.D), stride=(self.dq_m_stride, 1)),
                 )
+
+                # dQ GEMM setup: keep this q-head-local so it does not stay live
+                # across the whole outer compute body.
+                _sdS_dQ_A = cute.make_tensor(
+                    cute.make_ptr(self.dtype, ds_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                    cute.make_layout((self.m_block, self.tile_size_N), stride=(self.p_stride, 1)),
+                )
+                smem_copy_dS_dQ_A = cute.make_tiled_copy_A(
+                    cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype),
+                    tiled_mma,
+                )
+                thr_copy_dS_dQ_A = smem_copy_dS_dQ_A.get_slice(tidx)
+                tCrdS_dQ_A = tiled_mma.make_fragment_A(thr_mma.partition_A(_sdS_dQ_A))
+                tdSrdS_dQ_A_v = thr_copy_dS_dQ_A.retile(tCrdS_dQ_A)
+                tdSsdS_dQ_A = thr_copy_dS_dQ_A.partition_S(_sdS_dQ_A)
+
+                _sKt_dQ_B = cute.make_tensor(
+                    cute.recast_ptr(
+                        cute.make_ptr(self.dtype, k_smem_ptr, cute.AddressSpace.smem, assumed_align=128),
+                        kv_swz,
+                        dtype=self.dtype,
+                    ),
+                    cute.make_layout((self.D, self.tile_size_N), stride=(1, self.D)),
+                )
+                smem_copy_Kt_dQ_B = cute.make_tiled_copy_B(
+                    cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype),
+                    tiled_mma,
+                )
+                thr_copy_Kt_dQ_B = smem_copy_Kt_dQ_B.get_slice(tidx)
+                tCrKt_dQ_B = tiled_mma.make_fragment_B(thr_mma.partition_B(_sKt_dQ_B))
+                tKrKt_dQ_B_v = thr_copy_Kt_dQ_B.retile(tCrKt_dQ_B)
+                tKsKt_dQ_B = thr_copy_Kt_dQ_B.partition_S(_sKt_dQ_B)
+                acc_dQ = cute.make_fragment(tiled_mma.partition_shape_C((self.m_block, self.D)), Float32)
+                mc_dQ = cute.make_identity_tensor((self.m_block, self.D))
+                tSc_dQ = thr_mma.partition_C(mc_dQ)
+                tSc_dQ_mn = self._make_acc_tensor_mn_view(tSc_dQ)
+                dq_shape = tiled_mma.partition_shape_C((self.m_block, self.D))
+                num_rows_dQ = dq_shape[0][1] * dq_shape[1]
 
                 # Prologue: load Q[0], dO[0] → smem
                 gQ_block = cute.local_tile(gQ_head, (self.m_block, self.D), (Int32(0), Int32(0)))
@@ -775,7 +818,7 @@ class FlashAttentionSm120BwdOp(Op):
                             for c in cutlass.range_constexpr(cute.size(tSc_dQ_mn.shape[1])):
                                 col_idx = tSc_dQ_mn[0, c][1]
                                 scaled_val = acc_dQ_mn[r, c] * Float32(self.scale_val)
-                                elem_offset = global_row * Int32(self.D) + Int32(col_idx)
+                                elem_offset = global_row * Int32(self.dq_m_stride) + Int32(col_idx)
                                 _atomic_add_f32(scaled_val, g_dq.iterator + elem_offset)
 
                     if m_next < Int32(self.num_m_blocks):
@@ -814,8 +857,7 @@ class FlashAttentionSm120BwdOp(Op):
                 cute.make_layout((self.tile_size_N, self.D), stride=(self.D, 1)),
             )
             tCrdK_q = cute.make_fragment_like(acc_dK, self.dtype)
-            for i in cutlass.range_constexpr(cute.size(acc_dK)):
-                tCrdK_q[i] = acc_dK[i].to(self.dtype)
+            tCrdK_q.store(acc_dK.load().to(self.dtype))
             tOrdK = thr_copy_out.retile(tCrdK_q)
             tOsdK = thr_copy_out.partition_D(sdK_out)
             cute.copy(smem_copy_out, tOrdK, tOsdK)
@@ -829,8 +871,7 @@ class FlashAttentionSm120BwdOp(Op):
                 cute.make_layout((self.tile_size_N, self.D), stride=(self.D, 1)),
             )
             tCrdV_q = cute.make_fragment_like(acc_dV, self.dtype)
-            for i in cutlass.range_constexpr(cute.size(acc_dV)):
-                tCrdV_q[i] = acc_dV[i].to(self.dtype)
+            tCrdV_q.store(acc_dV.load().to(self.dtype))
             tOrdV = thr_copy_out.retile(tCrdV_q)
             tOsdV = thr_copy_out.partition_D(sdV_out)
             cute.copy(smem_copy_out, tOrdV, tOsdV)
@@ -850,17 +891,20 @@ class FlashAttentionSm120BwdOp(Op):
             cute.recast_ptr(
                 cute.make_ptr(self.dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.dtype
             ),
-            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
+            cute.make_layout(self._dk_tma_smem_shape),
         )
         gdK = cute.local_tile(
-            dk_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
+            dk_tma_gmem, self._dk_tma_smem_shape, (None, None, None, None),
         )
         tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
             dk_tma, Int32(0), cute.make_layout(1),
             cute.group_modes(sdK, 0, 4), cute.group_modes(gdK, 0, 4),
         )
         with cute.arch.elect_one():
-            cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)])
+            if self.dk_tma_permuted:
+                cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)])
+            else:
+                cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)])
 
         # dV at page offset kv_tile_bytes
         sdV = cute.make_tensor(
@@ -868,17 +912,20 @@ class FlashAttentionSm120BwdOp(Op):
                 cute.make_ptr(self.dtype, page_ptr + Int32(self.kv_tile_bytes), cute.AddressSpace.smem),
                 _o_swz, dtype=self.dtype,
             ),
-            cute.make_layout((self.D, self.tile_size_N, 1, 1)),
+            cute.make_layout(self._dv_tma_smem_shape),
         )
         gdV = cute.local_tile(
-            dv_tma_gmem, (self.D, self.tile_size_N, 1, 1), (None, None, None, None),
+            dv_tma_gmem, self._dv_tma_smem_shape, (None, None, None, None),
         )
         tVsV, tVgV = cute.nvgpu.cpasync.tma_partition(
             dv_tma, Int32(0), cute.make_layout(1),
             cute.group_modes(sdV, 0, 4), cute.group_modes(gdV, 0, 4),
         )
         with cute.arch.elect_one():
-            cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)])
+            if self.dv_tma_permuted:
+                cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)])
+            else:
+                cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)])
 
 
 __all__ = ["FlashAttentionSm120BwdOp"]

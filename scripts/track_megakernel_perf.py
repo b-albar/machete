@@ -11,6 +11,7 @@ are not polluted by process-local caches:
 Supported workloads:
 - ``decode``: full Qwen decode megakernel with configurable layer count
 - ``prefill``: full Qwen prefill benchmark path built from fused layer kernels
+- ``backward``: full Qwen activation-backward megakernel with configurable layer count
 - ``layer-fwd``: single Qwen layer forward megakernel
 - ``layer-bwd``: single Qwen layer backward megakernel
 
@@ -120,6 +121,21 @@ def _track_prefill(args: argparse.Namespace) -> None:
     _print_table(rows, ["mode", "batch", "seq_len", "page_size"])
 
 
+def _track_backward(args: argparse.Namespace) -> None:
+    rows = []
+    for layers in args.layers:
+        rows.append(_run_worker([
+            "backward-worker",
+            "--layers", str(layers),
+            "--batch", str(args.batch),
+            "--seq-len", str(args.seq_len),
+            "--page-size", str(args.page_size),
+            "--warmup", str(args.warmup),
+            "--rep", str(args.rep),
+        ]))
+    _print_table(rows, ["mode", "layers", "batch", "seq_len", "page_size"])
+
+
 def _track_layer(args: argparse.Namespace, mode: str) -> None:
     rows = []
     for seq_len in args.seq_lens:
@@ -209,6 +225,45 @@ def _measure_prefill(args: argparse.Namespace) -> dict:
     runtime_ms = Benchmark()._bench_kernel_func(spec, warmup=args.warmup, rep=args.rep)
     return {
         "mode": "prefill",
+        "batch": args.batch,
+        "seq_len": args.seq_len,
+        "page_size": args.page_size,
+        "build_ms": build_ms,
+        "runtime_ms": runtime_ms,
+    }
+
+
+def _measure_backward(args: argparse.Namespace) -> dict:
+    import torch
+
+    from benchmarks.kernels.benchmark_qwen3_5_backward import megakernel_backward_build
+    from benchmarks.kernels.benchmark_qwen3_5_decode import HIDDEN, VOCAB_SIZE, allocate_model_weights
+    from machete.utils.benchmark import Benchmark
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    weights = allocate_model_weights(dtype=dtype, device="cuda")
+    x = torch.randn(args.batch, args.seq_len, HIDDEN, dtype=dtype, device="cuda")
+    residual = torch.randn(args.batch, args.seq_len, HIDDEN, dtype=dtype, device="cuda")
+    d_logits = torch.randn(args.batch, args.seq_len, VOCAB_SIZE, dtype=dtype, device="cuda")
+
+    t0 = time.perf_counter()
+    spec, _dx, _dres = megakernel_backward_build(
+        args.batch,
+        args.seq_len,
+        x,
+        residual,
+        weights,
+        d_logits,
+        page_size=args.page_size,
+        num_layers=args.layers,
+    )
+    torch.cuda.synchronize()
+    build_ms = (time.perf_counter() - t0) * 1000.0
+    runtime_ms = Benchmark()._bench_kernel_func(spec, warmup=args.warmup, rep=args.rep)
+    return {
+        "mode": "backward",
+        "layers": args.layers,
         "batch": args.batch,
         "seq_len": args.seq_len,
         "page_size": args.page_size,
@@ -344,6 +399,14 @@ def _build_parser() -> argparse.ArgumentParser:
     prefill.add_argument("--warmup", type=int, default=5)
     prefill.add_argument("--rep", type=int, default=20)
 
+    backward = sub.add_parser("backward")
+    backward.add_argument("--layers", nargs="+", type=int, default=[1, 2, 4])
+    backward.add_argument("--batch", type=int, default=1)
+    backward.add_argument("--seq-len", type=int, default=128)
+    backward.add_argument("--page-size", type=int, default=32768)
+    backward.add_argument("--warmup", type=int, default=5)
+    backward.add_argument("--rep", type=int, default=20)
+
     layer_fwd = sub.add_parser("layer-fwd")
     layer_fwd.add_argument("--seq-lens", nargs="+", type=int, default=[128, 512, 1024])
     layer_fwd.add_argument("--batch", type=int, default=1)
@@ -373,6 +436,14 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_prefill.add_argument("--warmup", type=int, required=True)
     worker_prefill.add_argument("--rep", type=int, required=True)
 
+    worker_backward = sub.add_parser("backward-worker")
+    worker_backward.add_argument("--layers", type=int, required=True)
+    worker_backward.add_argument("--batch", type=int, required=True)
+    worker_backward.add_argument("--seq-len", type=int, required=True)
+    worker_backward.add_argument("--page-size", type=int, required=True)
+    worker_backward.add_argument("--warmup", type=int, required=True)
+    worker_backward.add_argument("--rep", type=int, required=True)
+
     worker_layer_fwd = sub.add_parser("layer-fwd-worker")
     worker_layer_fwd.add_argument("--batch", type=int, required=True)
     worker_layer_fwd.add_argument("--seq-len", type=int, required=True)
@@ -401,6 +472,9 @@ def main() -> None:
         if args.mode == "prefill-worker":
             print(json.dumps(_measure_prefill(args)))
             return
+        if args.mode == "backward-worker":
+            print(json.dumps(_measure_backward(args)))
+            return
         if args.mode == "layer-fwd-worker":
             print(json.dumps(_measure_layer_fwd(args)))
             return
@@ -414,6 +488,9 @@ def main() -> None:
         return
     if args.mode == "prefill":
         _track_prefill(args)
+        return
+    if args.mode == "backward":
+        _track_backward(args)
         return
     if args.mode == "layer-fwd":
         _track_layer(args, "layer-fwd-worker")

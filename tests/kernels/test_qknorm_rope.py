@@ -16,8 +16,11 @@ import pytest
 import torch
 
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qknorm_rope import QKNormRopeOp
-from machete.kernels.qknorm_rope.ref import qknorm_rope_pytorch
+from machete.kernels.qknorm_rope import QKNormRopeBwdOp, QKNormRopeOp
+from machete.kernels.qknorm_rope.ref import (
+    qknorm_rope_backward_pytorch,
+    qknorm_rope_pytorch,
+)
 from machete.utils.testing import verify_kernel
 
 
@@ -65,6 +68,24 @@ def mk_qknorm_rope(q, norm_weight, cos, sin):
     q_out = q.clone()
     run_qknorm_rope(q_out, norm_weight, cos, sin)
     return q_out
+
+
+def mk_qknorm_rope_bwd(q, norm_weight, cos, sin, dout):
+    """Megakernel QKNorm+RoPE backward returning dq only."""
+    q_flat = q.float().view(q.shape[0] * q.shape[1], q.shape[2], q.shape[3]).contiguous()
+    dout_flat = dout.float().view_as(q_flat).contiguous()
+    dq_flat = torch.empty_like(q_flat)
+    ops = QKNormRopeBwdOp.schedule(
+        q=q_flat,
+        dout=dout_flat,
+        dq=dq_flat,
+        norm_weight=norm_weight.float().contiguous(),
+        cos=cos.float().contiguous(),
+        sin=sin.float().contiguous(),
+    )
+    kernel = Megakernel(ops, config=MegakernelConfig(num_sms=2))
+    kernel.run()
+    return dq_flat.view_as(q)
 
 
 def build_qknorm_rope_kernel(q, norm_weight, cos, sin, eps=1e-6, num_sms=2):
@@ -204,6 +225,53 @@ class TestQKNormRopeGPU:
         out = mk_qknorm_rope(q, norm_weight, cos, sin)
         assert not torch.isnan(out).any(), "NaN in output with tiny inputs"
         assert not torch.isinf(out).any(), "Inf in output with tiny inputs"
+
+    @pytest.mark.parametrize(
+        "b,s,h,d,d2",
+        [
+            (1, 16, 4, 128, 16),
+            (1, 32, 8, 256, 32),
+        ],
+    )
+    def test_reference_backward_matches_autograd(self, b, s, h, d, d2):
+        """Standalone backward reference stays consistent with autograd."""
+        torch.manual_seed(123)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda")
+        norm_weight = torch.randn(d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        dout = torch.randn_like(q)
+
+        dq_ref, dw_ref = qknorm_rope_backward_pytorch(
+            q, norm_weight, cos, sin, dout,
+        )
+
+        q_ = q.detach().clone().requires_grad_(True)
+        w_ = norm_weight.detach().clone().requires_grad_(True)
+        out = qknorm_rope_pytorch(q_, w_, cos, sin)
+        out.backward(dout)
+
+        torch.testing.assert_close(dq_ref, q_.grad, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(dw_ref, w_.grad, atol=1e-6, rtol=1e-6)
+
+    @pytest.mark.parametrize(
+        "b,s,h,d,d2",
+        [
+            (1, 16, 4, 128, 32),
+            (1, 32, 8, 256, 32),
+        ],
+    )
+    def test_backward_dq_matches_reference(self, b, s, h, d, d2):
+        """Megakernel backward dq matches PyTorch reference on the Qwen path."""
+        torch.manual_seed(7)
+        q = torch.randn(b, s, h, d, dtype=torch.float32, device="cuda")
+        norm_weight = torch.randn(d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        dout = torch.randn_like(q)
+        dq_ref, _ = qknorm_rope_backward_pytorch(q, norm_weight, cos, sin, dout)
+        dq_mk = mk_qknorm_rope_bwd(q, norm_weight, cos, sin, dout)
+        torch.testing.assert_close(dq_mk.float(), dq_ref.float(), atol=2e-1, rtol=0)
 
     def test_batch_dynamic_reuses_compiled_kernel(self):
         """Changing batch should not force recompilation for QKNormRope."""

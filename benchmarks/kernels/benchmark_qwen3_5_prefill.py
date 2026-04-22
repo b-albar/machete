@@ -123,10 +123,10 @@ def _schedule_prefill_layer_ops(
     q_4d = q_buf.view(batch * seq_len, NUM_Q_HEADS, HEAD_DIM)
     k_4d = k_buf.view(batch * seq_len, NUM_KV_HEADS, HEAD_DIM)
 
-    q_fa = q_buf.view(batch, seq_len, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    k_fa = k_buf.view(batch, seq_len, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    v_fa = v_buf.view(batch, seq_len, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-    o_fa = attn_out_buf.view(batch, seq_len, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+    q_fa = q_buf.view(batch, seq_len, NUM_Q_HEADS, HEAD_DIM)
+    k_fa = k_buf.view(batch, seq_len, NUM_KV_HEADS, HEAD_DIM)
+    v_fa = v_buf.view(batch, seq_len, NUM_KV_HEADS, HEAD_DIM)
+    o_fa = attn_out_buf.view(batch, seq_len, NUM_Q_HEADS, HEAD_DIM)
 
     fa_ops, fa_config = flash_attention_schedule(
         q=q_fa,

@@ -161,7 +161,7 @@ def _tile_call_args(op_cls, method_params: set) -> List[str]:
 
 def _tma_call_args(method_params_ordered: List[str], tma_local_mapping: Dict[str, str]) -> List[str]:
     """Map local TMA method parameters back to canonical wrapper parameter names."""
-    return [tma_local_mapping[param] for param in method_params_ordered if param in tma_local_mapping]
+    return [param for param in method_params_ordered if param in tma_local_mapping]
 
 
 def _wrapper_signature_suffix(is_load_phase, extra_params, tensor_param_names, tma_param_names) -> str:
@@ -174,8 +174,35 @@ def _wrapper_signature_suffix(is_load_phase, extra_params, tensor_param_names, t
     if tensor_param_names:
         parts.extend(dict.fromkeys(tensor_param_names))
     if tma_param_names:
-        parts.extend(tma_param_names)
+        parts.extend(dict.fromkeys(tma_param_names))
     return f", {', '.join(parts)}" if parts else ""
+
+
+def _tma_rebind_preamble(instance, tma_rebind_specs) -> str:
+    """Build wrapper source that rebinds shared TMA atoms to runtime desc ptrs."""
+    if not tma_rebind_specs:
+        return ""
+
+    lines: List[str] = []
+    for spec in tma_rebind_specs:
+        gmem_line = (
+            f"\n    {spec['local_gmem_name']} = make_runtime_tma_gmem(\n"
+            f"        {spec['direction']!r},\n"
+            f"        {spec['runtime_tensor_name']},\n"
+            f"        {spec['smem_layout_src']},\n"
+            f"        {spec['cta_tiler_src']},\n"
+            f"    )"
+        )
+        lines.append(
+            f"    {spec['local_atom_name']} = copy.copy({spec['wrapper_atom_name']})\n"
+            f"    {spec['local_atom_name']}._trait = RuntimeDescTMATrait(\n"
+            f"        {spec['wrapper_atom_name']}._trait.value,\n"
+            f"        runtime_desc_ptr_from_pool({spec['desc_pool_name']}, {spec['desc_slot_name']}),\n"
+            f"        field_namespace={spec['field_namespace']!r},\n"
+            f"        supports_mbar={spec['supports_mbar']},\n"
+            f"    ){gmem_line}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _tensor_reconstruction_preamble(instance, tensor_names: List[str]) -> Tuple[str, List[str]]:
@@ -240,6 +267,14 @@ def _tensor_reconstruction_preamble(instance, tensor_names: List[str]) -> Tuple[
 
         shape_src = "(" + ", ".join(shape_exprs) + ("," if len(shape_exprs) == 1 else "") + ")"
         stride_src = "(" + ", ".join(stride_exprs) + ("," if len(stride_exprs) == 1 else "") + ")"
+        stride_vals = [getattr(instance, f"{tensor_name}_stride_{dim_name}") for dim_name in dims]
+        one_stride_dims = [i for i, s in enumerate(stride_vals) if s == 1]
+        if len(one_stride_dims) == 1:
+            leading_dim = one_stride_dims[0]
+        elif stride_vals:
+            leading_dim = min(range(len(stride_vals)), key=lambda i: stride_vals[i])
+        else:
+            leading_dim = 0
         tensor_src = (
             f"cute.make_tensor("
             f"cute.make_ptr(_instance.{dtype_attr}, ld_global_i64(op_config_ptr, Int32({ptr_slot})), "
@@ -248,6 +283,9 @@ def _tensor_reconstruction_preamble(instance, tensor_names: List[str]) -> Tuple[
             f")"
         )
         preamble_lines.append(f"    {tensor_name} = {tensor_src}")
+        preamble_lines.append(
+            f"    {tensor_name}.mark_layout_dynamic(leading_dim={leading_dim})"
+        )
 
     if not preamble_lines:
         return "", fallback_names
@@ -291,6 +329,7 @@ def _build_phase_wrapper(
     tma_local_mapping=None,
     reconstruct_tensors=False,
     extra_reconstruct_tensor_names=None,
+    tma_rebind_specs=None,
 ):
     """Build a @cute.jit wrapper that delegates to an Op instance method.
 
@@ -413,6 +452,16 @@ def _build_phase_wrapper(
     has_tma = bool(tma_local_mapping)
 
     body = _wrapper_body(phase_name, call_str, append_mbar, has_tma)
+    if tma_local_mapping and not tma_rebind_specs:
+        alias_lines = [
+            f"    {local_name} = {canonical_name}"
+            for local_name, canonical_name in tma_local_mapping.items()
+            if local_name != canonical_name
+        ]
+        if alias_lines:
+            body = "\n".join(alias_lines) + "\n" + body
+    if tma_rebind_specs:
+        body = _tma_rebind_preamble(instance, tma_rebind_specs) + body
     if reconstruct_preamble:
         body = reconstruct_preamble + body
     needs_fence = phase_name == "compute" or phase_name in ("store", "communicate")
@@ -430,6 +479,15 @@ def _build_phase_wrapper(
         "Int64": Int64,
         "_instance": instance,
     }
+    if tma_rebind_specs:
+        import copy
+
+        from .transport import RuntimeDescTMATrait, make_runtime_tma_gmem, runtime_desc_ptr_from_pool
+
+        exec_globals["copy"] = copy
+        exec_globals["RuntimeDescTMATrait"] = RuntimeDescTMATrait
+        exec_globals["make_runtime_tma_gmem"] = make_runtime_tma_gmem
+        exec_globals["runtime_desc_ptr_from_pool"] = runtime_desc_ptr_from_pool
     if reconstruct_preamble:
         from .interpreter import ld_global_i32, ld_global_i64
 
@@ -498,6 +556,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_local_mapping=tma_local_mapping,
             reconstruct_tensors=reconstruct_tensors,
             extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
+            tma_rebind_specs=getattr(instance, "_machete_tma_rebind_specs", {}).get(phase_name),
         )
     else:
         fn = _build_phase_wrapper(
@@ -509,6 +568,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             tma_local_mapping=tma_local_mapping,
             reconstruct_tensors=reconstruct_tensors,
             extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
+            tma_rebind_specs=getattr(instance, "_machete_tma_rebind_specs", {}).get(phase_name),
         )
 
     if noinline:

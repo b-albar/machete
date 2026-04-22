@@ -467,6 +467,7 @@ class RMSNormBwdOp(Op):
         "x": (None, ("B", "S", "D")),
         "weight": (None, ("B", "S", "D")),
         "gate": (None, ("B", "S", "D")),
+        "add": (None, ("B", "S", "D")),
     }
     writes = {
         "dx": (None, ("B", "S", "D")),
@@ -485,6 +486,7 @@ class RMSNormBwdOp(Op):
         self.gemma = getattr(self, 'gemma', 0)
         self.has_residual = getattr(self, 'has_residual', 0)
         self.has_gate = getattr(self, 'has_gate', 0)
+        self.has_add = getattr(self, 'has_add', 0)
         self.per_row_weight = getattr(self, 'per_row_weight', 0)
         if self.x_dtype in (cutlass.Float16, cutlass.BFloat16):
             self.elem_bytes = 2
@@ -512,13 +514,16 @@ class RMSNormBwdOp(Op):
         x, dx = tensors['x'], tensors['dx']
         has_residual = 'd_residual' in tensors
         has_gate = 'gate' in tensors
+        has_add = 'add' in tensors
         if not has_gate:
             tensors['gate'] = x
+        if not has_add:
+            tensors['add'] = x
         if not has_residual:
             tensors['d_residual'] = dx
         if 'dgate' not in tensors:
             tensors['dgate'] = dx
-        return has_residual, has_gate
+        return has_residual, has_gate, has_add
 
     @classmethod
     def schedule(cls, tile_sizes=None, residual=False, gemma=False,
@@ -526,7 +531,7 @@ class RMSNormBwdOp(Op):
                          **tensors):
         tensors = dict(tensors)
         _expand_weight(tensors)
-        has_residual, has_gate = cls._fill_dummies(tensors)
+        has_residual, has_gate, has_add = cls._fill_dummies(tensors)
         tile_sizes = dict(tile_sizes or {})
         D = tensors['x'].shape[-1]
         elem_bytes = tensors['x'].element_size()
@@ -546,6 +551,8 @@ class RMSNormBwdOp(Op):
             ops[0].static_dims['has_residual'] = 1
         if has_gate:
             ops[0].static_dims['has_gate'] = 1
+        if has_add:
+            ops[0].static_dims['has_add'] = 1
         if per_row_weight:
             ops[0].static_dims['per_row_weight'] = 1
         ops[0].static_dims['page_size'] = page_size
@@ -631,6 +638,13 @@ class RMSNormBwdOp(Op):
                 op_config_ptr,
                 type(self)._CONFIG_PTR_I64_INDEX["dgate"],
                 self.dgate_dtype,
+                flat_size,
+            )
+        if const_expr(self.has_add):
+            add = _config_flat_tensor(
+                op_config_ptr,
+                type(self)._CONFIG_PTR_I64_INDEX["add"],
+                self.add_dtype,
                 flat_size,
             )
         if const_expr(self.has_residual):
@@ -747,6 +761,14 @@ class RMSNormBwdOp(Op):
                     dx_reg = cute.make_fragment_like(x_reg)
 
                     if const_expr(self.has_gate):
+                        add_reg = cute.make_fragment_like(x_part)
+                        if const_expr(self.has_add):
+                            add_row = cute.make_tensor(
+                                add.iterator + global_offset,
+                                cute.make_layout(self.D),
+                            )
+                            add_part = cute.local_partition(add_row, thr_layout, tidx)
+                            cute.autovec_copy(add_part, add_reg)
                         dgate_reg = cute.make_fragment_like(x_reg)
                         for i in range(cute.size(x_reg)):
                             g = gate_reg[i].to(Float32)
@@ -761,6 +783,8 @@ class RMSNormBwdOp(Op):
                             dy_norm = d * silu_g
                             dw_x = dy_norm * wi
                             dx_val = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
+                            if const_expr(self.has_add):
+                                dx_val = dx_val + add_reg[i].to(Float32)
 
                             normed = x_val * rstd * wi
                             dgate_val = d * normed * silu_grad
@@ -776,6 +800,14 @@ class RMSNormBwdOp(Op):
                         dgate_part = cute.local_partition(dgate_row, thr_layout, tidx)
                         cute.autovec_copy(dgate_reg, dgate_part)
                     else:
+                        add_reg = cute.make_fragment_like(x_part)
+                        if const_expr(self.has_add):
+                            add_row = cute.make_tensor(
+                                add.iterator + global_offset,
+                                cute.make_layout(self.D),
+                            )
+                            add_part = cute.local_partition(add_row, thr_layout, tidx)
+                            cute.autovec_copy(add_part, add_reg)
                         for i in range(cute.size(x_reg)):
                             d = dout_reg[i].to(Float32)
                             wi = w_reg[i].to(Float32)
@@ -784,6 +816,8 @@ class RMSNormBwdOp(Op):
                             result = (dw_x - x_val * rstd * rstd * mean_grad) * rstd
                             if const_expr(self.residual):
                                 result = result + d
+                            if const_expr(self.has_add):
+                                result = result + add_reg[i].to(Float32)
                             dx_reg[i] = result.to(self.x_dtype)
 
                     # Write dx to smem (overwrite x row)

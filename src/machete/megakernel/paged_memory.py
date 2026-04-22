@@ -291,14 +291,14 @@ class NPageLayout:
     page_size: int = 16384
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 56 bytes
-    #   [op_idx, linear_tile_idx, handler_idx, handler_local_idx,
-    #    tile_0..tile_4, inner_iters, reserved pad, num_warps, op_config_ptr]
+    # - Per-page tile info: num_pages * 48 bytes
+    #   [op_idx, linear_tile_idx, handler_idx,
+    #    tile_0..tile_4, inner_iters, num_warps, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 56  # Per-page tile metadata (12 int32 slots incl. pad + 1 int64)
+    _TILE_INFO_SIZE: int = 48  # Per-page tile metadata (10 int32 slots + 1 int64)
     _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
     _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
