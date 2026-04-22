@@ -346,7 +346,3 @@ class TestTileSizeRatios:
             assert result[k].item() == expected_sum, (
                 f"tile {k}: expected {expected_sum}, got {result[k].item()}"
             )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

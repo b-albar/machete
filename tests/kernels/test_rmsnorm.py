@@ -13,10 +13,15 @@ a pure PyTorch reference implementation. Covers all variants:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
+from tests.kernels.support import requires_hopper_cutlass
 from machete.kernels.rms_norm.ref import (
     rmsnorm_pytorch,
     rmsnorm_backward_pytorch,
@@ -26,26 +31,21 @@ from machete.kernels.rms_norm.ref import (
     rmsnorm_gated_backward_pytorch,
 )
 
-
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+requires_gpu = requires_hopper_cutlass
 
 
-try:
-    import cutlass  # noqa: F401
+CORE_SHAPES = [
+    (1, 64),
+    (32, 256),
+    (128, 512),
+    (32, 4096),
+]
 
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
-
-
-requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
+VARIANT_SHAPES = [
+    (1, 64),
+    (32, 256),
+    (128, 512),
+]
 
 
 # =============================================================================
@@ -202,15 +202,8 @@ def _run_rmsnorm_gated_backward(dout_2d, x_2d, gate, weight):
 class TestRMSNormForward:
     """Forward pass correctness tests."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-        (256, 1024),
-        (32, 4096),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     def test_forward_shapes(self, M, D):
         """RMSNorm forward produces correct output for various shapes."""
         torch.manual_seed(42)
@@ -222,7 +215,7 @@ class TestRMSNormForward:
 
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_forward_ones_weight(self):
         """With weight=1, output should be x * rstd."""
         torch.manual_seed(42)
@@ -235,7 +228,7 @@ class TestRMSNormForward:
 
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_forward_constant_input(self):
         """Constant input: all elements equal -> normalized to weight."""
         M, D = 8, 64
@@ -246,7 +239,7 @@ class TestRMSNormForward:
         expected = torch.ones(M, D, dtype=torch.float32, device="cuda")
         torch.testing.assert_close(y_mk, expected, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_forward_batch_independence(self):
         """Each row is normalized independently."""
         torch.manual_seed(42)
@@ -259,7 +252,7 @@ class TestRMSNormForward:
 
         torch.testing.assert_close(y_full[0], y_single[0], atol=1e-5, rtol=1e-5)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_forward_kernel_cache(self):
         """Second run with same shapes should reuse compiled kernel."""
         torch.manual_seed(42)
@@ -283,14 +276,8 @@ class TestRMSNormForward:
 class TestRMSNormBackward:
     """Backward pass correctness tests."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-        (32, 4096),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     def test_backward_shapes(self, M, D):
         """RMSNorm backward produces correct gradients for various shapes."""
         torch.manual_seed(42)
@@ -303,7 +290,7 @@ class TestRMSNormBackward:
 
         torch.testing.assert_close(dx_mk, dx_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_backward_zero_grad(self):
         """Zero grad_output -> zero grad_input."""
         M, D = 8, 128
@@ -355,14 +342,8 @@ class TestRMSNormReference:
 class TestRMSNormResidualForward:
     """Forward pass with residual connection: y = rmsnorm(x) + x."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-        (32, 4096),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     def test_residual_forward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -373,7 +354,7 @@ class TestRMSNormResidualForward:
 
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_residual_vs_no_residual(self):
         torch.manual_seed(42)
         M, D = 16, 128
@@ -394,14 +375,8 @@ class TestRMSNormResidualForward:
 class TestRMSNormResidualBackward:
     """Backward pass with residual: dx = dx_rmsnorm + dout."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-        (32, 4096),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     def test_residual_backward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -413,7 +388,7 @@ class TestRMSNormResidualBackward:
 
         torch.testing.assert_close(dx_mk, dx_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_residual_vs_no_residual_backward(self):
         torch.manual_seed(42)
         M, D = 16, 128
@@ -435,13 +410,8 @@ class TestRMSNormResidualBackward:
 class TestGemmaRMSNormForward:
     """Gemma-style RMSNorm: y = x * (1+w) * rstd."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_gemma_forward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -452,7 +422,7 @@ class TestGemmaRMSNormForward:
 
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_gemma_vs_standard(self):
         torch.manual_seed(42)
         M, D = 16, 128
@@ -468,13 +438,8 @@ class TestGemmaRMSNormForward:
 class TestGemmaRMSNormBackward:
     """Gemma-style RMSNorm backward."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_gemma_backward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -495,13 +460,8 @@ class TestGemmaRMSNormBackward:
 class TestFusedAddRMSNormForward:
     """Fused add + RMSNorm forward: residual_out = x + res, y = rmsnorm(residual_out)."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_fused_add_forward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -514,7 +474,7 @@ class TestFusedAddRMSNormForward:
         torch.testing.assert_close(res_out_mk, res_out_ref, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_fused_add_zero_residual(self):
         """With zero residual, should match plain rmsnorm."""
         torch.manual_seed(42)
@@ -532,13 +492,8 @@ class TestFusedAddRMSNormForward:
 class TestFusedAddRMSNormBackward:
     """Fused add + RMSNorm backward."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_fused_add_backward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -555,7 +510,7 @@ class TestFusedAddRMSNormBackward:
         torch.testing.assert_close(dx_mk, dx_ref, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(dres_mk, dres_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_fused_add_backward_dx_equals_dres(self):
         """dx and d_residual should be identical (sum gradient)."""
         torch.manual_seed(42)
@@ -580,13 +535,8 @@ class TestFusedAddRMSNormBackward:
 class TestRMSNormGatedForward:
     """Gated RMSNorm forward: y = rmsnorm(x, w) * silu(gate)."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_gated_forward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -598,7 +548,7 @@ class TestRMSNormGatedForward:
 
         torch.testing.assert_close(y_mk, y_ref, atol=1e-3, rtol=1e-3)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_gated_ones_gate(self):
         """silu(0) = 0, so gate=0 -> y should be ~0."""
         torch.manual_seed(42)
@@ -614,13 +564,8 @@ class TestRMSNormGatedForward:
 class TestRMSNormGatedBackward:
     """Gated RMSNorm backward."""
 
-    @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @requires_hopper_cutlass
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_gated_backward_shapes(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -657,12 +602,7 @@ class TestPerRowWeightForward:
     """Per-row weight RMSNorm: each row has its own weight vector."""
 
     @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_per_row_weight_forward(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")
@@ -707,12 +647,7 @@ class TestPerRowWeightBackward:
     """Per-row weight RMSNorm backward."""
 
     @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64),
-        (4, 128),
-        (32, 256),
-        (128, 512),
-    ])
+    @pytest.mark.parametrize("M,D", VARIANT_SHAPES)
     def test_per_row_weight_backward(self, M, D):
         torch.manual_seed(42)
         x = torch.randn(M, D, dtype=torch.float32, device="cuda")

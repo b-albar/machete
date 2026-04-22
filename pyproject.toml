@@ -75,3 +75,20 @@ exclude = [
 init_forbid_extra = true
 init_typed = true
 warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu: tests that exercise CUDA kernels or device runtime behavior",
+    "kernels: kernel-level tests under tests/kernels",
+    "megakernel: megakernel framework tests under tests/megakernel",
+    "patching: model patching/integration tests under tests/patching and tests/test_patch.py",
+    "unit: fast host-side or narrowly scoped behavioral coverage",
+    "smoke: compile-and-run sanity coverage for maintained default paths",
+    "integration: multi-op, model, or cross-subsystem coverage",
+    "slow: heavier end-to-end checks that are not the default fast gate",
+    "deps: scheduler dependency-mapping coverage under tests/megakernel/deps",
+    "arch_sm100: tests specific to SM100 kernels or behavior",
+    "arch_sm120: tests specific to SM120 kernels or behavior",
+]

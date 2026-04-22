@@ -8,8 +8,13 @@ Tests that the megakernel framework correctly:
 3. Op's load/store methods use TMA copy atoms for async DMA
 """
 
+import importlib.util
+
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 import cutlass
 import cutlass.cute as cute

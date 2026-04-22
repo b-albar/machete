@@ -14,9 +14,13 @@ Tests include:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 
 def is_hopper_or_newer():
@@ -426,4 +430,3 @@ class TestFullyFused:
             o_fused.float(), o_ref.float(), atol=5e-1, rtol=2e-1,
             msg="Fully fused GDN output mismatch vs reference",
         )
-

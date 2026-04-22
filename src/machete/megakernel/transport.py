@@ -56,24 +56,6 @@ def runtime_desc_ptr_type():
     return cute_ir.PtrType.get(cn.TmaDescriptorTiledType.get(), 0, 64)
 
 
-def runtime_desc_gmem_ptr_from_pool(pool_ptr, slot, *, loc=None, ip=None):
-    """Return a gmem typed tensormap pointer for one descriptor pool slot."""
-    byte_ptr = cute.make_ptr(
-        Uint8,
-        pool_ptr,
-        AddressSpace.gmem,
-        assumed_align=_TMA_DESC_BYTES,
-        loc=loc,
-        ip=ip,
-    )
-    return _TMA_DESC_MANAGER.get_tensormap_ptr(
-        byte_ptr + Int64(slot) * Int64(_TMA_DESC_BYTES),
-        address_space=AddressSpace.gmem,
-        loc=loc,
-        ip=ip,
-    )
-
-
 def runtime_desc_ptr_from_pool(pool_ptr, slot, *, loc=None, ip=None):
     """Return a generic typed tensormap pointer for one descriptor pool slot."""
     byte_ptr = cute.make_ptr(
@@ -91,17 +73,6 @@ def runtime_desc_ptr_from_pool(pool_ptr, slot, *, loc=None, ip=None):
         ip=ip,
     )
     return desc_ptr
-
-
-def init_runtime_desc_pool_slot(copy_atom, pool_ptr, slot, *, warp_id=0, loc=None, ip=None):
-    """Initialize one descriptor pool slot from a copy atom."""
-    _TMA_DESC_MANAGER.init_tensormap_from_atom(
-        copy_atom,
-        runtime_desc_gmem_ptr_from_pool(pool_ptr, slot, loc=loc, ip=ip),
-        warp_id=warp_id,
-        loc=loc,
-        ip=ip,
-    )
 
 
 def fence_runtime_desc_pool(*, loc=None, ip=None):

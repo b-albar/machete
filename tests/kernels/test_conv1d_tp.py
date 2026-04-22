@@ -8,9 +8,13 @@ Tests:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 from machete.kernels.conv1d.ref import causal_conv1d_ref
 
@@ -188,8 +192,3 @@ class TestConv1dTPMultiGPU:
         torch.testing.assert_close(y, ref, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
             peer_y.to("cuda:0"), ref, atol=1e-2, rtol=1e-2)
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main(["-v", __file__]))

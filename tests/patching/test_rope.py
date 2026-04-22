@@ -4,19 +4,12 @@
 import pytest
 import torch
 
+from tests.support import is_hopper_available
 from machete.patching.ops.rope import (
     MacheteRoPE,
     apply_rope,
     HAS_MEGAKERNEL_ROPE,
 )
-
-
-def is_hopper_available():
-    """Check if Hopper (SM90+) GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 def rope_pytorch_ref(q, cos, sin):

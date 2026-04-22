@@ -231,38 +231,6 @@ def global_barrier_signal_gpu(
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
-
-@dsl_user_op
-def atomic_add_acq_rel_gpu_i32(
-    base_ptr: Int64,
-    idx: Int32,
-    loc=None,
-    ip=None,
-) -> Int32:
-    """Atomic increment (add 1) with acquire-release semantics, GPU scope.
-
-    Computes address as base_ptr + idx * 4, then atomically adds 1.
-    Returns the OLD value before the increment. Used for cross-block
-    coordination: release ensures this block's prior writes are visible,
-    acquire ensures the caller sees other blocks' released writes.
-    """
-    return llvm.inline_asm(
-        Int32.mlir_type,
-        [base_ptr.ir_value(loc=loc, ip=ip), idx.ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .u64 %addr;
-            mad.wide.u32 %addr, $2, 4, $1;
-            atom.add.acq_rel.gpu.global.u32 $0, [%addr], 1;
-        }
-        """,
-        "=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 # =============================================================================
 # Instruction Stream Access
 # =============================================================================

@@ -6,19 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.support import is_sm90_available
 from machete.patching.ops.linear_cross_entropy import (
     MacheteLinearCrossEntropy,
     fused_linear_cross_entropy,
     HAS_QUACK_LINEAR_CE,
 )
-
-
-def is_sm90_available():
-    """Check if SM90+ GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 def linear_cross_entropy_ref(x, weight, target, ignore_index=-100, reduction="mean"):

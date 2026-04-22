@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.support import is_sm90_available
 from machete.patching.glm4 import (
     ATTENTION_CLASSES,
     RMSNORM_CLASSES,
@@ -17,14 +18,6 @@ from machete.patching.glm4 import (
     unpatch_causal_lm,
 )
 from machete.patch import patch, unpatch, is_patched, MODEL_TYPE_MODULES
-
-
-def is_sm90_available():
-    """Check if SM90+ GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 # =============================================================================

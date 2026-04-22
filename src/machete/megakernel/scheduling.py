@@ -20,9 +20,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
-import cutlass.cute as cute
-from cutlass import Int32
-
 from .ops import MAX_TILE_DIMS, Op, ScheduledOp
 
 
@@ -174,55 +171,6 @@ class _DepEdge:
     consumer_idx: int
     kind: str  # "one_to_one", "many_to_one", "one_to_many"
 
-
-def _compute_formula_coeffs(
-    source_op: ScheduledOp,
-    target_op: ScheduledOp,
-    shared_dims: Set[str],
-) -> Tuple[int, ...]:
-    """Compute coefficients for source computing target's barrier index.
-
-    Maps shared dimension values from source tile coordinates to target's
-    linear index. The target's strides are computed from tile_counts
-    (row-major: stride[i] = product of tile_counts[i+1:]).
-
-    For each shared dim, find which axis it maps to on each side, then
-    accumulate the target stride onto the source axis coefficient.
-
-    Returns:
-        Tuple of MAX_TILE_DIMS coefficients.
-    """
-    s_dims = source_op.dim_names
-    t_dims = target_op.dim_names
-
-    # Compute target strides from tile_counts (row-major linearization)
-    t_counts = target_op.tile_counts
-    t_strides = {}
-    stride = 1
-    for i in range(len(t_counts) - 1, -1, -1):
-        t_strides[i] = stride
-        stride *= t_counts[i]
-
-    coeffs = [0] * MAX_TILE_DIMS
-
-    if shared_dims:
-        for dim in shared_dims:
-            s_axis = s_dims[dim]
-            t_axis = t_dims[dim]
-            coeffs[s_axis] += t_strides[t_axis]
-    elif not s_dims and not t_dims:
-        # Raw ops (no named dimensions): use source's own linear index
-        s_counts = source_op.tile_counts
-        stride = 1
-        for i in range(len(s_counts) - 1, -1, -1):
-            coeffs[i] = stride
-            stride *= s_counts[i]
-    # else: named ops with no shared dims — should not happen
-    # (_resolve_named_formulas raises ValueError before reaching here)
-
-    return tuple(coeffs)
-
-
 # =============================================================================
 # Tile Schedulers
 # =============================================================================
@@ -261,24 +209,6 @@ class TileScheduler(ABC):
             Ordered list of TileInstruction (without END marker)
         """
         pass
-
-    @staticmethod
-    def _producer_threshold(
-        edge: "_DepEdge",
-        consumer_cursor: int,
-        producer_total: int,
-        consumer_total: int,
-    ) -> int:
-        """Minimum producer tiles that must be emitted before consumer tile k."""
-        if edge.kind == "many_to_one":
-            return producer_total
-        elif edge.kind == "one_to_many":
-            return min(
-                (consumer_cursor * producer_total) // consumer_total + 1,
-                producer_total,
-            )
-        else:
-            return min(consumer_cursor + 1, producer_total)
 
 
 def _compute_op_depths(num_ops: int, edges: List["_DepEdge"]) -> List[int]:
@@ -1142,86 +1072,6 @@ class InstructionStreamBuilder:
         while len(entry) < max_waits * 2:
             entry.extend([-1, 0])
         return entry
-
-    def build_decompose_tile_fn(self):
-        """Build a @cute.jit function that decomposes (op_idx, linear_idx) → (t0..t4).
-
-        Uses compile-time baked per-op tile_counts to perform integer
-        div/mod decomposition. Pure ALU — no memory access.
-
-        Returns:
-            A @cute.jit function: decompose_tile(op_idx, linear_idx) → (t0, t1, t2, t3, t4)
-        """
-        import linecache
-        import machete.megakernel.compile as compile_mod
-
-        lines = []
-        for rec in self._op_records:
-            idx = rec.op_idx
-            tc = rec.op.tile_counts
-            ndims = len(tc)
-            keyword = "if" if idx == 0 else "elif"
-
-            # Build decomposition: divide linear_idx by strides
-            # For tile_counts = (4, 3, 2): strides = (6, 2, 1)
-            # t0 = linear_idx // 6; rem = linear_idx % 6
-            # t1 = rem // 2; t2 = rem % 2
-            body_lines = []
-            if ndims == 1:
-                body_lines.append("        t0 = _lin")
-            else:
-                remainder = "_lin"
-                for d in range(ndims):
-                    stride = 1
-                    for k in range(d + 1, ndims):
-                        stride *= tc[k]
-                    if d == ndims - 1:
-                        body_lines.append(f"        t{d} = {remainder}")
-                    else:
-                        body_lines.append(
-                            f"        t{d} = {remainder} // Int32({stride})"
-                        )
-                        if d < ndims - 2:
-                            body_lines.append(
-                                f"        {remainder} = {remainder} % Int32({stride})"
-                            )
-                        else:
-                            # Last remainder becomes the final dim
-                            body_lines.append(
-                                f"        t{d+1} = {remainder} % Int32({stride})"
-                            )
-                            break
-
-            lines.append(
-                f"    {keyword} op_idx == Int32({idx}):\n"
-                + "\n".join(body_lines)
-            )
-
-        body = "\n".join(lines) if lines else "    pass"
-        fn_source = (
-            "@cute.jit\n"
-            "def decompose_tile(op_idx, linear_idx):\n"
-            "    t0 = Int32(0)\n"
-            "    t1 = Int32(0)\n"
-            "    t2 = Int32(0)\n"
-            "    t3 = Int32(0)\n"
-            "    t4 = Int32(0)\n"
-            "    _lin = linear_idx\n"
-            f"{body}\n"
-            "    return t0, t1, t2, t3, t4\n"
-        )
-
-        exec_globals = {"cute": cute, "Int32": Int32}
-        compile_mod._compile_counter += 1
-        unique_filename = f"<decompose_tile>_{compile_mod._compile_counter}"
-        linecache.cache[unique_filename] = (
-            len(fn_source), None, fn_source.splitlines(True), unique_filename,
-        )
-        compile_mod._linecache_entries.append(unique_filename)
-
-        code = compile(fn_source, unique_filename, "exec")
-        exec(code, exec_globals)
-        return exec_globals["decompose_tile"]
 
     def get_op_barrier_formulas(self) -> Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]:
         """Get per-op barrier formulas for compile-time baking.

@@ -45,20 +45,32 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from cutlass.cute.nvgpu import warp
+import torch
 
-from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, config_dim_i32
 from machete.megakernel.interpreter import (
-    ld_global_i32,
     named_barrier_sync,
 )
 
 
-def _config_dim_i32(op_config_ptr, dim_name: str, cls):
-    """Load one packed dynamic dimension from the op config."""
-    return ld_global_i32(
-        op_config_ptr,
-        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
-    )
+def _max_attention_page_size(device=None):
+    if device is None:
+        device = torch.cuda.current_device()
+    max_smem = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return ((max_smem - 512) // 128) * 128
+
+
+def _effective_page_size(q, page_size):
+    if page_size is None:
+        return _max_attention_page_size(q.device)
+    return page_size
+
+
+def _bshd_to_bhsd(x):
+    if x is None:
+        return None
+    assert x.ndim == 4, f"Expected 4D BSHD tensor, got shape={tuple(x.shape)}"
+    return x.permute(0, 2, 1, 3)
 
 
 class FlashAttentionSm120Op(Op):
@@ -272,8 +284,9 @@ class FlashAttentionSm120Op(Op):
                          kv_group_size=1, **tensors):
         """Schedule cooperative flash attention forward.
 
-        Accepts 4D tensors (B, H, M, D) or 3D tensors (BH, M, D) for backward
-        compatibility (3D is treated as B=1, H=BH).
+        Accepts 4D tensors in BSHD layout or 3D tensors `(BH, M, D)` for
+        backward compatibility. 4D tensors are converted to zero-copy BHSD
+        views internally before scheduling the underlying kernel.
 
         Two modes depending on page_size:
         - Q-in-smem: Q persists in smem alongside KV. tile_M can be 2x warps
@@ -281,8 +294,6 @@ class FlashAttentionSm120Op(Op):
         - Q-preload: Q preloaded to registers, smem reclaimed for KV.
           tile_M = warps * 16. Used for smaller page_size.
         """
-        import torch
-
         # 3D backward compat: reshape (BH, M, D) → (1, BH, M, D)
         for name in ("q", "k", "v", "o"):
             t = tensors.get(name)
@@ -290,6 +301,12 @@ class FlashAttentionSm120Op(Op):
                 tensors[name] = t.unsqueeze(0)
         if "lse" in tensors and tensors["lse"] is not None and tensors["lse"].ndim == 2:
             tensors["lse"] = tensors["lse"].unsqueeze(0)
+        elif tensors.get("q") is not None and tensors["q"].ndim == 4:
+            q = tensors["q"]
+            page_size = _effective_page_size(q, page_size)
+            for name in ("q", "k", "v", "o"):
+                if tensors.get(name) is not None:
+                    tensors[name] = _bshd_to_bhsd(tensors[name])
 
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
@@ -489,7 +506,7 @@ class FlashAttentionSm120Op(Op):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
 
-        runtime_N = _config_dim_i32(op_config_ptr, "N", type(self))
+        runtime_N = config_dim_i32(op_config_ptr, "N", type(self))
         runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
         runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
         runtime_v_b_stride = Int32(self.v_b_stride) if self.v_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
@@ -858,7 +875,7 @@ class FlashAttentionSm120Op(Op):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
 
-        runtime_N = _config_dim_i32(op_config_ptr, "N", type(self))
+        runtime_N = config_dim_i32(op_config_ptr, "N", type(self))
         runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
         runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
         runtime_v_b_stride = Int32(self.v_b_stride) if self.v_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)

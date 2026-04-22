@@ -32,30 +32,16 @@ from cutlass.cute.nvgpu.cpasync import (
     group_bulk_copy_modes,
 )
 
-from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
+from machete.megakernel.ops import (
+    Op,
+    DEFAULT_PAGE_SIZE,
+    config_dim_i32,
+    config_flat_tensor,
+)
 from machete.megakernel.interpreter import (
-    ld_global_i32,
-    ld_global_i64,
     mbarrier_arrive_expect_tx,
     named_barrier_sync,
 )
-
-
-def _config_flat_tensor(op_config_ptr, slot: int, dtype, size: int):
-    """Build a flat global tensor view from a packed config pointer slot."""
-    ptr = ld_global_i64(op_config_ptr, Int32(slot))
-    return cute.make_tensor(
-        cute.make_ptr(dtype, ptr, cute.AddressSpace.gmem, assumed_align=16),
-        cute.make_layout(size),
-    )
-
-
-def _config_dim_i32(op_config_ptr, dim_name: str, cls):
-    """Load a dynamic dimension value from the packed config."""
-    return ld_global_i32(
-        op_config_ptr,
-        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
-    )
 
 
 class QKNormRopeOp(Op):
@@ -170,7 +156,7 @@ class QKNormRopeOp(Op):
              op_config_ptr, work_mbar):
         """Load q/cos/sin tile from global to shared memory.
         """
-        runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
+        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
         pos_start = tile_M * self.tile_size_M
         head_start = tile_H * self.tile_size_H
 
@@ -273,11 +259,12 @@ class QKNormRopeOp(Op):
         num_warps = self.threads_per_row // 32
         thr_layout_D = cute.make_layout(32)
 
-        norm_weight = _config_flat_tensor(
+        norm_weight = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["norm_weight"],
+            "norm_weight",
             self.norm_weight_dtype,
             self.D,
+            type(self),
         )
 
         # Load norm_weight from global → regs (once, reused for all pos/heads)
@@ -464,7 +451,7 @@ class QKNormRopeOp(Op):
     def store(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin,
               op_config_ptr):
         """Store modified q from shared to global memory."""
-        runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
+        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
         s2g = cute.make_copy_atom(
             CopyBulkS2GOp(),
             self.q_dtype,
@@ -565,42 +552,48 @@ class QKNormRopeBwdOp(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_M, tile_H, op_config_ptr):
-        runtime_M = _config_dim_i32(op_config_ptr, "M", type(self))
-        q = _config_flat_tensor(
+        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
+        q = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["q"],
+            "q",
             self.q_dtype,
             runtime_M * Int32(self.H * self.D),
+            type(self),
         )
-        dout = _config_flat_tensor(
+        dout = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["dout"],
+            "dout",
             self.dout_dtype,
             runtime_M * Int32(self.H * self.D),
+            type(self),
         )
-        dq = _config_flat_tensor(
+        dq = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["dq"],
+            "dq",
             self.dq_dtype,
             runtime_M * Int32(self.H * self.D),
+            type(self),
         )
-        norm_weight = _config_flat_tensor(
+        norm_weight = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["norm_weight"],
+            "norm_weight",
             self.norm_weight_dtype,
             self.D,
+            type(self),
         )
-        cos = _config_flat_tensor(
+        cos = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["cos"],
+            "cos",
             self.cos_dtype,
             self.S * self.D2,
+            type(self),
         )
-        sin = _config_flat_tensor(
+        sin = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["sin"],
+            "sin",
             self.sin_dtype,
             self.S * self.D2,
+            type(self),
         )
 
         warp_idx = cute.arch.warp_idx()

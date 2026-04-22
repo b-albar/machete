@@ -10,17 +10,25 @@ Subclass ``Op`` and declare tensors, tiling, then implement compute::
 
     class MyOp(Op):
         reads  = {"x": (Float32, ("M", "D"))}
-        writes = {"x": (Float32, ("M", "D"))}
+        writes = {"y": (Float32, ("M", "D"))}
         tile   = ("M", "D")  # dimension names only
 
-        @staticmethod
-        def compute(page_ptr, op_config_ptr):
-            ...  # tile_M, tile_D, M, D available from init_source
+        @cute.jit
+        def compute(self, page_ptr, tile_M, tile_D, op_config_ptr):
+            runtime_m = config_dim_i32(op_config_ptr, "M", type(self))
+            x = config_flat_tensor(op_config_ptr, "x", self.x_dtype, runtime_m * self.D, type(self))
+            y = config_flat_tensor(op_config_ptr, "y", self.y_dtype, runtime_m * self.D, type(self))
+            ...
 
     # Tile sizes passed at schedule time; tile_counts deduced
     ops = MyOp.schedule(x=tensor, tile_sizes={"M": 4})
     kernel = Megakernel(ops)
     kernel.run()
+
+Shared config helpers intentionally mirror common CuTe DSL patterns:
+    - ``config_dim_i32(op_config_ptr, "B", type(self))``
+    - ``config_ptr_i64(op_config_ptr, "x", type(self))``
+    - ``config_flat_tensor(op_config_ptr, "x", self.x_dtype, size, type(self))``
 """
 
 import math
@@ -29,7 +37,11 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 import cutlass
+import cutlass.cute as cute
 import torch
+from cutlass import Int32
+
+from .interpreter import ld_global_i32, ld_global_i64
 
 
 # =============================================================================
@@ -547,6 +559,38 @@ DEFAULT_PAGE_SIZE: int = 49152
 """Default page size in bytes (48KB). Must match MegakernelConfig.page_size."""
 
 
+@cute.jit
+def config_dim_i32(op_config_ptr, dim_name: str, cls):
+    """Load one named dynamic dimension from ``op_config_ptr``.
+
+    This mirrors typical CuTe DSL usage: pass the config pointer plus the op
+    class and ask for the named dimension directly instead of hard-coding slot
+    arithmetic in each op.
+    """
+    return ld_global_i32(
+        op_config_ptr,
+        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
+    )
+
+
+@cute.jit
+def config_ptr_i64(op_config_ptr, tensor_name: str, cls):
+    """Load one named tensor pointer from ``op_config_ptr``."""
+    return ld_global_i64(
+        op_config_ptr,
+        Int32(cls._CONFIG_PTR_I64_INDEX[tensor_name]),
+    )
+
+
+def config_flat_tensor(op_config_ptr, tensor_name: str, dtype, size: int, cls):
+    """Build a flat gmem CuTe tensor view from one named packed config tensor."""
+    ptr = config_ptr_i64(op_config_ptr, tensor_name, cls)
+    return cute.make_tensor(
+        cute.make_ptr(dtype, ptr, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_layout(size),
+    )
+
+
 class Op:
     """Base class for GPU-executable operations with pipelined execution.
 
@@ -791,17 +835,6 @@ class ScheduledOp:
         if axis < len(self.tile_counts):
             return self.tile_counts[axis]
         return 1
-
-    def tile_size_for_axis(self, axis: int) -> int:
-        """Get tile size for a given axis index. Default is 1."""
-        for dim_name, ax in self.dim_names.items():
-            if ax == axis and dim_name in self.tile_sizes:
-                return self.tile_sizes[dim_name]
-        return 1
-
-    def axis_for_dim(self, dim_name: str) -> Optional[int]:
-        """Get the tile axis index for a semantic dimension name, or None."""
-        return self.dim_names.get(dim_name)
 
 __all__ = [
     # Constants

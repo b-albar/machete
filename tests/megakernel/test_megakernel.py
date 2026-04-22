@@ -8,12 +8,7 @@ Tests the megakernel that uses instruction stream and fine-grained barriers.
 import pytest
 import torch
 
-from machete.megakernel.ops import Op
-
-
-class _NOPOp(Op):
-    """Test-only no-op for megakernel tests."""
-    pass
+from tests.megakernel.support import get_nop_op
 
 
 class TestMegakernel:
@@ -22,11 +17,12 @@ class TestMegakernel:
     def test_megakernel_creation(self):
         """Test creating a megakernel instance."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
 
         # Define some operations
         ops = [
-            ScheduledOp(_NOPOp, tile_counts=(32,)),
-            ScheduledOp(_NOPOp, tile_counts=(16,)),
+            ScheduledOp(NopOp, tile_counts=(32,)),
+            ScheduledOp(NopOp, tile_counts=(16,)),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -41,8 +37,9 @@ class TestMegakernel:
     def test_validation_check(self):
         """Test that validation checks for Hopper+ Architecture."""
         from machete.megakernel import Megakernel, ScheduledOp
+        NopOp = get_nop_op()
 
-        ops = [ScheduledOp(_NOPOp, tile_counts=(1,))]
+        ops = [ScheduledOp(NopOp, tile_counts=(1,))]
         kernel = Megakernel(ops)
 
         major, _ = torch.cuda.get_device_capability()
@@ -58,10 +55,3 @@ class TestMegakernel:
                 if "requires Hopper" in str(e):
                     raise e
                 print(f"Kernel tried to run but failed (expected on some envs): {e}")
-
-
-if __name__ == "__main__":
-    print("Running Megakernel tests...")
-    import sys
-
-    sys.exit(pytest.main(["-v", __file__]))

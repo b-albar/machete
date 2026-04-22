@@ -27,6 +27,20 @@ def _tma_field_namespace_and_mbar(direction: str) -> Tuple[str, bool]:
     raise ValueError(f"unknown TMA direction: {direction}")
 
 
+def _atom_signature(desc) -> Tuple[Any, ...]:
+    """Return a stable signature for sharing identical wrapper TMA atoms.
+
+    This only dedupes the wrapper atom object. Runtime tensors and desc slots
+    stay per-descriptor, so runtime rebinding still sees the right desc ptr.
+    """
+    return (
+        getattr(desc, "direction", None),
+        tuple(getattr(desc, "tile_shape", ()) or ()),
+        tuple(getattr(desc, "dim_perm", ()) or ()),
+        getattr(desc, "smem_layout_src", None),
+    )
+
+
 def _build_tma_runtime_layout(backend, kernel):
     """Build compact per-phase TMA arg lists plus wrapper rebind specs."""
     local_desc_by_name: Dict[str, Any] = {
@@ -51,6 +65,8 @@ def _build_tma_runtime_layout(backend, kernel):
     op_phase_desc_slots = {phase: [[] for _ in kernel.ops] for phase in PHASE_NAMES}
     local_desc_pool_name = "local_tma_desc_pool_ptr"
     peer_desc_pool_name = "peer_tma_desc_pool_ptr"
+    shared_local_atom_by_sig: Dict[Tuple[Any, ...], str] = {}
+    shared_peer_atom_by_sig: Dict[Tuple[Any, ...], str] = {}
 
     for op_idx, spec in enumerate(backend.ir.op_specs):
         handler_idx = backend.ir.op_handler_indices[op_idx]
@@ -86,6 +102,11 @@ def _build_tma_runtime_layout(backend, kernel):
                 )
                 if desc is None:
                     raise KeyError(f"missing descriptor metadata for {canonical_desc}")
+                atom_sig = _atom_signature(desc)
+                if phase_name != "communicate":
+                    canonical_atom = shared_local_atom_by_sig.setdefault(atom_sig, canonical_atom)
+                else:
+                    canonical_atom = shared_peer_atom_by_sig.setdefault(atom_sig, canonical_atom)
                 field_namespace, supports_mbar = _tma_field_namespace_and_mbar(
                     getattr(desc, "direction", "s2g")
                 )
@@ -268,7 +289,6 @@ def make_switch_dispatch_callable(
             return None
 
     _dispatch.__name__ = fn_name
-    _dispatch._noinline = True
     _dispatch._machete_switch_dispatch = True
     _dispatch._machete_phase_name = phase_name
     return _dispatch

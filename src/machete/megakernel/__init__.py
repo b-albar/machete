@@ -7,7 +7,7 @@ instruction stream and fine-grained tile-level barriers for maximum
 pipeline overlap between operations.
 
 Usage:
-    from machete.megakernel import Megakernel
+    from machete.megakernel import Megakernel, config_dim_i32, config_flat_tensor
     from machete.kernels.rms_norm import RMSNormOp
 
     ops = RMSNormOp.schedule(x=x, weight=w, y=y)
@@ -21,6 +21,9 @@ from .ops import (
     ScheduledOp,
     TensorMeta,
     build_op_config,
+    config_dim_i32,
+    config_ptr_i64,
+    config_flat_tensor,
 )
 
 from .registries import (
@@ -69,6 +72,9 @@ __all__ = [
     "PeerTMARegistry",
     "validate_op_compatibility",
     "build_op_config",
+    "config_dim_i32",
+    "config_ptr_i64",
+    "config_flat_tensor",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation

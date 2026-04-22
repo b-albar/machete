@@ -291,7 +291,3 @@ class TestManyToOnePatternGPU:
         assert torch.equal(output, expected), (
             f"Expected {expected.tolist()}, got {output.tolist()}"
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

@@ -102,6 +102,38 @@ def _get_local_tma_args(op_obj, phase_name: str, tma_mapping: Dict[str, str]) ->
     )
 
 
+def _phase_reconstructs_all_tensors(instance, phase_tensor_names: Tuple[str, ...]) -> bool:
+    """Return whether a phase can rebuild every local tensor from ``op_config_ptr``.
+
+    When this is true, handler-local dispatch does not need to distinguish ops
+    by concrete tensor bindings for that phase; the wrapper rebuilds them from
+    packed config instead.
+    """
+    if not phase_tensor_names:
+        return True
+
+    op_cls = instance.__class__
+    unique_tensors = {
+        name: dims for name, _dtype, dims in getattr(op_cls, "_UNIQUE_TENSORS", ())
+    }
+    ptr_slots = getattr(op_cls, "_CONFIG_PTR_I64_INDEX", {})
+    dynamic_offsets = getattr(op_cls, "_CONFIG_DYNAMIC_I32_OFFSET", {})
+
+    for tensor_name in phase_tensor_names:
+        dims = unique_tensors.get(tensor_name)
+        ptr_slot = ptr_slots.get(tensor_name)
+        dtype_attr = f"{tensor_name}_dtype"
+        if dims is None or ptr_slot is None or not hasattr(instance, dtype_attr):
+            return False
+        for dim_name in dims:
+            stride_attr = f"{tensor_name}_stride_{dim_name}"
+            if not hasattr(instance, stride_attr):
+                return False
+            if dim_name not in dynamic_offsets and not hasattr(instance, dim_name):
+                return False
+    return True
+
+
 def _build_compile_key(
     op,
     *,
@@ -174,6 +206,10 @@ def build_handler_backend_ir(kernel) -> BackendIR:
             phase: _get_local_tma_args(instance, phase, phase_mappings[phase])
             for phase in PHASE_NAMES
         }
+        phase_reconstructs_all_tensors = {
+            phase: _phase_reconstructs_all_tensors(instance, local_tensor_names[phase])
+            for phase in PHASE_NAMES
+        }
         tma_args = {
             phase: tuple(phase_mappings[phase][name] for name in local_tma_args[phase])
             for phase in PHASE_NAMES
@@ -235,7 +271,9 @@ def build_handler_backend_ir(kernel) -> BackendIR:
 
             phase_variant_map = phase_variant_idx_by_handler[phase].setdefault(handler_idx, {})
             phase_binding_key = (
-                op_specs[-1].tensor_args[phase],
+                ()
+                if phase_reconstructs_all_tensors[phase]
+                else op_specs[-1].tensor_args[phase],
                 op_specs[-1].tma_args[phase],
             )
             phase_local_idx = phase_variant_map.get(phase_binding_key)
@@ -260,7 +298,6 @@ def build_handler_backend_ir(kernel) -> BackendIR:
                 seen_names.add(name)
                 phase_names.append(name)
         arg_index_by_name = {name: idx for idx, name in enumerate(phase_names)}
-
         handler_variant_tables: List[Tuple[Tuple[int, ...], ...]] = []
         for handler_idx in range(len(handler_specs)):
             variant_map = phase_variant_idx_by_handler[phase].get(handler_idx, {})
@@ -302,63 +339,8 @@ class HandlerBackend:
     def phase_local_indices(self, phase_name: str) -> List[int]:
         return list(self.ir.op_phase_local_indices[phase_name])
 
-    def phase_transport_indices(self, phase_name: str) -> List[int]:
-        return list(self.ir.op_phase_transport_indices[phase_name])
-
-    def phase_transport_records(self) -> Dict[str, List[Tuple[str, ...]]]:
-        return {
-            phase: list(self.ir.phase_transport_records[phase])
-            for phase in PHASE_NAMES
-        }
-
-    def phase_local_transport_positions(self) -> Dict[str, List[Tuple[Tuple[int, ...], ...]]]:
-        return {
-            phase: list(self.ir.phase_local_transport_positions[phase])
-            for phase in PHASE_NAMES
-        }
-
     def all_canonical(self, kernel) -> List[str]:
         return []
-
-    def all_tma_canonical(self, kernel) -> List[str]:
-        return (
-            kernel._tma_registry.all_canonical_names
-            + kernel._peer_tma_registry.all_canonical_names
-        )
-
-    def op_tensor_args(self) -> List[List[str]]:
-        return [[] for _ in self.ir.op_specs]
-
-    def phase_op_tensor_args(self) -> Dict[str, List[List[str]]]:
-        return {
-            phase: [[] for _ in self.ir.op_specs]
-            for phase in PHASE_NAMES
-        }
-
-    def op_tma_args(self) -> Dict[str, List[List[str]]]:
-        return {
-            phase: [list(spec.tma_args[phase]) for spec in self.ir.op_specs]
-            for phase in PHASE_NAMES
-        }
-
-    def phase_tensor_names(self, kernel) -> Dict[str, List[str]]:
-        """Return the canonical tensor names actually used by each phase."""
-        return {phase: [] for phase in PHASE_NAMES}
-
-    def phase_tma_names(self) -> Dict[str, List[str]]:
-        """Return the canonical TMA names actually used by each phase."""
-        phase_names: Dict[str, List[str]] = {}
-        for phase in PHASE_NAMES:
-            seen = set()
-            names: List[str] = []
-            for spec in self.ir.op_specs:
-                for name in spec.tma_args[phase]:
-                    if name in seen:
-                        continue
-                    seen.add(name)
-                    names.append(name)
-            phase_names[phase] = names
-        return phase_names
 
     def compile_phase_dispatch_inputs(self, kernel) -> Dict[str, Any]:
         """Compile phase wrappers and synthesize runtime dispatch objects."""

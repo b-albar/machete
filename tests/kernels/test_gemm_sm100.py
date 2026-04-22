@@ -7,9 +7,30 @@ torch.matmul with fp32 accumulation as reference.
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
+FORWARD_CASES = [
+    (128, 128, 128, torch.bfloat16, 128, 128, 64, 65536),
+    (128, 64, 128, torch.bfloat16, 128, 128, 64, 65536),
+    (256, 256, 256, torch.bfloat16, 128, 128, 64, 65536),
+    (256, 512, 1024, torch.bfloat16, 128, 128, 64, 65536),
+    (512, 1024, 512, torch.bfloat16, 128, 128, 64, 65536),
+    (1024, 1024, 1024, torch.bfloat16, 128, 128, 64, 65536),
+    (128, 256, 128, torch.bfloat16, 128, 128, 64, 65536),
+    (128, 1024, 128, torch.bfloat16, 128, 128, 64, 65536),
+    (128, 128, 128, torch.bfloat16, 64, 64, 64, 32768),
+    (256, 256, 256, torch.bfloat16, 128, 64, 64, 49152),
+    (128, 128, 128, torch.float16, 128, 128, 64, 65536),
+    (256, 512, 256, torch.float16, 128, 128, 64, 65536),
+    (512, 128, 128, torch.bfloat16, 128, 128, 64, 65536),
+    (128, 128, 512, torch.bfloat16, 128, 128, 64, 65536),
+]
 
 
 def _has_sm100_smem():
@@ -93,72 +114,13 @@ def _gemm_case(M, K, N, dtype, tile_m=128, tile_n=128, tile_k=64,
 class TestGemmSm100Forward:
     """GemmSm100Op forward pass correctness tests."""
 
-    # --- Basic shapes ---
-
-    def test_basic_128x128(self):
-        _gemm_case(128, 128, 128, torch.bfloat16)
-
-    def test_basic_128x64(self):
-        _gemm_case(128, 64, 128, torch.bfloat16)
-
-    def test_basic_256x256(self):
-        _gemm_case(256, 256, 256, torch.bfloat16)
-
-    # --- Larger shapes ---
-
-    def test_256x512x1024(self):
-        _gemm_case(256, 512, 1024, torch.bfloat16)
-
-    def test_512x1024x512(self):
-        _gemm_case(512, 1024, 512, torch.bfloat16)
-
-    def test_1024x1024x1024(self):
-        _gemm_case(1024, 1024, 1024, torch.bfloat16)
-
-    # --- Multiple K-blocks ---
-
-    def test_multi_k_blocks(self):
-        """K=256 with tile_K=64 → 4 K-blocks."""
-        _gemm_case(128, 256, 128, torch.bfloat16, tile_k=64)
-
-    def test_large_k(self):
-        """K=1024 → 16 K-blocks."""
-        _gemm_case(128, 1024, 128, torch.bfloat16, tile_k=64)
-
-    # --- Smaller tile configs ---
-
-    def test_tile_64x64(self):
-        _gemm_case(128, 128, 128, torch.bfloat16,
-                   tile_m=64, tile_n=64, tile_k=64, page_size=32768)
-
-    def test_tile_128x64(self):
-        _gemm_case(256, 256, 256, torch.bfloat16,
-                   tile_m=128, tile_n=64, tile_k=64, page_size=49152)
-
-    # --- fp16 ---
-
-    def test_fp16_basic(self):
-        _gemm_case(128, 128, 128, torch.float16)
-
-    def test_fp16_large(self):
-        _gemm_case(256, 512, 256, torch.float16)
-
-    # --- Multi-tile (output larger than one tile) ---
-
-    def test_multi_tile_m(self):
-        """M=512 with tile_S=128 → 4 M-tiles."""
-        _gemm_case(512, 128, 128, torch.bfloat16,
-                   tile_m=128, tile_n=128, tile_k=64)
-
-    def test_multi_tile_n(self):
-        """N=512 with tile_N=128 → 4 N-tiles."""
-        _gemm_case(128, 128, 512, torch.bfloat16,
-                   tile_m=128, tile_n=128, tile_k=64)
-
-    def test_multi_tile_both(self):
-        """M=256, N=256 with 128×128 tiles → 2×2 tiles."""
-        _gemm_case(256, 256, 256, torch.bfloat16,
-                   tile_m=128, tile_n=128, tile_k=64)
+    @pytest.mark.parametrize("M,K,N,dtype,tile_m,tile_n,tile_k,page_size", FORWARD_CASES)
+    def test_forward_matrix(self, M, K, N, dtype, tile_m, tile_n, tile_k, page_size):
+        """Representative SM100 forward matrix."""
+        _gemm_case(
+            M, K, N, dtype,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, page_size=page_size,
+        )
 
 
 @requires_blackwell

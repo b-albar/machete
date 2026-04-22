@@ -3,28 +3,35 @@
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
-try:
-    import cutlass
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+from tests.kernels.support import requires_hopper_cutlass
 
 
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+requires_gpu = requires_hopper_cutlass
 
+FORWARD_CASES = [
+    (1, 16, 128, 128),
+    (1, 16, 2048, 128),
+    (8, 16, 2048, 128),
+    (1, 16, 1024, 64),
+]
 
-requires_gpu = pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
+CAUSAL_CASES = [
+    (1, 16, 128, 128),
+    (4, 16, 512, 128),
+]
+
+GQA_CASES = [
+    (8, 2, 16, 512, 128, False),
+    (8, 2, 16, 2048, 256, False),
+    (8, 2, 16, 512, 128, True),
+]
 
 
 def _run_flash_decoding(q, k, v, num_splits=0, causal=False, kv_group_size=1):
@@ -55,31 +62,9 @@ def _ref_attention(q, k, v, causal=False, kv_group_size=1):
 class TestFlashDecodingBasic:
     """Basic FlashDecoding correctness tests."""
 
-    @pytest.mark.parametrize("BH,M,N,D", [
-        (1, 16, 128, 128),
-        (1, 16, 256, 128),
-        (1, 16, 512, 128),
-        (1, 16, 2048, 128),
-    ])
-    def test_basic_decode(self, BH, M, N, D):
-        """Single-head decode: BH=1, M=16 (typical decode config)."""
-        torch.manual_seed(42)
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-
-        o = _run_flash_decoding(q, k, v)
-        o_ref = _ref_attention(q, k, v)
-
-        torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
-
-    @pytest.mark.parametrize("BH,M,N,D", [
-        (4, 16, 512, 128),
-        (8, 16, 2048, 128),
-        (1, 16, 1024, 64),
-    ])
-    def test_multi_head(self, BH, M, N, D):
-        """Multi-head decode."""
+    @pytest.mark.parametrize("BH,M,N,D", FORWARD_CASES)
+    def test_forward_matrix(self, BH, M, N, D):
+        """Representative non-causal decode matrix."""
         torch.manual_seed(42)
         q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
         k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
@@ -116,28 +101,12 @@ class TestFlashDecodingBasic:
 
         torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
 
-    def test_long_decode_path(self):
-        torch.manual_seed(42)
-        BH, M, N, D = 1, 16, 2048, 128
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-
-        o = _run_flash_decoding(q, k, v)
-        o_ref = _ref_attention(q, k, v)
-
-        torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
-
-
 @requires_gpu
 class TestFlashDecodingCausal:
     """FlashDecoding with causal masking."""
 
-    @pytest.mark.parametrize("BH,M,N,D", [
-        (1, 16, 128, 128),
-        (4, 16, 512, 128),
-    ])
-    def test_causal(self, BH, M, N, D):
+    @pytest.mark.parametrize("BH,M,N,D", CAUSAL_CASES)
+    def test_causal_matrix(self, BH, M, N, D):
         torch.manual_seed(42)
         q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
         k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
@@ -153,32 +122,17 @@ class TestFlashDecodingCausal:
 class TestFlashDecodingGQA:
     """FlashDecoding with grouped query attention."""
 
-    @pytest.mark.parametrize("BH,BH_kv,M,N,D", [
-        (8, 2, 16, 512, 128),
-        (8, 2, 16, 2048, 256),
-    ])
-    def test_gqa(self, BH, BH_kv, M, N, D):
+    @pytest.mark.parametrize("BH,BH_kv,M,N,D,causal", GQA_CASES)
+    def test_gqa_matrix(self, BH, BH_kv, M, N, D, causal):
         torch.manual_seed(42)
         kv_group_size = BH // BH_kv
         q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
         k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
         v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
 
-        o = _run_flash_decoding(q, k, v, kv_group_size=kv_group_size)
-        o_ref = _ref_attention(q, k, v, kv_group_size=kv_group_size)
-
-        torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)
-
-    def test_gqa_causal(self):
-        """GQA + causal masking."""
-        torch.manual_seed(42)
-        BH, BH_kv, M, N, D = 8, 2, 16, 512, 128
-        kv_group_size = BH // BH_kv
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
-
-        o = _run_flash_decoding(q, k, v, causal=True, kv_group_size=kv_group_size)
-        o_ref = _ref_attention(q, k, v, causal=True, kv_group_size=kv_group_size)
+        o = _run_flash_decoding(
+            q, k, v, causal=causal, kv_group_size=kv_group_size)
+        o_ref = _ref_attention(
+            q, k, v, causal=causal, kv_group_size=kv_group_size)
 
         torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=5e-2)

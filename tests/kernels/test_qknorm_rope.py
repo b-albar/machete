@@ -12,8 +12,13 @@ Tests cover:
 5. Normalization weight effect
 """
 
+import importlib.util
+
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.kernels.qknorm_rope import QKNormRopeBwdOp, QKNormRopeOp
@@ -291,7 +296,3 @@ class TestQKNormRopeGPU:
         assert k1._compiled_kernel is k2._compiled_kernel
         torch.testing.assert_close(out1, ref_qknorm_rope(q1, norm_weight, cos, sin), atol=2e-1, rtol=0)
         torch.testing.assert_close(out2, ref_qknorm_rope(q2, norm_weight, cos, sin), atol=2e-1, rtol=0)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

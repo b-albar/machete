@@ -7,29 +7,24 @@ reference implementation (moe_gemm_ref).
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
-
-def is_sm90_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor >= 90
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+from tests.kernels.support import requires_sm90_cutlass
 
 
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
+requires_gpu = requires_sm90_cutlass
 
-
-requires_gpu = pytest.mark.skipif(
-    not (is_sm90_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires SM_90+ GPU with CUTLASS",
-)
+FORWARD_CASES = [
+    (32, 4, 2, 64, 32, 32, 32, 32),
+    (128, 8, 2, 128, 64, 64, 32, 32),
+    (64, 4, 2, 128, 64, 64, 32, 32),
+    (256, 16, 2, 256, 128, 64, 32, 32),
+]
 
 
 # =============================================================================
@@ -202,25 +197,17 @@ def _moe_gemm_case(num_tokens, num_experts, topk, K, N, dtype,
 class TestMoeGemmForward:
     """MoE grouped GEMM forward pass correctness tests."""
 
-    # ----- Basic sizes -----
-
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_small(self, dtype):
-        """Small: 32 tokens, 4 experts, K=64, N=32."""
-        _moe_gemm_case(32, 4, 2, 64, 32, dtype,
-                       tile_m=32, tile_n=32, tile_k=32)
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_medium(self, dtype):
-        """Medium: 128 tokens, 8 experts, K=128, N=64."""
-        _moe_gemm_case(128, 8, 2, 128, 64, dtype,
-                       tile_m=64, tile_n=32, tile_k=32)
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_multi_k_block(self, dtype):
-        """Multiple K-blocks: K=128, tile_K=32 → 4 K-blocks."""
-        _moe_gemm_case(64, 4, 2, 128, 64, dtype,
-                       tile_m=64, tile_n=32, tile_k=32)
+    @pytest.mark.parametrize(
+        "num_tokens,num_experts,topk,K,N,tile_m,tile_n,tile_k", FORWARD_CASES)
+    def test_forward_matrix(
+        self, dtype, num_tokens, num_experts, topk, K, N, tile_m, tile_n, tile_k
+    ):
+        """Representative MoE GEMM forward matrix."""
+        _moe_gemm_case(
+            num_tokens, num_experts, topk, K, N, dtype,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        )
 
     # ----- Topk variations -----
 
@@ -264,15 +251,6 @@ class TestMoeGemmForward:
 
         valid = sorted_token_ids < num_tokens
         torch.testing.assert_close(c[valid], ref[valid], atol=1e-1, rtol=1e-2)
-
-    # ----- Larger sizes -----
-
-    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_larger(self, dtype):
-        """Larger: 256 tokens, 16 experts, K=256, N=128."""
-        _moe_gemm_case(256, 16, 2, 256, 128, dtype,
-                       tile_m=64, tile_n=32, tile_k=32)
-
 
 # =============================================================================
 # Tests: End-to-end MoE

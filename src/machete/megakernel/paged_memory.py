@@ -28,6 +28,19 @@ from cutlass._mlir.dialects import llvm
 MAX_PAGES: int = 16  # Maximum number of pages
 IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 
+# Per-slot tile-info layout in shared memory (int32 slots, plus one int64).
+TILE_INFO_OP_IDX: int = 0
+TILE_INFO_LINEAR_IDX: int = 1
+TILE_INFO_HANDLER_IDX: int = 2
+TILE_INFO_TILE_0: int = 3
+TILE_INFO_TILE_1: int = 4
+TILE_INFO_TILE_2: int = 5
+TILE_INFO_TILE_3: int = 6
+TILE_INFO_TILE_4: int = 7
+TILE_INFO_PACKED_WARP_INFO: int = 8
+TILE_INFO_OP_CONFIG: int = 10
+TILE_INFO_PACK_SCALE: int = 65536
+
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
 #
@@ -292,13 +305,13 @@ class NPageLayout:
 
     # Scratch area layout (ring buffer):
     # - Per-page tile info: num_pages * 48 bytes
-    #   [op_idx, linear_tile_idx, handler_idx,
-    #    tile_0..tile_4, inner_iters, num_warps, op_config_ptr]
+    #   [op_idx, linear_tile_idx, handler_idx, tile_0..tile_4,
+    #    packed(inner_iters, num_warps), pad, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 48  # Per-page tile metadata (10 int32 slots + 1 int64)
+    _TILE_INFO_SIZE: int = 48  # Per-page tile metadata (10 int32 slots incl. pad + 1 int64)
     _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
     _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
@@ -339,14 +352,6 @@ class NPageLayout:
 
         # Total size
         self.total_size = self.pages_start + self.num_pages * self.aligned_page_size
-
-    def get_page_offset(self, page_idx: int) -> int:
-        """Get offset for a specific page."""
-        if page_idx < 0 or page_idx >= self.num_pages:
-            raise ValueError(
-                f"Invalid page_idx {page_idx}, must be 0 to {self.num_pages - 1}"
-            )
-        return self.pages_start + page_idx * self.aligned_page_size
 
     def work_notify_mbar_offset(self, slot_idx: int) -> int:
         """Get offset to the work_notify mbarrier for a given work slot."""

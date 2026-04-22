@@ -7,32 +7,16 @@ PyTorch reference implementations.
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
+from tests.kernels.support import requires_hopper_cutlass
 from machete.kernels.activation.ref import activation_pytorch
-
-
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
-
-
-try:
-    import cutlass  # noqa: F401
-
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
-
-
-requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
 
 
 # =============================================================================
@@ -118,7 +102,7 @@ def _run_gemm_activation(a, b_t, activation='relu', tile_m=64, tile_n=32, tile_k
 class TestActivationStandalone:
     """Standalone activation correctness tests."""
 
-    @requires_gpu
+    @requires_hopper_cutlass
     @pytest.mark.parametrize("M,D", [
         (1, 64),
         (4, 128),
@@ -139,7 +123,7 @@ class TestActivationStandalone:
         rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
         torch.testing.assert_close(x, y_ref, rtol=rtol, atol=atol)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_relu_zeros_negatives(self):
         """ReLU should zero out all negative values."""
         M, D = 16, 128
@@ -153,7 +137,7 @@ class TestActivationStandalone:
             x[x_ref >= 0], x_ref[x_ref >= 0], rtol=1e-3, atol=1e-3,
         )
 
-    @requires_gpu
+    @requires_hopper_cutlass
     def test_batch_dynamic_reuses_compiled_tma_kernel(self):
         """Same op should reuse the compiled kernel across batch sizes."""
         from machete.megakernel import Megakernel, MegakernelConfig
@@ -193,7 +177,7 @@ class TestActivationStandalone:
 class TestGemmActivation:
     """Fused GEMM + Activation correctness tests."""
 
-    @requires_gpu
+    @requires_hopper_cutlass
     @pytest.mark.parametrize("activation", ['relu', 'silu'])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_fused_gemm_activation(self, activation, dtype):
@@ -213,7 +197,7 @@ class TestGemmActivation:
         rtol, atol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
         torch.testing.assert_close(c, c_ref, rtol=rtol, atol=atol)
 
-    @requires_gpu
+    @requires_hopper_cutlass
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_fused_gemm_relu_multi_k(self, dtype):
         """Fused GEMM + ReLU with multiple K tiles."""
@@ -230,7 +214,3 @@ class TestGemmActivation:
 
         rtol, atol = (5e-2, 5e-2) if dtype == torch.bfloat16 else (1e-2, 1e-2)
         torch.testing.assert_close(c, c_ref, rtol=rtol, atol=atol)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

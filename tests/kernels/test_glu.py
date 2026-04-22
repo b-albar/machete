@@ -12,31 +12,26 @@ a pure PyTorch reference implementation. Covers:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
 from machete.kernels.glu.ref import glu_pytorch, glu_backward_pytorch
+from tests.kernels.support import requires_hopper_cutlass
 
 
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+requires_gpu = requires_hopper_cutlass
 
-
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
-
-
-requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
+CORE_SHAPES = [
+    (1, 64),
+    (32, 256),
+    (128, 512),
+    (16, 4096),
+]
 
 
 # =============================================================================
@@ -100,9 +95,7 @@ class TestGLUForward:
     """Test GLUOp forward against PyTorch reference."""
 
     @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64), (4, 128), (32, 256), (128, 512), (32, 2048), (16, 4096),
-    ])
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     @pytest.mark.parametrize("activation", ["silu", "relu", "identity"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_forward(self, M, D, activation, dtype):
@@ -150,9 +143,7 @@ class TestGLUBackward:
     """Test GLUBwdOp against PyTorch reference."""
 
     @requires_gpu
-    @pytest.mark.parametrize("M,D", [
-        (1, 64), (4, 128), (32, 256), (128, 512), (32, 2048), (16, 4096),
-    ])
+    @pytest.mark.parametrize("M,D", CORE_SHAPES)
     @pytest.mark.parametrize("activation", ["silu", "relu", "identity"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_backward(self, M, D, activation, dtype):

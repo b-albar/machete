@@ -14,9 +14,15 @@ Tests cover:
 6. Autograd forward + backward through megakernel_apply
 """
 
+import importlib.util
+
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
+from tests.support import is_hopper_available
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.kernels.rope import RopeOp, RopeBwdOp
 from machete.kernels.rope.ref import (
@@ -30,13 +36,6 @@ from machete.kernels.rope.autograd import RopeAutogradOp
 
 if HAS_TRITON:
     from machete.kernels.rope.ref import rope_triton
-
-
-def is_hopper_available():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 # =============================================================================
@@ -400,7 +399,3 @@ class TestRopeAutogradGPU:
             atol=atol,
             check_grad=True,
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

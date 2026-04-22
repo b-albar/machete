@@ -170,11 +170,6 @@ class TensorRegistry:
         """List of canonical tensor parameter names in order."""
         return [name for name, _, _ in self.tensors]
 
-    @property
-    def num_tensors(self) -> int:
-        """Number of unique tensors."""
-        return len(self.tensors)
-
     def get_op_tensor_args(self, op_idx: int, op_cls) -> List[str]:
         """Get ordered canonical tensor names for an op's function call.
 
@@ -654,7 +649,7 @@ class TMARegistry:
         atom_counter = 0
         gmem_counter = 0
         desc_counter = 0
-        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
+        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str, str]] = {}
         atom_name_cache: Dict[Tuple[Any, ...], str] = {}
         gmem_name_cache: Dict[Tuple[Any, ...], str] = {}
 
@@ -688,21 +683,13 @@ class TMARegistry:
                         dim_perm=dim_perm,
                     )
                     if desc_key in desc_name_cache:
-                        canonical_atom, canonical_gmem = desc_name_cache[desc_key]
+                        canonical_atom, canonical_gmem, canonical_desc = desc_name_cache[desc_key]
                         _set_tma_mapping(
                             op_mappings[(i, phase)],
                             tensor_name,
                             canonical_atom,
                             canonical_gmem,
-                            next(
-                                desc.canonical_desc
-                                for desc in descriptors
-                                if desc.canonical_atom == canonical_atom
-                                and desc.canonical_gmem == canonical_gmem
-                                and desc.tensor_canonical == tensor_canonical
-                                and desc.direction == direction
-                                and desc.original_tensor is original_ref
-                            ),
+                            canonical_desc,
                         )
                     else:
                         atom_key = _local_tma_atom_key(
@@ -734,7 +721,11 @@ class TMARegistry:
                             gmem_counter += 1
                         canonical_desc = f"tma{desc_counter}_desc"
                         desc_counter += 1
-                        desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
+                        desc_name_cache[desc_key] = (
+                            canonical_atom,
+                            canonical_gmem,
+                            canonical_desc,
+                        )
                         _append_tma_descriptor(
                             descriptors,
                             op_mappings,
@@ -854,7 +845,7 @@ class PeerTMARegistry:
         op_mappings: Dict[Tuple[int, str], Dict[str, str]] = {}
         counter = 0
         desc_counter = 0
-        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str]] = {}
+        desc_name_cache: Dict[Tuple[Any, ...], Tuple[str, str, str]] = {}
         num_peers = peer_buffer_registry.num_peers
 
         for i, op in enumerate(ops):
@@ -887,29 +878,25 @@ class PeerTMARegistry:
                         smem_layout_src=smem_layout_src,
                     )
                     if desc_key in desc_name_cache:
-                        canonical_atom, canonical_gmem = desc_name_cache[desc_key]
+                        canonical_atom, canonical_gmem, canonical_desc = desc_name_cache[desc_key]
                         _set_peer_tma_mapping(
                             op_mappings[(i, "communicate")],
                             tensor_name,
                             peer_idx,
                             canonical_atom,
                             canonical_gmem,
-                            next(
-                                desc.canonical_desc
-                                for desc in descriptors
-                                if desc.canonical_atom == canonical_atom
-                                and desc.canonical_gmem == canonical_gmem
-                                and desc.tensor_canonical == tensor_canonical
-                                and desc.peer_idx == peer_idx
-                                and desc.direction == direction
-                            ),
+                            canonical_desc,
                         )
                     else:
                         canonical_atom = f"ptma{counter}_p{peer_idx}_atom"
                         canonical_gmem = f"ptma{counter}_p{peer_idx}_gmem"
                         canonical_desc = f"ptma{desc_counter}_desc"
                         desc_counter += 1
-                        desc_name_cache[desc_key] = (canonical_atom, canonical_gmem)
+                        desc_name_cache[desc_key] = (
+                            canonical_atom,
+                            canonical_gmem,
+                            canonical_desc,
+                        )
                         _append_peer_tma_descriptor(
                             descriptors,
                             op_mappings,

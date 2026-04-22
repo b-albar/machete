@@ -33,6 +33,7 @@ from cutlass import Int32, Float32
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm
+import torch
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
@@ -47,6 +48,26 @@ def _atomic_add_f32(val: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) 
         res=T.f32(), op=nvvm.AtomicOpKind.FADD,
         ptr=gmem_ptr.llvm_ptr, a=Float32(val).ir_value()
     )
+
+
+def _max_attention_page_size(device=None):
+    if device is None:
+        device = torch.cuda.current_device()
+    max_smem = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return ((max_smem - 512) // 128) * 128
+
+
+def _effective_page_size(q, page_size):
+    if page_size is None:
+        return _max_attention_page_size(q.device)
+    return page_size
+
+
+def _bshd_to_bhsd(x):
+    if x is None:
+        return None
+    assert x.ndim == 4, f"Expected 4D BSHD tensor, got shape={tuple(x.shape)}"
+    return x.permute(0, 2, 1, 3)
 
 
 class FlashAttentionSm120BwdOp(Op):
@@ -254,6 +275,13 @@ class FlashAttentionSm120BwdOp(Op):
                 if name in tensors and tensors[name] is not None:
                     tensors[name] = tensors[name].unsqueeze(0)
             k = tensors["k"]
+            q = tensors.get("q")
+        elif q is not None and q.ndim == 4:
+            page_size = _effective_page_size(q, page_size)
+            for name in ("k", "v", "q", "dout", "dq", "dk", "dv"):
+                if name in tensors and tensors[name] is not None:
+                    tensors[name] = _bshd_to_bhsd(tensors[name])
+            k = tensors.get("k")
             q = tensors.get("q")
 
         if k is not None:

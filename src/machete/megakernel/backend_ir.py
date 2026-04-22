@@ -2,7 +2,7 @@
 """Backend IR for megakernel handler-based dispatch."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 PHASE_NAMES = ("load", "compute", "store", "communicate")
 

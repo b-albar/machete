@@ -335,36 +335,3 @@ class TestCuteTensorParams:
         print(f"RESULT: Maximum 2D dynamic cute.Tensor parameters = {max_working}")
         print(f"{'=' * 60}")
         assert max_working >= 5, f"Expected at least 5 tensor params, got {max_working}"
-
-
-if __name__ == "__main__":
-    if not is_hopper_available():
-        print("Hopper (SM90+) GPU required")
-        exit(1)
-
-    print("Testing cute.Tensor as kernel parameters")
-    print("=" * 60)
-
-    test = TestCuteTensorParams()
-
-    print("\n--- test_single_tensor_param ---")
-    test.test_single_tensor_param()
-    print("PASSED")
-
-    print("\n--- test_multiple_tensor_params ---")
-    test.test_multiple_tensor_params()
-    print("PASSED")
-
-    print("\n--- test_2d_tensor_params ---")
-    test.test_2d_tensor_params()
-    print("PASSED")
-
-    print("\n--- test_dynamic_layout_tensor_params ---")
-    test.test_dynamic_layout_tensor_params()
-    print("PASSED")
-
-    print("\n--- test_param_limit_1d ---")
-    test.test_param_limit_1d()
-
-    print("\n--- test_param_limit_2d_dynamic ---")
-    test.test_param_limit_2d_dynamic()

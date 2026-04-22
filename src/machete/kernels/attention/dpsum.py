@@ -17,23 +17,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 
-from machete.megakernel.interpreter import ld_global_i32, ld_global_i64
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op
-
-
-def _config_flat_tensor(op_config_ptr, slot: int, dtype, size: int):
-    ptr = ld_global_i64(op_config_ptr, Int32(slot))
-    return cute.make_tensor(
-        cute.make_ptr(dtype, ptr, cute.AddressSpace.gmem, assumed_align=16),
-        cute.make_layout(size),
-    )
-
-
-def _config_dim_i32(op_config_ptr, dim_name: str, cls):
-    return ld_global_i32(
-        op_config_ptr,
-        Int32(cls._CONFIG_DYNAMIC_I32_OFFSET[dim_name]),
-    )
+from machete.megakernel.ops import (
+    DEFAULT_PAGE_SIZE,
+    Op,
+    config_dim_i32,
+    config_flat_tensor,
+)
 
 
 class AttentionDPSumOp(Op):
@@ -65,24 +54,27 @@ class AttentionDPSumOp(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_H, op_config_ptr):
-        runtime_B = _config_dim_i32(op_config_ptr, "B", type(self))
-        dout = _config_flat_tensor(
+        runtime_B = config_dim_i32(op_config_ptr, "B", type(self))
+        dout = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["dout"],
+            "dout",
             self.dout_dtype,
             runtime_B * Int32(self.S * self.H * self.D),
+            type(self),
         )
-        o = _config_flat_tensor(
+        o = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["o"],
+            "o",
             self.o_dtype,
             runtime_B * Int32(self.S * self.H * self.D),
+            type(self),
         )
-        dpsum = _config_flat_tensor(
+        dpsum = config_flat_tensor(
             op_config_ptr,
-            type(self)._CONFIG_PTR_I64_INDEX["dpsum"],
+            "dpsum",
             self.dpsum_dtype,
             runtime_B * Int32(self.H * self.S),
+            type(self),
         )
 
         warp_idx = cute.arch.warp_idx()

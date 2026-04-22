@@ -299,7 +299,3 @@ class TestChainMixedDimsGPU:
         assert torch.equal(d, expected), (
             f"Expected {expected.tolist()}, got {d.tolist()}"
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

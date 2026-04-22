@@ -9,9 +9,13 @@ Tests:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 
 def _is_sm90_or_newer():
@@ -347,8 +351,3 @@ class TestGemmTPRowParallel:
         torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(
             peer_c.squeeze(0).to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main(["-v", __file__]))
