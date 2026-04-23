@@ -264,7 +264,7 @@ class GemmOp(Op):
     }
     writes = {"c": (None, ("B", "S", "N"))}
     tile = ("B", "S", "N")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     tma_loads = {"a", "a_scale", "b"}
     tma_stores = {"c"}
@@ -979,6 +979,60 @@ class GemmOp(Op):
         return 32, 32, 16
 
     @classmethod
+    def _shape_aware_auto_tiles(
+        cls,
+        page_size,
+        *,
+        input_k,
+        output_n,
+        elem_bytes=2,
+        has_a_scale=False,
+    ):
+        """Compute tiles with a small shape-aware preference list.
+
+        The default spatial preference is good for balanced GEMMs, but Qwen
+        projection shapes are skewed:
+        - expanders like Q projection benefit from a fatter N tile
+        - reducers like O/down projection benefit from narrower N and larger K
+        """
+        a_factor = 2 if has_a_scale else 1
+        mbar_bytes = 32
+
+        preferred = []
+        if output_n >= 2 * input_k:
+            preferred.extend([(64, 64, 64), (128, 64, 32)])
+        elif input_k >= 2 * output_n:
+            # Moderately skinny reducers like Qwen O-proj (K=2048 -> N=1024)
+            # behave differently standalone vs fused. For the fused one-page
+            # path at larger page sizes, Qwen O-proj benefits from the narrower
+            # N tile again, while very skinny reducers continue to prefer it.
+            if page_size <= 32 * 1024:
+                preferred.extend([(64, 32, 64), (32, 64, 64), (64, 64, 64)])
+            elif input_k <= 2048:
+                if page_size >= 96 * 1024:
+                    preferred.extend([(64, 32, 64), (32, 64, 64), (64, 64, 64)])
+                else:
+                    preferred.extend([(32, 64, 64), (64, 32, 64), (64, 64, 64)])
+            else:
+                preferred.extend([(64, 32, 64), (64, 64, 64)])
+
+        preferred.extend([(128, 64, 32), (128, 128, 32), (64, 64, 64), (64, 64, 32), (64, 32, 64), (32, 32, 16)])
+
+        seen = set()
+        for tile_S, tile_N, tile_K in preferred:
+            key = (tile_S, tile_N, tile_K)
+            if key in seen:
+                continue
+            seen.add(key)
+            buf_stride = (a_factor * tile_S + tile_N) * tile_K * elem_bytes
+            ab_total = 2 * buf_stride + mbar_bytes
+            c_total = tile_S * tile_N * elem_bytes
+            if max(ab_total, c_total) <= page_size:
+                return tile_S, tile_N, tile_K
+
+        return cls._auto_tiles(page_size, elem_bytes=elem_bytes, has_a_scale=has_a_scale)
+
+    @classmethod
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
                          activation=None, has_a_scale=0, **tensors):
         """Schedule forward GEMM.
@@ -1002,9 +1056,19 @@ class GemmOp(Op):
         ts.setdefault("B", 1)
         if "S" not in ts or "N" not in ts:
             a = tensors.get('a')
+            b = tensors.get('b')
             elem_bytes = a.element_size() if a is not None else 2
-            auto_S, auto_N, auto_K = cls._auto_tiles(
-                page_size, elem_bytes, has_a_scale=bool(has_a_scale))
+            if a is not None and b is not None:
+                auto_S, auto_N, auto_K = cls._shape_aware_auto_tiles(
+                    page_size,
+                    input_k=a.shape[-1],
+                    output_n=b.shape[0],
+                    elem_bytes=elem_bytes,
+                    has_a_scale=bool(has_a_scale),
+                )
+            else:
+                auto_S, auto_N, auto_K = cls._auto_tiles(
+                    page_size, elem_bytes, has_a_scale=bool(has_a_scale))
             ts.setdefault("S", auto_S)
             ts.setdefault("N", auto_N)
             ts.setdefault("K", auto_K)

@@ -103,6 +103,19 @@ class QKNormRopeOp(Op):
 
         self.q_nbits_per_row = self.q_row_elems * self.elem_bytes * 8
         self.cs_nbits_per_row = self.D2 * self.elem_bytes * 8
+        self.num_warps = self.threads_per_row // 32
+        # Qwen-style Q/K tiles saturate with 2-3 compute warps. When the
+        # fused megakernel runs at the GEMM-optimal 224 TPB, extra compute
+        # warps only add shell overhead and, for the D2<32 path, more barrier
+        # participants. Keep the global TPB fixed and cap the active warps
+        # locally inside the op.
+        if self.D >= 256 and self.tile_size_H >= 8:
+            self.effective_warps = min(self.num_warps, 3)
+        elif self.D >= 128:
+            self.effective_warps = min(self.num_warps, 2)
+        else:
+            self.effective_warps = min(self.num_warps, 1)
+        self.effective_threads = self.effective_warps * 32
 
     # =========================================================================
     # Scheduling
@@ -125,7 +138,16 @@ class QKNormRopeOp(Op):
             tile_H -= 1
         tiles["H"] = tile_H
         row_bytes = (tile_H * D + 2 * D2) * elem_bytes
-        tiles["M"] = max(1, page_size // row_bytes)
+        tile_M = max(1, page_size // row_bytes)
+        # Large page sizes do not help this op by simply inflating the row
+        # tile. Once the normalization+RoPE working set gets too tall, the
+        # barriered compute phase loses throughput. Q-shaped tiles (H>=8) peak
+        # around 8 rows; narrower K-shaped tiles can sustain about 16 rows.
+        if tile_H >= 8:
+            tile_M = min(tile_M, 8)
+        else:
+            tile_M = min(tile_M, 16)
+        tiles["M"] = tile_M
         return tiles
 
     @classmethod
@@ -256,7 +278,7 @@ class QKNormRopeOp(Op):
 
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
+        num_warps = self.effective_warps
         thr_layout_D = cute.make_layout(32)
 
         norm_weight = config_flat_tensor(
@@ -279,111 +301,15 @@ class QKNormRopeOp(Op):
         eps_val = Float32(self.eps)
         inv_D = Float32(1.0 / self.D)
 
-        if self.D2 >= 32:
-            # =================================================================
-            # Path A: D2 >= 32 — fused normalize + rotate in registers
-            # =================================================================
-            d2_regs = self.D2 // 32  # register elements per lane in rotary part
+        if warp_idx < Int32(self.effective_warps):
+            if self.D2 >= 32:
+                # =================================================================
+                # Path A: D2 >= 32 — fused normalize + rotate in registers
+                # =================================================================
+                d2_regs = self.D2 // 32  # register elements per lane in rotary part
 
-            for local_pos in range(self.tile_size_M):
-                # Load cos/sin for this position (32-lane partition over D2)
-                cos_row = cute.make_tensor(
-                    cos_smem + local_pos * self.D2,
-                    cute.make_layout(self.D2),
-                )
-                sin_row = cute.make_tensor(
-                    sin_smem + local_pos * self.D2,
-                    cute.make_layout(self.D2),
-                )
-                cos_part = cute.local_partition(cos_row, thr_layout_D, lane_idx)
-                sin_part = cute.local_partition(sin_row, thr_layout_D, lane_idx)
-                cos_reg = cute.make_fragment_like(cos_part)
-                sin_reg = cute.make_fragment_like(sin_part)
-                cute.autovec_copy(cos_part, cos_reg)
-                cute.autovec_copy(sin_part, sin_reg)
-
-                for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                    q_base = (local_pos * self.tile_size_H + local_h) * self.D
-
-                    # Load full D-row from smem → regs
-                    q_full_row = cute.make_tensor(
-                        q_smem + q_base, cute.make_layout(self.D),
-                    )
-                    q_full_part = cute.local_partition(
-                        q_full_row, thr_layout_D, lane_idx,
-                    )
-                    q_reg = cute.make_fragment_like(q_full_part)
-                    cute.autovec_copy(q_full_part, q_reg)
-
-                    # RMSNorm: sum of squares → warp reduction
-                    partial_sq = Float32(0.0)
-                    for i in range(cute.size(q_reg)):
-                        val = q_reg[i].to(Float32)
-                        partial_sq = partial_sq + val * val
-                    sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                    rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
-
-                    # Normalize + apply weight
-                    for i in range(cute.size(q_reg)):
-                        q_reg[i] = (
-                            q_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
-                        ).to(self.q_dtype)
-
-                    # RoPE in-register: reg layout with stride-32 partition
-                    # reg[k] corresponds to position lane_idx + k*32
-                    # q0 = positions [0, D2) → reg indices [0, d2_regs)
-                    # q1 = positions [D2, 2*D2) → reg indices [d2_regs, 2*d2_regs)
-                    for k in range(d2_regs):
-                        v0 = q_reg[k].to(Float32)
-                        v1 = q_reg[k + d2_regs].to(Float32)
-                        c = cos_reg[k].to(Float32)
-                        sn = sin_reg[k].to(Float32)
-                        q_reg[k] = (v0 * c - v1 * sn).to(self.q_dtype)
-                        q_reg[k + d2_regs] = (v1 * c + v0 * sn).to(self.q_dtype)
-
-                    # Write back full D-row to smem
-                    cute.autovec_copy(q_reg, q_full_part)
-        else:
-            # =================================================================
-            # Path B: D2 < 32 — two-pass with barrier
-            # =================================================================
-            thr_count_d2 = self.D2
-            thr_layout_d2 = cute.make_layout(thr_count_d2)
-            compute_threads = Int32(self.threads_per_row)
-
-            for local_pos in range(self.tile_size_M):
-                # Pass 1: RMSNorm (all 32 lanes per warp)
-                for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                    q_base = (local_pos * self.tile_size_H + local_h) * self.D
-
-                    q_full_row = cute.make_tensor(
-                        q_smem + q_base, cute.make_layout(self.D),
-                    )
-                    q_full_part = cute.local_partition(
-                        q_full_row, thr_layout_D, lane_idx,
-                    )
-                    q_reg = cute.make_fragment_like(q_full_part)
-                    cute.autovec_copy(q_full_part, q_reg)
-
-                    partial_sq = Float32(0.0)
-                    for i in range(cute.size(q_reg)):
-                        val = q_reg[i].to(Float32)
-                        partial_sq = partial_sq + val * val
-                    sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                    rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
-
-                    for i in range(cute.size(q_reg)):
-                        q_reg[i] = (
-                            q_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
-                        ).to(self.q_dtype)
-
-                    cute.autovec_copy(q_reg, q_full_part)
-
-                # Barrier: ensure all norm writes are visible before RoPE reads
-                named_barrier_sync(Int32(2), compute_threads)
-
-                # Pass 2: RoPE (D2 lanes only)
-                if lane_idx < Int32(thr_count_d2):
+                for local_pos in range(self.tile_size_M):
+                    # Load cos/sin for this position (32-lane partition over D2)
                     cos_row = cute.make_tensor(
                         cos_smem + local_pos * self.D2,
                         cute.make_layout(self.D2),
@@ -392,56 +318,145 @@ class QKNormRopeOp(Op):
                         sin_smem + local_pos * self.D2,
                         cute.make_layout(self.D2),
                     )
-                    cos_part = cute.local_partition(
-                        cos_row, thr_layout_d2, lane_idx,
-                    )
-                    sin_part = cute.local_partition(
-                        sin_row, thr_layout_d2, lane_idx,
-                    )
+                    cos_part = cute.local_partition(cos_row, thr_layout_D, lane_idx)
+                    sin_part = cute.local_partition(sin_row, thr_layout_D, lane_idx)
                     cos_reg = cute.make_fragment_like(cos_part)
                     sin_reg = cute.make_fragment_like(sin_part)
                     cute.autovec_copy(cos_part, cos_reg)
                     cute.autovec_copy(sin_part, sin_reg)
 
                     for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                        q_base = (
-                            (local_pos * self.tile_size_H + local_h) * self.D
+                        q_base = (local_pos * self.tile_size_H + local_h) * self.D
+
+                        # Load full D-row from smem → regs
+                        q_full_row = cute.make_tensor(
+                            q_smem + q_base, cute.make_layout(self.D),
                         )
-                        q0_row = cute.make_tensor(
-                            q_smem + q_base, cute.make_layout(self.D2),
+                        q_full_part = cute.local_partition(
+                            q_full_row, thr_layout_D, lane_idx,
                         )
-                        q1_row = cute.make_tensor(
-                            q_smem + q_base + self.D2,
+                        q_reg = cute.make_fragment_like(q_full_part)
+                        cute.autovec_copy(q_full_part, q_reg)
+
+                        # RMSNorm: sum of squares → warp reduction
+                        partial_sq = Float32(0.0)
+                        for i in range(cute.size(q_reg)):
+                            val = q_reg[i].to(Float32)
+                            partial_sq = partial_sq + val * val
+                        sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
+                        rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
+
+                        # Normalize + apply weight
+                        for i in range(cute.size(q_reg)):
+                            q_reg[i] = (
+                                q_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
+                            ).to(self.q_dtype)
+
+                        # RoPE in-register: reg layout with stride-32 partition
+                        for k in range(d2_regs):
+                            v0 = q_reg[k].to(Float32)
+                            v1 = q_reg[k + d2_regs].to(Float32)
+                            c = cos_reg[k].to(Float32)
+                            sn = sin_reg[k].to(Float32)
+                            q_reg[k] = (v0 * c - v1 * sn).to(self.q_dtype)
+                            q_reg[k + d2_regs] = (v1 * c + v0 * sn).to(self.q_dtype)
+
+                        cute.autovec_copy(q_reg, q_full_part)
+            else:
+                # =================================================================
+                # Path B: D2 < 32 — two-pass with barrier
+                # =================================================================
+                thr_count_d2 = self.D2
+                thr_layout_d2 = cute.make_layout(thr_count_d2)
+                compute_threads = Int32(self.effective_threads)
+
+                for local_pos in range(self.tile_size_M):
+                    for local_h in range(warp_idx, self.tile_size_H, num_warps):
+                        q_base = (local_pos * self.tile_size_H + local_h) * self.D
+
+                        q_full_row = cute.make_tensor(
+                            q_smem + q_base, cute.make_layout(self.D),
+                        )
+                        q_full_part = cute.local_partition(
+                            q_full_row, thr_layout_D, lane_idx,
+                        )
+                        q_reg = cute.make_fragment_like(q_full_part)
+                        cute.autovec_copy(q_full_part, q_reg)
+
+                        partial_sq = Float32(0.0)
+                        for i in range(cute.size(q_reg)):
+                            val = q_reg[i].to(Float32)
+                            partial_sq = partial_sq + val * val
+                        sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
+                        rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
+
+                        for i in range(cute.size(q_reg)):
+                            q_reg[i] = (
+                                q_reg[i].to(Float32) * rstd * w_reg[i].to(Float32)
+                            ).to(self.q_dtype)
+
+                        cute.autovec_copy(q_reg, q_full_part)
+
+                    named_barrier_sync(Int32(2), compute_threads)
+
+                    if lane_idx < Int32(thr_count_d2):
+                        cos_row = cute.make_tensor(
+                            cos_smem + local_pos * self.D2,
                             cute.make_layout(self.D2),
                         )
-                        q0_part = cute.local_partition(
-                            q0_row, thr_layout_d2, lane_idx,
+                        sin_row = cute.make_tensor(
+                            sin_smem + local_pos * self.D2,
+                            cute.make_layout(self.D2),
                         )
-                        q1_part = cute.local_partition(
-                            q1_row, thr_layout_d2, lane_idx,
+                        cos_part = cute.local_partition(
+                            cos_row, thr_layout_d2, lane_idx,
                         )
-                        q0_reg = cute.make_fragment_like(q0_part)
-                        q1_reg = cute.make_fragment_like(q1_part)
-                        cute.autovec_copy(q0_part, q0_reg)
-                        cute.autovec_copy(q1_part, q1_reg)
+                        sin_part = cute.local_partition(
+                            sin_row, thr_layout_d2, lane_idx,
+                        )
+                        cos_reg = cute.make_fragment_like(cos_part)
+                        sin_reg = cute.make_fragment_like(sin_part)
+                        cute.autovec_copy(cos_part, cos_reg)
+                        cute.autovec_copy(sin_part, sin_reg)
 
-                        out0_reg = cute.make_fragment_like(q0_reg)
-                        out1_reg = cute.make_fragment_like(q1_reg)
-                        for i in range(cute.size(q0_reg)):
-                            c = cos_reg[i].to(Float32)
-                            sn = sin_reg[i].to(Float32)
-                            v0 = q0_reg[i].to(Float32)
-                            v1 = q1_reg[i].to(Float32)
-                            out0_reg[i] = (v0 * c - v1 * sn).to(self.q_dtype)
-                            out1_reg[i] = (v1 * c + v0 * sn).to(
-                                self.q_dtype,
+                        for local_h in range(warp_idx, self.tile_size_H, num_warps):
+                            q_base = (
+                                (local_pos * self.tile_size_H + local_h) * self.D
                             )
+                            q0_row = cute.make_tensor(
+                                q_smem + q_base, cute.make_layout(self.D2),
+                            )
+                            q1_row = cute.make_tensor(
+                                q_smem + q_base + self.D2,
+                                cute.make_layout(self.D2),
+                            )
+                            q0_part = cute.local_partition(
+                                q0_row, thr_layout_d2, lane_idx,
+                            )
+                            q1_part = cute.local_partition(
+                                q1_row, thr_layout_d2, lane_idx,
+                            )
+                            q0_reg = cute.make_fragment_like(q0_part)
+                            q1_reg = cute.make_fragment_like(q1_part)
+                            cute.autovec_copy(q0_part, q0_reg)
+                            cute.autovec_copy(q1_part, q1_reg)
 
-                        cute.autovec_copy(out0_reg, q0_part)
-                        cute.autovec_copy(out1_reg, q1_part)
+                            out0_reg = cute.make_fragment_like(q0_reg)
+                            out1_reg = cute.make_fragment_like(q1_reg)
+                            for i in range(cute.size(q0_reg)):
+                                c = cos_reg[i].to(Float32)
+                                sn = sin_reg[i].to(Float32)
+                                v0 = q0_reg[i].to(Float32)
+                                v1 = q1_reg[i].to(Float32)
+                                out0_reg[i] = (v0 * c - v1 * sn).to(self.q_dtype)
+                                out1_reg[i] = (v1 * c + v0 * sn).to(
+                                    self.q_dtype,
+                                )
 
-                # Barrier after RoPE writes before next position iteration
-                named_barrier_sync(Int32(2), compute_threads)
+                            cute.autovec_copy(out0_reg, q0_part)
+                            cute.autovec_copy(out1_reg, q1_part)
+
+                    named_barrier_sync(Int32(2), compute_threads)
 
     # =========================================================================
     # Store (S→G)

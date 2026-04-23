@@ -196,6 +196,19 @@ def sequential_forward(
     return out, residual
 
 
+def maybe_compiled_forward(fn, example_args):
+    """Return a warmed ``torch.compile`` version of ``fn`` when available."""
+    try:
+        compiled = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+        compiled(*example_args)
+        compiled(*example_args)
+        torch.cuda.synchronize()
+        return compiled
+    except Exception as exc:
+        print(f"  torch.compile failed: {exc}")
+        return None
+
+
 # =============================================================================
 # Megakernel fused forward
 # =============================================================================
@@ -278,7 +291,7 @@ def megakernel_forward_build(
     rmsnorm1_ops = RMSNormOp.schedule(
         x=x, weight=w_attn_norm, y=h,
         residual_in=residual, residual_out=residual_out,
-        tile_sizes={"S": 16}, page_size=fa_page_size,
+        page_size=fa_page_size,
     )
     gemm_q_ops = GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=fa_page_size)
     gemm_k_ops = GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=fa_page_size)
@@ -293,10 +306,10 @@ def megakernel_forward_build(
     rmsnorm2_ops = RMSNormOp.schedule(
         x=proj, weight=w_mlp_norm, y=h2,
         residual_in=residual_out, residual_out=residual_out2,
-        tile_sizes={"S": 16}, page_size=fa_page_size,
+        page_size=fa_page_size,
     )
     gemm_gu_ops = GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=fa_page_size)
-    glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", tile_sizes={"S": 2}, page_size=fa_page_size)
+    glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", page_size=fa_page_size)
     gemm_down_ops = GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=fa_page_size)
 
     keep_alive = [
@@ -1070,6 +1083,9 @@ def bench_qwen35_layer_fwd(seq_len, batch, page_size):
     sequential_forward(*args)
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_forward(*args)
+    compiled_forward = maybe_compiled_forward(sequential_forward, args)
+    if compiled_forward is not None:
+        funcs["torch_compile"] = lambda: compiled_forward(*args)
 
     # --- Megakernel: single kernel + 3-kernel split ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
@@ -1143,6 +1159,9 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
     sequential_no_attn(*args)
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_no_attn(*args)
+    compiled_forward = maybe_compiled_forward(sequential_no_attn, args)
+    if compiled_forward is not None:
+        funcs["torch_compile"] = lambda: compiled_forward(*args)
 
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         try:
@@ -1184,7 +1203,6 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     y=h,
                     residual_in=residual,
                     residual_out=res_out,
-                    tile_sizes={"S": 16},
                     page_size=page_size,
                 )
                 + GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=page_size)
@@ -1199,11 +1217,10 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     y=h2,
                     residual_in=res_out,
                     residual_out=res_out2,
-                    tile_sizes={"S": 16},
                     page_size=page_size,
                 )
                 + GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
-                + GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", tile_sizes={"S": 2}, page_size=page_size)
+                + GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", page_size=page_size)
                 + GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size)
             )
             config = GemmOp.kernel_config(all_ops)

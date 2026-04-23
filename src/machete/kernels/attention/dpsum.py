@@ -36,7 +36,7 @@ class AttentionDPSumOp(Op):
         "dpsum": (cutlass.Float32, ("B", "H", "S")),
     }
     tile = ("B", "S", "H")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     def __init__(self, **config):
         super().__init__(**config)

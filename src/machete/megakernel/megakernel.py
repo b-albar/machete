@@ -40,7 +40,7 @@ from .scheduling import (
     TileInstruction,
 )
 from .compile import exec_generated_source
-from .backend import build_handler_backend_ir, HandlerBackend
+from .backend import build_backend
 from .backend_ir import PHASE_NAMES
 from .interpreter import (
     global_barrier_signal,
@@ -260,6 +260,7 @@ class Megakernel:
     # Class-level cache for compiled kernels to avoid recompilation
     # Key: (op_classes_tuple, static_dims_tuple, config_key)
     _compiled_kernel_cache: Dict[Tuple, Any] = {}
+    _dispatch_inputs_cache: Dict[Tuple, Any] = {}
 
     def __init__(
         self,
@@ -367,10 +368,10 @@ class Megakernel:
             self._peer_tma_registry = PeerTMARegistry.from_ops(ops, self._tensor_registry, self._peer_buffer_registry)
         else:
             self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
-            self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
+        self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
         self._peer_tma_cute_tensors: Optional[List] = None
-        self._backend_ir = build_handler_backend_ir(self)
-        self._backend = HandlerBackend(self._backend_ir)
+        self._tma_runtime_layout_cache: Dict[int, tuple] = {}
+        self._backend_ir, self._backend = build_backend(self, self.config.backend)
         self._launch_state: Optional[_LaunchState] = None
         self._cached_cu_stream = None
         self._cached_torch_stream_id = None
@@ -422,7 +423,7 @@ class Megakernel:
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
             self._instructions_tensor = self._builder.build_tensor(
-                self.device, scheduler=self._scheduler
+                self.device, scheduler=self._scheduler, instructions=instructions
             )
             self._num_instructions = self._instructions_tensor.shape[0]
             self._num_instructions_i32 = Int32(self._num_instructions)
@@ -477,8 +478,6 @@ class Megakernel:
         }
         from .backend_dispatch import (
             _build_tma_runtime_layout,
-            group_uses_handler_local_idx,
-            group_uses_handler_local_idx_from_transport,
         )
         (
             op_phase_tma_args,
@@ -489,54 +488,16 @@ class Megakernel:
             phase_local_transport_positions,
             phase_local_desc_slots,
             _handler_rebind_specs,
+            phase_uses_local_idx,
+            phase_uses_transport_selector,
+            phase_uses_desc_slot_selector,
         ) = _build_tma_runtime_layout(self._backend, self)
-        by_handler: Dict[int, List[int]] = {}
-        for op_idx, handler_idx in enumerate(op_handler_indices):
-            by_handler.setdefault(handler_idx, []).append(op_idx)
-
-        phase_uses_local_idx = {}
-        phase_uses_transport_selector = {}
-        phase_uses_desc_slot_selector = {}
-        for phase in PHASE_NAMES:
-            uses_local_idx = False
-            uses_transport_selector = False
-            uses_desc_slot_selector = False
-            for handler_idx, op_indices in by_handler.items():
-                handler_local_ids = [
-                    op_phase_local_indices[phase][op_idx] for op_idx in op_indices
-                ]
-                handler_uses_local_idx = group_uses_handler_local_idx(
-                    handler_local_ids=handler_local_ids,
-                    op_indices=op_indices,
-                    op_phase_tensor_args=[[] for _ in self.ops],
-                    op_phase_tma_args=op_phase_tma_args[phase],
-                )
-                unique_desc_slot_groups = {
-                    tuple(phase_local_desc_slots[phase][handler_idx][local_id])
-                    for local_id in set(handler_local_ids)
-                }
-                handler_uses_transport_selector = group_uses_handler_local_idx_from_transport(
-                    handler_local_ids=handler_local_ids,
-                    handler_local_transport_positions=phase_local_transport_positions[
-                    phase
-                    ][handler_idx],
-                )
-                if handler_uses_transport_selector:
-                    uses_transport_selector = True
-                handler_uses_desc_slot_selector = len(unique_desc_slot_groups) != 1
-                if handler_uses_desc_slot_selector:
-                    uses_desc_slot_selector = True
-                if (
-                    handler_uses_local_idx
-                    or handler_uses_transport_selector
-                    or handler_uses_desc_slot_selector
-                ):
-                    uses_local_idx = True
-                    break
-
-            phase_uses_local_idx[phase] = uses_local_idx
-            phase_uses_transport_selector[phase] = uses_transport_selector
-            phase_uses_desc_slot_selector[phase] = uses_desc_slot_selector
+        runtime_transport_records = getattr(self._backend, "runtime_transport_records", False)
+        if runtime_transport_records:
+            op_phase_local_indices = {
+                phase: list(_op_phase_transport_indices[phase])
+                for phase in PHASE_NAMES
+            }
 
         for op_idx, op in enumerate(self.ops):
             kernel_config = {"threads_per_row": num_compute_threads}
@@ -855,7 +816,11 @@ class Megakernel:
         Returns:
             (dispatch_load, dispatch_compute, dispatch_store)
         """
-        dispatch_inputs = self._backend.compile_phase_dispatch_inputs(self)
+        cache_key = ("dispatch_inputs", self._make_cache_key())
+        dispatch_inputs = Megakernel._dispatch_inputs_cache.get(cache_key)
+        if dispatch_inputs is None:
+            dispatch_inputs = self._backend.compile_phase_dispatch_inputs(self)
+            Megakernel._dispatch_inputs_cache[cache_key] = dispatch_inputs
         return (
             dispatch_inputs["dispatch_load"],
             dispatch_inputs["dispatch_compute"],
@@ -1109,10 +1074,27 @@ class Megakernel:
                 return helper_name
             helper_name = f"_make_tma_helper_{len(helper_name_by_key)}"
             helper_name_by_key[key] = helper_name
+            direction = getattr(desc, "direction", "s2g")
+            if direction == "g2s":
+                copy_op = "CopyBulkTensorTileG2SOp()"
+            elif direction == "s2g":
+                copy_op = "CopyBulkTensorTileS2GOp()"
+            elif direction == "s2g_reduce":
+                copy_op = "CopyReduceBulkTensorTileS2GOp(reduction_kind=ReductionOp.ADD)"
+            else:
+                raise ValueError(f"Unknown TMA direction: {direction}")
+            shape_str = ", ".join(str(s) for s in desc.tile_shape)
+            smem_layout_code = desc.smem_layout_src or f"cute.make_layout(({shape_str},))"
             helper_sources.append(
                 "@cute.jit\n"
                 f"def {helper_name}(tensor):\n"
-                f"    atom, gmem = {self._render_tma_creation_expr(desc, 'tensor')}\n"
+                "    atom, gmem = make_runtime_desc_tma_atom(\n"
+                f"        {copy_op},\n"
+                "        tensor,\n"
+                f"        {smem_layout_code},\n"
+                f"        ({shape_str},),\n"
+                "        num_multicast=1,\n"
+                "    )\n"
                 "    return atom, gmem, atom._trait.desc_ptr\n"
             )
             return helper_name
@@ -1303,9 +1285,10 @@ class Megakernel:
             "get_smem_base_ptr": get_smem_base_ptr,
             "_kernel_loop": kernel_loop,
         }
-        from .transport import copy_runtime_desc_to_pool, fence_runtime_desc_pool
+        from .transport import copy_runtime_desc_to_pool, fence_runtime_desc_pool, make_runtime_desc_tma_atom
         pk_globals["copy_runtime_desc_to_pool"] = copy_runtime_desc_to_pool
         pk_globals["fence_runtime_desc_pool"] = fence_runtime_desc_pool
+        pk_globals["make_runtime_desc_tma_atom"] = make_runtime_desc_tma_atom
 
         if tma_registry.has_tma:
             from cutlass.cute.nvgpu.cpasync import (
@@ -1786,7 +1769,6 @@ class Megakernel:
                 _ctrl_cached_uses_mask = Int32(0)
                 _ctrl_cached_config = Int64(0)
 
-                dispatch_load_slot_ptr = flags_ptr + FLAG_DISPATCH_LOAD
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
                 load_done_ptr = flags_ptr + FLAG_LOAD_DONE
@@ -1822,10 +1804,6 @@ class Megakernel:
                                     _compute_done_mbar(smem_base, _wait_slot), _wait_phase
                                 )
                                 _si = ld_shared_i32(store_idx_ptr)
-
-                            _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-                            while _dl_prev != Int32(-1):
-                                _dl_prev = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
 
                             _p_slot = produce_idx % Int32(num_pages)
                             _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
@@ -1872,16 +1850,12 @@ class Megakernel:
                                 _ctrl_cached_config,
                             )
                             produce_idx = produce_idx + Int32(1)
-                            st_shared_i32(produce_idx_ptr, produce_idx)
-                            st_shared_release_cta_i32(dispatch_load_slot_ptr, _p_slot)
+                            st_shared_release_cta_i32(produce_idx_ptr, produce_idx)
 
                         if _instr_op == Int32(TileInstruction.END_MARKER):
                             if _fetch_idx >= num_instructions:
                                 _store_idx_done = ld_shared_i32(store_idx_ptr)
                                 if (produce_idx - _store_idx_done) < Int32(num_pages):
-                                    _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
-                                    while _dl_last != Int32(-1):
-                                        _dl_last = ld_shared_acquire_cta_i32(dispatch_load_slot_ptr)
                                     _sent = produce_idx % Int32(num_pages)
                                     st_shared_i32(
                                         smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
@@ -1904,79 +1878,78 @@ class Megakernel:
                     )
 
                 _ldr_done = Int32(0)
-                _ldr_dispatch_ptr = flags_ptr + FLAG_DISPATCH_LOAD
                 _ldr_load_done_ptr = flags_ptr + FLAG_LOAD_DONE
+                _ldr_produce_ptr = flags_ptr + FLAG_PRODUCE_IDX
+                _ldr_idx = Int32(0)
 
                 while _ldr_done == Int32(0):
-                    _dl_slot = ld_shared_acquire_cta_i32(_ldr_dispatch_ptr)
-                    if _dl_slot != Int32(-1):
+                    _p_idx = ld_shared_acquire_cta_i32(_ldr_produce_ptr)
+                    if _ldr_idx < _p_idx:
+                        _dl_slot = _ldr_idx % Int32(num_pages)
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
                         _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
-                        _dl_meta_base = _op_meta_base(_dl_op)
-                        _dl_handler = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
-                        _dl_handler_local = Int32(0)
-                        if const_expr(dispatch_load_uses_handler_local_idx):
-                            _dl_handler_local = _op_meta_i32_base(
-                                op_meta_ptr, _dl_meta_base, Int32(_OP_META_LOAD_LOCAL_IDX)
-                            )
-                        _dl_0 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_0))
-                        _dl_1 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_1))
-                        _dl_2 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_2))
-                        _dl_3 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_3))
-                        _dl_4 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_4))
-                        _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
-                        _dl_pp = _get_page_ptr(smem_base, _dl_slot)
-                        _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
-                        _dl_iter = Int32(0)
-                        if const_expr(tracing):
-                            _tl = trace_start()
-                        if const_expr(dispatch_load_uses_handler_local_idx):
-                            dispatch_load(
-                                _dl_handler,
-                                _dl_handler_local,
-                                _dl_pp,
-                                _dl_0,
-                                _dl_1,
-                                _dl_2,
-                                _dl_3,
-                                _dl_4,
-                                _dl_config,
-                                _dl_mbar,
-                                _dl_iter,
-                            )
-                        else:
-                            dispatch_load(
-                                _dl_handler,
-                                _dl_pp,
-                                _dl_0,
-                                _dl_1,
-                                _dl_2,
-                                _dl_3,
-                                _dl_4,
-                                _dl_config,
-                                _dl_mbar,
-                                _dl_iter,
-                            )
-                        if const_expr(tracing):
-                            _dma_lane = end_event_dynamic_raw_1(
-                                _tl,
-                                _trace_buf,
-                                Int32(trace_row_stride),
-                                _dma_lane,
-                                ld_global_i32(trace_load_fmt_ptr, _dl_op),
-                                _dl_op,
-                            )
-                        with cute.arch.elect_one():
-                            st_shared_release_cta_i32(_ldr_dispatch_ptr, Int32(-1))
-
-                    if _dl_slot == Int32(-1):
+                        if _dl_op != Int32(TileInstruction.END_MARKER):
+                            _dl_meta_base = _op_meta_base(_dl_op)
+                            _dl_handler = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
+                            _dl_handler_local = Int32(0)
+                            if const_expr(dispatch_load_uses_handler_local_idx):
+                                _dl_handler_local = _op_meta_i32_base(
+                                    op_meta_ptr, _dl_meta_base, Int32(_OP_META_LOAD_LOCAL_IDX)
+                                )
+                            _dl_0 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_0))
+                            _dl_1 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_1))
+                            _dl_2 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_2))
+                            _dl_3 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_3))
+                            _dl_4 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_4))
+                            _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
+                            _dl_pp = _get_page_ptr(smem_base, _dl_slot)
+                            _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
+                            _dl_iter = Int32(0)
+                            if const_expr(tracing):
+                                _tl = trace_start()
+                            if const_expr(dispatch_load_uses_handler_local_idx):
+                                dispatch_load(
+                                    _dl_handler,
+                                    _dl_handler_local,
+                                    _dl_pp,
+                                    _dl_0,
+                                    _dl_1,
+                                    _dl_2,
+                                    _dl_3,
+                                    _dl_4,
+                                    _dl_config,
+                                    _dl_mbar,
+                                    _dl_iter,
+                                )
+                            else:
+                                dispatch_load(
+                                    _dl_handler,
+                                    _dl_pp,
+                                    _dl_0,
+                                    _dl_1,
+                                    _dl_2,
+                                    _dl_3,
+                                    _dl_4,
+                                    _dl_config,
+                                    _dl_mbar,
+                                    _dl_iter,
+                                )
+                            if const_expr(tracing):
+                                _dma_lane = end_event_dynamic_raw_1(
+                                    _tl,
+                                    _trace_buf,
+                                    Int32(trace_row_stride),
+                                    _dma_lane,
+                                    ld_global_i32(trace_load_fmt_ptr, _dl_op),
+                                    _dl_op,
+                                )
+                        _ldr_idx = _ldr_idx + Int32(1)
+                    else:
                         nanosleep(Int32(100))
 
                     _ldr_done = ld_shared_i32(_ldr_load_done_ptr)
-                    if _ldr_done == Int32(1):
-                        _dl_final = ld_shared_i32(_ldr_dispatch_ptr)
-                        if _dl_final != Int32(-1):
-                            _ldr_done = Int32(0)
+                    if _ldr_done == Int32(1) and _ldr_idx < ld_shared_acquire_cta_i32(_ldr_produce_ptr):
+                        _ldr_done = Int32(0)
 
                 if const_expr(tracing):
                     finish_lane_dynamic_raw(_trace_buf, _dma_lane)

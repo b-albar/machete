@@ -110,7 +110,7 @@ class FlashAttentionSm100Op(Op):
         "lse": (cutlass.Float32, ("B", "H", "M")),
     }
     tile = ("B", "H", "M", "D")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "M", "N")
 
     tma_loads = {"q"}
     tma_stores = {"o"}

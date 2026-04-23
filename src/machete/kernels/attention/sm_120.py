@@ -96,7 +96,7 @@ class FlashAttentionSm120Op(Op):
     }
     writes = {"o": (None, ("B", "H", "M", "D")), "lse": (cutlass.Float32, ("B", "H", "M"))}
     tile = ("B", "H", "M", "D")
-    dynamic_dims = ("B", "N")
+    dynamic_dims = ("B", "M", "N")
 
     # Only Q via TMA (DMA warp), K/V loaded by cpasync in compute
     tma_loads = {"q"}
@@ -346,6 +346,23 @@ class FlashAttentionSm120Op(Op):
                     tile_M = tile_M_2x  # Q-in-smem: rare, only if page >> Q
                 else:
                     tile_M = max(16, nw * 16)  # Q-preload: default
+
+                # For short-prefill Qwen-style shapes under the fixed fused
+                # 224-TPB regime, larger pages should spend the smem budget on
+                # a fatter M tile rather than leaving the attention block at
+                # the smaller 2-warp shape. At 96KB, 64x4 is the best variant
+                # we measured for M=128,D=256 and it matches the fused global
+                # TPB target exactly.
+                if M <= 128 and page_size <= 32 * 1024:
+                    tile_M = 16
+                    nw = 1
+                elif M <= 128 and page_size >= 96 * 1024:
+                    tile_M = 64 if M >= 64 else 32
+                    nw = 4 if tile_M == 64 else 2
+                elif M <= 128 and page_size >= 48 * 1024:
+                    tile_M = 32
+                    nw = 2
+
                 tile_sizes["M"] = tile_M
         # Auto-allocate lse output if not provided
         if "lse" not in tensors and q is not None:
@@ -506,6 +523,7 @@ class FlashAttentionSm120Op(Op):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
 
+        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
         runtime_N = config_dim_i32(op_config_ptr, "N", type(self))
         runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
         runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
@@ -667,7 +685,7 @@ class FlashAttentionSm120Op(Op):
             num_kv_blocks_eff = runtime_num_kv_blocks
             if self.causal:
                 _last_row = tile_M * Int32(self.tile_size_M) + Int32(self.tile_size_M - 1)
-                _max_col = _last_row + (runtime_N - Int32(self.M))
+                _max_col = _last_row + (runtime_N - runtime_M)
                 num_kv_blocks_eff = (_max_col + Int32(self.n_block)) // Int32(self.n_block)
                 if num_kv_blocks_eff > runtime_num_kv_blocks:
                     num_kv_blocks_eff = runtime_num_kv_blocks
@@ -742,14 +760,14 @@ class FlashAttentionSm120Op(Op):
                 if self.causal:
                     last_blk_col = kv_start + Int32(self.n_block - 1)
                     first_row = tile_M * Int32(self.tile_size_M)
-                    if last_blk_col > first_row + (runtime_N - Int32(self.M)):
+                    if last_blk_col > first_row + (runtime_N - runtime_M):
                         for r in cutlass.range_constexpr(num_rows):
                             row_idx = tScS_mn[r, 0][0]
                             global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
                             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                                 col_idx = tScS_mn[0, c][1]
                                 global_col = kv_start + Int32(col_idx)
-                                if global_col > global_row + (runtime_N - Int32(self.M)):
+                                if global_col > global_row + (runtime_N - runtime_M):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---
@@ -819,14 +837,14 @@ class FlashAttentionSm120Op(Op):
             # Write LSE to global via CuTe tensor. Each thread in the MMA partition owns
             # specific rows identified by the identity tensor tScS_mn[r, 0][0].
             # Only one thread per quad writes (threads 0,1,2,3 in a quad share the same row).
-            lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + tile_H) * Int32(self.M)
-            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
+            lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + tile_H) * runtime_M
+            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(runtime_M))
             lane_in_quad = tidx % Int32(4)
             for r in cutlass.range_constexpr(num_rows):
                 if lane_in_quad == Int32(0):
                     row_idx = tScS_mn[r, 0][0]
                     global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
-                    if global_row < Int32(self.M):
+                    if global_row < runtime_M:
                         lse_val = row_max[r] * Float32(self.scale_val) + cute.math.log(row_sum[r])
                         g_lse[global_row] = lse_val
 
@@ -875,6 +893,7 @@ class FlashAttentionSm120Op(Op):
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
 
+        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
         runtime_N = config_dim_i32(op_config_ptr, "N", type(self))
         runtime_k_b_stride = Int32(self.k_b_stride) if self.k_b_stride is not None else Int32(self.H_kv) * runtime_N * Int32(self.D)
         runtime_k_h_stride = Int32(self.k_h_stride) if self.k_h_stride is not None else runtime_N * Int32(self.D)
@@ -1020,7 +1039,7 @@ class FlashAttentionSm120Op(Op):
             num_kv_blocks_eff = runtime_num_kv_blocks
             if self.causal:
                 _last_row = tile_M * Int32(self.tile_size_M) + Int32(self.tile_size_M - 1)
-                _max_col = _last_row + (runtime_N - Int32(self.M))
+                _max_col = _last_row + (runtime_N - runtime_M)
                 num_kv_blocks_eff = (_max_col + Int32(self.n_block)) // Int32(self.n_block)
                 if num_kv_blocks_eff > runtime_num_kv_blocks:
                     num_kv_blocks_eff = runtime_num_kv_blocks
@@ -1084,14 +1103,14 @@ class FlashAttentionSm120Op(Op):
                 if self.causal:
                     last_blk_col = kv_start + Int32(self.n_block - 1)
                     first_row = tile_M * Int32(self.tile_size_M)
-                    if last_blk_col > first_row + (runtime_N - Int32(self.M)):
+                    if last_blk_col > first_row + (runtime_N - runtime_M):
                         for r in cutlass.range_constexpr(num_rows):
                             row_idx = tScS_mn[r, 0][0]
                             global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
                             for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                                 col_idx = tScS_mn[0, c][1]
                                 global_col = kv_start + Int32(col_idx)
-                                if global_col > global_row + (runtime_N - Int32(self.M)):
+                                if global_col > global_row + (runtime_N - runtime_M):
                                     acc_S_mn[r, c] = Float32(-1e30)
 
                 # --- Online softmax ---
@@ -1139,14 +1158,14 @@ class FlashAttentionSm120Op(Op):
             for r in cutlass.range_constexpr(num_rows):
                 row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
 
-            lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + tile_H) * Int32(self.M)
-            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
+            lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + tile_H) * runtime_M
+            g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(runtime_M))
             lane_in_quad = tidx % Int32(4)
             for r in cutlass.range_constexpr(num_rows):
                 if lane_in_quad == Int32(0):
                     row_idx = tScS_mn[r, 0][0]
                     global_row = tile_M * Int32(self.tile_size_M) + Int32(row_idx)
-                    if global_row < Int32(self.M):
+                    if global_row < runtime_M:
                         lse_val = row_max[r] * Float32(self.scale_val) + cute.math.log(row_sum[r])
                         g_lse[global_row] = lse_val
 

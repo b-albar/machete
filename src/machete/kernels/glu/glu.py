@@ -55,10 +55,25 @@ ACT_MAP = {
 }
 
 
+def _pick_forward_tile_size_s(x, y, activation, page_size):
+    """Choose a forward row tile that uses page capacity without overfilling it.
+
+    SwiGLU on large hidden sizes loses throughput when auto-scheduling simply
+    expands the row tile with page size. Larger pages are still useful, but the
+    best tile tends to stay small enough that the barriered register staging
+    phase does not balloon.
+    """
+    row_bytes = x.shape[-1] * x.element_size()
+    raw_tile_size_s = max(1, page_size // row_bytes)
+    if activation == ACT_SILU and y.shape[-1] >= 1024 and raw_tile_size_s > 3:
+        return 2
+    return raw_tile_size_s
+
+
 @cute.jit
 def _glu_forward_core(page_ptr, tile_S,
                       x_dtype, activation,
-                      D, N, S, tile_size_S,
+                      D, N, runtime_S, tile_size_S,
                       num_warps, max_rows_per_warp, threads_per_row):
     """Shared forward GLU compute core."""
     x_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
@@ -80,7 +95,7 @@ def _glu_forward_core(page_ptr, tile_S,
 
         if local_row < Int32(tile_size_S):
             row_idx = row_start + local_row
-            if row_idx < Int32(S):
+            if row_idx < runtime_S:
                 gate_row = cute.make_tensor(
                     x_smem + local_row * Int32(N),
                     cute.make_layout(D),
@@ -141,7 +156,7 @@ if getattr(_glu_forward_core, "__wrapped__", None) is not None:
 @cute.jit
 def _glu_forward_core_silu(page_ptr, tile_S,
                            x_dtype,
-                           D, N, S, tile_size_S,
+                           D, N, runtime_S, tile_size_S,
                            num_warps, max_rows_per_warp, threads_per_row):
     """Shared forward GLU core specialized for SiLU."""
     x_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
@@ -163,7 +178,7 @@ def _glu_forward_core_silu(page_ptr, tile_S,
 
         if local_row < Int32(tile_size_S):
             row_idx = row_start + local_row
-            if row_idx < Int32(S):
+            if row_idx < runtime_S:
                 gate_row = cute.make_tensor(
                     x_smem + local_row * Int32(N),
                     cute.make_layout(D),
@@ -206,6 +221,83 @@ def _glu_forward_core_silu(page_ptr, tile_S,
             cute.autovec_copy(y_regs[ri], y_part)
 
 
+@cute.jit
+def _glu_forward_core_direct(page_ptr, y_offset, tile_S,
+                             x_dtype, activation,
+                             D, N, runtime_S, tile_size_S,
+                             num_warps, max_rows_per_warp):
+    """Forward GLU core when x/y use disjoint smem regions.
+
+    Since y does not overwrite x, each warp can compute one row and write it
+    back immediately with no cross-warp barrier.
+    """
+    x_smem = cute.make_ptr(x_dtype, page_ptr, cute.AddressSpace.smem)
+    y_smem = cute.make_ptr(x_dtype, page_ptr + y_offset, cute.AddressSpace.smem)
+
+    warp_idx = cute.arch.warp_idx()
+    lane_idx = cute.arch.lane_idx()
+    thr_layout = cute.make_layout(32)
+    row_start = tile_S * Int32(tile_size_S)
+
+    for ri in cutlass.range_constexpr(max_rows_per_warp):
+        local_row = warp_idx + Int32(ri * num_warps)
+        if local_row < Int32(tile_size_S):
+            row_idx = row_start + local_row
+            if row_idx < runtime_S:
+                gate_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N),
+                    cute.make_layout(D),
+                )
+                gate_part = cute.local_partition(gate_row, thr_layout, lane_idx)
+                gate_reg = cute.make_fragment_like(gate_part)
+                cute.autovec_copy(gate_part, gate_reg)
+
+                up_row = cute.make_tensor(
+                    x_smem + local_row * Int32(N) + Int32(D),
+                    cute.make_layout(D),
+                )
+                up_part = cute.local_partition(up_row, thr_layout, lane_idx)
+                up_reg = cute.make_fragment_like(up_part)
+                cute.autovec_copy(up_part, up_reg)
+
+                y_row = cute.make_tensor(
+                    y_smem + local_row * Int32(D),
+                    cute.make_layout(D),
+                )
+                y_part = cute.local_partition(y_row, thr_layout, lane_idx)
+                y_reg = cute.make_fragment_like(y_part)
+
+                for i in range(cute.size(gate_reg)):
+                    g = gate_reg[i].to(Float32)
+                    u = up_reg[i].to(Float32)
+                    act_val = g
+                    if activation == ACT_RELU:
+                        act_val = g
+                        if g < Float32(0.0):
+                            act_val = Float32(0.0)
+                    elif activation == ACT_SILU:
+                        neg_g = Float32(0.0) - g
+                        exp_neg = cute.math.exp(neg_g, fastmath=True)
+                        act_val = g / (Float32(1.0) + exp_neg)
+                    y_reg[i] = (act_val * u).to(x_dtype)
+
+                cute.autovec_copy(y_reg, y_part)
+
+
+@cute.jit
+def _glu_forward_core_silu_direct(page_ptr, y_offset, tile_S,
+                                  x_dtype,
+                                  D, N, runtime_S, tile_size_S,
+                                  num_warps, max_rows_per_warp):
+    """Direct-write SiLU specialization for separate x/y smem regions."""
+    _glu_forward_core_direct(
+        page_ptr, y_offset, tile_S,
+        x_dtype, ACT_SILU,
+        D, N, runtime_S, tile_size_S,
+        num_warps, max_rows_per_warp,
+    )
+
+
 
 
 # =============================================================================
@@ -230,7 +322,7 @@ class GLUOp(Op):
         "y": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -253,6 +345,11 @@ class GLUOp(Op):
         # Smem: x occupies tile_S * N * elem_bytes (TMA loaded).
         # After barrier, y overwrites [0, tile_S * D * elem_bytes).
         self.x_tile_bytes = self.tile_size_S * self.N * self.elem_bytes
+        self.y_tile_bytes = self.tile_size_S * self.D * self.elem_bytes
+        self.use_separate_y_smem = (
+            self.x_tile_bytes + self.y_tile_bytes <= self.page_size
+        )
+        self.y_smem_offset = self.x_tile_bytes if self.use_separate_y_smem else 0
 
         assert self.x_tile_bytes <= self.page_size, (
             f"GLU: x tile ({self.x_tile_bytes}B) > page ({self.page_size}B). "
@@ -262,6 +359,27 @@ class GLUOp(Op):
         self.max_rows_per_warp = (
             (self.tile_size_S + self.num_warps - 1) // self.num_warps
         )
+        # Under a large global megakernel TPB, letting every compute warp
+        # participate in GLU raises barrier pressure without increasing useful
+        # row parallelism on the Qwen-sized SwiGLU tiles. Keep the DMA warp
+        # count global, but cap the active compute warps locally.
+        self.effective_warps = self.num_warps
+        if self.activation == ACT_SILU:
+            # Under the fixed 224-TPB megakernel, large-hidden SwiGLU usually
+            # benefits from a small compute group that is still larger than the
+            # row tile. The exception is the large-page direct-write path:
+            # once x/y have disjoint smem regions at 96KB, extra warps add
+            # overhead without adding useful row parallelism.
+            if self.use_separate_y_smem and self.page_size >= 96 * 1024:
+                self.effective_warps = min(self.num_warps, max(1, self.tile_size_S))
+            elif self.D >= 1024:
+                self.effective_warps = min(self.num_warps, 3)
+            else:
+                self.effective_warps = min(self.num_warps, max(1, self.tile_size_S))
+        self.max_rows_per_warp = (
+            (self.tile_size_S + self.effective_warps - 1) // self.effective_warps
+        )
+        self.effective_threads = self.effective_warps * 32
 
         if self.activation == ACT_SILU:
             self.compute = self.compute_silu
@@ -287,9 +405,9 @@ class GLUOp(Op):
 
         tile_sizes = dict(tile_sizes or {})
         if "S" not in tile_sizes:
-            N = x.shape[-1]
-            elem_bytes = x.element_size()
-            tile_sizes["S"] = max(1, page_size // (N * elem_bytes))
+            tile_sizes["S"] = _pick_forward_tile_size_s(
+                x, y, ACT_MAP.get(activation, ACT_SILU), page_size
+            )
         tile_sizes.setdefault("B", 1)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
@@ -339,7 +457,7 @@ class GLUOp(Op):
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_S):
+    def compute(self, page_ptr, tile_S, op_config_ptr):
         """GLU forward: read gate+up from smem x, compute y, write y to smem.
 
         Phase 1: All warps read from smem x (N-stride per row), compute y in
@@ -347,29 +465,56 @@ class GLUOp(Op):
         Barrier: named_barrier_sync ensures all warps done reading x.
         Phase 2: Write y to smem at offset 0 with D-stride per row.
         """
-        if self.activation == ACT_SILU:
-            _glu_forward_core_silu(
-                page_ptr, tile_S,
-                self.x_dtype,
-                self.D, self.N, self.S, self.tile_size_S,
-                self.num_warps, self.max_rows_per_warp, self.threads_per_row,
-            )
-        else:
-            _glu_forward_core(
-                page_ptr, tile_S,
-                self.x_dtype, self.activation,
-                self.D, self.N, self.S, self.tile_size_S,
-                self.num_warps, self.max_rows_per_warp, self.threads_per_row,
-            )
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        if cute.arch.warp_idx() < Int32(self.effective_warps):
+            if self.use_separate_y_smem:
+                if self.activation == ACT_SILU:
+                    _glu_forward_core_silu_direct(
+                        page_ptr, Int32(self.y_smem_offset), tile_S,
+                        self.x_dtype,
+                        self.D, self.N, runtime_S, self.tile_size_S,
+                        self.effective_warps, self.max_rows_per_warp,
+                    )
+                else:
+                    _glu_forward_core_direct(
+                        page_ptr, Int32(self.y_smem_offset), tile_S,
+                        self.x_dtype, self.activation,
+                        self.D, self.N, runtime_S, self.tile_size_S,
+                        self.effective_warps, self.max_rows_per_warp,
+                    )
+            elif self.activation == ACT_SILU:
+                _glu_forward_core_silu(
+                    page_ptr, tile_S,
+                    self.x_dtype,
+                    self.D, self.N, runtime_S, self.tile_size_S,
+                    self.effective_warps, self.max_rows_per_warp, self.effective_threads,
+                )
+            else:
+                _glu_forward_core(
+                    page_ptr, tile_S,
+                    self.x_dtype, self.activation,
+                    self.D, self.N, runtime_S, self.tile_size_S,
+                    self.effective_warps, self.max_rows_per_warp, self.effective_threads,
+                )
 
     @cute.jit
-    def compute_silu(self, page_ptr, tile_S):
-        _glu_forward_core_silu(
-            page_ptr, tile_S,
-            self.x_dtype,
-            self.D, self.N, self.S, self.tile_size_S,
-            self.num_warps, self.max_rows_per_warp, self.threads_per_row,
-        )
+    def compute_silu(self, page_ptr, tile_S, op_config_ptr):
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        if cute.arch.warp_idx() < Int32(self.effective_warps):
+            if self.use_separate_y_smem:
+                _glu_forward_core_silu_direct(
+                    page_ptr, Int32(self.y_smem_offset), tile_S,
+                    self.x_dtype,
+                    self.D, self.N, runtime_S, self.tile_size_S,
+                    self.effective_warps, self.max_rows_per_warp,
+                )
+            else:
+                _glu_forward_core_silu(
+                    page_ptr, tile_S,
+                    self.x_dtype,
+                    self.D, self.N, runtime_S, self.tile_size_S,
+                    self.effective_warps, self.max_rows_per_warp, self.effective_threads,
+                )
 
     # =========================================================================
     # Forward Store (TMA S->G)
@@ -380,7 +525,11 @@ class GLUOp(Op):
              y_tma, y_tma_gmem):
         """TMA store y (D × tile_S × 1) from smem[0] to global."""
         sY = cute.make_tensor(
-            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.y_smem_offset),
+                cute.AddressSpace.smem,
+            ),
             cute.make_layout((self.D, self.tile_size_S, 1)),
         )
         gY = cute.local_tile(
@@ -421,7 +570,7 @@ class GLUBwdOp(Op):
         "dx": (None, ("B", "S", "N")),
     }
     tile = ("B", "S", "D")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     tma_loads = {"x"}
     tma_stores = {"dx"}
@@ -528,11 +677,12 @@ class GLUBwdOp(Op):
         """
         x_smem = cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem)
         batch_size = config_dim_i32(op_config_ptr, "B", type(self))
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         dy_ptr = config_ptr_i64(op_config_ptr, "dy", type(self))
         dy = cute.make_tensor(
             cute.make_ptr(self.dy_dtype, dy_ptr, cute.AddressSpace.gmem, assumed_align=16),
             cute.make_layout(
-                (batch_size, self.S, self.D),
+                (batch_size, runtime_S, self.D),
                 stride=(self.dy_stride_B, self.dy_stride_S, self.dy_stride_D),
             ),
         )
@@ -546,9 +696,9 @@ class GLUBwdOp(Op):
         for local_row in range(warp_idx, self.tile_size_S, self.num_warps):
             row_idx = row_start + Int32(local_row)
 
-            if row_idx < Int32(self.S):
+            if row_idx < runtime_S:
                 # Read dy from global
-                dy_offset = (tile_B * Int32(self.S * self.D)
+                dy_offset = (tile_B * runtime_S * Int32(self.D)
                              + row_idx * Int32(self.D))
                 dy_row = cute.make_tensor(
                     dy.iterator + dy_offset,

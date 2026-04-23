@@ -19,9 +19,11 @@ Usage:
 """
 
 import ast
+import hashlib
 import inspect
 import linecache
 import textwrap
+from functools import lru_cache
 from typing import Dict, List, Tuple
 
 import cutlass.cute as cute
@@ -29,11 +31,27 @@ from cutlass import Int32, Int64
 
 from .ops import MAX_TILE_DIMS
 
-# Counter for unique filenames in linecache
-_compile_counter = 0
-
 # Track linecache entries for cleanup
 _linecache_entries: list = []
+
+# Counter for phase-wrapper filenames in linecache.
+_compile_counter = 0
+
+
+@lru_cache(maxsize=None)
+def _compile_generated_source(source: str, label: str):
+    """Compile generated source once per `(source, label)` pair."""
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
+    filename = f"<{label}>_{digest}"
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        source.splitlines(True),
+        filename,
+    )
+    if filename not in _linecache_entries:
+        _linecache_entries.append(filename)
+    return compile(source, filename, "exec")
 
 
 def exec_generated_source(source: str, label: str, exec_globals: dict) -> dict:
@@ -50,17 +68,7 @@ def exec_generated_source(source: str, label: str, exec_globals: dict) -> dict:
     Returns:
         The exec_globals dict (same object, for convenience).
     """
-    global _compile_counter
-    _compile_counter += 1
-    filename = f"<{label}>_{_compile_counter}"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(True),
-        filename,
-    )
-    _linecache_entries.append(filename)
-    code = compile(source, filename, "exec")
+    code = _compile_generated_source(source, label)
     exec(code, exec_globals)
     return exec_globals
 
@@ -81,6 +89,32 @@ def _register_generated_source(source: str, filename: str) -> None:
 # =============================================================================
 
 
+@lru_cache(maxsize=None)
+def _extract_body_from_file(source_file: str, fn_name: str, def_lineno: int) -> str:
+    """Extract a function body from a source file, cached by stable location."""
+    with open(source_file, "r", encoding="utf-8") as f:
+        file_source = f.read()
+    tree = ast.parse(file_source)
+
+    func_node = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == fn_name
+            and node.lineno == def_lineno
+        ):
+            func_node = node
+            break
+
+    if func_node is None:
+        raise ValueError(f"Could not find function def for {fn_name} at line {def_lineno}")
+
+    lines = file_source.splitlines()
+    body_start = func_node.body[0].lineno - 1
+    body_end = func_node.body[-1].end_lineno
+    return textwrap.dedent("\n".join(lines[body_start:body_end]))
+
+
 def _extract_body(fn):
     """Extract a function's body as dedented source code.
 
@@ -93,8 +127,6 @@ def _extract_body(fn):
     """
     source_file = inspect.getsourcefile(fn)
     if source_file:
-        file_source = inspect.getsource(inspect.getmodule(fn))
-        tree = ast.parse(file_source)
         source_lines, start_lineno = inspect.getsourcelines(fn)
         def_lineno = start_lineno
         for offset, line in enumerate(source_lines):
@@ -102,24 +134,7 @@ def _extract_body(fn):
             if stripped.startswith("def ") or stripped.startswith("async def "):
                 def_lineno = start_lineno + offset
                 break
-
-        func_node = None
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == fn.__name__
-                and node.lineno == def_lineno
-            ):
-                func_node = node
-                break
-
-        if func_node is None:
-            raise ValueError(f"Could not find function def for {fn.__name__} at line {def_lineno}")
-
-        lines = file_source.splitlines()
-        body_start = func_node.body[0].lineno - 1
-        body_end = func_node.body[-1].end_lineno
-        return textwrap.dedent("\n".join(lines[body_start:body_end]))
+        return _extract_body_from_file(source_file, fn.__name__, def_lineno)
 
     source = textwrap.dedent(inspect.getsource(fn))
     tree = ast.parse(source)

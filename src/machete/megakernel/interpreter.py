@@ -19,6 +19,10 @@ from cutlass._mlir.dialects import llvm
 # unique names.
 _ptx_label_counter = 0
 
+# The instruction tensor is stored as [op_idx, linear_tile_idx, tile_0..tile_4]
+# i.e. 7 int32 words per row.
+_INSTRUCTION_ROW_STRIDE_BYTES = 7 * 4
+
 
 # =============================================================================
 # Global Barrier (Inter-Block Synchronization)
@@ -245,16 +249,19 @@ def load_instruction_to_smem(
     loc=None,
     ip=None,
 ) -> None:
-    """Load a flat instruction (2 words) from global memory to shared memory.
+    """Load an instruction header (2 words) from global memory to shared memory.
 
-    Uses 1x ld.global.v2.b32 to load both instruction words (op_idx +
-    linear_tile_idx), then 1x st.shared.v2.b32 to write them to shared
-    memory.  v2 loads require 8-byte alignment, which is satisfied for
-    all instruction indices with 8-byte stride.
+    The instruction tensor is laid out as
+    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values, but only the
+    first two words (``op_idx`` and ``linear_tile_idx``) are needed here.
+    This helper therefore loads those two words from the start of the
+    selected row, using the full row stride. The row stride is 28 bytes,
+    so the second row is only 4-byte aligned; use scalar loads rather than
+    ``ld.global.v2.b32`` which requires 8-byte alignment.
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
-        instr_idx: Instruction index (byte offset = instr_idx * 8)
+        instr_idx: Instruction row index
         smem_dest: Shared memory destination address (must be 8-byte aligned)
     """
     llvm.inline_asm(
@@ -263,20 +270,24 @@ def load_instruction_to_smem(
             instr_ptr.ir_value(loc=loc, ip=ip),
             instr_idx.ir_value(loc=loc, ip=ip),
             smem_dest.ir_value(loc=loc, ip=ip),
+            Int32(_INSTRUCTION_ROW_STRIDE_BYTES).ir_value(loc=loc, ip=ip),
         ],
         """
         {
             .reg .u64 %gaddr;
             .reg .u32 %w0, %w1;
-            mad.wide.u32 %gaddr, $1, 8, $0;
-            ld.global.v2.b32 {%w0, %w1}, [%gaddr];
+            mad.wide.u32 %gaddr, $1, $3, $0;
+            ld.global.b32 %w0, [%gaddr];
+            ld.global.b32 %w1, [%gaddr+4];
             st.shared.v2.b32 [$2], {%w0, %w1};
         }
         """,
-        "l,r,r",
+        "l,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 

@@ -8,7 +8,19 @@ Tests the megakernel that uses instruction stream and fine-grained barriers.
 import pytest
 import torch
 
+from machete.kernels.attention import FlashAttentionSm120Op
+from machete.kernels.gemm import GemmOp
+from machete.kernels.glu import GLUOp
+from machete.kernels.qknorm_rope import QKNormRopeOp
+from machete.kernels.rms_norm import RMSNormOp
 from tests.megakernel.support import get_nop_op
+from tests.megakernel.support_tma import (
+    SYNTHETIC_TMA_N,
+    SYNTHETIC_TMA_TILE_M,
+    SyntheticTMAAddOneOp,
+)
+from machete.megakernel.backend import HandlerBackend, RuntimeBackend
+from machete.megakernel.backend_dispatch import _build_tma_runtime_layout
 
 
 class TestMegakernel:
@@ -32,6 +44,164 @@ class TestMegakernel:
         assert kernel.total_tiles == 48
         assert kernel.grid == (8, 1, 1)  # Now based on num_sms (persistent blocks)
         assert kernel.block == (256, 1, 1)
+
+    def test_backend_selection_uses_config(self):
+        """Megakernel should honor MegakernelConfig.backend."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
+
+        ops = [ScheduledOp(NopOp, tile_counts=(4,))]
+
+        handler_kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="handler"),
+            device="cpu",
+        )
+        runtime_kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            device="cpu",
+        )
+
+        assert isinstance(handler_kernel._backend, HandlerBackend)
+        assert isinstance(runtime_kernel._backend, RuntimeBackend)
+
+    def test_unknown_backend_raises(self):
+        """Unknown backend names should fail eagerly."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
+
+        ops = [ScheduledOp(NopOp, tile_counts=(1,))]
+
+        with pytest.raises(ValueError, match="Unknown megakernel backend"):
+            Megakernel(
+                ops,
+                config=MegakernelConfig(num_sms=1, backend="does-not-exist"),
+                device="cpu",
+            )
+
+    def test_runtime_backend_does_not_duplicate_identical_handlers(self):
+        """Repeated identical ops should share one emitted handler body."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
+
+        ops = [
+            ScheduledOp(NopOp, tile_counts=(32,)),
+            ScheduledOp(NopOp, tile_counts=(16,)),
+            ScheduledOp(NopOp, tile_counts=(8,)),
+        ]
+
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            device="cpu",
+        )
+
+        assert len(kernel._backend_ir.handler_specs) == 1
+        assert list(kernel._backend_ir.op_handler_indices) == [0, 0, 0]
+
+    def test_runtime_backend_local_indices_follow_transport_records(self):
+        """Runtime backend local phase ids should be transport-record ids."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
+
+        ops = [
+            ScheduledOp(NopOp, tile_counts=(4,)),
+            ScheduledOp(NopOp, tile_counts=(2,)),
+        ]
+
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            device="cpu",
+        )
+
+        for phase in ("load", "compute", "store", "communicate"):
+            assert (
+                list(kernel._backend_ir.op_phase_local_indices[phase])
+                == list(kernel._backend_ir.op_phase_transport_indices[phase])
+            )
+
+    def test_runtime_backend_transport_tables_do_not_grow_with_identical_layers(self):
+        """Runtime transport selector tables should scale with unique records, not layers."""
+        from machete.megakernel import Megakernel, MegakernelConfig
+
+        def _make_kernel(num_layers: int):
+            ops = []
+            for _ in range(num_layers):
+                x = torch.zeros(SYNTHETIC_TMA_TILE_M, SYNTHETIC_TMA_N, dtype=torch.float16)
+                y = torch.zeros(SYNTHETIC_TMA_TILE_M, SYNTHETIC_TMA_N, dtype=torch.float16)
+                ops.extend(
+                    SyntheticTMAAddOneOp.schedule(
+                        x=x,
+                        y=y,
+                        tile_sizes={"M": SYNTHETIC_TMA_TILE_M},
+                    )
+                )
+            kernel = Megakernel(
+                ops,
+                config=MegakernelConfig(num_sms=1, backend="runtime"),
+                device="cpu",
+            )
+            kernel._prepare_tensors()
+            return kernel
+
+        k1 = _make_kernel(1)
+        k32 = _make_kernel(32)
+
+        assert k1._phase_local_transport_position_widths["load"] == k32._phase_local_transport_position_widths["load"]
+        assert k1._phase_local_transport_position_widths["store"] == k32._phase_local_transport_position_widths["store"]
+        assert k1._phase_local_desc_slot_widths["load"] == 0
+        assert k1._phase_local_desc_slot_widths["store"] == 0
+        assert k32._phase_local_desc_slot_widths["load"] == 1
+        assert k32._phase_local_desc_slot_widths["store"] == 1
+
+        def _numel_or_zero(t):
+            return 0 if t is None else t.numel()
+
+        assert _numel_or_zero(k1._phase_local_transport_position_tensors["load"]) == _numel_or_zero(
+            k32._phase_local_transport_position_tensors["load"]
+        )
+        assert _numel_or_zero(k1._phase_local_transport_position_tensors["store"]) == _numel_or_zero(
+            k32._phase_local_transport_position_tensors["store"]
+        )
+        assert _numel_or_zero(k1._phase_local_desc_slot_tensors["load"]) < _numel_or_zero(
+            k32._phase_local_desc_slot_tensors["load"]
+        )
+        assert _numel_or_zero(k1._phase_local_desc_slot_tensors["store"]) < _numel_or_zero(
+            k32._phase_local_desc_slot_tensors["store"]
+        )
+
+    def test_tma_runtime_layout_is_cached_per_backend(self):
+        """Structural TMA runtime layout should be built once per backend instance."""
+        from machete.megakernel import Megakernel, MegakernelConfig
+
+        x = torch.zeros(SYNTHETIC_TMA_TILE_M, SYNTHETIC_TMA_N, dtype=torch.float16)
+        y = torch.zeros(SYNTHETIC_TMA_TILE_M, SYNTHETIC_TMA_N, dtype=torch.float16)
+        ops = SyntheticTMAAddOneOp.schedule(
+            x=x,
+            y=y,
+            tile_sizes={"M": SYNTHETIC_TMA_TILE_M},
+        )
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            device="cpu",
+        )
+
+        layout0 = _build_tma_runtime_layout(kernel._backend, kernel)
+        layout1 = _build_tma_runtime_layout(kernel._backend, kernel)
+
+        assert layout0 is layout1
+        assert len(kernel._tma_runtime_layout_cache) == 1
+
+    def test_qwen_forward_ops_expose_sequence_as_dynamic_dim(self):
+        """Sequence dimensions should be runtime-packed, not compile-time baked."""
+        assert RMSNormOp.dynamic_dims == ("B", "S")
+        assert GemmOp.dynamic_dims == ("B", "S")
+        assert GLUOp.dynamic_dims == ("B", "S")
+        assert QKNormRopeOp.dynamic_dims == ("M",)
+        assert FlashAttentionSm120Op.dynamic_dims == ("B", "M", "N")
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):

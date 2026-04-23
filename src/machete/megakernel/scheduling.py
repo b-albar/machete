@@ -81,19 +81,17 @@ class BarrierFormula:
 # Instruction Stream (Lightweight — barriers baked into handlers)
 # =============================================================================
 
-INSTRUCTION_WORDS = 2  # op_idx + linear_tile_idx (flat encoding)
+INSTRUCTION_WORDS = 2 + MAX_TILE_DIMS  # op_idx + linear_tile_idx + expanded tile coords
 
 
 @dataclass
 class TileInstruction:
     """A single tile work instruction for the persistent megakernel.
 
-    Flat encoding in global memory (2 x int32):
+    Flat encoding in global memory (7 x int32):
     [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
     [1]  linear_tile_idx: Row-major linearized tile index
-
-    Tile coordinates are decomposed at runtime from the linear index
-    using compile-time per-op tile_counts (via decompose_tile JIT fn).
+    [2:] tile coordinates padded to MAX_TILE_DIMS
 
     Barrier wait/signal logic is baked into op handlers at compile time
     via BarrierFormula, not encoded in the instruction stream.
@@ -106,16 +104,17 @@ class TileInstruction:
     END_MARKER: int = -1
 
     def pack(self, strides: Optional[Tuple[int, ...]] = None) -> List[int]:
-        """Pack into list of int32: [op_idx, linear_tile_idx].
+        """Pack into list of int32: [op_idx, linear_tile_idx, tile_0..tile_4].
 
         Args:
             strides: Row-major strides for linearization. If None (e.g., end
                 marker), linear index is 0.
         """
         if self.op_idx == self.END_MARKER or strides is None:
-            return [self.op_idx, 0]
+            return [self.op_idx, 0] + [0] * MAX_TILE_DIMS
         linear = sum(t * s for t, s in zip(self.tiles, strides))
-        return [self.op_idx, linear]
+        padded_tiles = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
+        return [self.op_idx, linear] + padded_tiles
 
     @classmethod
     def end_instruction(cls) -> "TileInstruction":
@@ -1005,16 +1004,22 @@ class InstructionStreamBuilder:
         instructions.append(TileInstruction.end_instruction())
         return instructions
 
-    def build_tensor(self, device: str = "cuda", scheduler: Optional[TileScheduler] = None):
+    def build_tensor(
+        self,
+        device: str = "cuda",
+        scheduler: Optional[TileScheduler] = None,
+        instructions: Optional[List[TileInstruction]] = None,
+    ):
         """Build instruction stream as GPU tensor.
 
         Returns:
             Tensor of shape [num_instructions, INSTRUCTION_WORDS] where
-            INSTRUCTION_WORDS=2 (op_idx + linear_tile_idx).
+            INSTRUCTION_WORDS=2 + MAX_TILE_DIMS.
         """
         import torch
 
-        instructions = self.build(scheduler=scheduler)
+        if instructions is None:
+            instructions = self.build(scheduler=scheduler)
         # Precompute row-major strides per op for linearization
         strides_by_op = {
             r.op_idx: _linear_strides(r.op.tile_counts)

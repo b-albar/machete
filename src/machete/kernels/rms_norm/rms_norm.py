@@ -70,7 +70,16 @@ def _expand_weight(tensors):
 def _auto_tile_S(D, elem_bytes, page_size):
     """Compute tile_size_S from page budget minus scratch."""
     usable = page_size - SCRATCH_BYTES
-    return max(1, usable // (D * elem_bytes))
+    tile_s = max(1, usable // (D * elem_bytes))
+    # Large hidden-size RMSNorm saturates early; oversized row tiles mostly
+    # increase barrier traffic and persistent-shell latency. Keep a moderately
+    # larger tile at 32 KB, then clamp to 4 rows once more page budget is
+    # available.
+    if D >= 1024:
+        if page_size <= 32 * 1024:
+            return min(tile_s, 8)
+        return min(tile_s, 4)
+    return tile_s
 
 
 def _align_up(x, align):
@@ -86,6 +95,22 @@ def _pick_rowwise_tma_tile_n(width, tile_s, elem_bytes):
         if width % tile_n == 0:
             return tile_n
     return 16
+
+
+def _pick_rmsnorm_tma_tile_d(width, tile_s, elem_bytes, page_size=None):
+    """Choose RMSNorm TMA width for fused performance, not standalone purity."""
+    if (
+        page_size is not None
+        and page_size >= 64 * 1024
+        and width >= 1024
+        and tile_s <= 4
+        and width % 256 == 0
+        and (256 * tile_s * elem_bytes) % 128 == 0
+    ):
+        return 256
+    if (width * tile_s * elem_bytes) % 128 == 0:
+        return width
+    return _pick_rowwise_tma_tile_n(width, tile_s, elem_bytes)
 
 
 def _rowwise_chunked_bytes(width, tile_s, elem_bytes):
@@ -159,7 +184,7 @@ class RMSNormOp(Op):
         "residual_out": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -194,7 +219,9 @@ class RMSNormOp(Op):
         self.tma_tile_D = getattr(
             self,
             'tma_tile_D',
-            _pick_rowwise_tma_tile_n(self.D, self.tile_size_S, self.elem_bytes),
+            _pick_rmsnorm_tma_tile_d(
+                self.D, self.tile_size_S, self.elem_bytes, self.page_size
+            ),
         )
         self.num_tma_tiles = self.D // self.tma_tile_D
         self.chunk_tile_elems = self.tma_tile_D * self.tile_size_S
@@ -208,9 +235,26 @@ class RMSNormOp(Op):
         max_warps = min(8, self.threads_per_row // 32)
         max_et = max_warps * 32
         self.effective_threads = 32
-        for t in range(32, max_et + 1, 32):
-            if self.D % t == 0:
-                self.effective_threads = t
+        override_threads = getattr(self, "effective_threads_override", 0)
+        if override_threads and override_threads <= max_et and self.D % override_threads == 0:
+            self.effective_threads = override_threads
+        elif self.D >= 1024:
+            if self.tile_size_S >= 8:
+                preferred = 64
+            elif self.page_size >= 96 * 1024:
+                preferred = 32
+            else:
+                preferred = 64
+            if preferred <= max_et and self.D % preferred == 0:
+                self.effective_threads = preferred
+            else:
+                for t in range(32, max_et + 1, 32):
+                    if self.D % t == 0:
+                        self.effective_threads = t
+        else:
+            for t in range(32, max_et + 1, 32):
+                if self.D % t == 0:
+                    self.effective_threads = t
         self.effective_warps = self.effective_threads // 32
 
     kernel_config = classmethod(_tma_kernel_config)
@@ -239,7 +283,10 @@ class RMSNormOp(Op):
         tile_sizes = dict(tile_sizes or {})
         D = tensors['x'].shape[-1]
         elem_bytes = tensors['x'].element_size()
-        max_tile_S = _auto_chunked_tile_S(D, elem_bytes, page_size, SCRATCH_BYTES)
+        max_tile_S = min(
+            _auto_chunked_tile_S(D, elem_bytes, page_size, SCRATCH_BYTES),
+            _auto_tile_S(D, elem_bytes, page_size),
+        )
         if "S" not in tile_sizes:
             tile_sizes["S"] = max_tile_S
         else:
@@ -263,10 +310,11 @@ class RMSNormOp(Op):
         if per_row_weight:
             ops[0].static_dims['per_row_weight'] = 1
         ops[0].static_dims['page_size'] = page_size
-        ops[0].static_dims['tma_tile_D'] = _pick_rowwise_tma_tile_n(
+        ops[0].static_dims['tma_tile_D'] = _pick_rmsnorm_tma_tile_d(
             D,
             tile_sizes["S"],
             elem_bytes,
+            page_size,
         )
         return ops
 
@@ -333,7 +381,8 @@ class RMSNormOp(Op):
         tidx = warp_idx * 32 + lane_idx
         thr_layout = cute.make_layout(self.effective_threads)
         batch_size = config_dim_i32(op_config_ptr, "B", type(self))
-        flat_size = batch_size * Int32(self.S * self.D)
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        flat_size = batch_size * runtime_S * Int32(self.D)
         weight = config_flat_tensor(
             op_config_ptr,
             "weight",
@@ -371,8 +420,8 @@ class RMSNormOp(Op):
             for local_row in range(self.tile_size_S):
                 row_idx = row_start + Int32(local_row)
 
-                if row_idx < Int32(self.S):
-                    global_offset = tile_B * Int32(self.S * self.D) + row_idx * Int32(self.D)
+                if row_idx < runtime_S:
+                    global_offset = tile_B * runtime_S * Int32(self.D) + row_idx * Int32(self.D)
 
                     partial_sq = Float32(0.0)
                     for wi in range(self.num_tma_tiles):
@@ -534,7 +583,7 @@ class RMSNormBwdOp(Op):
         "dgate": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
-    dynamic_dims = ("B",)
+    dynamic_dims = ("B", "S")
 
     tma_loads = {"x"}
     tma_stores = {"dx"}
@@ -570,7 +619,9 @@ class RMSNormBwdOp(Op):
         self.tma_tile_D = getattr(
             self,
             'tma_tile_D',
-            _pick_rowwise_tma_tile_n(self.D, self.tile_size_S, self.elem_bytes),
+            _pick_rmsnorm_tma_tile_d(
+                self.D, self.tile_size_S, self.elem_bytes, self.page_size
+            ),
         )
         self.num_tma_tiles = self.D // self.tma_tile_D
         self.chunk_tile_elems = self.tma_tile_D * self.tile_size_S
@@ -617,7 +668,10 @@ class RMSNormBwdOp(Op):
         tile_sizes = dict(tile_sizes or {})
         D = tensors['x'].shape[-1]
         elem_bytes = tensors['x'].element_size()
-        max_tile_S = _auto_chunked_tile_S(D, elem_bytes, page_size, SCRATCH_BYTES)
+        max_tile_S = min(
+            _auto_chunked_tile_S(D, elem_bytes, page_size, SCRATCH_BYTES),
+            _auto_tile_S(D, elem_bytes, page_size),
+        )
         if "S" not in tile_sizes:
             tile_sizes["S"] = max_tile_S
         else:
@@ -643,10 +697,11 @@ class RMSNormBwdOp(Op):
         if per_row_weight:
             ops[0].static_dims['per_row_weight'] = 1
         ops[0].static_dims['page_size'] = page_size
-        ops[0].static_dims['tma_tile_D'] = _pick_rowwise_tma_tile_n(
+        ops[0].static_dims['tma_tile_D'] = _pick_rmsnorm_tma_tile_d(
             D,
             tile_sizes["S"],
             elem_bytes,
+            page_size,
         )
         return ops
 
@@ -711,7 +766,8 @@ class RMSNormBwdOp(Op):
         tidx = warp_idx * 32 + lane_idx
         thr_layout = cute.make_layout(self.effective_threads)
         batch_size = config_dim_i32(op_config_ptr, "B", type(self))
-        flat_size = batch_size * Int32(self.S * self.D)
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        flat_size = batch_size * runtime_S * Int32(self.D)
         dout = config_flat_tensor(
             op_config_ptr,
             "dout",
@@ -765,8 +821,8 @@ class RMSNormBwdOp(Op):
             for local_row in range(self.tile_size_S):
                 row_idx = row_start + Int32(local_row)
 
-                if row_idx < Int32(self.S):
-                    global_offset = tile_B * Int32(self.S * self.D) + row_idx * Int32(self.D)
+                if row_idx < runtime_S:
+                    global_offset = tile_B * runtime_S * Int32(self.D) + row_idx * Int32(self.D)
 
                     # Fused reduction: compute both sum_sq and sum_grad
                     # in a single pass with one barrier sync

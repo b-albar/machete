@@ -150,7 +150,6 @@ def _schedule_prefill_layer_ops(
         y=h_buf,
         residual_in=res_in,
         residual_out=res_mid,
-        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf, page_size=fa_page_size)
@@ -166,11 +165,10 @@ def _schedule_prefill_layer_ops(
         y=h2_buf,
         residual_in=res_mid,
         residual_out=res_out,
-        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     ops += GemmOp.schedule(a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf, page_size=fa_page_size)
-    ops += GLUOp.schedule(x=gate_up_buf, y=mlp_h_buf, activation="silu", tile_sizes={"S": 2}, page_size=fa_page_size)
+    ops += GLUOp.schedule(x=gate_up_buf, y=mlp_h_buf, activation="silu", page_size=fa_page_size)
     ops += GemmOp.schedule(a=mlp_h_buf, b=weights[f"{pfx}.W_down"], c=x_out, page_size=fa_page_size)
 
     extra_keep = [q_4d, k_4d, q_fa, k_fa, v_fa, o_fa]
@@ -275,7 +273,6 @@ def megakernel_prefill_build(batch, seq_len, x, residual, weights, page_size=327
         y=h_final,
         residual_in=final_res,
         residual_out=residual_final,
-        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     all_ops += LmHeadGemmOp.schedule(a=h_final, b=weights["lm_head"], c=logits, page_size=fa_page_size)

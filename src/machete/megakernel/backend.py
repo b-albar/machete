@@ -1,9 +1,11 @@
 # Copyright (c) 2025, Machete Authors
-"""Handler-based backend for the persistent megakernel."""
+"""Backend implementations for the persistent megakernel."""
 
 from __future__ import annotations
 
 import inspect
+from functools import lru_cache
+from dataclasses import replace
 from typing import Any, Dict, List, Tuple
 
 from .backend_ir import BackendIR, HandlerSpec, OpCompileSpec
@@ -69,6 +71,36 @@ def _get_local_tensor_names(op_cls, tensor_mapping: Dict[str, str]) -> Tuple[str
     return tuple(name for name, _, _ in op_cls._UNIQUE_TENSORS if name in tensor_mapping)
 
 
+@lru_cache(maxsize=None)
+def _phase_param_names(op_cls, phase_name: str) -> Tuple[str, ...]:
+    """Return cached method parameter names for one op class / phase."""
+    method = getattr(op_cls, phase_name, None)
+    if method is None:
+        return ()
+    return tuple(name for name in inspect.signature(method).parameters if name != "self")
+
+
+@lru_cache(maxsize=None)
+def _callable_param_names(method_target) -> Tuple[str, ...]:
+    """Return cached parameter names for one concrete phase implementation."""
+    return tuple(name for name in inspect.signature(method_target).parameters if name != "self")
+
+
+def _phase_param_names_for_instance(op_obj, phase_name: str) -> Tuple[str, ...]:
+    """Return parameter names for the concrete phase bound on one instance.
+
+    Some ops, notably SM120 attention, rebind ``self.compute`` at construction
+    time to a more specialized implementation. The backend must follow that
+    concrete callable rather than the class-level placeholder method when it
+    decides which tensors/TMA args a phase consumes.
+    """
+    method = getattr(op_obj, phase_name, None)
+    if method is None:
+        return ()
+    method_target = getattr(method, "__func__", method)
+    return _callable_param_names(method_target)
+
+
 def _get_local_phase_tensor_names(
     op_obj,
     phase_name: str,
@@ -77,14 +109,11 @@ def _get_local_phase_tensor_names(
     """Return the op-local tensor names actually consumed by one phase."""
     if not tensor_mapping:
         return ()
-    method = getattr(op_obj, phase_name, None)
-    if method is None:
-        return ()
-    method_params = inspect.signature(method).parameters
+    method_param_names = frozenset(_phase_param_names_for_instance(op_obj, phase_name))
     return tuple(
         name
         for name, _, _ in getattr(type(op_obj), "_UNIQUE_TENSORS", ())
-        if name in tensor_mapping and name in method_params
+        if name in tensor_mapping and name in method_param_names
     )
 
 
@@ -92,13 +121,8 @@ def _get_local_tma_args(op_obj, phase_name: str, tma_mapping: Dict[str, str]) ->
     """Return op-local TMA names in phase method declaration order."""
     if not tma_mapping:
         return ()
-    method = getattr(op_obj, phase_name, None)
-    if method is None:
-        return ()
     return tuple(
-        name
-        for name in inspect.signature(method).parameters
-        if name != "self" and name in tma_mapping
+        name for name in _phase_param_names_for_instance(op_obj, phase_name) if name in tma_mapping
     )
 
 
@@ -352,7 +376,50 @@ class HandlerBackend:
         )
 
 
+class RuntimeBackend(HandlerBackend):
+    """Runtime-oriented backend facade.
+
+    This backend currently reuses the handler IR and dispatch implementation
+    while the framework is being moved away from hard-wired handler-specialized
+    construction. Keeping it as a distinct backend makes backend selection
+    explicit and lets tests lock the public contract before the runtime path
+    diverges internally.
+    """
+    runtime_transport_records = True
+
+
+def build_runtime_backend_ir(kernel) -> BackendIR:
+    """Build backend IR for the runtime backend.
+
+    The current runtime backend starts from the same IR as the handler path.
+    Future work can relax handler specialization without changing the
+    megakernel constructor or tests.
+    """
+    base_ir = build_handler_backend_ir(kernel)
+    return replace(
+        base_ir,
+        op_phase_local_indices={
+            phase: tuple(base_ir.op_phase_transport_indices[phase])
+            for phase in PHASE_NAMES
+        },
+    )
+
+
+def build_backend(kernel, backend_name: str):
+    """Construct the configured backend and its IR."""
+    if backend_name == "handler":
+        ir = build_handler_backend_ir(kernel)
+        return ir, HandlerBackend(ir)
+    if backend_name == "runtime":
+        ir = build_runtime_backend_ir(kernel)
+        return ir, RuntimeBackend(ir)
+    raise ValueError(f"Unknown megakernel backend: {backend_name}")
+
+
 __all__ = [
     "build_handler_backend_ir",
+    "build_runtime_backend_ir",
+    "build_backend",
     "HandlerBackend",
+    "RuntimeBackend",
 ]

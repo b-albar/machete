@@ -97,10 +97,13 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
     fd_kv_min = 2 * 16 * D * elem  # 2 KV buffers × 16 rows minimum
     fd_possible = (fd_q_bytes + fd_kv_min <= page_size and M >= 16 and M % 16 == 0)
 
-    # Dispatch: use FD when too few tiles to saturate SMs.
-    # Exception: single head with large M (>64) — combine overhead dominates.
+    # Dispatch: use FD only for decode-like short-query workloads.
+    # At moderate prefill lengths like M=128, FA2-style attention is still the
+    # better path even when the tile count looks low, because FlashDecoding's
+    # split/combine overhead dominates.
     use_fd = (fd_possible
               and total_tiles < num_SMs // 2
+              and M <= 64
               and (total_tiles >= 2 or M <= 64))
 
     tensors = dict(q=q, k=k, v=v, o=o)
