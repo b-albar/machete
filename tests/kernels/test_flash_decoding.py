@@ -55,20 +55,28 @@ def _run_flash_decoding(q, k, v, num_splits=0, causal=False, kv_group_size=1):
 def _ref_attention(q, k, v, causal=False, kv_group_size=1):
     """Reference attention using project's lower-left aligned causal mask."""
     from machete.kernels.attention.ref import flash_attention_pytorch
-    return flash_attention_pytorch(q, k, v, causal=causal, kv_group_size=kv_group_size)
+
+    B, M, H, D = q.shape
+    q_flat = q.permute(0, 2, 1, 3).reshape(B * H, M, D)
+    k_flat = k.permute(0, 2, 1, 3).reshape(B * k.shape[2], k.shape[1], D)
+    v_flat = v.permute(0, 2, 1, 3).reshape(B * v.shape[2], v.shape[1], D)
+    out = flash_attention_pytorch(
+        q_flat, k_flat, v_flat, causal=causal, kv_group_size=kv_group_size
+    )
+    return out.view(B, H, M, D).permute(0, 2, 1, 3).contiguous()
 
 
 @requires_gpu
 class TestFlashDecodingBasic:
     """Basic FlashDecoding correctness tests."""
 
-    @pytest.mark.parametrize("BH,M,N,D", FORWARD_CASES)
-    def test_forward_matrix(self, BH, M, N, D):
+    @pytest.mark.parametrize("H,M,N,D", FORWARD_CASES)
+    def test_forward_matrix(self, H, M, N, D):
         """Representative non-causal decode matrix."""
         torch.manual_seed(42)
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        q = torch.randn(1, M, H, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
 
         o = _run_flash_decoding(q, k, v)
         o_ref = _ref_attention(q, k, v)
@@ -78,10 +86,10 @@ class TestFlashDecodingBasic:
     def test_explicit_splits(self):
         """Test with explicitly specified num_splits."""
         torch.manual_seed(42)
-        BH, M, N, D = 1, 16, 512, 128
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        H, M, N, D = 1, 16, 512, 128
+        q = torch.randn(1, M, H, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
 
         for num_splits in [2, 4, 8]:
             o = _run_flash_decoding(q, k, v, num_splits=num_splits)
@@ -91,10 +99,10 @@ class TestFlashDecodingBasic:
     def test_bf16(self):
         """Test with bf16 dtype."""
         torch.manual_seed(42)
-        BH, M, N, D = 1, 16, 512, 128
-        q = torch.randn(BH, M, D, dtype=torch.bfloat16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.bfloat16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.bfloat16, device="cuda")
+        H, M, N, D = 1, 16, 512, 128
+        q = torch.randn(1, M, H, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(1, N, H, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(1, N, H, D, dtype=torch.bfloat16, device="cuda")
 
         o = _run_flash_decoding(q, k, v)
         o_ref = _ref_attention(q, k, v)
@@ -105,12 +113,12 @@ class TestFlashDecodingBasic:
 class TestFlashDecodingCausal:
     """FlashDecoding with causal masking."""
 
-    @pytest.mark.parametrize("BH,M,N,D", CAUSAL_CASES)
-    def test_causal_matrix(self, BH, M, N, D):
+    @pytest.mark.parametrize("H,M,N,D", CAUSAL_CASES)
+    def test_causal_matrix(self, H, M, N, D):
         torch.manual_seed(42)
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH, N, D, dtype=torch.float16, device="cuda")
+        q = torch.randn(1, M, H, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, N, H, D, dtype=torch.float16, device="cuda")
 
         o = _run_flash_decoding(q, k, v, causal=True)
         o_ref = _ref_attention(q, k, v, causal=True)
@@ -122,13 +130,13 @@ class TestFlashDecodingCausal:
 class TestFlashDecodingGQA:
     """FlashDecoding with grouped query attention."""
 
-    @pytest.mark.parametrize("BH,BH_kv,M,N,D,causal", GQA_CASES)
-    def test_gqa_matrix(self, BH, BH_kv, M, N, D, causal):
+    @pytest.mark.parametrize("H,H_kv,M,N,D,causal", GQA_CASES)
+    def test_gqa_matrix(self, H, H_kv, M, N, D, causal):
         torch.manual_seed(42)
-        kv_group_size = BH // BH_kv
-        q = torch.randn(BH, M, D, dtype=torch.float16, device="cuda")
-        k = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
-        v = torch.randn(BH_kv, N, D, dtype=torch.float16, device="cuda")
+        kv_group_size = H // H_kv
+        q = torch.randn(1, M, H, D, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, N, H_kv, D, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, N, H_kv, D, dtype=torch.float16, device="cuda")
 
         o = _run_flash_decoding(
             q, k, v, causal=causal, kv_group_size=kv_group_size)

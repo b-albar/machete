@@ -8,8 +8,7 @@ import torch
 
 try:
     from flash_attn.cute import flash_attn_func
-except ImportError as e:
-    print(f"Failed to import flash_attn_cute: {e}")
+except ImportError:
     flash_attn_func = None
 
 

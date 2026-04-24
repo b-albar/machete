@@ -102,6 +102,91 @@ class TensorMeta:
     dtype: Any  # Resolved CUTLASS dtype
     is_contiguous: bool  # Whether tensor is contiguous
     data_ptr: int  # GPU data pointer
+    storage_ptr: int  # Backing storage pointer (shared across aliasing views)
+    storage_offset: int  # Offset into backing storage, in elements
+
+
+def _decompose_storage_offset(meta: TensorMeta) -> Optional[Tuple[int, ...]]:
+    """Approximate the logical start indices of a non-overlapping view.
+
+    This is primarily used to recognize views that share the same backing
+    storage and differ only by a slice on the innermost dimension, such as a
+    packed QKV buffer consumed through separate q/k/v views.
+    """
+    if meta.ndim == 0:
+        return ()
+
+    remaining = meta.storage_offset
+    starts = []
+    for axis, stride in enumerate(meta.strides):
+        if stride <= 0:
+            return None
+        if axis == meta.ndim - 1:
+            starts.append(remaining)
+            break
+        starts.append(remaining // stride)
+        remaining %= stride
+    return tuple(starts)
+
+
+def is_last_dim_slice_alias(a: TensorMeta, b: TensorMeta) -> bool:
+    """Return whether two views share the same outer lattice and slice dim -1."""
+    if a.storage_ptr != b.storage_ptr or a.ndim != b.ndim or a.ndim == 0:
+        return False
+    if a.strides[-1] != 1 or b.strides[-1] != 1:
+        return False
+    if a.shape[:-1] != b.shape[:-1]:
+        return False
+    if a.strides[:-1] != b.strides[:-1]:
+        return False
+
+    a_starts = _decompose_storage_offset(a)
+    b_starts = _decompose_storage_offset(b)
+    if a_starts is None or b_starts is None:
+        return False
+    return a_starts[:-1] == b_starts[:-1]
+
+
+def tensor_meta_overlaps(a: TensorMeta, b: TensorMeta) -> bool:
+    """Return whether two tensor views overlap in device memory.
+
+    Exact data_ptr matches remain the fast path for traditional aliasing. We
+    also recognize views that share backing storage even when their ranks differ
+    (for example a GEMM output scheduled as flat BSK and a later BSHD slice).
+    """
+    if a.data_ptr == b.data_ptr:
+        return True
+    if a.storage_ptr == b.storage_ptr:
+        a_span = _tensor_storage_span(a)
+        b_span = _tensor_storage_span(b)
+        if a_span is not None and b_span is not None:
+            return max(a_span[0], b_span[0]) < min(a_span[1], b_span[1])
+    if not is_last_dim_slice_alias(a, b):
+        return False
+
+    a_starts = _decompose_storage_offset(a)
+    b_starts = _decompose_storage_offset(b)
+    assert a_starts is not None and b_starts is not None
+    a_lo = a_starts[-1]
+    a_hi = a_lo + a.shape[-1]
+    b_lo = b_starts[-1]
+    b_hi = b_lo + b.shape[-1]
+    return max(a_lo, b_lo) < min(a_hi, b_hi)
+
+
+def _tensor_storage_span(meta: TensorMeta) -> Optional[Tuple[int, int]]:
+    """Conservative half-open storage span in elements for positive-stride views."""
+    if meta.ndim == 0:
+        return (meta.storage_offset, meta.storage_offset + 1)
+    lo = meta.storage_offset
+    hi = lo
+    for size, stride in zip(meta.shape, meta.strides):
+        if size <= 0:
+            return (lo, lo)
+        if stride < 0:
+            return None
+        hi += (size - 1) * stride
+    return (lo, hi + 1)
 
 
 def _parse_dims(dims) -> List[str]:
@@ -296,6 +381,8 @@ def _capture_tensor_runtime_info(unique_tensors, tensors, tensor_dtypes):
             dtype=resolved_dtype,
             is_contiguous=tensor.is_contiguous(),
             data_ptr=tensor.data_ptr(),
+            storage_ptr=tensor.untyped_storage().data_ptr(),
+            storage_offset=tensor.storage_offset(),
         )
         tensor_strides[name] = tuple(tensor.stride())
 

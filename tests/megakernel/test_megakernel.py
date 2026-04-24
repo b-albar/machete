@@ -19,7 +19,7 @@ from tests.megakernel.support_tma import (
     SYNTHETIC_TMA_TILE_M,
     SyntheticTMAAddOneOp,
 )
-from machete.megakernel.backend import HandlerBackend, RuntimeBackend
+from machete.megakernel.backend import HandlerBackend
 from machete.megakernel.backend_dispatch import _build_tma_runtime_layout
 
 
@@ -64,7 +64,8 @@ class TestMegakernel:
         )
 
         assert isinstance(handler_kernel._backend, HandlerBackend)
-        assert isinstance(runtime_kernel._backend, RuntimeBackend)
+        assert isinstance(runtime_kernel._backend, HandlerBackend)
+        assert runtime_kernel.config.backend == "handler"
 
     def test_unknown_backend_raises(self):
         """Unknown backend names should fail eagerly."""
@@ -80,7 +81,7 @@ class TestMegakernel:
                 device="cpu",
             )
 
-    def test_runtime_backend_does_not_duplicate_identical_handlers(self):
+    def test_backend_does_not_duplicate_identical_handlers(self):
         """Repeated identical ops should share one emitted handler body."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
         NopOp = get_nop_op()
@@ -93,15 +94,15 @@ class TestMegakernel:
 
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            config=MegakernelConfig(num_sms=1, backend="handler"),
             device="cpu",
         )
 
         assert len(kernel._backend_ir.handler_specs) == 1
         assert list(kernel._backend_ir.op_handler_indices) == [0, 0, 0]
 
-    def test_runtime_backend_local_indices_follow_transport_records(self):
-        """Runtime backend local phase ids should be transport-record ids."""
+    def test_runtime_backend_alias_matches_handler_ir(self):
+        """The deprecated runtime alias should build the same backend IR as handler."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
         NopOp = get_nop_op()
 
@@ -110,7 +111,12 @@ class TestMegakernel:
             ScheduledOp(NopOp, tile_counts=(2,)),
         ]
 
-        kernel = Megakernel(
+        handler_kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, backend="handler"),
+            device="cpu",
+        )
+        runtime_kernel = Megakernel(
             ops,
             config=MegakernelConfig(num_sms=1, backend="runtime"),
             device="cpu",
@@ -118,12 +124,16 @@ class TestMegakernel:
 
         for phase in ("load", "compute", "store", "communicate"):
             assert (
-                list(kernel._backend_ir.op_phase_local_indices[phase])
-                == list(kernel._backend_ir.op_phase_transport_indices[phase])
+                list(handler_kernel._backend_ir.op_phase_local_indices[phase])
+                == list(runtime_kernel._backend_ir.op_phase_local_indices[phase])
+            )
+            assert (
+                list(handler_kernel._backend_ir.op_phase_transport_indices[phase])
+                == list(runtime_kernel._backend_ir.op_phase_transport_indices[phase])
             )
 
-    def test_runtime_backend_transport_tables_do_not_grow_with_identical_layers(self):
-        """Runtime transport selector tables should scale with unique records, not layers."""
+    def test_identical_tma_layers_share_handlers_but_keep_selector_metadata(self):
+        """Repeated TMA layers should share handlers while preserving per-op bindings."""
         from machete.megakernel import Megakernel, MegakernelConfig
 
         def _make_kernel(num_layers: int):
@@ -140,7 +150,7 @@ class TestMegakernel:
                 )
             kernel = Megakernel(
                 ops,
-                config=MegakernelConfig(num_sms=1, backend="runtime"),
+                config=MegakernelConfig(num_sms=1, backend="handler"),
                 device="cpu",
             )
             kernel._prepare_tensors()
@@ -149,20 +159,20 @@ class TestMegakernel:
         k1 = _make_kernel(1)
         k32 = _make_kernel(32)
 
-        assert k1._phase_local_transport_position_widths["load"] == k32._phase_local_transport_position_widths["load"]
-        assert k1._phase_local_transport_position_widths["store"] == k32._phase_local_transport_position_widths["store"]
-        assert k1._phase_local_desc_slot_widths["load"] == 0
-        assert k1._phase_local_desc_slot_widths["store"] == 0
-        assert k32._phase_local_desc_slot_widths["load"] == 1
-        assert k32._phase_local_desc_slot_widths["store"] == 1
+        assert len(k1._backend_ir.handler_specs) == 1
+        assert len(k32._backend_ir.handler_specs) == 1
+        assert k1._phase_local_transport_position_widths["load"] <= k32._phase_local_transport_position_widths["load"]
+        assert k1._phase_local_transport_position_widths["store"] <= k32._phase_local_transport_position_widths["store"]
+        assert k1._phase_local_desc_slot_widths["load"] <= k32._phase_local_desc_slot_widths["load"]
+        assert k1._phase_local_desc_slot_widths["store"] <= k32._phase_local_desc_slot_widths["store"]
 
         def _numel_or_zero(t):
             return 0 if t is None else t.numel()
 
-        assert _numel_or_zero(k1._phase_local_transport_position_tensors["load"]) == _numel_or_zero(
+        assert _numel_or_zero(k1._phase_local_transport_position_tensors["load"]) < _numel_or_zero(
             k32._phase_local_transport_position_tensors["load"]
         )
-        assert _numel_or_zero(k1._phase_local_transport_position_tensors["store"]) == _numel_or_zero(
+        assert _numel_or_zero(k1._phase_local_transport_position_tensors["store"]) < _numel_or_zero(
             k32._phase_local_transport_position_tensors["store"]
         )
         assert _numel_or_zero(k1._phase_local_desc_slot_tensors["load"]) < _numel_or_zero(
@@ -185,7 +195,7 @@ class TestMegakernel:
         )
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend="runtime"),
+            config=MegakernelConfig(num_sms=1, backend="handler"),
             device="cpu",
         )
 

@@ -357,11 +357,22 @@ class FlashAttentionSm120Op(Op):
                     tile_M = 16
                     nw = 1
                 elif M <= 128 and page_size >= 96 * 1024:
-                    tile_M = 64 if M >= 64 else 32
-                    nw = 4 if tile_M == 64 else 2
+                    if M >= 64:
+                        tile_M = 64
+                        nw = 4
+                    elif M >= 32:
+                        tile_M = 32
+                        nw = 2
+                    else:
+                        tile_M = 16
+                        nw = 1
                 elif M <= 128 and page_size >= 48 * 1024:
-                    tile_M = 32
-                    nw = 2
+                    if M >= 32:
+                        tile_M = 32
+                        nw = 2
+                    else:
+                        tile_M = 16
+                        nw = 1
 
                 tile_sizes["M"] = tile_M
         # Auto-allocate lse output if not provided

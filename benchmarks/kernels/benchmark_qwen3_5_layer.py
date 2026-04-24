@@ -62,8 +62,26 @@ def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
 def _pick_single_layer_forward_mma_reg_count(batch, seq_len, default_mma_regs=232):
     """Tune the fused forward runtime MMA register budget on SM120."""
     if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
-        return 224
+        return 192
     return default_mma_regs
+
+
+def _pick_single_layer_fused_gemm_tiles(batch, seq_len, page_size):
+    """Tune fused-Qwen GEMM tiles for the single-kernel SM120 path.
+
+    With a 32KB page, the single-kernel forward on Blackwell-class client GPUs
+    is occupancy-limited. Keeping the dominant projection tiles at 128x64x32
+    reduces the long-sequence penalty versus the default shape-aware chooser.
+    """
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024) and page_size <= 32 * 1024:
+        tile = {"S": 128, "N": 64, "K": 32}
+        return {
+            "qkv": tile,
+            "o": tile,
+            "gate_up": tile,
+            "down": tile,
+        }
+    return {}
 
 
 def _pick_single_layer_backward_tpb(batch, seq_len, gemm_tpb, fa_bwd_tpb):
@@ -246,21 +264,24 @@ def megakernel_forward_build(
     from machete.kernels.gemm import GemmOp
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.glu import GLUOp
-    from machete.kernels.qknorm_rope import QKNormRopeOp
+    from machete.kernels.qknorm_rope import PackedQKNormRopeOp
 
     dtype = x.dtype
     device = x.device
+    W_qkv = torch.cat([W_q, W_k, W_v], dim=0).contiguous()
 
     # --- Allocate intermediates ---
     residual_out = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
     h = torch.empty(B, S, HIDDEN, dtype=dtype, device=device)
-    q_3d = torch.empty(B, S, Q_DIM, dtype=dtype, device=device)
-    k_3d = torch.empty(B, S, KV_DIM, dtype=dtype, device=device)
-    v_3d = torch.empty(B, S, KV_DIM, dtype=dtype, device=device)
+    qkv_3d = torch.empty(B, S, Q_DIM + 2 * KV_DIM, dtype=dtype, device=device)
+    q_3d = qkv_3d[:, :, :Q_DIM]
+    k_3d = qkv_3d[:, :, Q_DIM:Q_DIM + KV_DIM]
+    v_3d = qkv_3d[:, :, Q_DIM + KV_DIM:]
 
     # 4D views for QKNormRope: (B*S, H, D)
     q_4d = q_3d.view(B * S, NUM_Q_HEADS, HEAD_DIM)
     k_4d = k_3d.view(B * S, NUM_KV_HEADS, HEAD_DIM)
+    qk_4d = qkv_3d[:, :, :Q_DIM + KV_DIM].view(B * S, NUM_Q_HEADS + NUM_KV_HEADS, HEAD_DIM)
 
     # 4D FA views sharing memory with GEMM outputs: (B, S, H, D)
     q_fa = q_3d.view(B, S, NUM_Q_HEADS, HEAD_DIM)
@@ -286,6 +307,7 @@ def megakernel_forward_build(
         causal=True, kv_group_size=KV_GROUP_SIZE, page_size=page_size,
     )
     fa_page_size = fa_config.page_size
+    gemm_tiles = _pick_single_layer_fused_gemm_tiles(B, S, fa_page_size)
 
     # Schedule non-FA ops with FA's page_size so they fit in the single kernel
     rmsnorm1_ops = RMSNormOp.schedule(
@@ -293,34 +315,64 @@ def megakernel_forward_build(
         residual_in=residual, residual_out=residual_out,
         page_size=fa_page_size,
     )
-    gemm_q_ops = GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=fa_page_size)
-    gemm_k_ops = GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=fa_page_size)
-    gemm_v_ops = GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=fa_page_size)
-    qknorm_q_ops = QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=fa_page_size)
-    qknorm_k_ops = QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=fa_page_size)
+    gemm_qkv_ops = GemmOp.schedule(
+        a=h,
+        b=W_qkv,
+        c=qkv_3d,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("qkv"),
+    )
+    qknorm_qk_ops = PackedQKNormRopeOp.schedule(
+        qk=qk_4d,
+        q_norm_weight=w_q_norm,
+        k_norm_weight=w_k_norm,
+        cos=cos,
+        sin=sin,
+        page_size=fa_page_size,
+        num_q_heads=NUM_Q_HEADS,
+        num_k_heads=NUM_KV_HEADS,
+    )
 
     for op in fa_ops:
         op.dim_aliases["M"] = "seq"
 
-    gemm_o_ops = GemmOp.schedule(a=attn_out_3d, b=W_o, c=proj, page_size=fa_page_size)
+    gemm_o_ops = GemmOp.schedule(
+        a=attn_out_3d,
+        b=W_o,
+        c=proj,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("o"),
+    )
     rmsnorm2_ops = RMSNormOp.schedule(
         x=proj, weight=w_mlp_norm, y=h2,
         residual_in=residual_out, residual_out=residual_out2,
         page_size=fa_page_size,
     )
-    gemm_gu_ops = GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=fa_page_size)
+    gemm_gu_ops = GemmOp.schedule(
+        a=h2,
+        b=W_gate_up,
+        c=gate_up,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("gate_up"),
+    )
     glu_ops = GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", page_size=fa_page_size)
-    gemm_down_ops = GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=fa_page_size)
+    gemm_down_ops = GemmOp.schedule(
+        a=mlp_h,
+        b=W_down,
+        c=out,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("down"),
+    )
 
     keep_alive = [
-        x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
+        x, residual, w_attn_norm, W_q, W_k, W_v, W_qkv, w_q_norm, w_k_norm,
         cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
-        residual_out, h, q_3d, k_3d, v_3d, q_4d, k_4d,
+        residual_out, h, qkv_3d, q_3d, k_3d, v_3d, q_4d, k_4d, qk_4d,
         q_fa, k_fa, v_fa, o_fa, lse, attn_out_3d, proj,
         residual_out2, h2, gate_up, mlp_h, out,
     ]
 
-    pre_attn_ops = rmsnorm1_ops + gemm_q_ops + gemm_k_ops + gemm_v_ops + qknorm_q_ops + qknorm_k_ops
+    pre_attn_ops = rmsnorm1_ops + gemm_qkv_ops + qknorm_qk_ops
     post_attn_ops = gemm_o_ops + rmsnorm2_ops + gemm_gu_ops + glu_ops + gemm_down_ops
 
     # --- Single kernel: all ops in one megakernel (FA page_size, num_pages=1) ---
@@ -1169,7 +1221,7 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
             from machete.kernels.gemm import GemmOp
             from machete.kernels.rms_norm import RMSNormOp
             from machete.kernels.glu import GLUOp
-            from machete.kernels.qknorm_rope import QKNormRopeOp
+            from machete.kernels.qknorm_rope import PackedQKNormRopeOp
 
             # K1: RMSNorm → GEMM(Q,K,V) → QKNormRope
             res_out = torch.empty_like(x)
@@ -1183,11 +1235,14 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
             # All ops in a single megakernel (no attention = no layout incompatibility)
             res_out = torch.empty_like(x)
             h = torch.empty_like(x)
-            q_3d = torch.empty(batch, seq_len, Q_DIM, dtype=dtype, device=device)
-            k_3d = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
-            v_3d = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
+            W_qkv = torch.cat([W_q, W_k, W_v], dim=0).contiguous()
+            qkv_3d = torch.empty(batch, seq_len, Q_DIM + 2 * KV_DIM, dtype=dtype, device=device)
+            q_3d = qkv_3d[:, :, :Q_DIM]
+            k_3d = qkv_3d[:, :, Q_DIM:Q_DIM + KV_DIM]
+            v_3d = qkv_3d[:, :, Q_DIM + KV_DIM:]
             q_4d = q_3d.view(batch * seq_len, NUM_Q_HEADS, HEAD_DIM)
             k_4d = k_3d.view(batch * seq_len, NUM_KV_HEADS, HEAD_DIM)
+            qk_4d = qkv_3d[:, :, :Q_DIM + KV_DIM].view(batch * seq_len, NUM_Q_HEADS + NUM_KV_HEADS, HEAD_DIM)
             attn_out = q_3d[:, :, :Q_DIM]  # dummy
             proj = torch.empty_like(x)
             res_out2 = torch.empty_like(x)
@@ -1195,6 +1250,7 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
             gate_up = torch.empty(batch, seq_len, 2 * INTERMEDIATE, dtype=dtype, device=device)
             mlp_h = torch.empty(batch, seq_len, INTERMEDIATE, dtype=dtype, device=device)
             out = torch.empty_like(x)
+            gemm_tiles = _pick_single_layer_fused_gemm_tiles(batch, seq_len, page_size)
 
             all_ops = (
                 RMSNormOp.schedule(
@@ -1205,12 +1261,18 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     residual_out=res_out,
                     page_size=page_size,
                 )
-                + GemmOp.schedule(a=h, b=W_q, c=q_3d, page_size=page_size)
-                + GemmOp.schedule(a=h, b=W_k, c=k_3d, page_size=page_size)
-                + GemmOp.schedule(a=h, b=W_v, c=v_3d, page_size=page_size)
-                + QKNormRopeOp.schedule(q=q_4d, norm_weight=w_q_norm, cos=cos, sin=sin, page_size=page_size)
-                + QKNormRopeOp.schedule(q=k_4d, norm_weight=w_k_norm, cos=cos, sin=sin, page_size=page_size)
-                + GemmOp.schedule(a=attn_out, b=W_o, c=proj, page_size=page_size)
+                + GemmOp.schedule(a=h, b=W_qkv, c=qkv_3d, page_size=page_size, tile_sizes=gemm_tiles.get("qkv"))
+                + PackedQKNormRopeOp.schedule(
+                    qk=qk_4d,
+                    q_norm_weight=w_q_norm,
+                    k_norm_weight=w_k_norm,
+                    cos=cos,
+                    sin=sin,
+                    page_size=page_size,
+                    num_q_heads=NUM_Q_HEADS,
+                    num_k_heads=NUM_KV_HEADS,
+                )
+                + GemmOp.schedule(a=attn_out, b=W_o, c=proj, page_size=page_size, tile_sizes=gemm_tiles.get("o"))
                 + RMSNormOp.schedule(
                     x=proj,
                     weight=w_mlp_norm,
@@ -1219,9 +1281,9 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     residual_out=res_out2,
                     page_size=page_size,
                 )
-                + GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size)
+                + GemmOp.schedule(a=h2, b=W_gate_up, c=gate_up, page_size=page_size, tile_sizes=gemm_tiles.get("gate_up"))
                 + GLUOp.schedule(x=gate_up, y=mlp_h, activation="silu", page_size=page_size)
-                + GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size)
+                + GemmOp.schedule(a=mlp_h, b=W_down, c=out, page_size=page_size, tile_sizes=gemm_tiles.get("down"))
             )
             config = GemmOp.kernel_config(all_ops)
             kernel = Megakernel(all_ops, config=config)
@@ -1238,6 +1300,7 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     W_q,
                     W_k,
                     W_v,
+                    W_qkv,
                     w_q_norm,
                     w_k_norm,
                     cos,
@@ -1248,11 +1311,13 @@ def bench_qwen35_no_attn(seq_len, batch, page_size):
                     W_down,
                     res_out,
                     h,
+                    qkv_3d,
                     q_3d,
                     k_3d,
                     v_3d,
                     q_4d,
                     k_4d,
+                    qk_4d,
                     attn_out,
                     proj,
                     res_out2,

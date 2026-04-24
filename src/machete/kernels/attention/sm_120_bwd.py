@@ -316,6 +316,10 @@ class FlashAttentionSm120BwdOp(Op):
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        if q is not None:
+            ops[0].static_dims["M"] = q.shape[2]
+        if k is not None:
+            ops[0].static_dims["N"] = k.shape[2]
         if causal:
             ops[0].static_dims["causal"] = 1
         if kv_group_size > 1:

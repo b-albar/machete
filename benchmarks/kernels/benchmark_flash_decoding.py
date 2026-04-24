@@ -29,7 +29,7 @@ except ImportError:
     CUTLASS_AVAILABLE = False
 
 PAGE_SIZES = [16384, 32768, 49152]
-BH_SIZES = [1, 4, 16, 32]
+H_SIZES = [1, 4, 16, 32]
 
 
 def is_hopper_or_newer():
@@ -37,6 +37,16 @@ def is_hopper_or_newer():
         return False
     major, _ = torch.cuda.get_device_capability()
     return major >= 9
+
+
+def _check_close(name, actual, expected):
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=2e-2,
+        atol=2e-2,
+        msg=lambda msg: f"{name} correctness failed:\n{msg}",
+    )
 
 
 # Decode configs: small M, large N
@@ -50,24 +60,26 @@ _BASE_CONFIGS = [
     (16, 131072, 128),
 ]
 
-CONFIGS = [(bh,) + c + (ps,) for c in _BASE_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+CONFIGS = [(h,) + c + (ps,) for c in _BASE_CONFIGS for h in H_SIZES for ps in PAGE_SIZES]
 
 
-@Benchmark.configs(["BH", "M", "N", "D", "page_size"], CONFIGS)
-def bench_flash_decoding(BH, M, N, D, page_size):
+@Benchmark.configs(["H", "M", "N", "D", "page_size"], CONFIGS)
+def bench_flash_decoding(H, M, N, D, page_size):
     torch_dtype = torch.bfloat16
     torch.manual_seed(42)
-    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
-    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    q = torch.randn(1, M, H, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(1, N, H, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(1, N, H, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
     # torch SDPA
-    q4d = q.unsqueeze(0)
-    k4d = k.unsqueeze(0)
-    v4d = v.unsqueeze(0)
+    q4d = q.permute(0, 2, 1, 3)
+    k4d = k.permute(0, 2, 1, 3)
+    v4d = v.permute(0, 2, 1, 3)
     funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q4d, k4d, v4d)
+    ref = funcs["sdpa"]().permute(0, 2, 1, 3).contiguous()
+    torch.cuda.synchronize()
 
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
         # Standard FA (single CTA per head)
@@ -81,6 +93,7 @@ def bench_flash_decoding(BH, M, N, D, page_size):
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel_fa.run()
             torch.cuda.synchronize()
+            _check_close("fa_mega", o_fa, ref)
             funcs["fa_mega"] = kernel_fa.bench_spec(
                 setup_fn=lambda o=o_fa: o.zero_(),
                 keep_alive=[q, k, v, o_fa],
@@ -98,6 +111,7 @@ def bench_flash_decoding(BH, M, N, D, page_size):
             with contextlib.redirect_stdout(io.StringIO()):
                 kernel_fd.run()
             torch.cuda.synchronize()
+            _check_close("flash_dec", o_fd, ref)
             funcs["flash_dec"] = kernel_fd.bench_spec(
                 setup_fn=lambda o=o_fd: o.zero_(),
                 keep_alive=[q, k, v, o_fd],

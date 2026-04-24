@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import inspect
 from functools import lru_cache
-from dataclasses import replace
 from typing import Any, Dict, List, Tuple
 
 from .backend_ir import BackendIR, HandlerSpec, OpCompileSpec
@@ -17,7 +16,7 @@ NUM_DMA_WARPS = 3
 PHASE_NAMES = ("load", "compute", "store", "communicate")
 
 
-def _phase_should_noinline(instance, phase_name: str) -> bool:
+def _phase_should_noinline(instance, phase_name: str, inline_thin_phases: bool = True) -> bool:
     """Return whether one phase should stay behind a noinline boundary.
 
     The handler backend defaults to noinline for every phase. A small set of
@@ -57,10 +56,11 @@ def _phase_should_noinline(instance, phase_name: str) -> bool:
         },
     }
 
-    if op_name in inline_phase_ops.get(phase_name, set()):
-        return False
-    if phase_name == "compute" and op_name == "GemmOp" and compute_name == "compute_unscaled":
-        return False
+    if inline_thin_phases:
+        if op_name in inline_phase_ops.get(phase_name, set()):
+            return False
+        if phase_name == "compute" and op_name == "GemmOp" and compute_name == "compute_unscaled":
+            return False
     return True
 
 
@@ -368,58 +368,34 @@ class HandlerBackend:
 
     def compile_phase_dispatch_inputs(self, kernel) -> Dict[str, Any]:
         """Compile phase wrappers and synthesize runtime dispatch objects."""
+        def phase_should_noinline(instance, phase_name):
+            return _phase_should_noinline(
+                instance,
+                phase_name,
+                inline_thin_phases=kernel.config.inline_thin_phases,
+            )
+
         return compile_phase_dispatch_inputs(
             self,
             kernel,
             num_dma_warps=NUM_DMA_WARPS,
-            phase_should_noinline=_phase_should_noinline,
+            phase_should_noinline=phase_should_noinline,
         )
 
 
-class RuntimeBackend(HandlerBackend):
-    """Runtime-oriented backend facade.
-
-    This backend currently reuses the handler IR and dispatch implementation
-    while the framework is being moved away from hard-wired handler-specialized
-    construction. Keeping it as a distinct backend makes backend selection
-    explicit and lets tests lock the public contract before the runtime path
-    diverges internally.
-    """
-    runtime_transport_records = True
-
-
-def build_runtime_backend_ir(kernel) -> BackendIR:
-    """Build backend IR for the runtime backend.
-
-    The current runtime backend starts from the same IR as the handler path.
-    Future work can relax handler specialization without changing the
-    megakernel constructor or tests.
-    """
-    base_ir = build_handler_backend_ir(kernel)
-    return replace(
-        base_ir,
-        op_phase_local_indices={
-            phase: tuple(base_ir.op_phase_transport_indices[phase])
-            for phase in PHASE_NAMES
-        },
-    )
-
-
 def build_backend(kernel, backend_name: str):
-    """Construct the configured backend and its IR."""
-    if backend_name == "handler":
+    """Construct the configured backend and its IR.
+
+    ``runtime`` remains accepted as a compatibility alias for ``handler``.
+    """
+    if backend_name in ("handler", "runtime"):
         ir = build_handler_backend_ir(kernel)
         return ir, HandlerBackend(ir)
-    if backend_name == "runtime":
-        ir = build_runtime_backend_ir(kernel)
-        return ir, RuntimeBackend(ir)
     raise ValueError(f"Unknown megakernel backend: {backend_name}")
 
 
 __all__ = [
     "build_handler_backend_ir",
-    "build_runtime_backend_ir",
     "build_backend",
     "HandlerBackend",
-    "RuntimeBackend",
 ]

@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
-from .ops import MAX_TILE_DIMS, Op, ScheduledOp
+from .ops import MAX_TILE_DIMS, Op, ScheduledOp, tensor_meta_overlaps
 
 
 # =============================================================================
@@ -545,23 +545,23 @@ class InstructionStreamBuilder:
         """Detect cross-buffer dependencies by tensor pointer identity.
 
         Maps (consumer_op_idx, consumer_input_buf) → producer_op_idx when
-        a consumer's input shares the same data_ptr as a producer's output,
-        even though their buffer names differ. E.g., RopeOp writes 'q'
-        (ptr=k_flat) and PrepOp reads 'k' (ptr=k_f) where both are views
-        of the same storage.
+        a consumer's input overlaps a producer's output, even though their
+        buffer names differ. Exact pointer matches remain supported, and we
+        also handle packed-buffer aliases such as a fused QKV output consumed
+        through separate q/k/v slice views.
         """
         tensor_ptr_deps: Dict[Tuple[int, str], int] = {}
         for cons_rec in self._op_records:
             for cons_buf in cons_rec.op.op_cls.INPUTS:
-                cons_ptr = cons_rec.op.tensor_ptrs.get(cons_buf)
-                if cons_ptr is None:
+                cons_meta = cons_rec.op.tensor_metas.get(cons_buf)
+                if cons_meta is None:
                     continue
                 for prod_rec in self._op_records:
                     if prod_rec.op_idx >= cons_rec.op_idx:
                         continue
                     for prod_buf in prod_rec.op.op_cls.OUTPUTS:
-                        prod_ptr = prod_rec.op.tensor_ptrs.get(prod_buf)
-                        if prod_ptr is not None and prod_ptr == cons_ptr:
+                        prod_meta = prod_rec.op.tensor_metas.get(prod_buf)
+                        if prod_meta is not None and tensor_meta_overlaps(prod_meta, cons_meta):
                             tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
         return tensor_ptr_deps
 
@@ -615,6 +615,7 @@ class InstructionStreamBuilder:
         """Resolve ordered op pairs for RAW plus shared-storage anti-dependencies."""
         pairs: List[Tuple[int, int]] = []
         seen: Set[Tuple[int, int]] = set()
+        raw_pairs: Set[Tuple[int, int]] = set()
 
         # RAW edges from declared inputs.
         for rec in self._op_records:
@@ -625,6 +626,7 @@ class InstructionStreamBuilder:
                 pair = (prod_idx, rec.op_idx)
                 if pair not in seen:
                     seen.add(pair)
+                    raw_pairs.add(pair)
                     pairs.append(pair)
 
         # Shared-storage anti-dependencies: a later writer must wait until all
@@ -633,19 +635,21 @@ class InstructionStreamBuilder:
         # across different op classes and layers).
         for rec in self._op_records:
             for out_name in rec.op.op_cls.OUTPUTS:
-                out_ptr = rec.op.tensor_ptrs.get(out_name)
-                if out_ptr is None:
+                out_meta = rec.op.tensor_metas.get(out_name)
+                if out_meta is None:
                     continue
                 for cand_idx in range(rec.op_idx - 1, -1, -1):
                     cand = self._op_records[cand_idx]
                     matched = False
                     for cand_name in cand.op.op_cls.INPUTS:
-                        if cand.op.tensor_ptrs.get(cand_name) == out_ptr:
+                        cand_meta = cand.op.tensor_metas.get(cand_name)
+                        if cand_meta is not None and tensor_meta_overlaps(cand_meta, out_meta):
                             matched = True
                             break
                     if not matched:
                         for cand_name in cand.op.op_cls.OUTPUTS:
-                            if cand.op.tensor_ptrs.get(cand_name) == out_ptr:
+                            cand_meta = cand.op.tensor_metas.get(cand_name)
+                            if cand_meta is not None and tensor_meta_overlaps(cand_meta, out_meta):
                                 matched = True
                                 break
                     if matched:
@@ -654,7 +658,48 @@ class InstructionStreamBuilder:
                             seen.add(pair)
                             pairs.append(pair)
 
-        return pairs
+        return self._transitively_reduce_dep_pairs(pairs, preserve=raw_pairs)
+
+    @staticmethod
+    def _transitively_reduce_dep_pairs(
+        pairs: List[Tuple[int, int]],
+        preserve: Optional[Set[Tuple[int, int]]] = None,
+    ) -> List[Tuple[int, int]]:
+        """Remove dependency pairs already implied by another op-level path.
+
+        Shared-storage anti-dependencies can connect a later writer to every
+        earlier reader/writer of the same scratch tensor. In long fused graphs
+        that creates O(layers^2) wait formulas even though most are implied by
+        the nearest intervening dependencies. Keeping only the op-level
+        transitive reduction preserves ordering while keeping per-instruction
+        wait metadata proportional to the real frontier.
+        """
+        if len(pairs) <= 1:
+            return pairs
+        preserve = preserve or set()
+
+        adjacency: Dict[int, Set[int]] = {}
+        for src, dst in pairs:
+            adjacency.setdefault(src, set()).add(dst)
+
+        def has_alternate_path(src: int, dst: int) -> bool:
+            stack = [node for node in adjacency.get(src, ()) if node != dst]
+            visited: Set[int] = set()
+            while stack:
+                node = stack.pop()
+                if node == dst:
+                    return True
+                if node in visited:
+                    continue
+                visited.add(node)
+                stack.extend(adjacency.get(node, ()))
+            return False
+
+        return [
+            (src, dst)
+            for src, dst in pairs
+            if (src, dst) in preserve or not has_alternate_path(src, dst)
+        ]
 
     def _resolve_dep_edges(self) -> List[_DepEdge]:
         """Resolve op-level dependency edges for tile scheduling.
@@ -929,6 +974,7 @@ class InstructionStreamBuilder:
             i: ([], []) for i in range(len(self._op_records))
         }
         barrier_counter = 0
+        signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int], int] = {}
 
         for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
                 producer = self._op_records[prod_idx]
@@ -955,26 +1001,31 @@ class InstructionStreamBuilder:
                     shared_pairs,
                 )
 
-                # Producer signal formula
-                formulas[prod_idx][1].append(
-                    BarrierFormula(
-                        base=barrier_counter,
-                        coeffs=producer_coeffs,
-                        divs=producer_divs,
+                # Fan-out consumers can share the same producer-side readiness
+                # counter. Each consumer still keeps its own expected count.
+                signal_key = (prod_idx, producer_coeffs, producer_divs, num_barriers)
+                signal_base = signal_family_cache.get(signal_key)
+                if signal_base is None:
+                    signal_base = barrier_counter
+                    signal_family_cache[signal_key] = signal_base
+                    formulas[prod_idx][1].append(
+                        BarrierFormula(
+                            base=signal_base,
+                            coeffs=producer_coeffs,
+                            divs=producer_divs,
+                        )
                     )
-                )
+                    barrier_counter += num_barriers
 
                 # Consumer wait formula
                 formulas[cons_idx][0].append(
                     BarrierFormula(
-                        base=barrier_counter,
+                        base=signal_base,
                         coeffs=consumer_coeffs,
                         divs=consumer_divs,
                         expected=expected,
                     )
                 )
-
-                barrier_counter += num_barriers
 
         return formulas, barrier_counter
 
@@ -1037,6 +1088,12 @@ class InstructionStreamBuilder:
         formulas, _ = self._resolve()
         return max((len(wf) for wf, _ in formulas.values()), default=0)
 
+    @property
+    def max_signal_deps(self) -> int:
+        """Maximum number of signal dependencies across all ops."""
+        formulas, _ = self._resolve()
+        return max((len(sf) for _wf, sf in formulas.values()), default=0)
+
     def build_wait_info_tensor(self, instructions, device="cuda"):
         """Pre-compute (barrier_idx, expected) per instruction.
 
@@ -1055,6 +1112,23 @@ class InstructionStreamBuilder:
         ]
 
         return torch.tensor(wait_data, dtype=torch.int32, device=device)
+
+    def build_signal_info_tensor(self, instructions, device="cuda"):
+        """Pre-compute signal barrier indices per instruction.
+
+        Returns tensor [num_instr, max_signals], where -1 means skip.
+        """
+        import torch
+
+        formulas, _ = self._resolve()
+        max_signals = max(1, self.max_signal_deps)
+
+        signal_data = [
+            self._build_signal_info_entry(instr, formulas, max_signals)
+            for instr in instructions
+        ]
+
+        return torch.tensor(signal_data, dtype=torch.int32, device=device)
 
     @staticmethod
     def _build_wait_info_entry(
@@ -1076,6 +1150,28 @@ class InstructionStreamBuilder:
 
         while len(entry) < max_waits * 2:
             entry.extend([-1, 0])
+        return entry
+
+    @staticmethod
+    def _build_signal_info_entry(
+        instr: TileInstruction,
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+        max_signals: int,
+    ) -> List[int]:
+        """Pack signal metadata for one instruction into barrier indices."""
+        if instr.op_idx == TileInstruction.END_MARKER:
+            return [-1] * max_signals
+
+        entry: List[int] = []
+        signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
+        for formula in signal_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                entry.append(-1)
+            else:
+                entry.append(formula.compute_index(instr.tiles))
+
+        while len(entry) < max_signals:
+            entry.append(-1)
         return entry
 
     def get_op_barrier_formulas(self) -> Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]:

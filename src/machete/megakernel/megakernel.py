@@ -72,6 +72,7 @@ from .paged_memory import (
     FLAG_STORE_IDX,
     FLAG_LOAD_DONE,
     TILE_INFO_HANDLER_IDX as _TILE_INFO_HANDLER_IDX,
+    TILE_INFO_INSTRUCTION_IDX as _TILE_INFO_INSTRUCTION_IDX,
     TILE_INFO_LINEAR_IDX as _TILE_INFO_LINEAR_IDX,
     TILE_INFO_OP_CONFIG as _TILE_INFO_OP_CONFIG,
     TILE_INFO_PACKED_WARP_INFO as _TILE_INFO_PACKED_WARP_INFO,
@@ -167,6 +168,9 @@ class MegakernelConfig:
         opt_level: LLVM optimization level 0-3 (default: 2). noinline requires <= 2.
         tracing: Enable cutedsl-trace instrumentation (default: False).
             When False, trace blocks are stripped at source level (zero overhead).
+        sync_compute_warps_after_tile: Keep a CTA named-barrier sync after each
+            compute tile. This is conservative for generic ops; specialized
+            streams can disable it when per-slot mbarrier arrivals are enough.
 
     Multi-GPU (peer TMA):
         peer_buffers: {tensor_name: [peer0_tensor, peer1_tensor, ...]}
@@ -183,6 +187,8 @@ class MegakernelConfig:
     dma_reg_count: int = 40
     mma_reg_count: int = 232
     noinline: bool = True
+    inline_thin_phases: bool = True
+    sync_compute_warps_after_tile: bool = True
     opt_level: int = 2
     backend: str = "handler"
 
@@ -272,6 +278,8 @@ class Megakernel:
         """Construct a megakernel instance and build its host-side runtime state."""
         self.ops = ops
         self.config = config or MegakernelConfig()
+        if self.config.backend == "runtime":
+            self.config.backend = "handler"
         self.device = device
         self._scheduler = scheduler
 
@@ -368,7 +376,7 @@ class Megakernel:
             self._peer_tma_registry = PeerTMARegistry.from_ops(ops, self._tensor_registry, self._peer_buffer_registry)
         else:
             self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
-        self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
+            self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
         self._peer_tma_cute_tensors: Optional[List] = None
         self._tma_runtime_layout_cache: Dict[int, tuple] = {}
         self._backend_ir, self._backend = build_backend(self, self.config.backend)
@@ -429,6 +437,10 @@ class Megakernel:
             self._num_instructions_i32 = Int32(self._num_instructions)
             # Pre-computed barrier indices for controller warp
             self._wait_info = self._builder.build_wait_info_tensor(instructions, self.device)
+            self._max_signal_formulas = max(1, self._builder.max_signal_deps)
+            self._signal_metadata_tensor = self._builder.build_signal_info_tensor(
+                instructions, self.device
+            )
 
         if self._barriers_tensor is None:
             self._barriers_tensor = torch.zeros(self.num_barriers, dtype=torch.int32, device=self.device)
@@ -459,15 +471,12 @@ class Megakernel:
     def _prepare_op_metadata_tensors(self) -> None:
         """Build runtime metadata tables for the persistent shell."""
         formulas = self._builder.get_op_barrier_formulas()
-        self._max_signal_formulas = max(
-            1, max((len(signal) for _wait, signal in formulas.values()), default=0)
-        )
+        self._max_signal_formulas = max(1, self._builder.max_signal_deps)
         threads_per_block = self.config.threads_per_block
         num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32
         default_num_mma_warps = num_compute_threads // 32
 
         op_meta = []
-        signal_meta = []
         has_communicate = self._peer_tma_registry.has_peer_tma
         peer_signal_offsets = [] if has_communicate else None
         peer_barrier_offset = 0
@@ -504,7 +513,7 @@ class Megakernel:
             config = build_op_config(op, kernel_config=kernel_config)
             instance = op.op_cls(**config)
             tile_strides = self._tile_linear_strides(op.tile_counts)
-            _wait_formulas, signal_formulas = formulas.get(op_idx, ([], []))
+            _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
             # Keep op_config_ptr live for every phase.
             #
             # Phase wrappers may reconstruct tensors from op_config_ptr even
@@ -536,20 +545,6 @@ class Megakernel:
                 ]
             )
 
-            for signal_idx in range(self._max_signal_formulas):
-                if signal_idx < len(signal_formulas):
-                    formula = signal_formulas[signal_idx]
-                    signal_meta.extend(
-                        [
-                            formula.base,
-                            formula.guard_max,
-                            *formula.coeffs,
-                            *formula.divs,
-                        ]
-                    )
-                else:
-                    signal_meta.extend([-1, BarrierFormula.NO_GUARD] + [0] * (MAX_TILE_DIMS * 2))
-
             if has_communicate:
                 if self._op_has_peer_barriers(op):
                     peer_signal_offsets.append(peer_barrier_offset)
@@ -559,9 +554,6 @@ class Megakernel:
 
         self._op_metadata_tensor = torch.tensor(
             op_meta, dtype=torch.int32, device=self.device
-        )
-        self._signal_metadata_tensor = torch.tensor(
-            signal_meta, dtype=torch.int32, device=self.device
         )
         for phase in PHASE_NAMES:
             if phase_uses_local_idx.get(phase, False):
@@ -1505,53 +1497,16 @@ class Megakernel:
         @cute.jit
         def _signal_barriers_from_meta(
             signal_meta_ptr: Int64,
-            op_idx: Int32,
-            tile_0: Int32,
-            tile_1: Int32,
-            tile_2: Int32,
-            tile_3: Int32,
-            tile_4: Int32,
+            instruction_idx: Int32,
             barriers_ptr: Int64,
         ):
             for sig_idx in range_constexpr(self._max_signal_formulas):
-                base_offset = (
-                    op_idx * Int32(self._max_signal_formulas * _SIGNAL_META_STRIDE)
-                    + Int32(sig_idx * _SIGNAL_META_STRIDE)
+                barrier_idx = ld_global_i32(
+                    signal_meta_ptr,
+                    instruction_idx * Int32(self._max_signal_formulas) + Int32(sig_idx),
                 )
-                barrier_base = ld_global_i32(
-                    signal_meta_ptr, base_offset + Int32(_SIGNAL_META_BASE)
-                )
-                if barrier_base >= Int32(0):
-                    guard_max = ld_global_i32(
-                        signal_meta_ptr, base_offset + Int32(_SIGNAL_META_GUARD_MAX)
-                    )
-                    coeff0 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_COEFF_0 + 0))
-                    coeff1 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_COEFF_0 + 1))
-                    coeff2 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_COEFF_0 + 2))
-                    coeff3 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_COEFF_0 + 3))
-                    coeff4 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_COEFF_0 + 4))
-                    linear = (
-                        coeff0 * tile_0
-                        + coeff1 * tile_1
-                        + coeff2 * tile_2
-                        + coeff3 * tile_3
-                        + coeff4 * tile_4
-                    )
-                    if linear < guard_max:
-                        div0 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_DIV_0 + 0))
-                        div1 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_DIV_0 + 1))
-                        div2 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_DIV_0 + 2))
-                        div3 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_DIV_0 + 3))
-                        div4 = ld_global_i32(signal_meta_ptr, base_offset + Int32(_SIGNAL_META_DIV_0 + 4))
-                        barrier_idx = (
-                            barrier_base
-                            + coeff0 * (tile_0 // div0)
-                            + coeff1 * (tile_1 // div1)
-                            + coeff2 * (tile_2 // div2)
-                            + coeff3 * (tile_3 // div3)
-                            + coeff4 * (tile_4 // div4)
-                        )
-                        global_barrier_signal_gpu(barriers_ptr, barrier_idx)
+                if barrier_idx >= Int32(0):
+                    global_barrier_signal_gpu(barriers_ptr, barrier_idx)
 
         if has_communicate:
             @cute.jit
@@ -1617,6 +1572,7 @@ class Megakernel:
         return {
             "_TILE_INFO_LINEAR_IDX": _TILE_INFO_LINEAR_IDX,
             "_TILE_INFO_HANDLER_IDX": _TILE_INFO_HANDLER_IDX,
+            "_TILE_INFO_INSTRUCTION_IDX": _TILE_INFO_INSTRUCTION_IDX,
             "_TILE_INFO_TILE_0": _TILE_INFO_TILE_0,
             "_TILE_INFO_TILE_1": _TILE_INFO_TILE_1,
             "_TILE_INFO_TILE_2": _TILE_INFO_TILE_2,
@@ -1661,6 +1617,7 @@ class Megakernel:
             "ld_global_i32": ld_global_i32,
             "has_communicate": runtime["has_communicate"],
             "needs_warp_transition": runtime["needs_warp_transition"],
+            "sync_compute_warps_after_tile": self.config.sync_compute_warps_after_tile,
             "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
             "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
             "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
@@ -1768,6 +1725,8 @@ class Megakernel:
                 _ctrl_cached_meta_base = Int32(0)
                 _ctrl_cached_uses_mask = Int32(0)
                 _ctrl_cached_config = Int64(0)
+                _ctrl_cached_handler = Int32(0)
+                _ctrl_cached_packed_warp_info = Int32(0)
 
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
@@ -1817,6 +1776,18 @@ class Megakernel:
                                     _ctrl_cached_config = ld_global_i64(op_configs_ptr, _instr_op)
                                 else:
                                     _ctrl_cached_config = Int64(0)
+                                _ctrl_cached_handler = _op_meta_i32_base(
+                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_IDX)
+                                )
+                                _p_inner_iters = _op_meta_i32_base(
+                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_INNER_ITERS)
+                                )
+                                _p_num_warps = _op_meta_i32_base(
+                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_NUM_WARPS)
+                                )
+                                _ctrl_cached_packed_warp_info = (
+                                    _p_inner_iters + _p_num_warps * Int32(_TILE_INFO_PACK_SCALE)
+                                )
                                 _ctrl_cached_op_idx = _instr_op
                             else:
                                 _p_meta_base = _ctrl_cached_meta_base
@@ -1826,24 +1797,20 @@ class Megakernel:
                             st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_HANDLER_IDX),
-                                _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_IDX)
-                                ),
+                                _ctrl_cached_handler,
                             )
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_0), _p_t0)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_1), _p_t1)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_2), _p_t2)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_3), _p_t3)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_4), _p_t4)
-                            _p_inner_iters = _op_meta_i32_base(
-                                op_meta_ptr, _p_meta_base, Int32(_OP_META_INNER_ITERS)
-                            )
-                            _p_num_warps = _op_meta_i32_base(
-                                op_meta_ptr, _p_meta_base, Int32(_OP_META_NUM_WARPS)
-                            )
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_PACKED_WARP_INFO),
-                                _p_inner_iters + _p_num_warps * Int32(_TILE_INFO_PACK_SCALE),
+                                _ctrl_cached_packed_warp_info,
+                            )
+                            st_shared_i32(
+                                _p_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX),
+                                _fetch_idx_save,
                             )
                             st_shared_i64(
                                 _p_ti + Int32(4 * _TILE_INFO_OP_CONFIG),
@@ -2003,6 +1970,9 @@ class Megakernel:
                         _ds_packed_warp_info = ld_shared_i32(
                             _ds_ti + Int32(4 * _TILE_INFO_PACKED_WARP_INFO)
                         )
+                        _ds_instruction_idx = ld_shared_i32(
+                            _ds_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX)
+                        )
                         _ds_inner_iters = _ds_packed_warp_info % Int32(_TILE_INFO_PACK_SCALE)
                         _ds_config = ld_shared_i64(_ds_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
@@ -2119,12 +2089,7 @@ class Megakernel:
                         with cute.arch.elect_one():
                             signal_barriers(
                                 signal_meta_ptr,
-                                _ds_op,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_4,
+                                _ds_instruction_idx,
                                 barriers_ptr,
                             )
                             if const_expr(has_communicate):
@@ -2248,7 +2213,8 @@ class Megakernel:
                                 _op_config,
                             )
 
-                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
+                        if const_expr(sync_compute_warps_after_tile):
+                            named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
                         if const_expr(tracing):
                             _mma_lane = end_event_dynamic_raw_1(
@@ -2435,7 +2401,6 @@ class Megakernel:
         phase_runtime_keys = tuple(
             (
                 phase,
-                self._backend_ir.phase_local_transport_positions[phase],
                 self._phase_local_transport_position_widths[phase],
                 self._phase_local_desc_slot_widths[phase],
                 self._phase_local_transport_position_tensors[phase] is not None,
@@ -2459,41 +2424,36 @@ class Megakernel:
             self.config.mma_reg_count,
             self.config.num_devices,
             self.config.noinline,
+            self.config.inline_thin_phases,
+            self.config.sync_compute_warps_after_tile,
             self.config.opt_level,
         )
 
-        # TMA descriptors are created at launch time from runtime tensors, so
-        # the compiled kernel only depends on descriptor *structure*:
-        # tensor/layout rank, tile shape, dtype, direction, and stride order.
+        # TMA descriptors are created at launch time from runtime tensors, but
+        # the generated kernel signature still has one argument per descriptor.
+        # Keep descriptor order/count in the key, not only unique structures.
         #
         # Different allocations with the same shape/stride layout should share
         # the same compiled kernel. Runtime tensor handles still flow through
         # launch_state and TMA descriptors are rebuilt per launch.
         local_tma_key = tuple(
-            dict.fromkeys(
-                (
-                    desc.tensor_canonical,
-                    desc.direction,
-                    tuple(desc.tile_shape),
-                    getattr(desc.dtype, "__name__", str(desc.dtype)),
-                    desc.smem_layout_src,
-                    tuple(desc.dim_perm),
-                )
-                for desc in self._tma_registry.descriptors
+            (
+                desc.direction,
+                tuple(desc.tile_shape),
+                getattr(desc.dtype, "__name__", str(desc.dtype)),
+                desc.smem_layout_src,
+                tuple(desc.dim_perm),
             )
+            for desc in self._tma_registry.descriptors
         )
         peer_tma_key = tuple(
-            dict.fromkeys(
-                (
-                    desc.tensor_canonical,
-                    desc.peer_idx,
-                    desc.direction,
-                    tuple(desc.tile_shape),
-                    getattr(desc.dtype, "__name__", str(desc.dtype)),
-                    desc.smem_layout_src,
-                )
-                for desc in self._peer_tma_registry.descriptors
+            (
+                desc.direction,
+                tuple(desc.tile_shape),
+                getattr(desc.dtype, "__name__", str(desc.dtype)),
+                desc.smem_layout_src,
             )
+            for desc in self._peer_tma_registry.descriptors
         )
 
         return (

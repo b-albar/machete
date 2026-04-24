@@ -55,6 +55,7 @@ class KernelBenchSpec:
     setup_fn: Optional[Callable] = None
     stream: Any = None
     use_host_timer: bool = False
+    metadata: Optional[str] = None
     _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
 
 

@@ -21,6 +21,7 @@ from .ops import (
     TORCH_TO_CUTLASS_DTYPE,
     ScheduledOp,
     TensorMeta,
+    is_last_dim_slice_alias,
 )
 
 TMA_PHASE_SPECS = (
@@ -51,7 +52,11 @@ def _canonical_name_list(descriptors) -> List[str]:
 
 def _sorted_mapping_values(mapping: Dict[str, str]) -> List[str]:
     """Return canonical names ordered by sorted local parameter name."""
-    return [canonical for _local_name, canonical in sorted(mapping.items())]
+    return [
+        canonical
+        for local_name, canonical in sorted(mapping.items())
+        if not local_name.endswith("_desc")
+    ]
 
 
 def _iter_tma_phase_specs(op_cls):
@@ -77,6 +82,8 @@ def _resolve_tensor_canonical_name(
     tensor_registry: "TensorRegistry",
 ) -> Optional[str]:
     """Resolve an op-local tensor name to its canonical registry name."""
+    if tensor_name in tensor_registry.name_to_idx:
+        return tensor_name
     for mapping in tensor_registry.op_mappings.values():
         if tensor_name in mapping:
             return mapping[tensor_name]
@@ -861,6 +868,8 @@ class PeerTMARegistry:
                 tensor_canonical = tensor_registry.op_mappings[i].get(tensor_name)
                 if tensor_canonical is None:
                     continue
+                if peer_buffer_registry.get_peer_tensors(tensor_canonical) is None:
+                    continue
 
                 tma_tile_shape = _compute_tma_tile_shape(op_cls, tensor_name, op)
                 dtype = _resolve_tma_dtype(op, tensor_name)
@@ -944,12 +953,10 @@ class PeerTMARegistry:
 def validate_op_compatibility(ops: List[ScheduledOp], registry: "TensorRegistry") -> None:
     """Validate shared tensors across fused ops have compatible shapes.
 
-    When two ops share the same underlying tensor (same data_ptr), checks that:
-    1. Total element count matches (product of shapes).
-    2. Shared dimension names have matching values in static_dims.
-
-    This allows reshapes like (M, D) → (M, H, D) as long as total elements agree
-    and any dimension names in common (e.g. M) have the same value.
+    When two ops share the same starting pointer, the framework permits view
+    aliases with different logical shapes. This covers both reshapes like
+    (M, D) → (M, H, D) and packed-buffer consumers that reinterpret a prefix
+    or subview of a larger producer allocation.
 
     Args:
         ops: List of scheduled operations.
@@ -979,6 +986,10 @@ def validate_op_compatibility(ops: List[ScheduledOp], registry: "TensorRegistry"
             other_op_name = ops[other_idx].op_cls.__name__
 
             if ref_numel != other_numel:
+                if ref_meta.data_ptr == other_meta.data_ptr:
+                    continue
+                if is_last_dim_slice_alias(ref_meta, other_meta):
+                    continue
                 raise ValueError(
                     f"Shared tensor incompatibility: "
                     f"{ref_op_name}.{ref_name} has shape {ref_meta.shape} "

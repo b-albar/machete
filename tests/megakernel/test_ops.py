@@ -8,7 +8,8 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import MAX_TILE_DIMS, Op
+from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
     TileInstruction,
@@ -223,7 +224,7 @@ class TestTileInstructionPacking:
         instr = TileInstruction(op_idx=1, tiles=(5, 2, 0))
         packed = instr.pack()
         assert len(packed) == INSTRUCTION_WORDS
-        assert INSTRUCTION_WORDS == 2
+        assert INSTRUCTION_WORDS == 2 + MAX_TILE_DIMS
 
     def test_pack_fields(self):
         """Fields should pack as [op_idx, linear_tile_idx]."""
@@ -293,6 +294,55 @@ class _FanInOp(Op):
     """Test op that consumes both 'x' and 'y'."""
     INPUTS: ClassVar[List[str]] = ["x", "y"]
     OUTPUTS: ClassVar[List[str]] = []
+
+
+class _PackedQKVProducerOp(Op):
+    reads = {}
+    writes = {"qkv": (None, ("B", "S", "N"))}
+    tile = ("B", "S")
+    OUTPUTS: ClassVar[List[str]] = ["qkv"]
+
+
+class _PackedQConsumerOp(Op):
+    reads = {"q": (None, ("B", "S", "Q"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["q"]
+
+
+class _PackedKConsumerOp(Op):
+    reads = {"k": (None, ("B", "S", "K"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["k"]
+
+
+class _PackedVConsumerOp(Op):
+    reads = {"v": (None, ("B", "S", "V"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["v"]
+
+
+class _PackedV4DConsumerOp(Op):
+    reads = {"v": (None, ("B", "S", "H", "D"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["v"]
+
+
+class _ScratchWriterOp(Op):
+    reads = {}
+    writes = {"x": (None, ("B", "S"))}
+    tile = ("B", "S")
+    OUTPUTS: ClassVar[List[str]] = ["x"]
+
+
+class _ScratchReaderOp(Op):
+    reads = {"x": (None, ("B", "S"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["x"]
 
 
 class TestNamedBufferDeps:
@@ -378,8 +428,69 @@ class TestNamedBufferDeps:
         assert c_wait.coeffs[0] == 1  # batch maps to producer's dim 0
         assert c_wait.coeffs[1] == 0  # seqlen not in producer (broadcast)
         assert c_wait.compute_index((0, 0, 0)) == 0  # (batch=0, seqlen=0) → barrier 0
-        assert c_wait.compute_index((0, 7, 0)) == 0  # (batch=0, seqlen=7) → barrier 0
-        assert c_wait.compute_index((2, 5, 0)) == 2  # (batch=2, seqlen=5) → barrier 2
+
+    def test_packed_qkv_views_resolve_dependencies(self):
+        """Packed producer output should feed q/k/v slice consumers."""
+        qkv = torch.empty(1, 4, 12)
+        q = qkv[:, :, :8]
+        k = qkv[:, :, 8:10]
+        v = qkv[:, :, 10:]
+
+        prod = _PackedQKVProducerOp.schedule(
+            qkv=qkv,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        q_cons = _PackedQConsumerOp.schedule(
+            q=q,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        k_cons = _PackedKConsumerOp.schedule(
+            k=k,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        v_cons = _PackedVConsumerOp.schedule(
+            v=v,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+
+        validate_op_compatibility([prod, q_cons, k_cons, v_cons], TensorRegistry.from_ops([prod, q_cons, k_cons, v_cons]))
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(q_cons)
+        builder.add_op(k_cons)
+        builder.add_op(v_cons)
+        formulas = builder.get_op_barrier_formulas()
+        assert builder.num_barriers == 4
+
+        for op_idx in (1, 2, 3):
+            wait = formulas[op_idx][0]
+            assert len(wait) == 1
+            assert wait[0].expected == 1
+            assert wait[0].base == formulas[0][1][0].base
+
+    def test_packed_flat_producer_feeds_rank_changed_view(self):
+        """Flat producer output should feed a BSHD slice view of same storage."""
+        qkv = torch.empty(1, 4, 12)
+        v_4d = qkv.view(1, 4, 3, 4)[:, :, 2:, :]
+
+        prod = _PackedQKVProducerOp.schedule(
+            qkv=qkv,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        v_cons = _PackedV4DConsumerOp.schedule(
+            v=v_4d,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(v_cons)
+        formulas = builder.get_op_barrier_formulas()
+
+        wait = formulas[1][0]
+        assert len(wait) == 1
+        assert wait[0].expected == 1
 
     def test_fan_in(self):
         """OpA → "x", OpB → "y", OpC reads ["x", "y"]. OpC has 2 wait formulas."""
@@ -403,7 +514,7 @@ class TestNamedBufferDeps:
         assert c_waits[0].base != c_waits[1].base
 
     def test_fan_out(self):
-        """OpA → "x", both OpB and OpC read "x". OpA has 2 signal formulas."""
+        """OpA → "x", both OpB and OpC read "x". OpA signals once."""
         builder = InstructionStreamBuilder()
         builder.add_op(_ProducerOp, tile_counts=(4,),
                        dim_names={"batch": 0})
@@ -414,12 +525,26 @@ class TestNamedBufferDeps:
                        dim_names={"batch": 0})
         formulas = builder.get_op_barrier_formulas()
 
-        # OpA signals 2 barrier sets (one per downstream consumer)
+        # Both consumers can wait on the same producer-side readiness signal.
         p_signals = formulas[0][1]
-        assert len(p_signals) == 2
+        assert len(p_signals) == 1
 
-        # Different barrier bases for each edge
-        assert p_signals[0].base != p_signals[1].base
+        assert formulas[1][0][0].base == p_signals[0].base
+        assert formulas[2][0][0].base == p_signals[0].base
+
+    def test_reused_scratch_antideps_do_not_accumulate_waits(self):
+        """Repeated scratch reuse should keep wait formulas on the frontier."""
+        scratch = torch.empty(1, 8)
+        builder = InstructionStreamBuilder()
+        for _ in range(8):
+            builder.add_op(_ScratchWriterOp.schedule(
+                x=scratch, tile_sizes={"B": 1, "S": 1},
+            )[0])
+            builder.add_op(_ScratchReaderOp.schedule(
+                x=scratch, tile_sizes={"B": 1, "S": 1},
+            )[0])
+
+        assert builder.max_wait_deps <= 2
 
     def test_buffer_not_produced_is_external(self):
         """Consuming a buffer with no producer is treated as an external input."""

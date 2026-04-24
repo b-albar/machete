@@ -9,8 +9,14 @@ This complements the dedicated full-model decode benchmark:
 
 import contextlib
 import io
+import sys
+from pathlib import Path
 
 import torch
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from machete.utils.benchmark import Benchmark
 from benchmarks.kernels.benchmark_qwen3_5_decode import (
@@ -28,6 +34,7 @@ from benchmarks.kernels.benchmark_qwen3_5_decode import (
 )
 from benchmarks.kernels.benchmark_qwen3_5_layer import (
     sequential_forward,
+    maybe_compiled_forward,
     _pick_single_layer_forward_mma_reg_count,
     _pick_single_layer_forward_tpb,
 )
@@ -150,6 +157,7 @@ def _schedule_prefill_layer_ops(
         y=h_buf,
         residual_in=res_in,
         residual_out=res_mid,
+        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf, page_size=fa_page_size)
@@ -165,6 +173,7 @@ def _schedule_prefill_layer_ops(
         y=h2_buf,
         residual_in=res_mid,
         residual_out=res_out,
+        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     ops += GemmOp.schedule(a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf, page_size=fa_page_size)
@@ -175,7 +184,16 @@ def _schedule_prefill_layer_ops(
     return ops, fa_config, extra_keep
 
 
-def megakernel_prefill_build(batch, seq_len, x, residual, weights, page_size=32768, num_layers=NUM_LAYERS):
+def megakernel_prefill_build(
+    batch,
+    seq_len,
+    x,
+    residual,
+    weights,
+    page_size=32768,
+    num_pages=1,
+    num_layers=NUM_LAYERS,
+):
     """Build a single full-model prefill megakernel."""
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.gemm import GemmOp
@@ -273,6 +291,7 @@ def megakernel_prefill_build(batch, seq_len, x, residual, weights, page_size=327
         y=h_final,
         residual_in=final_res,
         residual_out=residual_final,
+        tile_sizes={"S": 16},
         page_size=fa_page_size,
     )
     all_ops += LmHeadGemmOp.schedule(a=h_final, b=weights["lm_head"], c=logits, page_size=fa_page_size)
@@ -287,26 +306,23 @@ def megakernel_prefill_build(batch, seq_len, x, residual, weights, page_size=327
             max_fa_tpb,
         ),
         page_size=fa_page_size,
-        num_pages=1,
+        num_pages=num_pages,
         mma_reg_count=_pick_single_layer_forward_mma_reg_count(batch, seq_len),
-    )
-
-    print(
-        f"  Megakernel: {len(all_ops)} ops ({num_layers} layers), "
-        f"{config.threads_per_block} threads, page={fa_page_size}"
     )
 
     kernel = Megakernel(all_ops, config=config)
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
     torch.cuda.synchronize()
-    return kernel.bench_spec(keep_alive=keep_alive), logits, residual_final
+    spec = kernel.bench_spec(keep_alive=keep_alive)
+    return spec, logits, residual_final
 
 
 @Benchmark.parametrize("batch", [1])
 @Benchmark.parametrize("seq_len", [128, 512, 1024])
+@Benchmark.parametrize("num_pages", [1, 2])
 @Benchmark.parametrize("page_size", PAGE_SIZES)
-def bench_qwen35_prefill(seq_len, batch, page_size):
+def bench_qwen35_prefill(seq_len, batch, num_pages, page_size):
     """Benchmark full-model Qwen 3.5 prefill."""
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -322,6 +338,9 @@ def bench_qwen35_prefill(seq_len, batch, page_size):
     sequential_prefill(*args)
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_prefill(*args)
+    compiled_forward = maybe_compiled_forward(sequential_prefill, args)
+    if compiled_forward is not None:
+        funcs["torch_compile"] = lambda: compiled_forward(*args)
 
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         try:
@@ -332,6 +351,7 @@ def bench_qwen35_prefill(seq_len, batch, page_size):
                 residual,
                 weights,
                 page_size=page_size,
+                num_pages=num_pages,
             )
             funcs["megakernel"] = spec
         except Exception as e:

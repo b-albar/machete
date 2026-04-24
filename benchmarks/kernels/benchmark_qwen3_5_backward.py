@@ -10,9 +10,15 @@ Current scope is activation backward:
 
 import contextlib
 import io
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from machete.utils.benchmark import Benchmark
 from benchmarks.kernels.benchmark_qwen3_5_decode import (
@@ -66,6 +72,19 @@ if _BaseGemmOp is not None:
 else:
     class LmHeadGemmOp:
         pass
+
+
+def maybe_compiled_backward(fn, example_args):
+    """Return a warmed ``torch.compile`` version of a backward wrapper when available."""
+    try:
+        compiled = torch.compile(fn, mode="reduce-overhead", fullgraph=False)
+        compiled(*example_args)
+        compiled(*example_args)
+        torch.cuda.synchronize()
+        return compiled
+    except Exception as exc:
+        print(f"  torch.compile failed: {exc}")
+        return None
 
 
 def sequential_prefill_backward(x, residual, weights, d_logits, num_layers=NUM_LAYERS):
@@ -370,6 +389,9 @@ def bench_qwen35_backward(seq_len, batch, page_size):
     d_logits = torch.randn(batch, seq_len, VOCAB_SIZE, dtype=dtype, device=device)
     spec, _dx, _dres = megakernel_backward_build(batch, seq_len, x, residual, weights, d_logits, page_size=page_size)
     funcs = {"sequential": lambda: sequential_prefill_backward(x, residual, weights, d_logits)}
+    compiled_backward = maybe_compiled_backward(sequential_prefill_backward, (x, residual, weights, d_logits))
+    if compiled_backward is not None:
+        funcs["torch_compile"] = lambda: compiled_backward(x, residual, weights, d_logits)
     funcs["megakernel"] = spec
     return funcs
 
@@ -378,5 +400,10 @@ if __name__ == "__main__":
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         print("verify 1 layer:", verify_full_backward(1, 128, num_layers=1))
         print("verify 2 layers:", verify_full_backward(1, 128, num_layers=2))
+        print()
+        print("-" * 80)
+        print("Full-Model Backward: Eager vs torch.compile vs Megakernel")
+        print("-" * 80)
+        bench_qwen35_backward._benchmark.run(mode="kernel", warmup=3, rep=10)
     else:
         print("Requires Hopper+ GPU with CUTLASS.")

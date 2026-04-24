@@ -110,11 +110,18 @@ def _gemm_compute_unscaled_core(page_ptr, tidx,
     """Shared unscaled GEMM compute core for forward decode-style paths."""
     mma_op = cute.nvgpu.warp.MmaF16BF16Op(
         a_dtype, Float32, (16, 8, 16))
-    tiled_mma = cute.make_tiled_mma(
-        mma_op,
-        cute.make_layout((num_mma_warps, 1, 1)),
-        permutation_mnk=(num_mma_warps * 16, 16, 16),
-    )
+    if cutlass.const_expr(tile_size_S <= 16):
+        tiled_mma = cute.make_tiled_mma(
+            mma_op,
+            cute.make_layout((1, num_mma_warps, 1)),
+            permutation_mnk=(16, num_mma_warps * 16, 16),
+        )
+    else:
+        tiled_mma = cute.make_tiled_mma(
+            mma_op,
+            cute.make_layout((num_mma_warps, 1, 1)),
+            permutation_mnk=(num_mma_warps * 16, 16, 16),
+        )
     thr_mma = tiled_mma.get_slice(tidx)
 
     swz = cute.make_swizzle(swz_B_ab, 4, 3)
@@ -326,6 +333,10 @@ class GemmOp(Op):
 
         self.num_k_blocks = (self.K + self.tile_K - 1) // self.tile_K
         self.num_mma_warps = self.threads_per_row // 32
+        if self.tile_size_S <= 16:
+            # Decode GEMMs have only one M tile; spread MMA warps across N
+            # instead of issuing duplicate M work from idle fixed-CTA threads.
+            self.num_mma_warps = min(self.num_mma_warps, max(1, self.tile_size_N // 32))
         self.num_mma_threads = self.num_mma_warps * 32
 
         # Number of K-blocks loaded by TMA in load(iter=0): always 2 (or 1 if only 1 K-block)
@@ -863,16 +874,18 @@ class GemmOp(Op):
     @cute.jit
     def compute_unscaled(self, page_ptr, tile_B, tile_S, tile_N):
         """GEMM compute path specialized for the common unscaled forward case."""
-        _gemm_compute_unscaled_core(
-            page_ptr,
-            cute.arch.thread_idx()[0],
-            self.a_dtype, self.b_dtype, self.c_dtype,
-            self.num_mma_warps, self.num_mma_threads,
-            self.tile_size_S, self.tile_size_N, self.tile_K,
-            self.buf_stride, self.b_offset, self.mbar_offset,
-            self.swz_B_ab, self.swz_B_c,
-            self.activation, Int32(self.num_k_blocks),
-        )
+        tidx = cute.arch.thread_idx()[0]
+        if tidx < Int32(self.num_mma_threads):
+            _gemm_compute_unscaled_core(
+                page_ptr,
+                tidx,
+                self.a_dtype, self.b_dtype, self.c_dtype,
+                self.num_mma_warps, self.num_mma_threads,
+                self.tile_size_S, self.tile_size_N, self.tile_K,
+                self.buf_stride, self.b_offset, self.mbar_offset,
+                self.swz_B_ab, self.swz_B_c,
+                self.activation, Int32(self.num_k_blocks),
+            )
 
     # =========================================================================
     # Forward Store (S->G): Regular TMA store of C

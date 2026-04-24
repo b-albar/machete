@@ -50,6 +50,9 @@ class AttentionDPSumOp(Op):
         tile_sizes.setdefault("H", 1)
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
+        dout = tensors.get("dout")
+        if dout is not None:
+            ops[0].static_dims["S"] = dout.shape[1]
         return ops
 
     @cute.jit

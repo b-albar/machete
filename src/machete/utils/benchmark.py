@@ -297,7 +297,12 @@ class Benchmark:
         has_gbps = bytes_fn is not None
         baseline_name = names[0] if names else None
 
-        header = f"{'Config':<48}"
+        show_check = any(
+            isinstance(candidate, KernelBenchSpec) and candidate.metadata
+            for candidate in self._current_kernel_funcs.values()
+        ) if hasattr(self, "_current_kernel_funcs") else False
+
+        header = f"{'Config':<36}"
         for name in names:
             if has_gbps:
                 header += f" {name:>16}"
@@ -305,17 +310,21 @@ class Benchmark:
                 header += f" {name + ' (ms)':>14}"
             if name != baseline_name:
                 header += f" {'speedup':>8}"
-        print(header)
+        if show_check:
+            header += f" {'check':<24}"
+        print(header.rstrip())
 
         if has_gbps:
-            sub = f"{'':<48}"
+            sub = f"{'':<36}"
             for name in names:
                 sub += f" {'ms':>8} {'GB/s':>7}"
                 if name != baseline_name:
                     sub += f" {'':<8}"
-            print(sub)
+            if show_check:
+                sub += f" {'':<24}"
+            print(sub.rstrip())
 
-        print("-" * len(header))
+        print("-" * len(header.rstrip()))
 
     def _print_kernel_row(self, params, func_results, names, bytes_fn):
         """Print a single result row for kernel benchmark."""
@@ -325,7 +334,8 @@ class Benchmark:
         # Abbreviate param names to fit more info: hidden_dim→D, seq_len→S, etc.
         _ABBREV = {
             "hidden_dim": "D", "seq_len": "S", "batch": "B", "page_size": "pg",
-            "BH": "BH", "M": "M", "N": "N", "K": "K", "D": "D",
+            "context_len": "ctx", "num_pages": "np",
+            "BH": "BH", "H": "H", "M": "M", "N": "N", "K": "K", "D": "D",
         }
         def _fmt_val(k, v):
             if k == "page_size" and isinstance(v, int):
@@ -334,14 +344,18 @@ class Benchmark:
         label = ", ".join(
             f"{_ABBREV.get(k, k)}={_fmt_val(k, v)}" for k, v in params.items()
         )
-        if len(label) > 47:
-            label = label[:44] + "..."
-        line = f"{label:<48}"
+        if len(label) > 35:
+            label = label[:32] + "..."
+        line = f"{label:<36}"
 
         baseline_ms = None
+        checks = []
         for name in names:
             data = func_results.get(name, {})
             time_ms = data.get("time_ms", float("nan"))
+            meta = data.get("metadata")
+            if meta:
+                checks.append(str(meta))
 
             if baseline_ms is None:
                 baseline_ms = time_ms
@@ -355,6 +369,12 @@ class Benchmark:
             if name != baseline_name and baseline_ms and baseline_ms > 0 and time_ms > 0:
                 speedup = baseline_ms / time_ms
                 line += f" {speedup:>7.2f}x"
+
+        if checks:
+            check = "; ".join(checks)
+            if len(check) > 24:
+                check = check[:21] + "..."
+            line += f" {check:<24}"
 
         print(line, flush=True)
 
@@ -424,6 +444,8 @@ class Benchmark:
                             func, warmup, rep, force_host_timer=row_use_host_timer
                         )
                         results[str(params)][func_name]["time_ms"] = time_ms
+                        if isinstance(func, KernelBenchSpec) and func.metadata:
+                            results[str(params)][func_name]["metadata"] = func.metadata
                         if bytes_fn is not None:
                             total_bytes = bytes_fn(**params)
                             gbps = memory_throughput(total_bytes, time_ms * 1000)
@@ -480,7 +502,9 @@ class Benchmark:
             # Line-by-line printing for kernel mode
             if mode == "kernel":
                 if not _header_printed and names_ordered:
+                    self._current_kernel_funcs = funcs
                     self._print_kernel_header(names_ordered, bytes_fn)
+                    del self._current_kernel_funcs
                     _header_printed = True
                 if str(params) in results:
                     self._print_kernel_row(

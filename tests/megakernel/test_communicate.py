@@ -260,6 +260,25 @@ class TestPeerBufferRegistry:
         assert registry.get_peer_tensors(registry.canonical_names[0]) is not None
         assert registry.get_peer_tensors(registry.canonical_names[1]) is not None
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_accepts_canonical_tensor_names(self):
+        """Peer buffers may be bound directly by canonical tensor name."""
+        x, y = _make_xy()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        tensor_registry = TensorRegistry.from_ops(ops)
+        canonical_y = tensor_registry.op_mappings[0]["y"]
+
+        registry = PeerBufferRegistry.from_config(
+            peer_map={canonical_y: [peer_y]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
+
+        assert registry.canonical_names == [canonical_y]
+        assert registry.get_peer_tensors(canonical_y) == [peer_y]
+
 
 # =============================================================================
 # PeerTMARegistry Tests
@@ -282,6 +301,27 @@ class TestPeerTMARegistry:
         assert not registry.has_peer_tma
         assert registry.all_canonical_names == []
         assert registry.num_peers == 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_only_configured_peer_buffers_get_descriptors(self):
+        """Peer TMA descriptors are emitted only for tensors with peer buffers."""
+        x, y, z = _make_xyz()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
+        tensor_registry = TensorRegistry.from_ops(ops)
+        canonical_y = tensor_registry.op_mappings[0]["y"]
+        peer_buffer_registry = PeerBufferRegistry.from_config(
+            peer_map={canonical_y: [peer_y]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
+
+        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
+
+        assert registry.has_peer_tma
+        assert len(registry.descriptors) == 1
+        assert registry.descriptors[0].tensor_canonical == canonical_y
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_single_peer_store_descriptors(self):
@@ -436,15 +476,20 @@ class TestPeerTMARegistry:
             SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
             + PeerStoreOp.schedule(x=y, y=z, tile_sizes={"M": TILE_M})
         )
-        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"z": [peer_z]})
+        tensor_registry = _make_tensor_registry(ops)
+        peer_buffer_registry = PeerBufferRegistry.from_config(
+            peer_map={tensor_registry.op_mappings[1]["y"]: [peer_z]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
         registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
 
         assert registry.get_op_peer_tma_args(0, "communicate") == []
         args = registry.get_op_peer_tma_args(1, "communicate")
         assert len(args) == 2
         mapping = registry.op_mappings[(1, "communicate")]
-        assert mapping["z_p0_tma"].startswith("ptma")
-        assert mapping["z_p0_tma_gmem"].startswith("ptma")
+        assert mapping["y_p0_tma"].startswith("ptma")
+        assert mapping["y_p0_tma_gmem"].startswith("ptma")
 
 
 # =============================================================================
@@ -672,7 +717,13 @@ class TestHasCommunicateAndPeerBarriers:
             SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
             + PeerStoreOp.schedule(x=y, y=z, tile_sizes={"M": TILE_M})
         )
-        kernel = Megakernel(ops, config=MegakernelConfig(peer_buffers={"z": [peer_z]}))
+        tensor_registry = _make_tensor_registry(ops)
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(
+                peer_buffers={tensor_registry.op_mappings[1]["y"]: [peer_z]}
+            ),
+        )
 
         assert kernel._peer_tma_registry.has_peer_tma
         assert kernel.num_peer_barriers == M // TILE_M

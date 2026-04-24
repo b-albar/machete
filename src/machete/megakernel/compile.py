@@ -466,7 +466,10 @@ def _build_phase_wrapper(
     # cute.copy outside for warp-convergent TMA copy).
     has_tma = bool(tma_local_mapping)
 
-    body = _wrapper_body(phase_name, call_str, append_mbar, has_tma)
+    if phase_name == "communicate" and not has_tma and not tma_rebind_specs:
+        body = "    pass\n"
+    else:
+        body = _wrapper_body(phase_name, call_str, append_mbar, has_tma)
     if tma_local_mapping and not tma_rebind_specs:
         alias_lines = [
             f"    {local_name} = {canonical_name}"

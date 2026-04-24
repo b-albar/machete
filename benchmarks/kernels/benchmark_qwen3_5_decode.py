@@ -11,22 +11,21 @@ Autoregressive decode is deeply memory-bound:
 
 Architecture (single megakernel, all 36 layers):
     Per layer:
-        RMSNorm(fused-add) → GEMM(Q) → GEMM(K) → GEMM(V)
-        → QKNormRope(Q,K) → FlashDecoding(Q, KV_cache[layer])
+        RMSNorm(fused-add) → GEMM(Q) → GEMM(KV packed BSHD)
+        → QKNormRope(Q,K) → KV cache update → FlashDecoding(Q, KV_cache[layer])
         → GEMM(O) → RMSNorm(fused-add) → GEMM(gate_up)
         → GLU → GEMM(down)
     Final: RMSNorm → GEMM(lm_head)
 
 KV cache handling:
-    For the benchmark, caches are pre-filled via sequential forward so
-    FlashDecoding reads correct data. K/V GEMMs still execute (same timing)
-    but write to scratch buffers. For production, a CopyOp would scatter
-    K/V into cache between GEMM and FlashDecoding.
+    K/V caches use native BSHD layout. The decode path writes current K/V into
+    cache in-kernel; K and V are consumed directly from packed BSHD views.
 
 Usage:
     python benchmarks/kernels/benchmark_qwen3_5_decode.py
 """
 
+import argparse
 import contextlib
 import io
 
@@ -37,6 +36,10 @@ from machete.utils.benchmark import Benchmark
 
 try:
     import cutlass  # noqa: F401
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from machete.megakernel.ops import Op
+
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
@@ -59,6 +62,171 @@ KV_DIM = NUM_KV_HEADS * HEAD_DIM  # 512
 KV_GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS  # 4
 EPS = 1e-6
 VOCAB_SIZE = 151936
+
+
+try:
+    from machete.kernels.gemm import GemmOp as _BaseGemmOp
+except ImportError:
+    _BaseGemmOp = None
+
+
+if _BaseGemmOp is not None:
+    class LmHeadGemmOp(_BaseGemmOp):
+        """Separate GEMM handler family for the final lm_head projection."""
+
+
+else:
+    class LmHeadGemmOp:
+        """Import-safe placeholder used only when Machete is not importable."""
+
+
+def maybe_compiled_forward(fn, example_args):
+    """Return a warmed ``torch.compile`` version of ``fn`` when available."""
+    try:
+        compiled = torch.compile(fn, mode="reduce-overhead", fullgraph=True)
+        compiled(*example_args)
+        compiled(*example_args)
+        torch.cuda.synchronize()
+        return compiled
+    except Exception as exc:
+        print(f"  torch.compile failed: {exc}")
+        return None
+
+
+def _correctness_status(actual, expected, rtol=2e-2, atol=2e-2):
+    """Compact correctness status for benchmark tables without aborting timing."""
+    with torch.no_grad():
+        actual_f = actual.float()
+        expected_f = expected.float()
+        diff = (actual_f - expected_f).abs()
+        max_abs = float(diff.max().item())
+        tol = atol + rtol * expected_f.abs()
+        bad = diff > tol
+        bad_count = int(bad.sum().item())
+        if bad_count == 0:
+            return f"OK/{max_abs:.3g}"
+        bad_pct = 100.0 * bad_count / max(1, actual.numel())
+        return f"BAD {bad_pct:.1f}%/{max_abs:.3g}"
+
+
+if CUTLASS_AVAILABLE:
+    from machete.kernels.qknorm_rope import QKNormRopeOp as _BaseQKNormRopeOp
+    from machete.kernels.qknorm_rope.qknorm_rope import CopyBulkS2GOp, group_bulk_copy_modes
+    from machete.megakernel.ops import config_dim_i32
+
+
+    class QKNormRopeKCacheStoreOp(_BaseQKNormRopeOp):
+        """QKNorm+RoPE for K that also writes K into the BSHD KV cache."""
+
+        reads = {
+            "q": (None, ("M", "H", "D")),
+            "norm_weight": (None, ("D",)),
+            "cos": (None, ("S", "D2")),
+            "sin": (None, ("S", "D2")),
+        }
+        writes = {
+            "dst_k": (None, ("B", "N", "H", "D")),
+        }
+        tile = ("M", "H")
+        dynamic_dims = ("M",)
+
+        @classmethod
+        def schedule(cls, tile_sizes=None, page_size=32768, eps=1e-6, cache_pos=0, **tensors):
+            tile_sizes = dict(tile_sizes or {})
+            auto = cls._auto_tiles(page_size, **tensors)
+            for k, v in auto.items():
+                tile_sizes.setdefault(k, v)
+            ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+            ops[0].static_dims["page_size"] = page_size
+            ops[0].static_dims["eps"] = eps
+            ops[0].static_dims["cache_pos"] = cache_pos
+            return ops
+
+        @cute.jit
+        def store(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin, dst_k,
+                  op_config_ptr):
+            """Store normalized K directly to cache."""
+            runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
+            s2g = cute.make_copy_atom(
+                CopyBulkS2GOp(),
+                self.q_dtype,
+                num_bits_per_copy=self.q_nbits_per_row,
+            )
+            pos_start = tile_M * self.tile_size_M
+            head_start = tile_H * self.tile_size_H
+            for local_pos in range(self.tile_size_M):
+                pos = pos_start + local_pos
+                if pos < runtime_M:
+                    seq = pos % Int32(self.S)
+                    batch_idx = pos // Int32(self.S)
+                    s_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            self.q_dtype,
+                            page_ptr + Int32(local_pos * self.q_row_elems * self.elem_bytes),
+                            cute.AddressSpace.smem,
+                        ),
+                        cute.make_layout((self.q_row_elems,)),
+                    )
+                    dst_k_tile = cute.make_tensor(
+                        dst_k.iterator
+                        + batch_idx * Int32(self.dst_k_stride_B)
+                        + (seq + Int32(self.cache_pos)) * Int32(self.dst_k_stride_N)
+                        + head_start * Int32(self.dst_k_stride_H),
+                        cute.make_layout((self.q_row_elems,)),
+                    )
+                    ssrc_k, kdst = group_bulk_copy_modes(s_tile, dst_k_tile)
+                    cute.copy(s2g, ssrc_k, kdst)
+
+    class VCacheStoreOp(Op):
+        """Copy BSHD V blocks into their BSHD KV-cache windows."""
+
+        reads = {"src_v": (None, ("B", "S", "H", "D"))}
+        writes = {"dst_v": (None, ("B", "N", "H", "D"))}
+        tile = ("B", "S", "H")
+        dynamic_dims = ("B", "S", "N")
+
+        @classmethod
+        def schedule(cls, tile_sizes=None, cache_pos=0, **tensors):
+            ts = dict(tile_sizes or {})
+            ts.setdefault("B", 1)
+            ts.setdefault("S", tensors["src_v"].shape[1])
+            ts.setdefault("H", tensors["src_v"].shape[2])
+            ops = [cls._schedule_single(tile_sizes=ts, **tensors)]
+            ops[0].static_dims["cache_pos"] = cache_pos
+            return ops
+
+        @cute.jit
+        def compute(self, page_ptr, tile_B, tile_S, tile_H, src_v, dst_v, op_config_ptr):
+            tidx = cute.arch.thread_idx()[0]
+            runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+            seq_start = tile_S * Int32(self.tile_size_S)
+            head_start = tile_H * Int32(self.tile_size_H)
+            for local_s in range(self.tile_size_S):
+                seq = seq_start + Int32(local_s)
+                if seq < runtime_S:
+                    for local_h in range(self.tile_size_H):
+                        h = head_start + Int32(local_h)
+                        if h < Int32(self.H):
+                            src_v_base = (
+                                tile_B * Int32(self.src_v_stride_B)
+                                + seq * Int32(self.src_v_stride_S)
+                                + h * Int32(self.src_v_stride_H)
+                            )
+                            dst_v_base = (
+                                tile_B * Int32(self.dst_v_stride_B)
+                                + (seq + Int32(self.cache_pos)) * Int32(self.dst_v_stride_N)
+                                + h * Int32(self.dst_v_stride_H)
+                            )
+                            src_v_row = cute.make_tensor(src_v.iterator + src_v_base, cute.make_layout(self.D))
+                            dst_v_row = cute.make_tensor(dst_v.iterator + dst_v_base, cute.make_layout(self.D))
+                            elem = tidx
+                            while elem < Int32(self.D):
+                                dst_v_row[elem] = src_v_row[elem]
+                                elem = elem + Int32(self.threads_per_row)
+
+else:
+    QKNormRopeKCacheStoreOp = None
+    VCacheStoreOp = None
 
 
 def is_sm90_or_newer():
@@ -112,6 +280,10 @@ def allocate_model_weights(dtype=torch.bfloat16, device="cuda"):
         w[f"{pfx}.W_q"] = torch.randn(Q_DIM, HIDDEN, dtype=dtype, device=device) * 0.02
         w[f"{pfx}.W_k"] = torch.randn(KV_DIM, HIDDEN, dtype=dtype, device=device) * 0.02
         w[f"{pfx}.W_v"] = torch.randn(KV_DIM, HIDDEN, dtype=dtype, device=device) * 0.02
+        w[f"{pfx}.W_kv"] = torch.cat(
+            [w[f"{pfx}.W_k"], w[f"{pfx}.W_v"]],
+            dim=0,
+        ).contiguous()
         w[f"{pfx}.w_q_norm"] = torch.ones(HEAD_DIM, dtype=dtype, device=device)
         w[f"{pfx}.w_k_norm"] = torch.ones(HEAD_DIM, dtype=dtype, device=device)
         w[f"{pfx}.W_o"] = torch.randn(HIDDEN, Q_DIM, dtype=dtype, device=device) * 0.02
@@ -126,17 +298,13 @@ def allocate_model_weights(dtype=torch.bfloat16, device="cuda"):
 
 
 def allocate_kv_cache(batch, max_seq_len, dtype=torch.bfloat16, device="cuda"):
-    """Per-layer K and V caches as separate (B, H_kv, max_seq, D) tensors.
-
-    Separate per-layer tensors (not one big block) so each has contiguous
-    (H_kv, max_seq, D) — compatible with FlashDecoding's TMA requirements.
-    """
+    """Per-layer K and V caches as native BSHD (B, max_seq, H_kv, D)."""
     k_caches = [
-        torch.zeros(batch, NUM_KV_HEADS, max_seq_len, HEAD_DIM, dtype=dtype, device=device)
+        torch.zeros(batch, max_seq_len, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
         for _ in range(NUM_LAYERS)
     ]
     v_caches = [
-        torch.zeros(batch, NUM_KV_HEADS, max_seq_len, HEAD_DIM, dtype=dtype, device=device)
+        torch.zeros(batch, max_seq_len, NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
         for _ in range(NUM_LAYERS)
     ]
     return k_caches, v_caches
@@ -146,14 +314,15 @@ def allocate_kv_cache(batch, max_seq_len, dtype=torch.bfloat16, device="cuda"):
 # Sequential decode (PyTorch baseline)
 # =============================================================================
 
-def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights):
+def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights,
+                           num_layers=NUM_LAYERS):
     """Full-model decode step: 36 layers + final norm + LM head.
 
     Args:
         x: (B, S, HIDDEN) — current token embeddings (S=16 for MMA alignment)
         residual: (B, S, HIDDEN) — residual stream
         pos: int — starting sequence position
-        k_caches, v_caches: lists of (B, H_kv, max_seq, D) per layer
+        k_caches, v_caches: lists of native BSHD (B, max_seq, H_kv, D) per layer
         weights: dict
 
     Returns:
@@ -162,7 +331,7 @@ def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights):
     B, S, _ = x.shape
     cos, sin = weights["cos"], weights["sin"]
 
-    for i in range(NUM_LAYERS):
+    for i in range(num_layers):
         pfx = f"layer.{i}"
         residual = x + residual
         h = _rmsnorm(residual, weights[f"{pfx}.attn_norm"])
@@ -178,13 +347,21 @@ def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights):
         k = _apply_rope(k, cos, sin, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM, pos)
 
         # Update KV cache
-        k_caches[i][:, :, pos:pos + S, :] = k.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-        v_caches[i][:, :, pos:pos + S, :] = v.view(B, S, NUM_KV_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
+        k_caches[i][:, pos:pos + S, :, :] = k.view(B, S, NUM_KV_HEADS, HEAD_DIM)
+        v_caches[i][:, pos:pos + S, :, :] = v.view(B, S, NUM_KV_HEADS, HEAD_DIM)
 
         # Attention over full context
         q_4d = q.view(B, S, NUM_Q_HEADS, HEAD_DIM).permute(0, 2, 1, 3)
-        k_full = k_caches[i][:, :, :pos + S, :].repeat_interleave(KV_GROUP_SIZE, dim=1)
-        v_full = v_caches[i][:, :, :pos + S, :].repeat_interleave(KV_GROUP_SIZE, dim=1)
+        k_full = (
+            k_caches[i][:, :pos + S, :, :]
+            .permute(0, 2, 1, 3)
+            .repeat_interleave(KV_GROUP_SIZE, dim=1)
+        )
+        v_full = (
+            v_caches[i][:, :pos + S, :, :]
+            .permute(0, 2, 1, 3)
+            .repeat_interleave(KV_GROUP_SIZE, dim=1)
+        )
         attn_out = F.scaled_dot_product_attention(q_4d, k_full, v_full, is_causal=False)
         attn_out = attn_out.permute(0, 2, 1, 3).contiguous().view(B, S, Q_DIM)
 
@@ -215,7 +392,7 @@ def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights):
 def _schedule_layer_ops(
     i, batch, pos, S, k_caches, v_caches, weights, page_size,
     x_in, res_in, x_out, res_out,
-    h_buf, q_buf, k_buf, v_buf, attn_out_buf, proj_buf,
+    h_buf, q_buf, kv_buf, attn_out_buf, proj_buf,
     h2_buf, gate_up_buf, mlp_h_buf,
 ):
     """Schedule all ops for one decoder layer. Returns (ops, fa_config, extra_keep_alive)."""
@@ -223,11 +400,14 @@ def _schedule_layer_ops(
     from machete.kernels.rms_norm import RMSNormOp
     from machete.kernels.glu import GLUOp
     from machete.kernels.qknorm_rope import QKNormRopeOp
-    from machete.kernels.attention import flash_attention_schedule
+    from machete.kernels.attention import FlashAttentionOp
+    from machete.kernels.attention.flash_decoding import flash_decoding_schedule
 
-    cos, sin = weights["cos"], weights["sin"]
+    cos = weights["cos"][pos:pos + S]
+    sin = weights["sin"][pos:pos + S]
     pfx = f"layer.{i}"
     ops = []
+    gate_up_tile = {"S": 16, "N": 128, "K": 32}
 
     # 1. RMSNorm (fused-add residual)
     ops += RMSNormOp.schedule(
@@ -236,38 +416,64 @@ def _schedule_layer_ops(
         tile_sizes={"S": 1}, page_size=page_size,
     )
 
-    # 2-4. QKV projections (K/V to scratch buffers)
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf, page_size=page_size)
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_k"], c=k_buf, page_size=page_size)
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_v"], c=v_buf, page_size=page_size)
+    # 2-4. Q projection plus packed KV projection. KV remains BSHD in the
+    # packed buffer; QKNorm/cache ops consume strided K/V views directly.
+    ops += GemmOp.schedule(
+        a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf,
+        page_size=page_size,
+    )
+    kv_flat = kv_buf.view(batch, S, 2 * KV_DIM)
+    ops += GemmOp.schedule(
+        a=h_buf, b=weights[f"{pfx}.W_kv"], c=kv_flat,
+        page_size=page_size,
+    )
 
     # 5. QKNormRope (per-head norm + partial RoPE, in-place)
     q_4d = q_buf.view(batch * S, NUM_Q_HEADS, HEAD_DIM)
-    k_4d = k_buf.view(batch * S, NUM_KV_HEADS, HEAD_DIM)
+    k_block = kv_buf[:, :, :NUM_KV_HEADS, :]
+    k_4d = k_block.as_strided(
+        (batch * S, NUM_KV_HEADS, HEAD_DIM),
+        (k_block.stride(1), k_block.stride(2), k_block.stride(3)),
+    )
     ops += QKNormRopeOp.schedule(
         q=q_4d, norm_weight=weights[f"{pfx}.w_q_norm"],
         cos=cos, sin=sin, page_size=page_size,
     )
-    ops += QKNormRopeOp.schedule(
+    # 6. Normalize/rope K and write current K/V into cache, then decode over
+    # the full cache window. K is already in shared memory here, so store it
+    # directly to cache instead of launching a separate K-cache copy op.
+    q_fd = q_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
+    v_block = kv_buf[:, :, NUM_KV_HEADS:, :]
+    k_fd = k_caches[i][:, :pos + S, :, :]
+    v_fd = v_caches[i][:, :pos + S, :, :]
+    o_fd = attn_out_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
+
+    ops += QKNormRopeKCacheStoreOp.schedule(
         q=k_4d, norm_weight=weights[f"{pfx}.w_k_norm"],
-        cos=cos, sin=sin, page_size=page_size,
+        cos=cos, sin=sin, dst_k=k_fd, cache_pos=pos,
+        page_size=page_size,
     )
+    ops += VCacheStoreOp.schedule(src_v=v_block, dst_v=v_fd, cache_pos=pos)
 
-    # 6. Attention over the pre-filled cache.
-    # Use the shared scheduler so decode-like workloads can pick
-    # FlashDecoding on Blackwell/Hopper instead of forcing the prefill FA path.
-    # On SM120 the attention scheduler expects BSHD tensors, so keep the
-    # logical decode views in (B, S, H, D) form and permute the cache from
-    # its stored (B, H_kv, S, D) layout.
-    q_fa = q_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
-    k_full = k_caches[i][:, :, :pos + S, :].permute(0, 2, 1, 3)
-    v_full = v_caches[i][:, :, :pos + S, :].permute(0, 2, 1, 3)
-    o_fa = attn_out_buf.view(batch, S, NUM_Q_HEADS, HEAD_DIM)
-
-    fa_ops, fa_config = flash_attention_schedule(
-        q=q_fa, k=k_full, v=v_full, o=o_fa,
-        kv_group_size=KV_GROUP_SIZE,
-    )
+    if k_fd.shape[1] <= 256:
+        fa_ops = FlashAttentionOp.schedule(
+            q=q_fd,
+            k=k_fd,
+            v=v_fd,
+            o=o_fd,
+            kv_group_size=KV_GROUP_SIZE,
+            page_size=page_size,
+        )
+        fa_config = FlashAttentionOp.kernel_config(fa_ops)
+    else:
+        fa_ops, fa_config = flash_decoding_schedule(
+            q=q_fd,
+            k=k_fd,
+            v=v_fd,
+            o=o_fd,
+            kv_group_size=KV_GROUP_SIZE,
+            page_size=page_size,
+        )
     for op in fa_ops:
         op.dim_aliases["M"] = f"fa_M_{i}"
     ops += fa_ops
@@ -286,17 +492,25 @@ def _schedule_layer_ops(
     )
 
     # 9-11. MLP
-    ops += GemmOp.schedule(a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf, page_size=page_size)
+    ops += GemmOp.schedule(
+        a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf,
+        page_size=page_size, tile_sizes=gate_up_tile,
+    )
     ops += GLUOp.schedule(x=gate_up_buf, y=mlp_h_buf, activation="silu", tile_sizes={"S": 1}, page_size=page_size)
-    ops += GemmOp.schedule(a=mlp_h_buf, b=weights[f"{pfx}.W_down"], c=x_out, page_size=page_size)
+    ops += GemmOp.schedule(
+        a=mlp_h_buf, b=weights[f"{pfx}.W_down"], c=x_out,
+        page_size=page_size,
+    )
 
-    extra_keep = [q_4d, k_4d, q_fa, k_full, v_full, o_fa]
+    extra_keep = [cos, sin, kv_flat, q_4d, k_block, k_4d, q_fd, v_block, k_fd, v_fd, o_fd]
     return ops, fa_config, extra_keep
 
 
 def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
                             x_init, residual_init,
-                            page_size=32768, num_layers=NUM_LAYERS):
+                            page_size=32768, num_pages=1,
+                            torch_lm_head=False,
+                            num_layers=NUM_LAYERS):
     """Build megakernel(s) for full-model decode.
 
     All layers are fused into a single megakernel instruction stream.
@@ -334,8 +548,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     # Shared per-op intermediates (reused every layer)
     h_buf = torch.empty(batch, S, HIDDEN, dtype=dtype, device=device)
     q_buf = torch.empty(batch, S, Q_DIM, dtype=dtype, device=device)
-    k_buf = torch.empty(batch, S, KV_DIM, dtype=dtype, device=device)
-    v_buf = torch.empty(batch, S, KV_DIM, dtype=dtype, device=device)
+    kv_buf = torch.empty(batch, S, 2 * NUM_KV_HEADS, HEAD_DIM, dtype=dtype, device=device)
     attn_out_buf = torch.empty(batch, S, Q_DIM, dtype=dtype, device=device)
     proj_buf = torch.empty(batch, S, HIDDEN, dtype=dtype, device=device)
     h2_buf = torch.empty(batch, S, HIDDEN, dtype=dtype, device=device)
@@ -348,7 +561,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     logits_buf = torch.empty(batch, S, VOCAB_SIZE, dtype=dtype, device=device)
 
     keep_alive = list(weights.values()) + k_caches + v_caches + [
-        *x_buf, *res_buf, h_buf, q_buf, k_buf, v_buf,
+        *x_buf, *res_buf, h_buf, q_buf, kv_buf,
         attn_out_buf, proj_buf, h2_buf, gate_up_buf, mlp_h_buf,
         h_final_buf, res_final, logits_buf,
     ]
@@ -365,7 +578,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
         layer_ops, fa_config, extra_keep = _schedule_layer_ops(
             i, batch, pos, S, k_caches, v_caches, weights, page_size,
             cur_x, cur_res, next_x, next_res,
-            h_buf, q_buf, k_buf, v_buf, attn_out_buf, proj_buf,
+            h_buf, q_buf, kv_buf, attn_out_buf, proj_buf,
             h2_buf, gate_up_buf, mlp_h_buf,
         )
         all_ops += layer_ops
@@ -380,10 +593,11 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
         residual_in=final_res, residual_out=res_final,
         tile_sizes={"S": 1}, page_size=page_size,
     )
-    all_ops += GemmOp.schedule(
-        a=h_final_buf, b=weights["lm_head"], c=logits_buf,
-        page_size=page_size,
-    )
+    if not torch_lm_head:
+        all_ops += LmHeadGemmOp.schedule(
+            a=h_final_buf, b=weights["lm_head"], c=logits_buf,
+            page_size=page_size,
+        )
 
     # --- Build megakernel ---
     gemm_like_ops = [op for op in all_ops if op.tile_sizes.get('S') is not None]
@@ -392,23 +606,45 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
         op.static_dims.get('page_size', page_size) for op in all_ops
     )
     config = MegakernelConfig(
-        threads_per_block=max(gemm_config.threads_per_block, max_fa_tpb),
+        threads_per_block=max(224, gemm_config.threads_per_block, max_fa_tpb),
         page_size=effective_page_size,
-        num_pages=1,
+        num_pages=num_pages,
+        sync_compute_warps_after_tile=False,
     )
-
-    print(f"  Megakernel: {len(all_ops)} ops ({num_layers} layers), "
-          f"{config.threads_per_block} threads, page={effective_page_size}")
 
     kernel = Megakernel(all_ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
         kernel.run()
     torch.cuda.synchronize()
+    if torch_lm_head:
+        torch.matmul(h_final_buf, weights["lm_head"].t(), out=logits_buf)
+        torch.cuda.synchronize()
 
     spec = kernel.bench_spec(keep_alive=keep_alive)
-    return spec, logits_buf, keep_alive
+    if torch_lm_head:
+        from machete.utils.benchmark_utils import KernelBenchSpec
 
+        core_spec = spec
+        bench_stream, cu_stream = core_spec.stream
+
+        def _setup():
+            if core_spec.setup_fn is not None:
+                core_spec.setup_fn()
+
+        def _launch():
+            core_spec.launch_fn()
+            with torch.cuda.stream(bench_stream):
+                torch.matmul(h_final_buf, weights["lm_head"].t(), out=logits_buf)
+
+        spec = KernelBenchSpec(
+            launch_fn=_launch,
+            setup_fn=_setup,
+            stream=(bench_stream, cu_stream),
+            use_host_timer=core_spec.use_host_timer,
+            _keep_alive=(core_spec, keep_alive, h_final_buf, logits_buf, weights["lm_head"]),
+        )
+    return spec, logits_buf, res_final
 
 # =============================================================================
 # Bandwidth / FLOPs analysis
@@ -471,8 +707,9 @@ DECODE_S = 16
 
 @Benchmark.parametrize("batch", [1])
 @Benchmark.parametrize("context_len", [128, 256, 512, 1024, 2048, 4096])
+@Benchmark.parametrize("num_pages", [1, 2])
 @Benchmark.parametrize("page_size", [32768, 49152])
-def bench_qwen35_decode(context_len, batch, page_size):
+def bench_qwen35_decode(context_len, batch, num_pages, page_size):
     """Benchmark full-model Qwen 3.5 decode step (S=16 for MMA alignment)."""
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -485,35 +722,67 @@ def bench_qwen35_decode(context_len, batch, page_size):
     x = torch.randn(batch, DECODE_S, HIDDEN, dtype=dtype, device=device)
     residual = torch.zeros(batch, DECODE_S, HIDDEN, dtype=dtype, device=device)
     for i in range(NUM_LAYERS):
-        k_caches[i][:, :, :pos, :].normal_()
-        v_caches[i][:, :, :pos, :].normal_()
+        k_caches[i][:, :pos, :, :].normal_()
+        v_caches[i][:, :pos, :, :].normal_()
 
     # --- Sequential baseline ---
-    kc_clone = [c.clone() for c in k_caches]
-    vc_clone = [c.clone() for c in v_caches]
-    sequential_decode_step(x, residual.clone(), pos, kc_clone, vc_clone, weights)
+    sequential_decode_step(
+        x, residual.clone(), pos, k_caches, v_caches, weights,
+    )
     torch.cuda.synchronize()
 
     funcs = {}
     funcs["sequential"] = lambda: sequential_decode_step(
-        x, residual.clone(), pos,
-        [c.clone() for c in k_caches],
-        [c.clone() for c in v_caches],
-        weights,
+        x, residual.clone(), pos, k_caches, v_caches, weights,
     )
+
+    def decode_timed(x_arg, residual_arg):
+        return sequential_decode_step(
+            x_arg, residual_arg, pos, k_caches, v_caches, weights,
+        )
+
+    compiled_forward = maybe_compiled_forward(decode_timed, (x, residual.clone()))
+    if compiled_forward is not None:
+        funcs["torch_compile"] = lambda: compiled_forward(x, residual.clone())
 
     # --- Megakernel ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
-        kc_pre = [c.clone() for c in kc_clone]
-        vc_pre = [c.clone() for c in vc_clone]
+        ref_logits, ref_residual = sequential_decode_step(
+            x,
+            residual.clone(),
+            pos,
+            [c.clone() for c in k_caches],
+            [c.clone() for c in v_caches],
+            weights,
+        )
+        torch.cuda.synchronize()
+        kc_pre = [c.clone() for c in k_caches]
+        vc_pre = [c.clone() for c in v_caches]
 
         try:
-            spec_1k, _, _ = megakernel_decode_build(
+            spec_1k, logits_mk, residual_mk = megakernel_decode_build(
                 batch, pos, kc_pre, vc_pre, weights,
                 x_init=x, residual_init=residual.clone(),
                 page_size=page_size,
+                num_pages=num_pages,
+                torch_lm_head=True,
             )
-            funcs["megakernel_1k"] = spec_1k
+            logits_check = _correctness_status(
+                logits_mk, ref_logits, rtol=2e-2, atol=2e-1
+            )
+            residual_check = _correctness_status(
+                residual_mk, ref_residual, rtol=2e-2, atol=3.5e-1
+            )
+            spec_1k.metadata = (
+                f"OK L={logits_check.split('/', 1)[1]} R={residual_check.split('/', 1)[1]}"
+                if logits_check.startswith("OK") and residual_check.startswith("OK")
+                else (
+                    f"L {logits_check}"
+                    if not logits_check.startswith("OK")
+                    else f"R {residual_check}"
+                )
+            )
+            funcs["mega"] = spec_1k
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -527,6 +796,25 @@ def bench_qwen35_decode(context_len, batch, page_size):
 # =============================================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--context-len", type=int, action="append")
+    parser.add_argument("--batch", type=int, action="append")
+    parser.add_argument("--page-size", type=int, action="append")
+    parser.add_argument("--num-pages", type=int, action="append")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--rep", type=int, default=20)
+    args = parser.parse_args()
+
+    params = bench_qwen35_decode._benchmark.parameters
+    if args.context_len is not None:
+        params["context_len"] = args.context_len
+    if args.batch is not None:
+        params["batch"] = args.batch
+    if args.page_size is not None:
+        params["page_size"] = args.page_size
+    if args.num_pages is not None:
+        params["num_pages"] = args.num_pages
+
     print("=" * 100)
     print("Qwen 3.5-0.8B Full-Model Decode Benchmark (Single Megakernel)")
     print(f"  {NUM_LAYERS} layers, hidden={HIDDEN}, intermediate={INTERMEDIATE}")
@@ -538,7 +826,7 @@ if __name__ == "__main__":
         props = torch.cuda.get_device_properties(0)
         print(f"GPU: {props.name} ({props.multi_processor_count} SMs)")
         print(f"SM90+: {is_sm90_or_newer()}")
-        hbm_gb = props.total_mem / 1e9
+        hbm_gb = props.total_memory / 1e9
         print(f"HBM: {hbm_gb:.1f} GB")
     print(f"CUTLASS: {CUTLASS_AVAILABLE}")
 
@@ -580,6 +868,6 @@ if __name__ == "__main__":
     print("-" * 80)
     bench_qwen35_decode._benchmark.run(
         mode="kernel",
-        warmup=5,
-        rep=20,
+        warmup=args.warmup,
+        rep=args.rep,
     )
