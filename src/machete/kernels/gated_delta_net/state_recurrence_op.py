@@ -93,9 +93,6 @@ class GDNStateRecurrenceOp(Op):
         self.uv_copy_dim1 = self.BV // self.async_copy_elems
         self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # Configurable pipeline stages (can be 1 or 2)
         self.num_stages = getattr(self, "num_stages", 2)
 

@@ -266,10 +266,6 @@ class FlashAttentionSm120Op(Op):
             f"(num_mma_warps={self.num_mma_warps})."
         )
 
-        # DMA loads Q once, then compute handles everything
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
         # Override compute method (select Q-in-smem vs Q-preload path)

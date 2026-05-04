@@ -173,9 +173,6 @@ class _FlashDecodingSplitTmaOp(Op):
         # Compute KV blocks per split
         self.blocks_per_split = (self.num_kv_blocks + self.num_splits - 1) // self.num_splits
 
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
         self.rescale_threshold = 8.0
@@ -753,8 +750,6 @@ class _FlashDecodingSplitCpAsyncBase(_FlashDecodingSplitTmaOp):
         )
 
         self.blocks_per_split = (self.num_kv_blocks + self.num_splits - 1) // self.num_splits
-        self.inner_iters = 1
-        self.inner_depth = 1
         self.scale_log2e = self.scale_val * 1.4426950408889634074
         self.rescale_threshold = 8.0
         self.compute = self.compute_mma
@@ -1749,9 +1744,6 @@ class FlashDecodingCombineOp(Op):
         super().__init__(**config)
         self.num_splits = self.SPLIT
         self.num_mma_threads = self.threads_per_row
-        self.inner_iters = 1
-        self.inner_depth = 1
-
     @classmethod
     def schedule(cls, tile_sizes=None, **tensors):
         """Schedule combine op — one tile per head."""

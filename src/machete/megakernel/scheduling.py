@@ -284,6 +284,55 @@ def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]
     return consumer_deps
 
 
+def _coalesce_pipeline_ranges(
+    instructions: List[TileInstruction],
+    *,
+    range_axis: int,
+    range_end_axis: int,
+    max_range_tiles: int = 0,
+) -> List[TileInstruction]:
+    """Coalesce adjacent single-block instructions into [start, end) ranges."""
+    if not instructions:
+        return []
+    if range_axis < 0:
+        return instructions
+    if range_end_axis < 0:
+        range_end_axis = range_axis + 1
+    if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
+        return instructions
+
+    out: List[TileInstruction] = []
+    idx = 0
+    while idx < len(instructions):
+        first = instructions[idx]
+        tiles = list(first.tiles) + [0] * (MAX_TILE_DIMS - len(first.tiles))
+        start = tiles[range_axis]
+        end = start + 1
+        idx += 1
+
+        while idx < len(instructions):
+            candidate = instructions[idx]
+            cand_tiles = list(candidate.tiles) + [0] * (MAX_TILE_DIMS - len(candidate.tiles))
+            if max_range_tiles > 0 and end - start >= max_range_tiles:
+                break
+            same_prefix = True
+            for axis in range(MAX_TILE_DIMS):
+                if axis in (range_axis, range_end_axis):
+                    continue
+                if cand_tiles[axis] != tiles[axis]:
+                    same_prefix = False
+                    break
+            if not same_prefix or cand_tiles[range_axis] != end:
+                break
+            end += 1
+            idx += 1
+
+        tiles[range_end_axis] = end
+        out.append(TileInstruction(op_idx=first.op_idx, tiles=tuple(tiles)))
+
+    return out
+
+
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
 
@@ -1298,8 +1347,45 @@ class InstructionStreamBuilder:
 
         non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
         queues: List[List[TileInstruction]] = [[] for _ in range(num_blocks)]
-        for block_idx in range(num_blocks):
-            queues[block_idx] = non_end[block_idx::num_blocks]
+
+        run_start = 0
+        while run_start < len(non_end):
+            op_idx = non_end[run_start].op_idx
+            run_end = run_start + 1
+            while run_end < len(non_end) and non_end[run_end].op_idx == op_idx:
+                run_end += 1
+
+            run = non_end[run_start:run_end]
+            op = self._op_records[op_idx].op
+            pipeline = getattr(op.op_cls, "pipeline", None)
+            if pipeline is not None:
+                # Staged pipeline instructions can own contiguous output ranges
+                # per resident CTA instead of striping every Nth tile.
+                if pipeline.coalesce_ranges and num_blocks > len(run):
+                    coalesced_run = _coalesce_pipeline_ranges(
+                        run,
+                        range_axis=pipeline.range_axis,
+                        range_end_axis=pipeline.range_end_axis,
+                        max_range_tiles=pipeline.range_block_size,
+                    )
+                    for local_idx, instr in enumerate(coalesced_run):
+                        queues[local_idx % num_blocks].append(instr)
+                else:
+                    for block_idx in range(num_blocks):
+                        begin = (len(run) * block_idx) // num_blocks
+                        end = (len(run) * (block_idx + 1)) // num_blocks
+                        block_run = run[begin:end]
+                        if pipeline.coalesce_ranges:
+                            block_run = _coalesce_pipeline_ranges(
+                                block_run,
+                                range_axis=pipeline.range_axis,
+                                range_end_axis=pipeline.range_end_axis,
+                            )
+                        queues[block_idx].extend(block_run)
+            else:
+                for local_idx, instr in enumerate(run):
+                    queues[local_idx % num_blocks].append(instr)
+            run_start = run_end
 
         queue_len = 1
         end = TileInstruction.end_instruction()

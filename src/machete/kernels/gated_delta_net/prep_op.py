@@ -133,10 +133,6 @@ class GDNPrepOp(Op):
         self.BV_PAD = self.BV + 8
         self.BT_PAD = self.BT + 2
 
-        # DMA warp loads k via TMA in NK sub-blocks, double-buffered
-        self.inner_iters = max(1, self.NK - 1)
-        self.inner_depth = 1
-
         # Per-buffer: [BT, BK] with SW128 swizzle
         self._k_buf_bytes = self.BT * self.BK * self.elem_bytes  # 8KB for BT=BK=64
         self._buf_stride = self._k_buf_bytes
@@ -241,10 +237,9 @@ class GDNPrepOp(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_B, tile_NH, tile_S,
-             k_tma, k_tma_gmem, work_mbar, inner_iter_idx):
+             k_tma, k_tma_gmem, work_mbar):
         """TMA k load: NK sub-blocks [BT, BK] into double buffer.
 
-        iter 0: loads tma_k_blocks (up to 2) K-blocks into buf 0 and buf 1.
         Gmem tensor is 3D (K, H, B*T) — framework merges B and T dims.
         """
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -255,33 +250,31 @@ class GDNPrepOp(Op):
         # Merged B*T coordinate: framework collapses B and T into one CuTe mode
         merged_t = tile_B * Int32(self.S // self.BT) + tile_S
 
-        if inner_iter_idx == Int32(0):
-            nbytes = Int32(self._k_tma_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        nbytes = Int32(self._k_tma_bytes)
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
 
-            for _k in cutlass.range_constexpr(self._tma_k_blocks):
-                _buf_base = page_ptr + Int32(_k * self._buf_stride)
-                sK = cute.make_tensor(
-                    cute.recast_ptr(
-                        cute.make_ptr(self.k_dtype, _buf_base,
-                                      cute.AddressSpace.smem),
-                        swz, dtype=self.k_dtype),
-                    cute.make_layout((self.BK, 1, self.BT),
-                                     stride=(1, self.BK, self.BK)),
-                )
-                gK = cute.local_tile(
-                    k_tma_gmem,
-                    (self.BK, 1, self.BT),
-                    (None, None, None),
-                )
-                tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
-                    k_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
-                )
-                # Coords: (None, K_block, H_coord, merged_BT_coord)
-                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_NH, merged_t)],
-                          tKsK, tma_bar_ptr=mbar_ptr)
+        for _k in cutlass.range_constexpr(self._tma_k_blocks):
+            _buf_base = page_ptr + Int32(_k * self._buf_stride)
+            sK = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.k_dtype, _buf_base,
+                                  cute.AddressSpace.smem),
+                    swz, dtype=self.k_dtype),
+                cute.make_layout((self.BK, 1, self.BT),
+                                 stride=(1, self.BK, self.BK)),
+            )
+            gK = cute.local_tile(
+                k_tma_gmem,
+                (self.BK, 1, self.BT),
+                (None, None, None),
+            )
+            tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+                k_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
+            )
+            cute.copy(k_tma, tKgK[(None, Int32(_k), tile_NH, merged_t)],
+                      tKsK, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # Forward Compute — Cooperative cpasync + Tensor Core MMA

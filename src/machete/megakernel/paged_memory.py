@@ -37,10 +37,9 @@ TILE_INFO_TILE_1: int = 4
 TILE_INFO_TILE_2: int = 5
 TILE_INFO_TILE_3: int = 6
 TILE_INFO_TILE_4: int = 7
-TILE_INFO_PACKED_WARP_INFO: int = 8
+TILE_INFO_NUM_WARPS: int = 8
 TILE_INFO_INSTRUCTION_IDX: int = 9
 TILE_INFO_OP_CONFIG: int = 10
-TILE_INFO_PACK_SCALE: int = 65536
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -307,7 +306,7 @@ class NPageLayout:
     # Scratch area layout (ring buffer):
     # - Per-page tile info: num_pages * 48 bytes
     #   [op_idx, linear_tile_idx, handler_idx, tile_0..tile_4,
-    #    packed(inner_iters, num_warps), pad, op_config_ptr]
+    #    num_warps, pad, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * 28 bytes (full packed TileInstruction rows)
@@ -426,6 +425,117 @@ class NPageLayout:
         )
 
 
+@dataclass(frozen=True)
+class PipelinePageLayout:
+    """Layout for pipeline-local storage inside one megakernel page."""
+
+    page_count: int
+    page_bytes: int
+    semaphore_count: int = 0
+    scratch_bytes: int = 0
+
+    def __post_init__(self):
+        if self.page_count < 1:
+            raise ValueError("page_count must be >= 1")
+        if self.page_bytes < 0:
+            raise ValueError("page_bytes must be non-negative")
+        if self.semaphore_count < 0:
+            raise ValueError("semaphore_count must be non-negative")
+        if self.scratch_bytes < 0:
+            raise ValueError("scratch_bytes must be non-negative")
+
+    @property
+    def pages_offset(self) -> int:
+        return 0
+
+    @property
+    def semaphores_offset(self) -> int:
+        return _align_up(self.page_count * self.page_bytes, 8)
+
+    @property
+    def scratch_offset(self) -> int:
+        return _align_up(
+            self.semaphores_offset + self.semaphore_count * NPageLayout._MBARRIER_SIZE,
+            16,
+        )
+
+    @property
+    def total_size(self) -> int:
+        return _align_up(self.scratch_offset + self.scratch_bytes, 128)
+
+    def page_offset(self, page_idx: int) -> int:
+        if page_idx < 0 or page_idx >= self.page_count:
+            raise IndexError(
+                f"pipeline page {page_idx} out of range for {self.page_count} pages"
+            )
+        return self.pages_offset + page_idx * self.page_bytes
+
+    def activation_page_offset(self) -> int:
+        return self.page_offset(0)
+
+    def weight_page_offset(
+        self,
+        *,
+        input_stage: int,
+        page_in_stage: int,
+        input_stages: int,
+        stage_pages: int,
+    ) -> int:
+        if input_stage < 0 or input_stage >= input_stages:
+            raise IndexError(
+                f"input_stage {input_stage} out of range for {input_stages} stages"
+            )
+        if page_in_stage < 0 or page_in_stage >= stage_pages:
+            raise IndexError(
+                f"page_in_stage {page_in_stage} out of range for {stage_pages} pages"
+            )
+        return self.page_offset(1 + input_stage * stage_pages + page_in_stage)
+
+    def semaphore_offset(self, sem_idx: int) -> int:
+        if sem_idx < 0 or sem_idx >= self.semaphore_count:
+            raise IndexError(
+                f"pipeline semaphore {sem_idx} out of range for {self.semaphore_count} semaphores"
+            )
+        return self.semaphores_offset + sem_idx * NPageLayout._MBARRIER_SIZE
+
+    @staticmethod
+    def activations_arrived_sem() -> int:
+        return 0
+
+    @staticmethod
+    def weights_arrived_sem(input_stage: int) -> int:
+        return 1 + input_stage
+
+    @staticmethod
+    def weights_finished_sem(input_stages: int, input_stage: int) -> int:
+        return 1 + input_stages + input_stage
+
+    @staticmethod
+    def outputs_arrived_sem(input_stages: int, output_stage: int) -> int:
+        return 1 + 2 * input_stages + output_stage
+
+    @staticmethod
+    def outputs_finished_sem(
+        input_stages: int,
+        output_stages: int,
+        output_stage: int,
+    ) -> int:
+        return 1 + 2 * input_stages + output_stages + output_stage
+
+    def output_scratch_offset(
+        self,
+        *,
+        output_stage: int,
+        output_stages: int,
+    ) -> int:
+        if output_stage < 0 or output_stage >= output_stages:
+            raise IndexError(
+                f"output_stage {output_stage} out of range for {output_stages} stages"
+            )
+        stage_bytes = self.scratch_bytes // max(1, output_stages)
+        return self.scratch_offset + output_stage * stage_bytes
+
+
 __all__ = [
     "MAX_PAGES",
     "IQ_DEPTH",
@@ -440,4 +550,5 @@ __all__ = [
     "ld_shared_v2_b32",
     "st_shared_v2_b32",
     "NPageLayout",
+    "PipelinePageLayout",
 ]

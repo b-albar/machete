@@ -50,7 +50,140 @@ from .interpreter import ld_global_i32, ld_global_i64
 
 MAX_TILE_DIMS = 5  # Matches TMA's 5D tensor capability
 
-_SCHEDULING_STATIC_DIM_PREFIXES = ("barrier_",)
+_SCHEDULING_STATIC_DIM_PREFIXES = ("barrier_", "pipeline_", "load_replay_")
+
+
+@dataclass(frozen=True)
+class PipelineSpec:
+    """Compile-time resource and range contract for staged pipeline ops.
+
+    This is intentionally structural metadata. Ops still implement the normal
+    ``load``/``compute``/``store`` phases; this declaration only tells the
+    megakernel how much instruction-local staged state to reserve and whether
+    scheduler-side tile ranges can be coalesced.
+    """
+
+    page_count: int
+    page_bytes: int = 0
+    input_stages: int = 0
+    output_stages: int = 0
+    stage_pages: int = 1
+    semaphore_count: int = 0
+    scratch_bytes: int = 0
+    range_axis: int = -1
+    range_end_axis: int = -1
+    range_block_size: int = 1
+    coalesce_ranges: bool = False
+
+    def __post_init__(self):
+        if self.page_count < 1:
+            raise ValueError("PipelineSpec.page_count must be >= 1")
+        if self.page_bytes < 0:
+            raise ValueError("PipelineSpec.page_bytes must be non-negative")
+        if self.input_stages < 0 or self.output_stages < 0:
+            raise ValueError("PipelineSpec stages must be non-negative")
+        if self.stage_pages < 1:
+            raise ValueError("PipelineSpec.stage_pages must be >= 1")
+        if self.semaphore_count < 0:
+            raise ValueError("PipelineSpec.semaphore_count must be non-negative")
+        if self.scratch_bytes < 0:
+            raise ValueError("PipelineSpec.scratch_bytes must be non-negative")
+        if self.range_axis < -1 or self.range_axis >= MAX_TILE_DIMS:
+            raise ValueError(
+                f"PipelineSpec.range_axis must be -1 or in [0, {MAX_TILE_DIMS})"
+            )
+        if self.range_end_axis < -1 or self.range_end_axis >= MAX_TILE_DIMS:
+            raise ValueError(
+                f"PipelineSpec.range_end_axis must be -1 or in [0, {MAX_TILE_DIMS})"
+            )
+        if self.coalesce_ranges and self.range_axis < 0:
+            raise ValueError("PipelineSpec.coalesce_ranges requires range_axis >= 0")
+        if (
+            self.coalesce_ranges
+            and self.range_end_axis >= 0
+            and self.range_end_axis == self.range_axis
+        ):
+            raise ValueError("PipelineSpec.range_end_axis must differ from range_axis")
+        if self.range_block_size < 1:
+            raise ValueError("PipelineSpec.range_block_size must be >= 1")
+
+    @property
+    def resource_bytes(self) -> int:
+        """Minimum bytes needed inside an op page for pipeline-local state."""
+        return self.page_count * self.page_bytes + self.semaphore_count * 8 + self.scratch_bytes
+
+    def with_overrides(self, **overrides: int) -> "PipelineSpec":
+        values = {
+            "page_count": self.page_count,
+            "page_bytes": self.page_bytes,
+            "input_stages": self.input_stages,
+            "output_stages": self.output_stages,
+            "stage_pages": self.stage_pages,
+            "semaphore_count": self.semaphore_count,
+            "scratch_bytes": self.scratch_bytes,
+            "range_axis": self.range_axis,
+            "range_end_axis": self.range_end_axis,
+            "range_block_size": self.range_block_size,
+            "coalesce_ranges": self.coalesce_ranges,
+        }
+        values.update({k: v for k, v in overrides.items() if v is not None})
+        return PipelineSpec(**values)
+
+    @classmethod
+    def staged_matvec(
+        cls,
+        *,
+        input_stages: int = 3,
+        output_stages: int = 3,
+        stage_pages: int = 4,
+        page_bytes: int = 0,
+        scratch_bytes: int = 0,
+        range_axis: int = -1,
+        range_end_axis: int = -1,
+        range_block_size: int = 1,
+        coalesce_ranges: bool = False,
+    ) -> "PipelineSpec":
+        """Return the page/semaphore contract used by staged matvec pipelines."""
+        return cls(
+            page_count=1 + input_stages * stage_pages,
+            page_bytes=page_bytes,
+            input_stages=input_stages,
+            output_stages=output_stages,
+            stage_pages=stage_pages,
+            semaphore_count=1 + 2 * (input_stages + output_stages),
+            scratch_bytes=scratch_bytes,
+            range_axis=range_axis,
+            range_end_axis=range_end_axis,
+            range_block_size=range_block_size,
+            coalesce_ranges=coalesce_ranges,
+        )
+
+
+@dataclass(frozen=True)
+class PipelineABI:
+    """Execution ABI for ops that declare ``pipeline`` resources.
+
+    ``PipelineSpec`` describes memory/range resources. This ABI describes
+    how the op consumes them.
+    """
+
+    kind: str
+    execution: str
+
+    KIND_STAGED: ClassVar[str] = "staged"
+    EXECUTION_OP_OWNED: ClassVar[str] = "op_owned"
+
+    def __post_init__(self):
+        if self.kind != self.KIND_STAGED:
+            raise ValueError(f"unsupported pipeline ABI kind: {self.kind!r}")
+        if self.execution != self.EXECUTION_OP_OWNED:
+            raise ValueError(
+                f"unsupported pipeline ABI execution: {self.execution!r}"
+            )
+
+    @classmethod
+    def op_owned(cls) -> "PipelineABI":
+        return cls(kind=cls.KIND_STAGED, execution=cls.EXECUTION_OP_OWNED)
 
 
 def is_compile_static_dim(name: str) -> bool:
@@ -496,6 +629,7 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
     transfer_sets = {
         "_TMA_LOADS": set(getattr(cls, "tma_loads", set())),
         "_TMA_STORES": set(getattr(cls, "tma_stores", set())),
+        "_TMA_COMPUTE_STORES": set(getattr(cls, "tma_compute_stores", set())),
         "_TMA_REDUCE_STORES": set(getattr(cls, "tma_reduce_stores", set())),
         "_PEER_STORES": set(getattr(cls, "peer_stores", set())),
         "_PEER_REDUCE_STORES": set(getattr(cls, "peer_reduce_stores", set())),
@@ -503,6 +637,12 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
 
     _validate_tensor_set(transfer_sets["_TMA_LOADS"], read_names, "tma_loads", "reads")
     _validate_tensor_set(transfer_sets["_TMA_STORES"], write_names, "tma_stores", "writes")
+    _validate_tensor_set(
+        transfer_sets["_TMA_COMPUTE_STORES"],
+        write_names,
+        "tma_compute_stores",
+        "writes",
+    )
     _validate_tensor_set(
         transfer_sets["_TMA_REDUCE_STORES"],
         write_names,
@@ -525,6 +665,7 @@ def _collect_tma_tensor_dims(unique_tensors, transfer_sets):
     tma_tensor_names = (
         transfer_sets["_TMA_LOADS"]
         | transfer_sets["_TMA_STORES"]
+        | transfer_sets["_TMA_COMPUTE_STORES"]
         | transfer_sets["_TMA_REDUCE_STORES"]
         | transfer_sets["_PEER_STORES"]
         | transfer_sets["_PEER_REDUCE_STORES"]
@@ -695,6 +836,8 @@ def _process_op_declarations(cls):
         """
         if phase == "load":
             tma_names = cls._TMA_LOADS
+        elif phase == "compute":
+            tma_names = cls._TMA_COMPUTE_STORES
         elif phase == "store":
             tma_names = cls._TMA_STORES | cls._TMA_REDUCE_STORES
         else:
@@ -797,6 +940,8 @@ class Op:
     # producer OUTPUTS to consumer INPUTS to build the dependency DAG.
     INPUTS: ClassVar[List[str]] = []
     OUTPUTS: ClassVar[List[str]] = []
+    pipeline: ClassVar[Optional[PipelineSpec]] = None
+    pipeline_abi: ClassVar[Optional[PipelineABI]] = None
 
     def __init__(self, **config):
         """Initialize Op instance with compile-time configuration.
@@ -886,8 +1031,6 @@ class Op:
         Default: no-op (for ops that don't need multi-GPU communication).
         """
         pass
-
-
 
 def build_op_config(
     op: "ScheduledOp",
@@ -1005,6 +1148,8 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "TORCH_TO_CUTLASS_DTYPE",
     # Metadata
+    "PipelineSpec",
+    "PipelineABI",
     "TensorMeta",
     # Protocol
     "Op",

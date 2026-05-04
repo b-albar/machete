@@ -207,10 +207,6 @@ class FlashAttentionSm120BwdOp(Op):
             f"tile_N={self.tile_size_N}, D={self.D}"
         )
 
-        # DMA loads K+V once, compute handles everything
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # Swizzle for K/V smem only (TMA requires it)
         if self.D >= 64:
             self.swizzle_B = 3

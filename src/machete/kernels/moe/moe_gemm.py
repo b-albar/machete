@@ -95,9 +95,7 @@ class MoeGemmOp(Op):
         self.num_mma_warps = self.threads_per_row // 32
         self.num_mma_threads = self.num_mma_warps * 32
 
-        # DMA TMA-loads first 2 K-blocks of sorted_x
         self.tma_k_blocks = min(2, self.num_k_blocks)
-        self.inner_iters = max(1, self.num_k_blocks - 1)
 
         # Swizzle for bank-conflict-free LdMatrix reads
         if self.tile_K % 64 == 0 and self.tile_K >= 64:
@@ -167,78 +165,33 @@ class MoeGemmOp(Op):
     @cute.jit
     def load(self, page_ptr, tile_M, tile_N,
              sorted_x_tma, sorted_x_tma_gmem,
-             work_mbar, inner_iter_idx):
-        """TMA load of sorted_x K-blocks.
-
-        iter 0 (load warp):  Init mbarriers, TMA K0+K1 → buf0+buf1.
-        iter 1+ (store warp): Wait buf_free, TMA one K-block → buf.
-        """
+             work_mbar):
+        """TMA load of sorted_x K-blocks through an op-owned K loop."""
         swz = cute.make_swizzle(self.swz_B, 4, 3)
 
-        # Mbarrier pointers (4 x 8B after data)
         _bf_0 = page_ptr + Int32(self.mbar_offset)
         _bf_1 = page_ptr + Int32(self.mbar_offset + 8)
         _kr_0 = page_ptr + Int32(self.mbar_offset + 16)
         _kr_1 = page_ptr + Int32(self.mbar_offset + 24)
 
-        if inner_iter_idx == Int32(0):
-            # === ITER 0: init mbarriers + TMA first 2 K-blocks ===
-            with cute.arch.elect_one():
-                mbarrier_init(_bf_0, Int32(1))
-                mbarrier_init(_bf_1, Int32(1))
-                mbarrier_init(_kr_0, Int32(1))
-                mbarrier_init(_kr_1, Int32(1))
-            mbarrier_init_fence()
+        with cute.arch.elect_one():
+            mbarrier_init(_bf_0, Int32(1))
+            mbarrier_init(_bf_1, Int32(1))
+            mbarrier_init(_kr_0, Int32(1))
+            mbarrier_init(_kr_1, Int32(1))
+        mbarrier_init_fence()
 
-            mbar_ptr = cute.make_ptr(
-                cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-            nbytes = Int32(self.tma_k_blocks * self.x_tma_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
-
-            for _k in cutlass.range_constexpr(self.tma_k_blocks):
-                _buf_base = page_ptr + Int32(_k * self.x_buf_stride)
-                sX_ptr = cute.recast_ptr(
-                    cute.make_ptr(self.sorted_x_dtype, _buf_base,
-                                  cute.AddressSpace.smem),
-                    swz, dtype=self.sorted_x_dtype)
-                sX = cute.make_tensor(
-                    sX_ptr,
-                    cute.make_layout((self.tile_K, self.tile_size_M),
-                                     stride=(1, self.tile_K)))
-                gX = cute.local_tile(
-                    sorted_x_tma_gmem, (self.tile_K, self.tile_size_M),
-                    (None, None))
-                tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
-                    sorted_x_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sX, 0, 2),
-                    cute.group_modes(gX, 0, 2))
-
-                cute.copy(sorted_x_tma, tXgX[(None, Int32(_k), tile_M)],
-                          tXsX, tma_bar_ptr=mbar_ptr)
-
-        if inner_iter_idx > Int32(0):
-            # === ITER 1+: TMA one K-block into freed buffer ===
-            _k_block = inner_iter_idx + Int32(1)
+        _k_block = Int32(0)
+        while _k_block < Int32(self.num_k_blocks):
             _buf_idx = _k_block % Int32(2)
-
-            _bf_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-            if _buf_idx == Int32(0):
-                mbarrier_wait(_bf_0, _bf_phase)
-            if _buf_idx == Int32(1):
-                mbarrier_wait(_bf_1, _bf_phase)
-
             _buf_base = _buf_idx * Int32(self.x_buf_stride) + page_ptr
-            _kr_ptr = cute.make_ptr(
-                cutlass.Int64, _kr_0, cute.AddressSpace.smem)
-            if _buf_idx == Int32(0):
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_kr_0, Int32(self.x_tma_bytes))
-            if _buf_idx == Int32(1):
-                _kr_ptr = cute.make_ptr(
-                    cutlass.Int64, _kr_1, cute.AddressSpace.smem)
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_kr_1, Int32(self.x_tma_bytes))
+
+            if _k_block >= Int32(2):
+                _bf_phase = ((_k_block - Int32(2)) // Int32(2)) % Int32(2)
+                if _buf_idx == Int32(0):
+                    mbarrier_wait(_bf_0, _bf_phase)
+                if _buf_idx == Int32(1):
+                    mbarrier_wait(_bf_1, _bf_phase)
 
             sX_ptr = cute.recast_ptr(
                 cute.make_ptr(self.sorted_x_dtype, _buf_base,
@@ -256,8 +209,33 @@ class MoeGemmOp(Op):
                 cute.group_modes(sX, 0, 2),
                 cute.group_modes(gX, 0, 2))
 
-            cute.copy(sorted_x_tma, tXgX[(None, _k_block, tile_M)],
-                      tXsX, tma_bar_ptr=_kr_ptr)
+            if _k_block < Int32(2):
+                _mbar_ptr = cute.make_ptr(
+                    cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+                if _k_block == Int32(0):
+                    nbytes = Int32(self.tma_k_blocks * self.x_tma_bytes)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                cute.copy(sorted_x_tma, tXgX[(None, _k_block, tile_M)],
+                          tXsX, tma_bar_ptr=_mbar_ptr)
+
+            if _k_block >= Int32(2):
+                _kr_ptr = cute.make_ptr(
+                    cutlass.Int64, _kr_0, cute.AddressSpace.smem)
+                if _buf_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _kr_0, Int32(self.x_tma_bytes))
+                if _buf_idx == Int32(1):
+                    _kr_ptr = cute.make_ptr(
+                        cutlass.Int64, _kr_1, cute.AddressSpace.smem)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _kr_1, Int32(self.x_tma_bytes))
+                cute.copy(sorted_x_tma, tXgX[(None, _k_block, tile_M)],
+                          tXsX, tma_bar_ptr=_kr_ptr)
+
+            _k_block = _k_block + Int32(1)
 
     # =========================================================================
     # Forward Compute: cpasync W + MMA

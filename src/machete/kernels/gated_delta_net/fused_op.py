@@ -129,9 +129,6 @@ def _fused_init(self):
     self.uv_copy_dim1 = self.BV // self.async_copy_elems
     self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
-    self.inner_iters = 1
-    self.inner_depth = 1
-
     # Smem layout (48KB page):
     #   [0]           s_primary: [BT, K or BV]  (q for fwd, do for bwd)
     #   [primary_end] s_buf:     [BT, BK] × 2   double-buffered (w/k for fwd, q/k/w for bwd)

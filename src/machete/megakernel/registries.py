@@ -26,6 +26,7 @@ from .ops import (
 
 TMA_PHASE_SPECS = (
     ("load", "_TMA_LOADS", "g2s"),
+    ("compute", "_TMA_COMPUTE_STORES", "s2g"),
     ("store", "_TMA_STORES", "s2g"),
     ("store", "_TMA_REDUCE_STORES", "s2g_reduce"),
 )
@@ -751,10 +752,6 @@ class TMARegistry:
                             smem_layout_src=smem_layout_src,
                             dim_perm=dim_perm,
                         )
-
-            # Compute phases operate on local math views only. TMA transport is
-            # owned by load/store/communicate and should not inflate compute ABI.
-            op_mappings[(i, "compute")] = {}
 
         return cls(descriptors=descriptors, op_mappings=op_mappings)
 

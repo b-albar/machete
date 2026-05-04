@@ -1,9 +1,8 @@
 # Copyright (c) 2025, Machete Authors
 """Instruction-shaped decode matvec ops for SM120 Blackwell GPUs.
 
-These ops intentionally mirror the coarse instructions in
-HazyResearch/Megakernels' low-latency Llama C++ demo rather than composing the
-generic RMSNorm/GEMM/RoPE/GLU kernels:
+These ops intentionally use coarse decode instructions rather than composing
+the generic RMSNorm/GEMM/RoPE/GLU kernels:
 
 * RMS + Q matvec + RoPE
 * RMS + K matvec + RoPE + KV-cache append
@@ -694,7 +693,7 @@ def schedule_decode_layer_sm120(
     """Schedule one decode layer using instruction-shaped SM120 ops.
 
     This is the public convenience layer for the low-level classes above.  It
-    follows the Hazy C++ instruction structure:
+    follows the fused decode instruction structure:
     RMS+Q/RoPE, RMS+K/RoPE/cache, RMS+V/cache, attention, O+residual,
     RMS+gate/up+SiLU, and four 2048-wide down-proj reduction blocks.
     """

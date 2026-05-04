@@ -2,16 +2,16 @@
 # Copyright (c) 2025, Machete Authors
 """Benchmark a Llama-3.2-1B style decode pass as one Machete megakernel.
 
-This mirrors the low-latency Llama setup from HazyResearch/Megakernels:
+This mirrors a low-latency Llama decode setup:
     - 16 layers, hidden=2048, intermediate=8192
     - 32 query heads, 8 KV heads, head_dim=64
     - matvec/decode tile of 16 rows, matching their 16-element block design
 
-The Hazy C++ implementation defines larger fused instructions such as
-RMS+QKV+RoPE+KV-append and RMS+up/gate+SiLU.  In this repo we express the same
-forward pass with the existing Machete op vocabulary inside a single persistent
-megakernel, preserving the important pieces for B200 benchmarking: one launch,
-paged shared-memory reuse, and fine-grained instruction dependencies.
+The fused implementation defines larger instructions such as RMS+QKV+RoPE+
+KV-append and RMS+up/gate+SiLU.  In this repo we express the same forward pass
+with the existing Machete op vocabulary inside a single persistent megakernel,
+preserving the important pieces for B200 benchmarking: one launch, paged
+shared-memory reuse, and fine-grained instruction dependencies.
 
 Usage:
     python benchmarks/kernels/benchmark_llama1b_decode.py --context-len 2048 --num-pages 3
@@ -676,6 +676,6 @@ if __name__ == "__main__":
             f"AI={total_flops / total_bytes:.2f} FLOP/byte, "
             f"B200 memory limit={total_bytes / 8.0e12 * 1e6:.0f} us"
         )
-    print(f"  Hazy reported B200 target: under 680 us, theoretical around 3000 forwards/s.")
+    print(f"  Reference B200 target: under 680 us, theoretical around 3000 forwards/s.")
 
     bench_llama1b_decode._benchmark.run(mode="kernel", warmup=args.warmup, rep=args.rep)

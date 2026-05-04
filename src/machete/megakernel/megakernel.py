@@ -12,8 +12,9 @@ This file owns host-side runtime state, launch caching, and the generated
 persistent kernel shell. It does not define individual op math.
 """
 
-from dataclasses import dataclass
 import ctypes
+from dataclasses import dataclass
+import inspect
 import re
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,8 +77,7 @@ from .paged_memory import (
     TILE_INFO_INSTRUCTION_IDX as _TILE_INFO_INSTRUCTION_IDX,
     TILE_INFO_LINEAR_IDX as _TILE_INFO_LINEAR_IDX,
     TILE_INFO_OP_CONFIG as _TILE_INFO_OP_CONFIG,
-    TILE_INFO_PACKED_WARP_INFO as _TILE_INFO_PACKED_WARP_INFO,
-    TILE_INFO_PACK_SCALE as _TILE_INFO_PACK_SCALE,
+    TILE_INFO_NUM_WARPS as _TILE_INFO_NUM_WARPS,
     TILE_INFO_TILE_0 as _TILE_INFO_TILE_0,
     TILE_INFO_TILE_1 as _TILE_INFO_TILE_1,
     TILE_INFO_TILE_2 as _TILE_INFO_TILE_2,
@@ -116,28 +116,27 @@ _PHASE_DESC_SLOT_PTR_ATTRS = {
 }
 
 # Per-op metadata layout (int32 entries).
-_OP_META_INNER_ITERS = 0
-_OP_META_NUM_WARPS = 1
-_OP_META_USES_CONFIG_MASK = 2
-_OP_META_STRIDE_0 = 3
-_OP_META_STRIDE_1 = 4
-_OP_META_STRIDE_2 = 5
-_OP_META_STRIDE_3 = 6
-_OP_META_STRIDE_4 = 7
-_OP_META_COUNT_0 = 8
-_OP_META_COUNT_1 = 9
-_OP_META_COUNT_2 = 10
-_OP_META_COUNT_3 = 11
-_OP_META_COUNT_4 = 12
-_OP_META_HANDLER_IDX = 13
-_OP_META_LOAD_LOCAL_IDX = 14
-_OP_META_COMPUTE_LOCAL_IDX = 15
-_OP_META_STORE_LOCAL_IDX = 16
-_OP_META_COMM_LOCAL_IDX = 17
-_OP_META_WAIT_COUNT = 18
-_OP_META_SIGNAL_COUNT = 19
-_OP_META_WAIT_ACQUIRE = 20
-_OP_META_STRIDE = 21
+_OP_META_NUM_WARPS = 0
+_OP_META_USES_CONFIG_MASK = 1
+_OP_META_STRIDE_0 = 2
+_OP_META_STRIDE_1 = 3
+_OP_META_STRIDE_2 = 4
+_OP_META_STRIDE_3 = 5
+_OP_META_STRIDE_4 = 6
+_OP_META_COUNT_0 = 7
+_OP_META_COUNT_1 = 8
+_OP_META_COUNT_2 = 9
+_OP_META_COUNT_3 = 10
+_OP_META_COUNT_4 = 11
+_OP_META_HANDLER_IDX = 12
+_OP_META_LOAD_LOCAL_IDX = 13
+_OP_META_COMPUTE_LOCAL_IDX = 14
+_OP_META_STORE_LOCAL_IDX = 15
+_OP_META_COMM_LOCAL_IDX = 16
+_OP_META_WAIT_COUNT = 17
+_OP_META_SIGNAL_COUNT = 18
+_OP_META_WAIT_ACQUIRE = 19
+_OP_META_STRIDE = 20
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -238,6 +237,31 @@ class _LaunchState:
     peer_tma_tensor_args: List[Any]
 
 
+def _unload_compiled_jit_module(compiled) -> None:
+    jit_module = getattr(compiled, "jit_module", None)
+    if jit_module is not None and not jit_module.is_unloaded():
+        jit_module.unload()
+
+
+def _sync_tma_desc_init_stream(stream) -> None:
+    """Drain descriptor initialization before kernels consume runtime TMA maps."""
+    import cuda.bindings.driver as cuda
+
+    err, = cuda.cuStreamSynchronize(stream)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuStreamSynchronize failed after TMA descriptor init: {err}")
+
+
+class _CompiledKernelCache(dict):
+    """Compiled-kernel cache that drops Python launch caches on explicit clear."""
+
+    def clear(self) -> None:
+        super().clear()
+        owner = globals().get("Megakernel")
+        if owner is not None:
+            owner._dispatch_inputs_cache.clear()
+
+
 # =============================================================================
 # Megakernel Implementation
 # =============================================================================
@@ -273,8 +297,90 @@ class Megakernel:
 
     # Class-level cache for compiled kernels to avoid recompilation
     # Key: (op_classes_tuple, static_dims_tuple, config_key)
-    _compiled_kernel_cache: Dict[Tuple, Any] = {}
+    _compiled_kernel_cache: Dict[Tuple, Any] = _CompiledKernelCache()
     _dispatch_inputs_cache: Dict[Tuple, Any] = {}
+    _active_tma_jit_modules: List[Any] = []
+
+    @staticmethod
+    def _cache_key_has_tma(cache_key: Tuple) -> bool:
+        return bool(cache_key[-2] or cache_key[-1])
+
+    @classmethod
+    def _drop_cached_tma_kernels(cls) -> None:
+        """Drop compiled TMA kernels before compiling a new TMA signature.
+
+        Keep the JIT modules loaded. Explicitly unloading a live CuTe TMA
+        module can corrupt subsequent TMA kernels in the same process; dropping
+        the Python cache entry is enough to avoid reusing incompatible launch
+        wrappers while preserving the CUDA module lifetime.
+        """
+        stale_keys = [
+            key for key in cls._compiled_kernel_cache
+            if cls._cache_key_has_tma(key)
+        ]
+        for key in stale_keys:
+            cls._compiled_kernel_cache.pop(key, None)
+        for key in list(cls._dispatch_inputs_cache):
+            if key and key[0] == "dispatch_inputs" and cls._cache_key_has_tma(key[1]):
+                cls._dispatch_inputs_cache.pop(key, None)
+
+    @classmethod
+    def _unload_active_tma_modules(cls) -> None:
+        cls._active_tma_jit_modules = [
+            jit_module for jit_module in cls._active_tma_jit_modules
+            if jit_module is not None and not jit_module.is_unloaded()
+        ]
+
+    @classmethod
+    def _track_active_tma_module(cls, compiled) -> None:
+        jit_module = getattr(compiled, "jit_module", None)
+        if jit_module is not None and not jit_module.is_unloaded():
+            cls._active_tma_jit_modules.append(jit_module)
+
+    @staticmethod
+    def _compiled_kernel_module_is_unloaded(compiled) -> bool:
+        jit_module = getattr(compiled, "jit_module", None)
+        return jit_module is not None and jit_module.is_unloaded()
+
+    @staticmethod
+    def _pipeline_for_cls(op_cls):
+        return getattr(op_cls, "pipeline", None)
+
+    @staticmethod
+    def _pipeline_static_dim(op: ScheduledOp, name: str):
+        return op.static_dims.get(f"pipeline_{name}")
+
+    @classmethod
+    def _ops_use_coalesced_pipeline(cls, ops: List[ScheduledOp]) -> bool:
+        return any(
+            (pipeline := cls._pipeline_for_cls(op.op_cls)) is not None
+            and pipeline.with_overrides(
+                range_axis=cls._pipeline_static_dim(op, "range_axis"),
+                range_end_axis=cls._pipeline_static_dim(op, "range_end_axis"),
+                range_block_size=cls._pipeline_static_dim(op, "range_block_size"),
+                coalesce_ranges=cls._pipeline_static_dim(op, "coalesce_ranges"),
+            ).coalesce_ranges
+            for op in ops
+        )
+
+    @classmethod
+    def _pipeline_spec_for_op(cls, op: ScheduledOp):
+        pipeline = cls._pipeline_for_cls(op.op_cls)
+        if pipeline is None:
+            return None
+        return pipeline.with_overrides(
+            page_count=cls._pipeline_static_dim(op, "page_count"),
+            page_bytes=cls._pipeline_static_dim(op, "page_bytes"),
+            semaphore_count=cls._pipeline_static_dim(op, "semaphore_count"),
+            scratch_bytes=cls._pipeline_static_dim(op, "scratch_bytes"),
+            input_stages=cls._pipeline_static_dim(op, "input_stages"),
+            output_stages=cls._pipeline_static_dim(op, "output_stages"),
+            stage_pages=cls._pipeline_static_dim(op, "stage_pages"),
+            range_axis=cls._pipeline_static_dim(op, "range_axis"),
+            range_end_axis=cls._pipeline_static_dim(op, "range_end_axis"),
+            range_block_size=cls._pipeline_static_dim(op, "range_block_size"),
+            coalesce_ranges=cls._pipeline_static_dim(op, "coalesce_ranges"),
+        )
 
     def __init__(
         self,
@@ -290,6 +396,9 @@ class Megakernel:
             self.config.backend = "handler"
         self.device = device
         self._scheduler = scheduler
+        if self._ops_use_coalesced_pipeline(ops):
+            Megakernel._unload_active_tma_modules()
+            Megakernel._drop_cached_tma_kernels()
 
         # Detect resident block count if not specified.
         #
@@ -331,6 +440,22 @@ class Megakernel:
                     f"page_size={self.config.page_size}B. Use "
                     f"kernel_config(ops) or increase config.page_size."
                 )
+            pipeline = self._pipeline_spec_for_op(op)
+            if pipeline is not None:
+                if "inner_iter_idx" in inspect.signature(op.op_cls.load).parameters:
+                    raise ValueError(
+                        f"Op {op.op_cls.__name__} load phases must own staged "
+                        "loops inside the op body."
+                    )
+                required = int(pipeline.resource_bytes)
+                effective_page = int(op_page or self.config.page_size)
+                if required > effective_page:
+                    raise ValueError(
+                        f"Op {op.op_cls.__name__} declares pipeline "
+                        f"resources requiring {required}B inside one page, "
+                        f"but effective page_size is {effective_page}B. "
+                        f"Increase page_size or reduce the pipeline page/scratch shape."
+                    )
 
         # Build instruction stream
         # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
@@ -540,6 +665,11 @@ class Megakernel:
             kernel_config = {"threads_per_row": num_compute_threads}
             config = build_op_config(op, kernel_config=kernel_config)
             instance = op.op_cls(**config)
+            if "inner_iter_idx" in inspect.signature(instance.load).parameters:
+                raise ValueError(
+                    f"{op.op_cls.__name__}.load uses inner_iter_idx, but "
+                    "runtime load loops must live inside the op load body."
+                )
             tile_strides = self._tile_linear_strides(op.tile_counts)
             _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
             # Keep op_config_ptr live for every phase.
@@ -563,7 +693,6 @@ class Megakernel:
 
             op_meta.extend(
                 [
-                    int(getattr(instance, "inner_iters", 1)),
                     int(getattr(instance, "num_mma_warps", default_num_mma_warps)),
                     uses_mask,
                     *tile_strides,
@@ -852,7 +981,6 @@ class Megakernel:
             dispatch_inputs["phase_uses_handler_local_idx"],
             dispatch_inputs["phase_uses_runtime_transport_selector"],
             dispatch_inputs["phase_uses_desc_slot_selector"],
-            dispatch_inputs["inner_iters_list"],
             dispatch_inputs["has_communicate"],
             dispatch_inputs["per_op_warps"],
             dispatch_inputs["phase_tensor_names"],
@@ -1308,6 +1436,7 @@ class Megakernel:
             "const_expr": cutlass.const_expr,
             "get_smem_base_ptr": get_smem_base_ptr,
             "_kernel_loop": kernel_loop,
+            "_sync_tma_desc_init_stream": _sync_tma_desc_init_stream,
         }
         from .transport import copy_runtime_desc_to_pool, fence_runtime_desc_pool, make_runtime_desc_tma_atom
         pk_globals["copy_runtime_desc_to_pool"] = copy_runtime_desc_to_pool
@@ -1425,7 +1554,6 @@ class Megakernel:
             phase_uses_handler_local_idx,
             phase_uses_runtime_transport_selector,
             phase_uses_desc_slot_selector,
-            inner_iters_list,
             has_communicate,
             per_op_warps,
             phase_tensor_names,
@@ -1596,7 +1724,6 @@ class Megakernel:
     def _op_meta_exec_globals() -> Dict[str, int]:
         """Return per-op metadata indices injected into generated kernel code."""
         return {
-            "_OP_META_INNER_ITERS": _OP_META_INNER_ITERS,
             "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
             "_OP_META_USES_CONFIG_MASK": _OP_META_USES_CONFIG_MASK,
             "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
@@ -1621,8 +1748,7 @@ class Megakernel:
             "_TILE_INFO_TILE_2": _TILE_INFO_TILE_2,
             "_TILE_INFO_TILE_3": _TILE_INFO_TILE_3,
             "_TILE_INFO_TILE_4": _TILE_INFO_TILE_4,
-            "_TILE_INFO_PACKED_WARP_INFO": _TILE_INFO_PACKED_WARP_INFO,
-            "_TILE_INFO_PACK_SCALE": _TILE_INFO_PACK_SCALE,
+            "_TILE_INFO_NUM_WARPS": _TILE_INFO_NUM_WARPS,
             "_TILE_INFO_OP_CONFIG": _TILE_INFO_OP_CONFIG,
         }
 
@@ -1779,7 +1905,7 @@ class Megakernel:
                 _ctrl_cached_uses_mask = Int32(0)
                 _ctrl_cached_config = Int64(0)
                 _ctrl_cached_handler = Int32(0)
-                _ctrl_cached_packed_warp_info = Int32(0)
+                _ctrl_cached_num_warps = Int32(1)
                 _ctrl_cached_wait_count = Int32(0)
                 _ctrl_cached_wait_acquire = Int32(0)
                 _ctrl_cached_wait_barrier = Int32(-2)
@@ -1818,10 +1944,7 @@ class Megakernel:
                                 _ctrl_cached_handler = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_IDX)
                                 )
-                                _p_inner_iters = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_INNER_ITERS)
-                                )
-                                _p_num_warps = _op_meta_i32_base(
+                                _ctrl_cached_num_warps = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_NUM_WARPS)
                                 )
                                 _ctrl_cached_wait_count = _op_meta_i32_base(
@@ -1829,9 +1952,6 @@ class Megakernel:
                                 )
                                 _ctrl_cached_wait_acquire = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
-                                )
-                                _ctrl_cached_packed_warp_info = (
-                                    _p_inner_iters + _p_num_warps * Int32(_TILE_INFO_PACK_SCALE)
                                 )
                                 _ctrl_cached_op_idx = _instr_op
                             else:
@@ -1896,8 +2016,8 @@ class Megakernel:
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_3), _p_t3)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_4), _p_t4)
                             st_shared_i32(
-                                _p_ti + Int32(4 * _TILE_INFO_PACKED_WARP_INFO),
-                                _ctrl_cached_packed_warp_info,
+                                _p_ti + Int32(4 * _TILE_INFO_NUM_WARPS),
+                                _ctrl_cached_num_warps,
                             )
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX),
@@ -1962,7 +2082,6 @@ class Megakernel:
                             _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
                             _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                             _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
-                            _dl_iter = Int32(0)
                             if const_expr(tracing):
                                 _tl = trace_start()
                             if const_expr(dispatch_load_uses_handler_local_idx):
@@ -1977,7 +2096,6 @@ class Megakernel:
                                     _dl_4,
                                     _dl_config,
                                     _dl_mbar,
-                                    _dl_iter,
                                 )
                             else:
                                 dispatch_load(
@@ -1990,7 +2108,6 @@ class Megakernel:
                                     _dl_4,
                                     _dl_config,
                                     _dl_mbar,
-                                    _dl_iter,
                                 )
                             if const_expr(tracing):
                                 _dma_lane = end_event_dynamic_raw_1(
@@ -2061,50 +2178,11 @@ class Megakernel:
                         _ds_2 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_2))
                         _ds_3 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_3))
                         _ds_4 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_4))
-                        _ds_packed_warp_info = ld_shared_i32(
-                            _ds_ti + Int32(4 * _TILE_INFO_PACKED_WARP_INFO)
-                        )
                         _ds_instruction_idx = ld_shared_i32(
                             _ds_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX)
                         )
-                        _ds_inner_iters = _ds_packed_warp_info % Int32(_TILE_INFO_PACK_SCALE)
                         _ds_config = ld_shared_i64(_ds_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
-                        _ds_mbar = _work_notify_mbar(smem_base, _s_slot)
-
-                        _n_iters = _ds_inner_iters
-                        if _n_iters > Int32(1):
-                            mbarrier_wait(_ds_mbar, _s_phase)
-                        _iter_idx = Int32(1)
-                        while _iter_idx < _n_iters:
-                            if const_expr(dispatch_load_uses_handler_local_idx):
-                                dispatch_load(
-                                    _ds_handler,
-                                    _dl_store_handler_local,
-                                    _ds_pp,
-                                    _ds_0,
-                                    _ds_1,
-                                    _ds_2,
-                                    _ds_3,
-                                    _ds_4,
-                                    _ds_config,
-                                    _ds_mbar,
-                                    _iter_idx,
-                                )
-                            else:
-                                dispatch_load(
-                                    _ds_handler,
-                                    _ds_pp,
-                                    _ds_0,
-                                    _ds_1,
-                                    _ds_2,
-                                    _ds_3,
-                                    _ds_4,
-                                    _ds_config,
-                                    _ds_mbar,
-                                    _iter_idx,
-                                )
-                            _iter_idx = _iter_idx + Int32(1)
 
                         if const_expr(tracing):
                             _tsw = trace_start()
@@ -2271,10 +2349,9 @@ class Megakernel:
                             _cached_op_idx = op_idx
 
                             if const_expr(needs_warp_transition):
-                                _packed_warp_info = ld_shared_i32(
-                                    tile_info_ptr + Int32(4 * _TILE_INFO_PACKED_WARP_INFO)
+                                _op_warps = ld_shared_i32(
+                                    tile_info_ptr + Int32(4 * _TILE_INFO_NUM_WARPS)
                                 )
-                                _op_warps = _packed_warp_info // Int32(_TILE_INFO_PACK_SCALE)
                                 if warp_id >= _op_warps:
                                     setmaxregister_decrease(MIN_IDLE_REGS)
                                 named_barrier_sync(
@@ -2577,17 +2654,28 @@ class Megakernel:
         # All are idempotent (check for None internally)
         self._prepare_tensors()
         self._prepare_cute_tensors()
+        cache_key = self._make_cache_key()
+        cache_key_has_tma = self._cache_key_has_tma(cache_key)
+        if (
+            self._compiled_kernel is None
+            and cache_key_has_tma
+            and cache_key not in Megakernel._compiled_kernel_cache
+        ):
+            Megakernel._unload_active_tma_modules()
+            Megakernel._drop_cached_tma_kernels()
         self._prepare_tma_tensors()
         self._prepare_peer_tma_tensors()
+        if self._compiled_kernel is not None and self._compiled_kernel_module_is_unloaded(
+            self._compiled_kernel
+        ):
+            self._compiled_kernel = None
         if self._compiled_kernel is None:
             # Check class-level cache first
-            cache_key = self._make_cache_key()
             if cache_key in Megakernel._compiled_kernel_cache:
                 self._compiled_kernel = Megakernel._compiled_kernel_cache[cache_key]
                 if self._eager_load_compiled_kernel_for_current_device():
                     torch.cuda.synchronize()
                 return
-
             self._validate_requirements()
             from cutedsl_trace.config import set_tracing_enabled
 
@@ -2671,6 +2759,8 @@ class Megakernel:
 
             # Store in class-level cache
             Megakernel._compiled_kernel_cache[cache_key] = self._compiled_kernel
+            if cache_key_has_tma:
+                Megakernel._track_active_tma_module(self._compiled_kernel)
             print("Compilation complete.")
 
     def _eager_load_compiled_kernel_for_current_device(self) -> bool:
@@ -2993,36 +3083,52 @@ class Megakernel:
 
     def _launch_compiled_kernel(self, launch_state: _LaunchState, stream, trace_buffer_ptr: Optional[Int64] = None) -> None:
         """Invoke the compiled kernel with a cached launch state."""
-        launch_args = [
-            launch_state.instructions_ptr,
-            launch_state.barriers_ptr,
-            launch_state.op_configs_ptr,
-            launch_state.op_meta_ptr,
-            *self._phase_local_idx_launch_args(launch_state),
-            *self._phase_local_transport_position_launch_args(launch_state),
-            *self._phase_local_desc_slot_launch_args(launch_state),
-            launch_state.signal_meta_ptr,
-        ]
-        if self._peer_tma_registry.has_peer_tma:
-            launch_args.append(launch_state.peer_signal_ptr)
-        if self.config.tracing:
-            launch_args.append(
-                trace_buffer_ptr if trace_buffer_ptr is not None else launch_state.trace_buffer_ptr
-            )
-        launch_args.extend(
-            [
-                launch_state.wait_info_ptr,
-                self._num_instructions_i32,
-                *launch_state.cute_tensors,
-                launch_state.local_tma_desc_pool_ptr,
-                launch_state.peer_tma_desc_pool_ptr,
-                *launch_state.tma_tensor_args,
-                *launch_state.peer_tma_tensor_args,
-                self._needs_tma_desc_pool_init,
+        def _launch_args(num_instructions: Int32, desc_pool_init_needed: bool) -> List[Any]:
+            launch_args = [
+                launch_state.instructions_ptr,
+                launch_state.barriers_ptr,
+                launch_state.op_configs_ptr,
+                launch_state.op_meta_ptr,
+                *self._phase_local_idx_launch_args(launch_state),
+                *self._phase_local_transport_position_launch_args(launch_state),
+                *self._phase_local_desc_slot_launch_args(launch_state),
+                launch_state.signal_meta_ptr,
             ]
+            if self._peer_tma_registry.has_peer_tma:
+                launch_args.append(launch_state.peer_signal_ptr)
+            if self.config.tracing:
+                launch_args.append(
+                    trace_buffer_ptr if trace_buffer_ptr is not None else launch_state.trace_buffer_ptr
+                )
+            launch_args.extend(
+                [
+                    launch_state.wait_info_ptr,
+                    num_instructions,
+                    *launch_state.cute_tensors,
+                    launch_state.local_tma_desc_pool_ptr,
+                    launch_state.peer_tma_desc_pool_ptr,
+                    *launch_state.tma_tensor_args,
+                    *launch_state.peer_tma_tensor_args,
+                    desc_pool_init_needed,
+                ]
+            )
+            launch_args.append(stream)
+            return launch_args
+
+        needs_desc_pool_init = self._needs_tma_desc_pool_init and (
+            self._tma_registry.has_tma or self._peer_tma_registry.has_peer_tma
         )
-        launch_args.append(stream)
-        self._compiled_kernel(*launch_args)
+        if needs_desc_pool_init:
+            # The generated wrapper launches descriptor initialization and the
+            # persistent kernel back-to-back. Some CUDA/CuTe stacks can still
+            # race the first runtime-TMA descriptor use in fully async mode, so
+            # first run a zero-instruction launch that only initializes the
+            # descriptor pool, drain it, then launch the real work hot path.
+            self._compiled_kernel(*_launch_args(Int32(0), True))
+            _sync_tma_desc_init_stream(stream)
+            self._needs_tma_desc_pool_init = False
+
+        self._compiled_kernel(*_launch_args(self._num_instructions_i32, False))
         self._needs_tma_desc_pool_init = False
 
     def wait(self) -> None:

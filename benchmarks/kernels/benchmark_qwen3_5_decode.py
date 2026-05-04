@@ -644,7 +644,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     # Shared per-op intermediates (reused every layer)
     h_buf = torch.empty(batch, S, HIDDEN, dtype=dtype, device=device)
     q_buf = torch.empty(batch, S, Q_DIM, dtype=dtype, device=device)
-    packed_qkv = os.environ.get("QWEN_DECODE_PACKED_QKV", "0") == "1"
+    packed_qkv = use_qwen_sm120_ops or os.environ.get("QWEN_DECODE_PACKED_QKV", "0") == "1"
     qkv_buf = None
     if packed_qkv:
         qkv_buf = torch.empty(

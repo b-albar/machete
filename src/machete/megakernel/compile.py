@@ -166,11 +166,10 @@ def _tile_call_args(op_cls, method_params: set) -> List[str]:
             tile_param = f"tile_{dim_name}"
             if tile_param in method_params:
                 call_args.append(f"tile_{op_cls.DIM_NAMES[dim_name]}")
-    else:
-        for axis in range(5):
-            tile_param = f"tile_{axis}"
-            if tile_param in method_params:
-                call_args.append(tile_param)
+    for axis in range(5):
+        tile_param = f"tile_{axis}"
+        if tile_param in method_params and tile_param not in call_args:
+            call_args.append(tile_param)
     return call_args
 
 
@@ -184,8 +183,6 @@ def _wrapper_signature_suffix(is_load_phase, extra_params, tensor_param_names, t
     parts = []
     if extra_params:
         parts.extend(extra_params)
-    if is_load_phase:
-        parts.append("inner_iter_idx")
     if tensor_param_names:
         parts.extend(dict.fromkeys(tensor_param_names))
     if tma_param_names:
@@ -412,7 +409,6 @@ def _build_phase_wrapper(
             "page_ptr",
             "op_config_ptr",
             "work_mbar",
-            "inner_iter_idx",
         }
         tma_local_names = set(tma_reverse)
         expects_tensors = any(
@@ -441,19 +437,12 @@ def _build_phase_wrapper(
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
 
-    is_load_phase = phase_name == "load"
-
-    if is_load_phase:
-        # inner_iter_idx: store warp passes iteration index for K-block loading
-        if "inner_iter_idx" in method_params:
-            call_args.append("inner_iter_idx")
-
     call_str = ", ".join(call_args)
 
     # Build wrapper function signature (standard dispatch format)
     tile_params = ", ".join(f"tile_{i}" for i in range(MAX_TILE_DIMS))
     signature_suffix = _wrapper_signature_suffix(
-        is_load_phase,
+        phase_name == "load",
         extra_params,
         wrapper_tensor_param_names,
         tma_param_names,

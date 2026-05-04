@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, List, Tuple
 
 import cutlass.cute as cute
@@ -466,11 +467,9 @@ def make_local_switch_binder(
 
             cursor = 8
             work_mbar = None
-            inner_iter_idx = None
             if is_load:
                 work_mbar = args[cursor]
-                inner_iter_idx = args[cursor + 1]
-                cursor += 2
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
 
@@ -479,7 +478,7 @@ def make_local_switch_binder(
             if use_direct_call:
                 call_args = [page_ptr, *tile_vals, op_config_ptr]
                 if is_load:
-                    call_args.extend([work_mbar, inner_iter_idx])
+                    call_args.append(work_mbar)
                 call_args.extend(phase_args[pos] for pos in direct_tensor_positions)
                 call_args.extend(phase_args[pos] for pos in direct_tma_positions)
                 phase_fn(*call_args)
@@ -498,7 +497,7 @@ def make_local_switch_binder(
                     tensor_positions, tma_positions = op_arg_positions[op_idx]
                     call_args = [page_ptr, *tile_vals, op_config_ptr]
                     if is_load:
-                        call_args.extend([work_mbar, inner_iter_idx])
+                        call_args.append(work_mbar)
                     call_args.extend(phase_args[pos] for pos in tensor_positions)
                     call_args.extend(phase_args[pos] for pos in tma_positions)
                     phase_fn(*call_args)
@@ -512,11 +511,9 @@ def make_local_switch_binder(
 
             cursor = 7
             work_mbar = None
-            inner_iter_idx = None
             if is_load:
                 work_mbar = args[cursor]
-                inner_iter_idx = args[cursor + 1]
-                cursor += 2
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
 
@@ -524,7 +521,7 @@ def make_local_switch_binder(
 
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
-                call_args.extend([work_mbar, inner_iter_idx])
+                call_args.append(work_mbar)
             call_args.extend(phase_args[pos] for pos in direct_tensor_positions)
             call_args.extend(phase_args[pos] for pos in direct_tma_positions)
             phase_fn(*call_args)
@@ -657,11 +654,9 @@ def make_transport_record_binder(
 
             cursor = 8
             work_mbar = None
-            inner_iter_idx = None
             if is_load:
                 work_mbar = args[cursor]
-                inner_iter_idx = args[cursor + 1]
-                cursor += 2
+                cursor += 1
             selector_ptr = None
             if accept_transport_selector:
                 selector_ptr = args[cursor]
@@ -675,7 +670,7 @@ def make_transport_record_binder(
 
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
-                call_args.extend([work_mbar, inner_iter_idx])
+                call_args.append(work_mbar)
             if use_direct_call:
                 call_args.extend(
                     phase_args[pos] for pos in direct_transport_positions
@@ -709,11 +704,9 @@ def make_transport_record_binder(
 
             cursor = 7
             work_mbar = None
-            inner_iter_idx = None
             if is_load:
                 work_mbar = args[cursor]
-                inner_iter_idx = args[cursor + 1]
-                cursor += 2
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
             if accept_desc_slot_selector:
@@ -723,7 +716,7 @@ def make_transport_record_binder(
 
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
-                call_args.extend([work_mbar, inner_iter_idx])
+                call_args.append(work_mbar)
             for slot, candidate_positions in enumerate(candidate_positions_by_slot):
                 call_args.append(phase_args[direct_transport_positions[slot]])
             if desc_slot_count:
@@ -949,7 +942,6 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
     compute_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     store_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     communicate_fns: List[Any] = [None] * len(backend.ir.handler_specs)
-    inner_iters_by_handler: List[int] = [1] * len(backend.ir.handler_specs)
     handler_warps: List[int] = [num_mma_warps] * len(backend.ir.handler_specs)
     phase_fn_lists = {"load": load_fns, "compute": compute_fns, "store": store_fns}
     if has_communicate:
@@ -964,7 +956,6 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
             kernel_config = {"threads_per_row": num_compute_threads}
             instance = op.op_cls(**build_op_config(op, kernel_config=kernel_config))
             handler_spec = backend.ir.handler_specs[handler_idx]
-            inner_iters_by_handler[handler_idx] = getattr(instance, "inner_iters", 1)
             handler_warps[handler_idx] = getattr(instance, "num_mma_warps", num_mma_warps)
             instance._machete_tma_rebind_specs = handler_rebind_specs.get(
                 handler_idx,
@@ -1093,7 +1084,6 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
             "store": store_uses_desc_slot_selector,
             "communicate": communicate_uses_desc_slot_selector,
         },
-        "inner_iters_list": [inner_iters_by_handler[h] for h in op_handler_indices],
         "has_communicate": has_communicate,
         "per_op_warps": [handler_warps[h] for h in op_handler_indices],
         "op_tensor_args": phase_op_tensor_args,
