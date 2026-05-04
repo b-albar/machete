@@ -39,7 +39,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 
-from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, config_dim_i32
 from machete.megakernel.interpreter import (
     mbarrier_init,
     mbarrier_init_fence,
@@ -1331,3 +1331,195 @@ class GemmRowParallelOp(GemmOp):
 
         # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
         cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+
+class ZeroTensorOp(Op):
+    """Experimental global-memory zero fill for split-K reduce GEMM outputs."""
+
+    reads = {}
+    writes = {"c": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
+    dynamic_dims = ("B", "S")
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        ts = dict(tile_sizes or {})
+        ts.setdefault("B", 1)
+        c = tensors.get("c")
+        if c is not None:
+            ts.setdefault("S", min(16, c.shape[1]))
+            ts.setdefault("N", min(128, c.shape[2]))
+        ops = [cls._schedule_single(tile_sizes=ts, **tensors)]
+        ops[0].static_dims["compute_threads"] = 128
+        return ops
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_N, c, op_config_ptr):
+        tidx = cute.arch.thread_idx()[0]
+        compute_threads = Int32(self.compute_threads)
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        seq_start = tile_S * Int32(self.tile_size_S)
+        n_start = tile_N * Int32(self.tile_size_N)
+        total = Int32(self.tile_size_S * self.tile_size_N)
+        idx = tidx
+        zero = Float32(0.0).to(self.c_dtype)
+        while idx < total:
+            local_s = idx // Int32(self.tile_size_N)
+            local_n = idx - local_s * Int32(self.tile_size_N)
+            seq = seq_start + local_s
+            n = n_start + local_n
+            if seq < runtime_S and n < Int32(self.N):
+                c_row = cute.make_tensor(
+                    c.iterator
+                    + tile_B * Int32(self.c_stride_B)
+                    + seq * Int32(self.c_stride_S)
+                    + n_start * Int32(self.c_stride_N),
+                    cute.make_layout((self.tile_size_N,)),
+                )
+                c_row[local_n] = zero
+            idx = idx + compute_threads
+
+
+class SumTwoTensorOp(Op):
+    """Experimental fp32 add of two bf16/fp16 3D tensors into one output."""
+
+    reads = {
+        "x0": (None, ("B", "S", "N")),
+        "x1": (None, ("B", "S", "N")),
+    }
+    writes = {"y": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
+    dynamic_dims = ("B", "S")
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        ts = dict(tile_sizes or {})
+        ts.setdefault("B", 1)
+        y = tensors.get("y")
+        if y is not None:
+            ts.setdefault("S", min(16, y.shape[1]))
+            ts.setdefault("N", min(128, y.shape[2]))
+        ops = [cls._schedule_single(tile_sizes=ts, **tensors)]
+        ops[0].static_dims["compute_threads"] = 128
+        return ops
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_N, x0, x1, y, op_config_ptr):
+        tidx = cute.arch.thread_idx()[0]
+        compute_threads = Int32(self.compute_threads)
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        seq_start = tile_S * Int32(self.tile_size_S)
+        n_start = tile_N * Int32(self.tile_size_N)
+        total = Int32(self.tile_size_S * self.tile_size_N)
+        idx = tidx
+        while idx < total:
+            local_s = idx // Int32(self.tile_size_N)
+            local_n = idx - local_s * Int32(self.tile_size_N)
+            seq = seq_start + local_s
+            n = n_start + local_n
+            if seq < runtime_S and n < Int32(self.N):
+                x0_row = cute.make_tensor(
+                    x0.iterator
+                    + tile_B * Int32(self.x0_stride_B)
+                    + seq * Int32(self.x0_stride_S)
+                    + n_start * Int32(self.x0_stride_N),
+                    cute.make_layout((self.tile_size_N,)),
+                )
+                x1_row = cute.make_tensor(
+                    x1.iterator
+                    + tile_B * Int32(self.x1_stride_B)
+                    + seq * Int32(self.x1_stride_S)
+                    + n_start * Int32(self.x1_stride_N),
+                    cute.make_layout((self.tile_size_N,)),
+                )
+                y_row = cute.make_tensor(
+                    y.iterator
+                    + tile_B * Int32(self.y_stride_B)
+                    + seq * Int32(self.y_stride_S)
+                    + n_start * Int32(self.y_stride_N),
+                    cute.make_layout((self.tile_size_N,)),
+                )
+                y_row[local_n] = (x0_row[local_n].to(Float32) + x1_row[local_n].to(Float32)).to(self.y_dtype)
+            idx = idx + compute_threads
+
+
+class GemmSplitKReduceOp(GemmRowParallelOp):
+    """Experimental local split-K GEMM using TMA reduce stores.
+
+    This op is intentionally separate from GemmOp. ``schedule`` returns a
+    zero-fill op followed by one reduce-store GEMM per K slice. It is meant to
+    test whether exposing K-slice chunks to the megakernel scheduler improves
+    overlap enough to justify a dedicated fused implementation.
+    """
+
+    peer_reduce_stores = set()
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE,
+                 split_k=2, activation=None, has_a_scale=0, **tensors):
+        if has_a_scale:
+            raise NotImplementedError("GemmSplitKReduceOp does not support a_scale yet")
+        if activation is not None:
+            raise NotImplementedError("GemmSplitKReduceOp does not support activation yet")
+        if split_k <= 1:
+            return GemmOp.schedule(
+                tile_sizes=tile_sizes,
+                page_size=page_size,
+                activation=activation,
+                has_a_scale=has_a_scale,
+                **tensors,
+            )
+
+        a = tensors["a"]
+        b = tensors["b"]
+        c = tensors["c"]
+        K = a.shape[-1]
+        if K != b.shape[-1]:
+            raise ValueError(f"split-K GEMM expects matching K, got {K} and {b.shape[-1]}")
+
+        ts = dict(tile_sizes or {})
+        if "S" not in ts or "N" not in ts:
+            elem_bytes = a.element_size()
+            auto_S, auto_N, auto_K = cls._shape_aware_auto_tiles(
+                page_size,
+                input_k=max(16, (K + split_k - 1) // split_k),
+                output_n=b.shape[0],
+                elem_bytes=elem_bytes,
+                has_a_scale=False,
+            )
+            ts.setdefault("S", auto_S)
+            ts.setdefault("N", auto_N)
+            ts.setdefault("K", auto_K)
+
+        ops = ZeroTensorOp.schedule(
+            c=c,
+            tile_sizes={
+                "B": ts.get("B", 1),
+                "S": ts.get("S", min(16, c.shape[1])),
+                "N": ts.get("N", min(128, c.shape[2])),
+            },
+        )
+
+        # Use near-even K slices rounded to 16 so tensor core K fragments stay valid.
+        step = ((K + split_k - 1) // split_k + 15) // 16 * 16
+        for split_idx, k0 in enumerate(range(0, K, step)):
+            k1 = min(K, k0 + step)
+            if k1 <= k0:
+                continue
+            a_slice = a[:, :, k0:k1]
+            b_slice = b[:, k0:k1]
+            part_ops = GemmOp.schedule.__func__(
+                cls,
+                a=a_slice,
+                b=b_slice,
+                c=c,
+                tile_sizes=ts,
+                page_size=page_size,
+                activation=None,
+                has_a_scale=0,
+            )
+            for op in part_ops:
+                op.static_dims["split_k_index"] = split_idx
+                op.static_dims["split_k_count"] = split_k
+            ops += part_ops
+        return ops

@@ -310,10 +310,10 @@ class NPageLayout:
     #    packed(inner_iters, num_warps), pad, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
-    # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
+    # - Instruction queue: IQ_DEPTH * 28 bytes (full packed TileInstruction rows)
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
     _TILE_INFO_SIZE: int = 48  # Per-page tile metadata (10 int32 slots incl. pad + 1 int64)
-    _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
+    _IQ_ENTRY_SIZE: int = 28  # Per IQ slot: op_idx + linear_tile_idx + tile_0..tile_4
     _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 

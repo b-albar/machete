@@ -77,6 +77,55 @@ def global_barrier_wait(
 
 
 @dsl_user_op
+def global_barrier_wait_relaxed(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    expected: Int32,
+    sleep_ns: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Wait on a global barrier using configurable-sleep acquire polling.
+
+    The producer signals the barrier after writing global outputs.  The wait
+    load must therefore be acquire-scoped; a volatile poll can observe the
+    counter update before the consumer sees the producer's data writes.
+    """
+    global _ptx_label_counter
+    _ptx_label_counter += 1
+    _loop = "LBB_bwait_relaxed_loop_{}".format(_ptx_label_counter)
+    _done = "LBB_bwait_relaxed_done_{}".format(_ptx_label_counter)
+
+    llvm.inline_asm(
+        None,
+        [
+            barrier_ptr.ir_value(loc=loc, ip=ip),
+            barrier_idx.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+            sleep_ns.ir_value(loc=loc, ip=ip),
+        ],
+        "{{ "
+        ".reg .pred %p; "
+        ".reg .u32 %val; "
+        ".reg .u64 %addr; "
+        "mad.wide.u32 %addr, $1, 4, $0; "
+        "{loop}: "
+        "ld.acquire.gpu.global.b32 %val, [%addr]; "
+        "setp.ge.u32 %p, %val, $2; "
+        "@%p bra {done}; "
+        "nanosleep.u32 $3; "
+        "bra {loop}; "
+        "{done}: "
+        "}}".format(loop=_loop, done=_done),
+        "l,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def check_barrier_ready(
     barrier_ptr: Int64,
     barrier_idx: Int32,
@@ -249,15 +298,12 @@ def load_instruction_to_smem(
     loc=None,
     ip=None,
 ) -> None:
-    """Load an instruction header (2 words) from global memory to shared memory.
+    """Load one packed instruction row from global memory to shared memory.
 
     The instruction tensor is laid out as
-    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values, but only the
-    first two words (``op_idx`` and ``linear_tile_idx``) are needed here.
-    This helper therefore loads those two words from the start of the
-    selected row, using the full row stride. The row stride is 28 bytes,
-    so the second row is only 4-byte aligned; use scalar loads rather than
-    ``ld.global.v2.b32`` which requires 8-byte alignment.
+    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values. The row stride is
+    28 bytes, so alternate rows are only 4-byte aligned; use scalar loads
+    rather than vectorized global loads that require wider alignment.
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
@@ -275,11 +321,19 @@ def load_instruction_to_smem(
         """
         {
             .reg .u64 %gaddr;
-            .reg .u32 %w0, %w1;
+            .reg .u32 %w0, %w1, %w2, %w3, %w4, %w5, %w6;
             mad.wide.u32 %gaddr, $1, $3, $0;
             ld.global.b32 %w0, [%gaddr];
             ld.global.b32 %w1, [%gaddr+4];
+            ld.global.b32 %w2, [%gaddr+8];
+            ld.global.b32 %w3, [%gaddr+12];
+            ld.global.b32 %w4, [%gaddr+16];
+            ld.global.b32 %w5, [%gaddr+20];
+            ld.global.b32 %w6, [%gaddr+24];
             st.shared.v2.b32 [$2], {%w0, %w1};
+            st.shared.v2.b32 [$2+8], {%w2, %w3};
+            st.shared.v2.b32 [$2+16], {%w4, %w5};
+            st.shared.b32 [$2+24], %w6;
         }
         """,
         "l,r,r,r",
@@ -784,6 +838,7 @@ def prefetch_instruction(
 
 __all__ = [
     "global_barrier_wait",
+    "global_barrier_wait_relaxed",
     "global_barrier_signal",
     "global_barrier_signal_gpu",
     "check_barrier_ready",

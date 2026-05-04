@@ -50,6 +50,19 @@ from .interpreter import ld_global_i32, ld_global_i64
 
 MAX_TILE_DIMS = 5  # Matches TMA's 5D tensor capability
 
+_SCHEDULING_STATIC_DIM_PREFIXES = ("barrier_",)
+
+
+def is_compile_static_dim(name: str) -> bool:
+    """Return whether a static dim should specialize device code.
+
+    Some ``ScheduledOp.static_dims`` entries are metadata for the host-side
+    dependency scheduler. They must stay on the op for barrier construction, but
+    they should not become ``self`` attributes or compile-key entries because
+    that creates duplicate handlers for identical device code.
+    """
+    return not name.startswith(_SCHEDULING_STATIC_DIM_PREFIXES)
+
 
 # =============================================================================
 # Dtype Mapping
@@ -147,6 +160,48 @@ def is_last_dim_slice_alias(a: TensorMeta, b: TensorMeta) -> bool:
     return a_starts[:-1] == b_starts[:-1]
 
 
+def _flattened_leading_overlap(a: TensorMeta, b: TensorMeta) -> Optional[bool]:
+    """Exact overlap for views that differ only by flattening the first 2 axes."""
+    if a.storage_ptr != b.storage_ptr:
+        return None
+    if a.ndim + 1 == b.ndim:
+        flat, expanded = a, b
+        swapped = False
+    elif b.ndim + 1 == a.ndim:
+        flat, expanded = b, a
+        swapped = True
+    else:
+        return None
+    if flat.ndim < 2:
+        return None
+    if flat.strides != expanded.strides[1:]:
+        return None
+    if flat.shape[0] != expanded.shape[0] * expanded.shape[1]:
+        return None
+
+    flat_starts = _decompose_storage_offset(flat)
+    expanded_starts = _decompose_storage_offset(expanded)
+    if flat_starts is None or expanded_starts is None:
+        return None
+
+    expanded_flat_start = expanded_starts[0] * expanded.shape[1] + expanded_starts[1]
+    flat_intervals = [(flat_starts[0], flat_starts[0] + flat.shape[0])]
+    expanded_intervals = [(expanded_flat_start, expanded_flat_start + expanded.shape[0] * expanded.shape[1])]
+    for axis in range(1, flat.ndim):
+        flat_intervals.append((flat_starts[axis], flat_starts[axis] + flat.shape[axis]))
+        expanded_axis = axis + 1
+        expanded_intervals.append((
+            expanded_starts[expanded_axis],
+            expanded_starts[expanded_axis] + expanded.shape[expanded_axis],
+        ))
+
+    overlaps = all(
+        max(f_lo, e_lo) < min(f_hi, e_hi)
+        for (f_lo, f_hi), (e_lo, e_hi) in zip(flat_intervals, expanded_intervals)
+    )
+    return overlaps if not swapped else overlaps
+
+
 def tensor_meta_overlaps(a: TensorMeta, b: TensorMeta) -> bool:
     """Return whether two tensor views overlap in device memory.
 
@@ -157,6 +212,21 @@ def tensor_meta_overlaps(a: TensorMeta, b: TensorMeta) -> bool:
     if a.data_ptr == b.data_ptr:
         return True
     if a.storage_ptr == b.storage_ptr:
+        flattened_overlap = _flattened_leading_overlap(a, b)
+        if flattened_overlap is not None:
+            return flattened_overlap
+        if a.ndim == b.ndim and a.strides == b.strides:
+            a_starts = _decompose_storage_offset(a)
+            b_starts = _decompose_storage_offset(b)
+            if a_starts is not None and b_starts is not None:
+                return all(
+                    max(a_starts[axis], b_starts[axis])
+                    < min(
+                        a_starts[axis] + a.shape[axis],
+                        b_starts[axis] + b.shape[axis],
+                    )
+                    for axis in range(a.ndim)
+                )
         a_span = _tensor_storage_span(a)
         b_span = _tensor_storage_span(b)
         if a_span is not None and b_span is not None:
@@ -846,7 +916,13 @@ def build_op_config(
 
     # Dim values (M, D, S, H, ...)
     if op.static_dims:
-        config.update(op.static_dims)
+        config.update(
+            {
+                name: value
+                for name, value in op.static_dims.items()
+                if is_compile_static_dim(name)
+            }
+        )
 
     # Tensor dtypes (x_dtype, weight_dtype, dout_dtype, ...)
     if hasattr(op.op_cls, "_UNIQUE_TENSORS"):
@@ -933,6 +1009,7 @@ __all__ = [
     # Protocol
     "Op",
     "build_op_config",
+    "is_compile_static_dim",
     # Scheduling
     "ScheduledOp",
 ]

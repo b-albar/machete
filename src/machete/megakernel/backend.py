@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 from .backend_ir import BackendIR, HandlerSpec, OpCompileSpec
 from .backend_dispatch import compile_phase_dispatch_inputs
-from .ops import build_op_config
+from .ops import build_op_config, is_compile_static_dim
 
 
 NUM_DMA_WARPS = 3
@@ -168,7 +168,16 @@ def _build_compile_key(
     tma_args: Dict[str, Tuple[str, ...]],
 ) -> Tuple[Any, ...]:
     """Build the compile-time handler signature for one scheduled op."""
-    static_dims_key = tuple(sorted(op.static_dims.items())) if op.static_dims else ()
+    static_dims_key = (
+        tuple(
+            sorted(
+                (name, value)
+                for name, value in op.static_dims.items()
+                if is_compile_static_dim(name)
+            )
+        )
+        if op.static_dims else ()
+    )
     dtypes_key = (
         tuple(sorted((name, dtype.__name__) for name, dtype in op.tensor_dtypes.items()))
         if op.tensor_dtypes else ()

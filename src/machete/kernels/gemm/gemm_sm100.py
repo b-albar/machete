@@ -11,7 +11,7 @@ Architecture:
     - DMA warps: TMA load A/B (double-buffered K-blocks), TMA store C
 
 Smem page layout (double-buffered K-blocks):
-    Phase 0 (load/compute): [A_buf0 | B_buf0 | A_buf1 | B_buf1 | mbarriers]
+    Phase 0 (load/compute): [A_buf0 | A_buf1 | B_buf0 | B_buf1 | mbarriers]
     Phase 1 (epilogue/store): [C: tile_S × tile_N × 2B]
 
 Usage:
@@ -26,8 +26,9 @@ Usage:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Int64, Float32
 from cutlass.cute.nvgpu import tcgen05
+from cutlass.utils import LayoutEnum
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
@@ -100,31 +101,32 @@ class GemmSm100Op(Op):
         tile_K = static_dims.get("tile_K", 64)
 
         if tensor_name == "a":
-            # A: K-major layout (S, K) with K contiguous → shape (K, S, 1) for TMA
+            # A: the registry has already permuted (B, S, K) into TMA order
+            # (K, S, B), matching Quack/CUTLASS's K-major SM100 layout.
             swz_B, n_contig = _sm100_swizzle_params(tile_K)
-            dim0, dim1, dim2 = tma_tile_shape  # (1, tile_S, tile_K)
-            # K-major outer: (8, n_contig) stride (n_contig, 1)
-            # Tiled up to (tile_K, tile_S, 1) for TMA
+            dim0, dim1, dim2 = tma_tile_shape  # (tile_K, tile_S, 1)
             return (
                 f"cute.make_composed_layout("
                 f"cute.make_swizzle({swz_B}, 4, 3), 0, "
-                f"cute.make_layout(({dim2}, {dim1}, {dim0}), "
-                f"stride=(1, {dim2}, {dim2 * dim1})))"
+                f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
+                f"stride=(1, {dim0}, {dim0 * dim1})))"
             )
         elif tensor_name == "b":
-            # B: K-major layout (N, K) with K contiguous → shape (K, N) for TMA
+            # B: the registry has already permuted (N, K) into TMA order
+            # (K, N), with K contiguous.
             swz_B, n_contig = _sm100_swizzle_params(tile_K)
-            dim0, dim1 = tma_tile_shape  # (tile_N, tile_K)
+            dim0, dim1 = tma_tile_shape  # (tile_K, tile_N)
             return (
                 f"cute.make_composed_layout("
                 f"cute.make_swizzle({swz_B}, 4, 3), 0, "
-                f"cute.make_layout(({dim1}, {dim0}), "
-                f"stride=(1, {dim1})))"
+                f"cute.make_layout(({dim0}, {dim1}), "
+                f"stride=(1, {dim0})))"
             )
         else:  # "c"
-            # C: row-major (S, N) — same swizzle logic as existing GemmOp
-            dim0, dim1, dim2 = tma_tile_shape  # (1, tile_S, tile_N)
-            tile_N = dim2
+            # C: the registry has already permuted (B, S, N) into TMA order
+            # (N, S, B), matching the row-major epilogue tile.
+            dim0, dim1, dim2 = tma_tile_shape  # (tile_N, tile_S, 1)
+            tile_N = dim0
             if tile_N >= 64:
                 swz_B = 3
             elif tile_N >= 32:
@@ -134,8 +136,8 @@ class GemmSm100Op(Op):
             return (
                 f"cute.make_composed_layout("
                 f"cute.make_swizzle({swz_B}, 4, 3), 0, "
-                f"cute.make_layout(({dim2}, {dim1}, {dim0}), "
-                f"stride=(1, {dim2}, {dim2 * dim1})))"
+                f"cute.make_layout(({dim0}, {dim1}, {dim2}), "
+                f"stride=(1, {dim0}, {dim0 * dim1})))"
             )
 
     # =========================================================================
@@ -175,11 +177,12 @@ class GemmSm100Op(Op):
         self.b_tile_bytes = self.tile_size_N * self.tile_K * self.elem_bytes
         self.c_tile_bytes = self.tile_size_S * self.tile_size_N * self.elem_bytes
 
-        # Double-buffer layout: [A0 | B0 | A1 | B1 | mbarriers(32B)]
-        self.buf_stride = self.a_tile_bytes + self.b_tile_bytes
-        self.b_offset = self.a_tile_bytes
-        self.mbar_offset = 2 * self.buf_stride
-        self.ab_tma_bytes = self.buf_stride  # A + B per buffer
+        # Quack-style grouped staging: [A0 | A1 | B0 | B1 | mbarriers(32B)].
+        # This matches blackwell_helpers.make_smem_layout_a/b staged layouts.
+        self.a_offset = 0
+        self.b_offset = 2 * self.a_tile_bytes
+        self.mbar_offset = self.b_offset + 2 * self.b_tile_bytes
+        self.ab_tma_bytes = self.a_tile_bytes + self.b_tile_bytes
         self.mbar_bytes = 32  # 4 × 8 bytes
 
         # K-loop: first 2 K-blocks loaded by DMA, rest by inner_iters
@@ -235,14 +238,15 @@ class GemmSm100Op(Op):
             mbarrier_init(_bf_1, Int32(self.num_mma_warps))
 
             for _k in cutlass.range_constexpr(self.tma_k_blocks):
-                _buf_base = page_ptr + Int32(_k * self.buf_stride)
+                _a_buf_base = page_ptr + Int32(_k * self.a_tile_bytes)
+                _b_buf_base = page_ptr + Int32(self.b_offset + _k * self.b_tile_bytes)
                 _mbar = _kr_0 if _k == 0 else _kr_1
                 mbar_ptr = cute.make_ptr(cutlass.Int64, _mbar, cute.AddressSpace.smem)
 
                 # TMA load A[tile_B, tile_S, K_block]
                 sA = cute.make_tensor(
                     cute.recast_ptr(
-                        cute.make_ptr(self.a_dtype, _buf_base,
+                        cute.make_ptr(self.a_dtype, _a_buf_base,
                                       cute.AddressSpace.smem, assumed_align=128),
                         swz, dtype=self.a_dtype),
                     cute.make_layout((self.tile_K, self.tile_size_S, 1),
@@ -263,7 +267,7 @@ class GemmSm100Op(Op):
                 # TMA load B[tile_N, K_block]
                 sB = cute.make_tensor(
                     cute.recast_ptr(
-                        cute.make_ptr(self.b_dtype, _buf_base + Int32(self.b_offset),
+                        cute.make_ptr(self.b_dtype, _b_buf_base,
                                       cute.AddressSpace.smem, assumed_align=128),
                         swz, dtype=self.b_dtype),
                     cute.make_layout((self.tile_K, self.tile_size_N),
@@ -290,7 +294,8 @@ class GemmSm100Op(Op):
             k_idx = inner_iter_idx + Int32(1)
             if k_idx < Int32(self.num_k_blocks):
                 buf_idx = k_idx % Int32(2)
-                _buf_base = page_ptr + buf_idx * Int32(self.buf_stride)
+                _a_buf_base = page_ptr + buf_idx * Int32(self.a_tile_bytes)
+                _b_buf_base = page_ptr + Int32(self.b_offset) + buf_idx * Int32(self.b_tile_bytes)
                 _bf = _bf_0 if buf_idx == Int32(0) else _bf_1
                 _kr = _kr_0 if buf_idx == Int32(0) else _kr_1
 
@@ -304,7 +309,7 @@ class GemmSm100Op(Op):
                 # TMA load A
                 sA = cute.make_tensor(
                     cute.recast_ptr(
-                        cute.make_ptr(self.a_dtype, _buf_base,
+                        cute.make_ptr(self.a_dtype, _a_buf_base,
                                       cute.AddressSpace.smem, assumed_align=128),
                         swz, dtype=self.a_dtype),
                     cute.make_layout((self.tile_K, self.tile_size_S, 1),
@@ -325,7 +330,7 @@ class GemmSm100Op(Op):
                 # TMA load B
                 sB = cute.make_tensor(
                     cute.recast_ptr(
-                        cute.make_ptr(self.b_dtype, _buf_base + Int32(self.b_offset),
+                        cute.make_ptr(self.b_dtype, _b_buf_base,
                                       cute.AddressSpace.smem, assumed_align=128),
                         swz, dtype=self.b_dtype),
                     cute.make_layout((self.tile_K, self.tile_size_N),
@@ -376,13 +381,12 @@ class GemmSm100Op(Op):
 
         # --- TMEM allocation ---
         # Warp 0 allocates TMEM, all warps sync and retrieve pointer
-        tmem_holding_buf = cute.arch.alloc_smem(8, alignment=8)
+        tmem_holding_buf = cute.arch.alloc_smem(Int64, 1, alignment=8)
         if warp_idx == Int32(0):
             # Compute accumulator shape and TMEM columns needed
             acc_shape = tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N))
-            acc_fake = cute.make_tensor(
-                cute.make_ptr(Float32, 0), cute.make_layout(acc_shape))
-            num_tmem_cols = bh.get_num_tmem_alloc_cols(acc_fake)
+            acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
+            num_tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(acc_fake)
             cute.arch.alloc_tmem(num_tmem_cols, tmem_holding_buf)
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
@@ -400,28 +404,33 @@ class GemmSm100Op(Op):
 
         # Create staged smem tensors using framework page
         sA_staged = cute.make_tensor(
-            cute.make_ptr(self.a_dtype, page_ptr,
-                          cute.AddressSpace.smem, assumed_align=128),
-            a_smem_layout,
+            cute.recast_ptr(
+                cute.make_ptr(self.a_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                a_smem_layout.inner,
+                dtype=self.a_dtype,
+            ),
+            a_smem_layout.outer,
         )
         sB_staged = cute.make_tensor(
-            cute.make_ptr(self.b_dtype, page_ptr + Int32(self.b_offset),
-                          cute.AddressSpace.smem, assumed_align=128),
-            b_smem_layout,
+            cute.recast_ptr(
+                cute.make_ptr(self.b_dtype, page_ptr + Int32(self.b_offset),
+                              cute.AddressSpace.smem, assumed_align=128),
+                b_smem_layout.inner,
+                dtype=self.b_dtype,
+            ),
+            b_smem_layout.outer,
         )
 
         # MMA partitions: fragment_A/B give smem descriptor tensors
-        # sA_mma needs inner (swizzle) + outer separation for get_tensor pattern
-        sA_mma_0 = sA_staged if hasattr(sA_staged, 'inner') else sA_staged
-        sB_mma_0 = sB_staged if hasattr(sB_staged, 'inner') else sB_staged
-
-        # Use staged smem for MMA fragments
-        tCrA = tiled_mma.make_fragment_A(sA_mma_0)
-        tCrB = tiled_mma.make_fragment_B(sB_mma_0)
+        tCrA = tiled_mma.make_fragment_A(sA_staged)
+        tCrB = tiled_mma.make_fragment_B(sB_staged)
 
         # Build accumulator in TMEM
         acc_shape = tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N))
-        tCtAcc = cute.make_tensor(acc_tmem_ptr, cute.make_layout(acc_shape))
+        acc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
+        tCtAcc_base = cute.make_tensor(acc_tmem_ptr, acc_fake.layout)
+        tCtAcc = tCtAcc_base[None, None, None, 0]
 
         # --- Op-managed mbarrier pointers ---
         _mbar_base = page_ptr + Int32(self.mbar_offset)
@@ -512,9 +521,9 @@ class GemmSm100Op(Op):
         )
 
         # Partition accumulator by epilogue tiles
-        tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0, None)], epi_tile)
+        tCtAcc_epi = cute.flat_divide(tCtAcc, epi_tile)
         tiled_copy_t2r = tcgen05.make_tmem_copy(
-            copy_atom_t2r, tCtAcc_epi[(None, None, 0, 0)])
+            copy_atom_t2r, tCtAcc_epi[(None, None, None, 0, 0)])
 
         thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
         tTR_tAcc = thr_copy_t2r.partition_S(tCtAcc_epi)
@@ -539,15 +548,19 @@ class GemmSm100Op(Op):
 
         # Epilogue smem layout
         epi_smem_layout = bh.make_smem_layout_epi(
-            tiled_copy_t2r,
-            cta_tile,
             self.c_dtype,
+            LayoutEnum.ROW_MAJOR,
+            epi_tile,
             1,  # 1 stage for epilogue
         )
         sC = cute.make_tensor(
-            cute.make_ptr(self.c_dtype, page_ptr,
-                          cute.AddressSpace.smem, assumed_align=128),
-            epi_smem_layout,
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr,
+                              cute.AddressSpace.smem, assumed_align=128),
+                epi_smem_layout.inner,
+                dtype=self.c_dtype,
+            ),
+            epi_smem_layout.outer,
         )
 
         tRS_sC = thr_copy_r2s.partition_D(sC)
@@ -586,11 +599,9 @@ class GemmSm100Op(Op):
         named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
         if warp_idx == Int32(0):
             cute.arch.relinquish_tmem_alloc_permit()
-            acc_shape_for_dealloc = tiled_mma.partition_shape_C(
-                (self.tile_size_S, self.tile_size_N))
-            acc_fake_for_dealloc = cute.make_tensor(
-                cute.make_ptr(Float32, 0), cute.make_layout(acc_shape_for_dealloc))
-            num_cols = bh.get_num_tmem_alloc_cols(acc_fake_for_dealloc)
+            acc_shape_for_dealloc = tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N))
+            acc_fake_for_dealloc = tiled_mma.make_fragment_C(cute.append(acc_shape_for_dealloc, 1))
+            num_cols = cutlass.utils.get_num_tmem_alloc_cols(acc_fake_for_dealloc)
             cute.arch.dealloc_tmem(acc_tmem_ptr, num_cols)
 
     # =========================================================================

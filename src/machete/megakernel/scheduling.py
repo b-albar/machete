@@ -54,13 +54,14 @@ class BarrierFormula:
     base: int
     coeffs: Tuple[int, ...] = (0,) * MAX_TILE_DIMS
     divs: Tuple[int, ...] = (1,) * MAX_TILE_DIMS
+    offset: int = 0
     expected: int = 1
     guard_max: int = NO_GUARD
 
     def compute_index(self, tiles: Tuple[int, ...]) -> int:
         """Compute barrier index for a given tile (host-side, for testing)."""
         padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
-        result = self.base
+        result = self.base + self.offset
         for i in range(MAX_TILE_DIMS):
             result += self.coeffs[i] * (padded[i] // self.divs[i])
         return result
@@ -388,6 +389,80 @@ class GroupedScheduler(TileScheduler):
         ]
 
 
+class ReadyScheduler(TileScheduler):
+    """Host-side ready-list scheduler using resolved barrier formulas.
+
+    Unlike BackwardScheduler, this can emit a consumer tile as soon as its
+    specific producer counters are satisfied, instead of batching all tiles of
+    each producer op first.
+    """
+
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        return _depth_sorted_instructions(op_records, _compute_op_depths(len(op_records), edges))
+
+    def schedule_with_formulas(
+        self,
+        op_records: List["_OpRecord"],
+        edges: List["_DepEdge"],
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+    ) -> List[TileInstruction]:
+        if not op_records:
+            return []
+
+        depths = _compute_op_depths(len(op_records), edges)
+        next_tile_idx = [0 for _ in op_records]
+        total_remaining = sum(len(rec.tiles) for rec in op_records)
+        signal_counts: Dict[int, int] = {}
+        out: List[TileInstruction] = []
+
+        def tile_ready(op_idx: int, tile: Tuple[int, ...]) -> bool:
+            wait_formulas = formulas.get(op_idx, ([], []))[0]
+            for formula in wait_formulas:
+                if formula.has_guard and not formula.is_guarded(tile):
+                    continue
+                barrier_idx = formula.compute_index(tile)
+                if signal_counts.get(barrier_idx, 0) < formula.expected:
+                    return False
+            return True
+
+        def emit_signals(op_idx: int, tile: Tuple[int, ...]) -> None:
+            signal_formulas = formulas.get(op_idx, ([], []))[1]
+            for formula in signal_formulas:
+                if formula.has_guard and not formula.is_guarded(tile):
+                    continue
+                barrier_idx = formula.compute_index(tile)
+                signal_counts[barrier_idx] = signal_counts.get(barrier_idx, 0) + 1
+
+        while total_remaining:
+            ready_ops = []
+            for op_idx, rec in enumerate(op_records):
+                tile_idx = next_tile_idx[op_idx]
+                if tile_idx >= len(rec.tiles):
+                    continue
+                tile = rec.tiles[tile_idx]
+                if tile_ready(op_idx, tile):
+                    # Prefer consumers once they become ready; this exposes
+                    # chunk-level overlap instead of draining producers first.
+                    ready_ops.append((depths[op_idx], op_idx))
+
+            if not ready_ops:
+                raise RuntimeError("ReadyScheduler deadlocked: no tile is ready")
+
+            _depth, op_idx = min(ready_ops)
+            tile = op_records[op_idx].tiles[next_tile_idx[op_idx]]
+            out.append(TileInstruction(op_idx=op_idx, tiles=tile))
+            emit_signals(op_idx, tile)
+            next_tile_idx[op_idx] += 1
+            total_remaining -= 1
+
+        return out
+
+
 # Default scheduler instance
 _default_scheduler: TileScheduler = BackwardScheduler()
 
@@ -607,6 +682,11 @@ class InstructionStreamBuilder:
             return None
         return prod_idx
 
+    @staticmethod
+    def _is_reduce_store(op: ScheduledOp, buf: str) -> bool:
+        """Whether this output is accumulated atomically rather than overwritten."""
+        return buf in getattr(op.op_cls, "_TMA_REDUCE_STORES", set())
+
     def _resolve_named_dep_pairs(
         self,
         buffer_producers: Dict[str, int],
@@ -628,6 +708,29 @@ class InstructionStreamBuilder:
                     seen.add(pair)
                     raw_pairs.add(pair)
                     pairs.append(pair)
+
+                # Split-K / row-parallel style reductions have multiple
+                # associative writers for one logical tensor. The latest writer
+                # is not sufficient as a RAW dependency: consumers need all
+                # prior reduce stores that overlap their input.
+                cons_meta = rec.op.tensor_metas.get(buf)
+                if cons_meta is not None:
+                    for cand_idx in range(rec.op_idx - 1, -1, -1):
+                        cand = self._op_records[cand_idx]
+                        added_reduce = False
+                        for cand_name in cand.op.op_cls.OUTPUTS:
+                            if not self._is_reduce_store(cand.op, cand_name):
+                                continue
+                            cand_meta = cand.op.tensor_metas.get(cand_name)
+                            if cand_meta is not None and tensor_meta_overlaps(cand_meta, cons_meta):
+                                pair = (cand_idx, rec.op_idx)
+                                if pair not in seen:
+                                    seen.add(pair)
+                                    raw_pairs.add(pair)
+                                    pairs.append(pair)
+                                added_reduce = True
+                        if added_reduce:
+                            continue
 
         # Shared-storage anti-dependencies: a later writer must wait until all
         # earlier readers/writers of the same underlying tensor have finished,
@@ -653,6 +756,22 @@ class InstructionStreamBuilder:
                                 matched = True
                                 break
                     if matched:
+                        # Atomic-reduce stores to the same output are
+                        # associative and may overlap. Consumers get explicit
+                        # RAW edges to all reduce writers above.
+                        if any(
+                            self._is_reduce_store(rec.op, out_name)
+                            and self._is_reduce_store(cand.op, cand_name)
+                            and rec.op.tensor_metas.get(out_name) is not None
+                            and cand.op.tensor_metas.get(cand_name) is not None
+                            and tensor_meta_overlaps(
+                                rec.op.tensor_metas[out_name],
+                                cand.op.tensor_metas[cand_name],
+                            )
+                            for out_name in rec.op.op_cls.OUTPUTS
+                            for cand_name in cand.op.op_cls.OUTPUTS
+                        ):
+                            continue
                         pair = (cand_idx, rec.op_idx)
                         if pair not in seen:
                             seen.add(pair)
@@ -814,11 +933,14 @@ class InstructionStreamBuilder:
 
         return formulas, barrier_counter
 
-    def _canonical_dim_map(self, op: ScheduledOp) -> Dict[str, str]:
-        """Map canonical dimension names back to the op's original dim names."""
+    def _canonical_dim_map(self, op: ScheduledOp, role: str) -> Dict[str, str]:
+        """Map role-specific canonical dimension names to original dim names."""
         canon_to_orig = {}
         for dim_name in op.dim_names:
-            canonical_name = op.dim_aliases.get(dim_name, dim_name)
+            canonical_name = op.static_dims.get(
+                f"barrier_{role}_alias_{dim_name}",
+                op.dim_aliases.get(dim_name, dim_name),
+            )
             canon_to_orig[canonical_name] = dim_name
         return canon_to_orig
 
@@ -828,8 +950,8 @@ class InstructionStreamBuilder:
         consumer: ScheduledOp,
     ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
         """Resolve shared and producer-only dimensions between two ops."""
-        producer_dims = self._canonical_dim_map(producer)
-        consumer_dims = self._canonical_dim_map(consumer)
+        producer_dims = self._canonical_dim_map(producer, "signal")
+        consumer_dims = self._canonical_dim_map(consumer, "wait")
         shared_canonical = set(producer_dims) & set(consumer_dims)
         producer_only = set(producer_dims) - shared_canonical
         shared_pairs = [
@@ -850,12 +972,16 @@ class InstructionStreamBuilder:
         compatible_pairs = []
 
         for canonical_name, producer_dim, consumer_dim in shared_pairs:
-            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
-            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal")
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait")
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
             producer_tiles = producer.tiles_for_axis(producer_axis)
             consumer_tiles = consumer.tiles_for_axis(consumer_axis)
+            producer_group_count = producer.static_dims.get(
+                f"barrier_group_count_{producer_dim}"
+            )
+            consumer_offset = self._barrier_index_offset(consumer, consumer_dim, "wait")
 
             if (
                 producer_tile_size != consumer_tile_size
@@ -877,7 +1003,14 @@ class InstructionStreamBuilder:
                     ratio = consumer_tile_size // producer_tile_size
                     producer_effective_tiles = (producer_tiles + ratio - 1) // ratio
                     if producer_effective_tiles != consumer_tiles:
-                        incompatible_dims.append(producer_dim)
+                        if (
+                            producer_group_count is not None
+                            and producer_effective_tiles == producer_group_count
+                            and consumer_offset + consumer_tiles <= producer_group_count
+                        ):
+                            compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+                        else:
+                            incompatible_dims.append(producer_dim)
                     else:
                         compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
             else:
@@ -900,8 +1033,8 @@ class InstructionStreamBuilder:
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            producer_tile_size = producer.tile_sizes.get(producer_dim, 1)
-            consumer_tile_size = consumer.tile_sizes.get(consumer_dim, 1)
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal")
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait")
             if producer_tile_size > consumer_tile_size:
                 consumer_divs[consumer_axis] = producer_tile_size // consumer_tile_size
             elif consumer_tile_size > producer_tile_size:
@@ -912,10 +1045,21 @@ class InstructionStreamBuilder:
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            num_barriers *= min(
-                producer.tiles_for_axis(producer_axis),
-                consumer.tiles_for_axis(consumer_axis),
+            producer_group_count = producer.static_dims.get(
+                f"barrier_group_count_{producer_dim}"
             )
+            consumer_group_count = consumer.static_dims.get(
+                f"barrier_group_count_{consumer_dim}"
+            )
+            if producer_group_count is not None:
+                num_barriers *= int(producer_group_count)
+            elif consumer_group_count is not None:
+                num_barriers *= int(consumer_group_count)
+            else:
+                num_barriers *= min(
+                    producer.tiles_for_axis(producer_axis),
+                    consumer.tiles_for_axis(consumer_axis),
+                )
 
         if producer_only_dims:
             collapsed = 1
@@ -951,6 +1095,41 @@ class InstructionStreamBuilder:
             consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
         return tuple(producer_coeffs), tuple(consumer_coeffs)
 
+    def _barrier_tile_size(self, op: ScheduledOp, dim: str, role: str) -> int:
+        """Return role-specific tile size used only for barrier index mapping."""
+        return int(
+            op.static_dims.get(
+                f"barrier_{role}_tile_size_{dim}",
+                op.static_dims.get(
+                    f"barrier_tile_size_{dim}",
+                    op.tile_sizes.get(dim, 1),
+                ),
+            )
+        )
+
+    def _barrier_index_offset(self, op: ScheduledOp, dim: str, role: str) -> int:
+        """Return role-specific barrier index offset for packed/subset views."""
+        return int(
+            op.static_dims.get(
+                f"barrier_{role}_index_offset_{dim}",
+                op.static_dims.get(f"barrier_index_offset_{dim}", 0),
+            )
+        )
+
+    def _barrier_formula_offsets(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+    ) -> Tuple[int, int]:
+        """Compute optional constant offsets for shared-dim barrier mappings."""
+        producer_offset = 0
+        consumer_offset = 0
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_offset += self._barrier_index_offset(producer, producer_dim, "signal")
+            consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait")
+        return producer_offset, consumer_offset
+
     def _resolve_named_formulas(
         self,
     ) -> Tuple[
@@ -974,7 +1153,7 @@ class InstructionStreamBuilder:
             i: ([], []) for i in range(len(self._op_records))
         }
         barrier_counter = 0
-        signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int], int] = {}
+        signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int, int], int] = {}
 
         for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
                 producer = self._op_records[prod_idx]
@@ -1000,10 +1179,15 @@ class InstructionStreamBuilder:
                     c_op,
                     shared_pairs,
                 )
+                producer_offset, consumer_offset = self._barrier_formula_offsets(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                )
 
                 # Fan-out consumers can share the same producer-side readiness
                 # counter. Each consumer still keeps its own expected count.
-                signal_key = (prod_idx, producer_coeffs, producer_divs, num_barriers)
+                signal_key = (prod_idx, producer_coeffs, producer_divs, num_barriers, producer_offset)
                 signal_base = signal_family_cache.get(signal_key)
                 if signal_base is None:
                     signal_base = barrier_counter
@@ -1013,6 +1197,7 @@ class InstructionStreamBuilder:
                             base=signal_base,
                             coeffs=producer_coeffs,
                             divs=producer_divs,
+                            offset=producer_offset,
                         )
                     )
                     barrier_counter += num_barriers
@@ -1023,6 +1208,7 @@ class InstructionStreamBuilder:
                         base=signal_base,
                         coeffs=consumer_coeffs,
                         divs=consumer_divs,
+                        offset=consumer_offset,
                         expected=expected,
                     )
                 )
@@ -1051,7 +1237,15 @@ class InstructionStreamBuilder:
         if scheduler is None:
             scheduler = get_default_scheduler()
 
-        instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
+        if hasattr(scheduler, "schedule_with_formulas"):
+            formulas, _ = self._resolve()
+            instructions = scheduler.schedule_with_formulas(
+                self._op_records,
+                edges,
+                formulas,
+            )
+        else:
+            instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
         instructions.append(TileInstruction.end_instruction())
         return instructions
 
@@ -1064,8 +1258,7 @@ class InstructionStreamBuilder:
         """Build instruction stream as GPU tensor.
 
         Returns:
-            Tensor of shape [num_instructions, INSTRUCTION_WORDS] where
-            INSTRUCTION_WORDS=2 + MAX_TILE_DIMS.
+            Tensor of shape [num_instructions, INSTRUCTION_WORDS].
         """
         import torch
 
@@ -1082,6 +1275,57 @@ class InstructionStreamBuilder:
         ]
         return torch.tensor(packed, dtype=torch.int32, device=device)
 
+    def build_queued_tensors(
+        self,
+        instructions: List[TileInstruction],
+        num_blocks: int,
+        device: str = "cuda",
+    ):
+        """Pack work into contiguous per-block instruction queues.
+
+        The C++ megakernel feeds each persistent CTA from its own instruction
+        queue. This preserves the measured-best strided assignment
+        (`i % num_blocks`) while making each CTA's fetch stream contiguous and
+        giving every queue an explicit END marker.
+
+        Returns:
+            (instructions_tensor, queued_instructions, queue_len)
+        """
+        import torch
+
+        if num_blocks <= 0:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}")
+
+        non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+        queues: List[List[TileInstruction]] = [[] for _ in range(num_blocks)]
+        for block_idx in range(num_blocks):
+            queues[block_idx] = non_end[block_idx::num_blocks]
+
+        queue_len = 1
+        end = TileInstruction.end_instruction()
+        for block_idx, queue in enumerate(queues):
+            queue.append(end)
+            queue_len = max(queue_len, len(queue))
+
+        queued_instructions: List[TileInstruction] = []
+        for queue in queues:
+            padded = queue + [end] * (queue_len - len(queue))
+            queued_instructions.extend(padded)
+
+        strides_by_op = {
+            r.op_idx: _linear_strides(r.op.tile_counts)
+            for r in self._op_records
+        }
+        packed = [
+            instr.pack(strides=strides_by_op.get(instr.op_idx))
+            for instr in queued_instructions
+        ]
+        return (
+            torch.tensor(packed, dtype=torch.int32, device=device),
+            queued_instructions,
+            queue_len,
+        )
+
     @property
     def max_wait_deps(self) -> int:
         """Maximum number of wait dependencies across all ops."""
@@ -1094,12 +1338,22 @@ class InstructionStreamBuilder:
         formulas, _ = self._resolve()
         return max((len(sf) for _wf, sf in formulas.values()), default=0)
 
-    def build_wait_info_tensor(self, instructions, device="cuda"):
+    def build_wait_info_tensor(
+        self,
+        instructions,
+        device="cuda",
+        num_blocks: Optional[int] = None,
+        queue_len: Optional[int] = None,
+    ):
         """Pre-compute (barrier_idx, expected) per instruction.
 
         Returns tensor [num_instr, max_waits * 2]:
         [wait0_barrier_idx, wait0_expected, wait1_barrier_idx, wait1_expected, ...]
         barrier_idx = -1 means skip.
+
+        When num_blocks is provided, repeated waits along each persistent CTA's
+        instruction stream are removed. Use queue_len for contiguous per-CTA
+        queues; omit it for the legacy strided layout.
         """
         import torch
 
@@ -1110,6 +1364,28 @@ class InstructionStreamBuilder:
             self._build_wait_info_entry(instr, formulas, max_waits)
             for instr in instructions
         ]
+        if num_blocks is not None and num_blocks > 0:
+            empty = [-1, 0] * max_waits
+            seen_waits = [dict() for _ in range(num_blocks)]
+            for idx, entry in enumerate(wait_data):
+                block_idx = idx // queue_len if queue_len is not None else idx % num_blocks
+                if block_idx >= num_blocks:
+                    block_idx = num_blocks - 1
+                if entry == empty:
+                    continue
+                compacted: List[int] = []
+                for pair_idx in range(max_waits):
+                    barrier_idx = entry[pair_idx * 2]
+                    expected = entry[pair_idx * 2 + 1]
+                    if barrier_idx < 0:
+                        continue
+                    if seen_waits[block_idx].get(barrier_idx, 0) >= expected:
+                        continue
+                    compacted.extend([barrier_idx, expected])
+                    seen_waits[block_idx][barrier_idx] = expected
+                while len(compacted) < max_waits * 2:
+                    compacted.extend([-1, 0])
+                wait_data[idx] = compacted
 
         return torch.tensor(wait_data, dtype=torch.int32, device=device)
 
@@ -1143,9 +1419,7 @@ class InstructionStreamBuilder:
         entry: List[int] = []
         wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
         for formula in wait_formulas:
-            if formula.has_guard and not formula.is_guarded(instr.tiles):
-                entry.extend([-1, 0])
-            else:
+            if not (formula.has_guard and not formula.is_guarded(instr.tiles)):
                 entry.extend([formula.compute_index(instr.tiles), formula.expected])
 
         while len(entry) < max_waits * 2:
@@ -1165,9 +1439,7 @@ class InstructionStreamBuilder:
         entry: List[int] = []
         signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
         for formula in signal_formulas:
-            if formula.has_guard and not formula.is_guarded(instr.tiles):
-                entry.append(-1)
-            else:
+            if not (formula.has_guard and not formula.is_guarded(instr.tiles)):
                 entry.append(formula.compute_index(instr.tiles))
 
         while len(entry) < max_signals:
@@ -1204,6 +1476,7 @@ __all__ = [
     "TileScheduler",
     "BackwardScheduler",
     "GroupedScheduler",
+    "ReadyScheduler",
     "get_default_scheduler",
     "set_default_scheduler",
     "InstructionStreamBuilder",

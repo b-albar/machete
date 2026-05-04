@@ -46,6 +46,7 @@ from .interpreter import (
     global_barrier_signal,
     global_barrier_signal_gpu,
     global_barrier_wait,
+    global_barrier_wait_relaxed,
     load_instruction_to_smem,
     ld_global_i32,
     ld_global_i64,
@@ -133,7 +134,10 @@ _OP_META_LOAD_LOCAL_IDX = 14
 _OP_META_COMPUTE_LOCAL_IDX = 15
 _OP_META_STORE_LOCAL_IDX = 16
 _OP_META_COMM_LOCAL_IDX = 17
-_OP_META_STRIDE = 18
+_OP_META_WAIT_COUNT = 18
+_OP_META_SIGNAL_COUNT = 19
+_OP_META_WAIT_ACQUIRE = 20
+_OP_META_STRIDE = 21
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -189,6 +193,10 @@ class MegakernelConfig:
     noinline: bool = True
     inline_thin_phases: bool = True
     sync_compute_warps_after_tile: bool = True
+    per_sm_instruction_queues: bool = False
+    loader_idle_sleep_ns: int = 100
+    relaxed_global_barriers: bool = False
+    global_barrier_sleep_ns: int = 8
     opt_level: int = 2
     backend: str = "handler"
 
@@ -430,16 +438,36 @@ class Megakernel:
         """Prepare instruction, barrier, wait_info, and config tensors on GPU."""
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
-            self._instructions_tensor = self._builder.build_tensor(
-                self.device, scheduler=self._scheduler, instructions=instructions
-            )
-            self._num_instructions = self._instructions_tensor.shape[0]
+            if self.config.per_sm_instruction_queues:
+                (
+                    self._instructions_tensor,
+                    materialized_instructions,
+                    queue_len,
+                ) = self._builder.build_queued_tensors(
+                    instructions,
+                    self.num_sms,
+                    device=self.device,
+                )
+                self._num_instructions = queue_len
+                wait_queue_len = queue_len
+            else:
+                materialized_instructions = instructions
+                wait_queue_len = None
+                self._instructions_tensor = self._builder.build_tensor(
+                    self.device, scheduler=self._scheduler, instructions=instructions
+                )
+                self._num_instructions = self._instructions_tensor.shape[0]
             self._num_instructions_i32 = Int32(self._num_instructions)
             # Pre-computed barrier indices for controller warp
-            self._wait_info = self._builder.build_wait_info_tensor(instructions, self.device)
+            self._wait_info = self._builder.build_wait_info_tensor(
+                materialized_instructions,
+                self.device,
+                num_blocks=self.num_sms,
+                queue_len=wait_queue_len,
+            )
             self._max_signal_formulas = max(1, self._builder.max_signal_deps)
             self._signal_metadata_tensor = self._builder.build_signal_info_tensor(
-                instructions, self.device
+                materialized_instructions, self.device
             )
 
         if self._barriers_tensor is None:
@@ -542,6 +570,9 @@ class Megakernel:
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
                     int(op_handler_indices[op_idx]),
                     *self._phase_local_indices_for_op(op_phase_local_indices, op_idx),
+                    len(_wait_formulas),
+                    len(_signal_formulas),
+                    int(op.static_dims.get("barrier_wait_acquire", 0)),
                 ]
             )
 
@@ -954,6 +985,7 @@ class Megakernel:
             "iq_offset": iq_offset,
             "flags_offset": flags_offset,
             "ring_state_offset": ring_state_offset,
+            "per_sm_instruction_queues": bool(self.config.per_sm_instruction_queues),
         }
         if extra_exec_globals:
             exec_globals.update(extra_exec_globals)
@@ -1498,15 +1530,23 @@ class Megakernel:
         def _signal_barriers_from_meta(
             signal_meta_ptr: Int64,
             instruction_idx: Int32,
+            signal_count: Int32,
             barriers_ptr: Int64,
         ):
+            done_signals = Int32(0)
             for sig_idx in range_constexpr(self._max_signal_formulas):
-                barrier_idx = ld_global_i32(
-                    signal_meta_ptr,
-                    instruction_idx * Int32(self._max_signal_formulas) + Int32(sig_idx),
-                )
-                if barrier_idx >= Int32(0):
-                    global_barrier_signal_gpu(barriers_ptr, barrier_idx)
+                if done_signals == Int32(0):
+                    if sig_idx < signal_count:
+                        barrier_idx = ld_global_i32(
+                            signal_meta_ptr,
+                            instruction_idx * Int32(self._max_signal_formulas) + Int32(sig_idx),
+                        )
+                        if barrier_idx >= Int32(0):
+                            global_barrier_signal_gpu(barriers_ptr, barrier_idx)
+                        else:
+                            done_signals = Int32(1)
+                    else:
+                        done_signals = Int32(1)
 
         if has_communicate:
             @cute.jit
@@ -1564,6 +1604,9 @@ class Megakernel:
             "_OP_META_COMPUTE_LOCAL_IDX": _OP_META_COMPUTE_LOCAL_IDX,
             "_OP_META_STORE_LOCAL_IDX": _OP_META_STORE_LOCAL_IDX,
             "_OP_META_COMM_LOCAL_IDX": _OP_META_COMM_LOCAL_IDX,
+            "_OP_META_WAIT_COUNT": _OP_META_WAIT_COUNT,
+            "_OP_META_SIGNAL_COUNT": _OP_META_SIGNAL_COUNT,
+            "_OP_META_WAIT_ACQUIRE": _OP_META_WAIT_ACQUIRE,
         }
 
     @staticmethod
@@ -1614,10 +1657,14 @@ class Megakernel:
             "_op_meta_i32_base": runtime["_op_meta_i32_base"],
             "max_waits": runtime["max_waits"],
             "global_barrier_wait": global_barrier_wait,
+            "global_barrier_wait_relaxed": global_barrier_wait_relaxed,
+            "relaxed_global_barriers": self.config.relaxed_global_barriers,
+            "global_barrier_sleep_ns": int(self.config.global_barrier_sleep_ns),
             "ld_global_i32": ld_global_i32,
             "has_communicate": runtime["has_communicate"],
             "needs_warp_transition": runtime["needs_warp_transition"],
             "sync_compute_warps_after_tile": self.config.sync_compute_warps_after_tile,
+            "loader_idle_sleep_ns": int(self.config.loader_idle_sleep_ns),
             "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
             "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
             "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
@@ -1719,6 +1766,12 @@ class Megakernel:
             if warp_id == Int32(num_mma_warps):
                 produce_idx = Int32(0)
                 _fetch_idx = block_id
+                _fetch_limit = num_instructions
+                _fetch_stride = num_blocks
+                if const_expr(per_sm_instruction_queues):
+                    _fetch_idx = block_id * num_instructions
+                    _fetch_limit = _fetch_idx + num_instructions
+                    _fetch_stride = Int32(1)
                 _fetch_idx_save = Int32(0)
                 _ctrl_done = Int32(0)
                 _ctrl_cached_op_idx = Int32(-1)
@@ -1727,6 +1780,10 @@ class Megakernel:
                 _ctrl_cached_config = Int64(0)
                 _ctrl_cached_handler = Int32(0)
                 _ctrl_cached_packed_warp_info = Int32(0)
+                _ctrl_cached_wait_count = Int32(0)
+                _ctrl_cached_wait_acquire = Int32(0)
+                _ctrl_cached_wait_barrier = Int32(-2)
+                _ctrl_cached_wait_expected = Int32(-1)
 
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
@@ -1737,35 +1794,17 @@ class Megakernel:
                     if lane_id == Int32(0):
                         _instr_op = Int32(TileInstruction.END_MARKER)
                         _instr_lin = Int32(0)
-                        if _fetch_idx < num_instructions:
+                        if _fetch_idx < _fetch_limit:
                             load_instruction_to_smem(instructions_ptr, _fetch_idx, _temp_instr)
                             _instr_op, _instr_lin = ld_shared_v2_b32(_temp_instr)
                             if _instr_op == Int32(TileInstruction.END_MARKER):
-                                _fetch_idx = num_instructions
+                                _fetch_idx = _fetch_limit
                             if _instr_op != Int32(TileInstruction.END_MARKER):
                                 _fetch_idx_save = _fetch_idx
-                                _fetch_idx = _fetch_idx + num_blocks
+                                _fetch_idx = _fetch_idx + _fetch_stride
 
                         _p_meta_base = Int32(0)
                         if _instr_op >= Int32(0):
-                            for _w in range_constexpr(max_waits):
-                                _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
-                                _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
-                                if _bar_idx >= Int32(0):
-                                    _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
-                                    global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
-
-                            _si = ld_shared_i32(store_idx_ptr)
-                            while (produce_idx - _si) >= Int32(num_pages):
-                                _wait_slot = produce_idx % Int32(num_pages)
-                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
-                                mbarrier_wait(
-                                    _compute_done_mbar(smem_base, _wait_slot), _wait_phase
-                                )
-                                _si = ld_shared_i32(store_idx_ptr)
-
-                            _p_slot = produce_idx % Int32(num_pages)
-                            _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
                             if _instr_op != _ctrl_cached_op_idx:
                                 _p_meta_base = _op_meta_base(_instr_op)
                                 _ctrl_cached_meta_base = _p_meta_base
@@ -1785,15 +1824,67 @@ class Megakernel:
                                 _p_num_warps = _op_meta_i32_base(
                                     op_meta_ptr, _p_meta_base, Int32(_OP_META_NUM_WARPS)
                                 )
+                                _ctrl_cached_wait_count = _op_meta_i32_base(
+                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_WAIT_COUNT)
+                                )
+                                _ctrl_cached_wait_acquire = _op_meta_i32_base(
+                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                                )
                                 _ctrl_cached_packed_warp_info = (
                                     _p_inner_iters + _p_num_warps * Int32(_TILE_INFO_PACK_SCALE)
                                 )
                                 _ctrl_cached_op_idx = _instr_op
                             else:
                                 _p_meta_base = _ctrl_cached_meta_base
-                            _p_t0, _p_t1, _p_t2, _p_t3, _p_t4 = decompose_tile(
-                                op_meta_ptr, _p_meta_base, _instr_lin
-                            )
+
+                            if _ctrl_cached_wait_count > Int32(0):
+                                _done_waits = Int32(0)
+                                for _w in range_constexpr(max_waits):
+                                    if _done_waits == Int32(0):
+                                        if _w < _ctrl_cached_wait_count:
+                                            _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
+                                            _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
+                                            if _bar_idx >= Int32(0):
+                                                _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
+                                                if (
+                                                    _bar_idx != _ctrl_cached_wait_barrier
+                                                    or _bar_exp != _ctrl_cached_wait_expected
+                                                ):
+                                                    if const_expr(relaxed_global_barriers):
+                                                        if _ctrl_cached_wait_acquire != Int32(0):
+                                                            global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                        else:
+                                                            global_barrier_wait_relaxed(
+                                                                barriers_ptr,
+                                                                _bar_idx,
+                                                                _bar_exp,
+                                                                Int32(global_barrier_sleep_ns),
+                                                            )
+                                                    else:
+                                                        global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                    _ctrl_cached_wait_barrier = _bar_idx
+                                                    _ctrl_cached_wait_expected = _bar_exp
+                                            else:
+                                                _done_waits = Int32(1)
+                                        else:
+                                            _done_waits = Int32(1)
+
+                            _si = ld_shared_i32(store_idx_ptr)
+                            while (produce_idx - _si) >= Int32(num_pages):
+                                _wait_slot = produce_idx % Int32(num_pages)
+                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
+                                mbarrier_wait(
+                                    _compute_done_mbar(smem_base, _wait_slot), _wait_phase
+                                )
+                                _si = ld_shared_i32(store_idx_ptr)
+
+                            _p_slot = produce_idx % Int32(num_pages)
+                            _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
+                            _p_t0 = ld_shared_i32(_temp_instr + Int32(8))
+                            _p_t1 = ld_shared_i32(_temp_instr + Int32(12))
+                            _p_t2 = ld_shared_i32(_temp_instr + Int32(16))
+                            _p_t3 = ld_shared_i32(_temp_instr + Int32(20))
+                            _p_t4 = ld_shared_i32(_temp_instr + Int32(24))
                             st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_HANDLER_IDX),
@@ -1820,7 +1911,7 @@ class Megakernel:
                             st_shared_release_cta_i32(produce_idx_ptr, produce_idx)
 
                         if _instr_op == Int32(TileInstruction.END_MARKER):
-                            if _fetch_idx >= num_instructions:
+                            if _fetch_idx >= _fetch_limit:
                                 _store_idx_done = ld_shared_i32(store_idx_ptr)
                                 if (produce_idx - _store_idx_done) < Int32(num_pages):
                                     _sent = produce_idx % Int32(num_pages)
@@ -1912,7 +2003,7 @@ class Megakernel:
                                 )
                         _ldr_idx = _ldr_idx + Int32(1)
                     else:
-                        nanosleep(Int32(100))
+                        nanosleep(Int32(loader_idle_sleep_ns))
 
                     _ldr_done = ld_shared_i32(_ldr_load_done_ptr)
                     if _ldr_done == Int32(1) and _ldr_idx < ld_shared_acquire_cta_i32(_ldr_produce_ptr):
@@ -1947,6 +2038,9 @@ class Megakernel:
                         _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
                         _ds_meta_base = _op_meta_base(_ds_op)
                         _ds_handler = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
+                        _ds_signal_count = _op_meta_i32_base(
+                            op_meta_ptr, _ds_meta_base, Int32(_OP_META_SIGNAL_COUNT)
+                        )
                         _dl_store_handler_local = Int32(0)
                         if const_expr(dispatch_load_uses_handler_local_idx):
                             _dl_store_handler_local = _op_meta_i32_base(
@@ -2087,11 +2181,13 @@ class Megakernel:
                             )
 
                         with cute.arch.elect_one():
-                            signal_barriers(
-                                signal_meta_ptr,
-                                _ds_instruction_idx,
-                                barriers_ptr,
-                            )
+                            if _ds_signal_count > Int32(0):
+                                signal_barriers(
+                                    signal_meta_ptr,
+                                    _ds_instruction_idx,
+                                    _ds_signal_count,
+                                    barriers_ptr,
+                                )
                             if const_expr(has_communicate):
                                 signal_peer_barriers(
                                     peer_signal_ptr,
@@ -2426,6 +2522,10 @@ class Megakernel:
             self.config.noinline,
             self.config.inline_thin_phases,
             self.config.sync_compute_warps_after_tile,
+            self.config.per_sm_instruction_queues,
+            self.config.loader_idle_sleep_ns,
+            self.config.relaxed_global_barriers,
+            self.config.global_barrier_sleep_ns,
             self.config.opt_level,
         )
 

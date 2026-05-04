@@ -8,7 +8,8 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.ops import MAX_TILE_DIMS, Op
+from machete.megakernel.backend import _build_compile_key
+from machete.megakernel.ops import MAX_TILE_DIMS, Op, ScheduledOp, build_op_config
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
@@ -26,6 +27,39 @@ from typing import ClassVar, List
 class _NOPOp(Op):
     """Test-only no-op for barrier formula and instruction stream tests."""
     pass
+
+
+def test_barrier_static_dims_do_not_specialize_device_code():
+    """Barrier metadata is scheduler-only and must not duplicate handlers."""
+    op_a = ScheduledOp(
+        _NOPOp,
+        static_dims={"M": 16, "barrier_wait_alias_H": "layer_0"},
+    )
+    op_b = ScheduledOp(
+        _NOPOp,
+        static_dims={"M": 16, "barrier_wait_alias_H": "layer_1"},
+    )
+
+    key_a = _build_compile_key(
+        op_a,
+        all_local_tensor_names=(),
+        local_tensor_names={phase: () for phase in ("load", "compute", "store", "communicate")},
+        local_tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tensor_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+    )
+    key_b = _build_compile_key(
+        op_b,
+        all_local_tensor_names=(),
+        local_tensor_names={phase: () for phase in ("load", "compute", "store", "communicate")},
+        local_tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tensor_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+    )
+
+    assert key_a == key_b
+    assert build_op_config(op_a)["M"] == 16
+    assert "barrier_wait_alias_H" not in build_op_config(op_a)
 
 
 # =============================================================================
@@ -820,6 +854,29 @@ class TestSchedulerAPI:
         # Check op 1 has all 6 tiles
         op1_tiles = {(i.tiles[0], i.tiles[1]) for i in instructions if i.op_idx == 1}
         assert op1_tiles == {(m, n) for m in range(3) for n in range(2)}
+
+    def test_per_sm_queues_preserve_tiles(self):
+        """Per-SM queues must not drop or duplicate work tiles."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        instructions = builder.build()
+
+        _tensor, queued, queue_len = builder.build_queued_tensors(
+            instructions,
+            num_blocks=3,
+            device="cpu",
+        )
+
+        non_end = [instr for instr in queued if instr.op_idx != TileInstruction.END_MARKER]
+        keys = [(instr.op_idx, instr.tiles) for instr in non_end]
+        assert len(keys) == 12
+        assert len(set(keys)) == 12
+        assert queue_len >= 2
+
+        for block_idx in range(3):
+            queue_end = queued[block_idx * queue_len + queue_len - 1]
+            assert queue_end.op_idx == TileInstruction.END_MARKER
 
     def test_scheduler_is_abstract(self):
         """TileScheduler base class cannot be instantiated directly."""

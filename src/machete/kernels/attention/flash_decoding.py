@@ -210,26 +210,35 @@ class _FlashDecodingSplitTmaOp(Op):
         # is the cp.async BSHD path and does not.
         effective_page_size = page_size + _MBAR_BYTES if cls is _FlashDecodingSplitTmaOp else page_size
 
+        elem = q.element_size()
+        q_tile_bytes = M * D * elem
+        kv_budget = effective_page_size - q_tile_bytes - _MBAR_BYTES
+        max_n_block = kv_budget // (2 * D * elem)
+        n_block = 1 << int(math.log2(max(16, max_n_block)))
+        if N < n_block:
+            n_block = max(16, (N // 16) * 16)
+        num_n_blocks = (N + n_block - 1) // n_block
+
+        # Short decode contexts are combiner dominated. Long contexts benefit
+        # from smaller KV chunks, but oversplitting can leave numerically empty
+        # or too-small split work and has shown nonfinite outputs in decode.
+        if D >= 256 and N <= 4096:
+            min_blocks_per_split = 16
+        elif N < 1024:
+            min_blocks_per_split = 4
+        else:
+            min_blocks_per_split = 8
+        max_splits = max(1, num_n_blocks // min_blocks_per_split)
+        max_requested_splits = num_n_blocks if N < 1024 else max_splits
+
         # Auto num_splits
         if num_splits <= 0:
             num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
-            elem = q.element_size()
-            q_tile_bytes = M * D * elem
-            kv_budget = effective_page_size - q_tile_bytes - _MBAR_BYTES
-            max_n_block = kv_budget // (2 * D * elem)
-            n_block = 1 << int(math.log2(max(16, max_n_block)))
-            if N < n_block:
-                n_block = max(16, (N // 16) * 16)
-            num_n_blocks = (N + n_block - 1) // n_block
-
             total_mblocks = B * H  # 1 M-tile per head for decode
-            # Short decode contexts are launch/combiner dominated. Requiring a
-            # fatter KV chunk per split keeps batch-1 latency competitive with
-            # SDPA while still allowing many splits for long caches.
-            min_blocks_per_split = 16 if N <= 4096 else 8
-            max_splits = max(1, num_n_blocks // min_blocks_per_split)
             num_splits = min(num_SMs // max(total_mblocks, 1), max_splits)
-            num_splits = max(num_splits, 1)
+        else:
+            num_splits = min(num_splits, max_requested_splits)
+        num_splits = max(num_splits, 1)
 
         # Allocate intermediate buffers
         o_partial = torch.empty(B, H, num_splits, M, D, dtype=torch.float32, device=q.device)
@@ -1212,22 +1221,31 @@ class FlashDecodingSplitBSHDOp(_FlashDecodingSplitCpAsyncBase):
 
         effective_page_size = page_size
 
+        elem = q.element_size()
+        q_tile_bytes = M * D * elem
+        kv_budget = effective_page_size - q_tile_bytes
+        max_n_block = kv_budget // (2 * D * elem)
+        n_block = 1 << int(math.log2(max(16, max_n_block)))
+        if N < n_block:
+            n_block = max(16, (N // 16) * 16)
+        num_n_blocks = (N + n_block - 1) // n_block
+
+        if D >= 256 and N <= 4096:
+            min_blocks_per_split = 16
+        elif N < 1024:
+            min_blocks_per_split = 4
+        else:
+            min_blocks_per_split = 8
+        max_splits = max(1, num_n_blocks // min_blocks_per_split)
+        max_requested_splits = num_n_blocks if N < 1024 else max_splits
+
         if num_splits <= 0:
             num_SMs = torch.cuda.get_device_properties(q.device).multi_processor_count
-            elem = q.element_size()
-            q_tile_bytes = M * D * elem
-            kv_budget = effective_page_size - q_tile_bytes
-            max_n_block = kv_budget // (2 * D * elem)
-            n_block = 1 << int(math.log2(max(16, max_n_block)))
-            if N < n_block:
-                n_block = max(16, (N // 16) * 16)
-            num_n_blocks = (N + n_block - 1) // n_block
-
             total_mblocks = B * H
-            min_blocks_per_split = 16 if N <= 4096 else 8
-            max_splits = max(1, num_n_blocks // min_blocks_per_split)
             num_splits = min(num_SMs // max(total_mblocks, 1), max_splits)
-            num_splits = max(num_splits, 1)
+        else:
+            num_splits = min(num_splits, max_requested_splits)
+        num_splits = max(num_splits, 1)
 
         o_partial = torch.empty(B, H, num_splits, M, D, dtype=torch.float32, device=q.device)
         lse_partial = torch.empty(B, H, num_splits, M, dtype=torch.float32, device=q.device)
