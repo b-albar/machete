@@ -55,7 +55,9 @@ def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
     regimes the original GEMM-heavy geometry is still better.
     """
     if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
-        return fa_tpb
+        # The persistent TMA replay shell reserves three DMA warps. Keep at
+        # least one compute warp in the long-sequence geometry.
+        return max(fa_tpb, 128)
     return max(gemm_tpb, fa_tpb)
 
 

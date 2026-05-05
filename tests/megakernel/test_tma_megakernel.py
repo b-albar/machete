@@ -147,6 +147,28 @@ class TestTMAMegakernel:
         Megakernel(ops).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
+    def test_tma_add_one_multi_wave(self):
+        """A resident CTA can process more than one TMA tile without hanging."""
+        M = TILE_M * 4
+        torch.manual_seed(42)
+        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=2, threads_per_block=128),
+        ).run()
+        torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_replay_rejects_dma_only_thread_geometry(self):
+        """TMA replay must not silently launch with no compute warps."""
+        torch.manual_seed(42)
+        x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        with pytest.raises(RuntimeError, match="at least one compute warp"):
+            Megakernel(ops, config=MegakernelConfig(threads_per_block=96)).compile()
+
     def test_tma_add_one_single_tile_noinline(self):
         """Noinline path should rebuild exec TMA from runtime desc pointers."""
         torch.manual_seed(42)

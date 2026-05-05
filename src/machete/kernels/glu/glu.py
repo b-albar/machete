@@ -382,7 +382,7 @@ class GLUOp(Op):
         self.effective_threads = self.effective_warps * 32
 
         if self.activation == ACT_SILU:
-            self.compute = self.compute_silu
+            self._bind_phase("compute", "compute_silu")
 
     # =========================================================================
     # Scheduling

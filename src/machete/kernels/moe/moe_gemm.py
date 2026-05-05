@@ -133,8 +133,7 @@ class MoeGemmOp(Op):
             f"tile_M={self.tile_size_M}, tile_N={self.tile_size_N}, tile_K={self.tile_K}"
         )
 
-        # Override compute to the MMA method (FlashAttentionSm120Op pattern)
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,

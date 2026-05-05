@@ -85,6 +85,8 @@ class CrossEntropyOp(Op):
     }
     tile = ("BT",)
     tma_loads = {"logits"}
+    load_phase = "load_logits"
+    compute_phase = "compute_ce"
 
     @classmethod
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
@@ -124,10 +126,6 @@ class CrossEntropyOp(Op):
         # Smem offsets: buf0 | buf1 | mbarriers | scratch
         self.mbar_offset = self.buf_bytes * 2
         self.scratch_offset = self.mbar_offset + 32  # after 4×8 mbarriers
-
-        # Override compute and load methods
-        self.compute = self.compute_ce
-        self.load = self.load_logits
 
     # =========================================================================
     # Scheduling

@@ -27,6 +27,7 @@ from .ops import (
     MAX_TILE_DIMS,
     ScheduledOp,
     build_op_config,
+    linearize_scheduled_items,
 )
 from .registries import (
     TensorRegistry,
@@ -38,6 +39,7 @@ from .registries import (
 from .scheduling import (
     BarrierFormula,
     InstructionStreamBuilder,
+    ReadyScheduler,
     TileInstruction,
 )
 from .compile import exec_generated_source
@@ -193,8 +195,9 @@ class MegakernelConfig:
     inline_thin_phases: bool = True
     sync_compute_warps_after_tile: bool = True
     per_sm_instruction_queues: bool = False
+    compute_only_replay: bool = True
     loader_idle_sleep_ns: int = 100
-    relaxed_global_barriers: bool = False
+    relaxed_global_barriers: bool = True
     global_barrier_sleep_ns: int = 8
     opt_level: int = 2
     backend: str = "handler"
@@ -390,12 +393,14 @@ class Megakernel:
         scheduler: Optional["TileScheduler"] = None,
     ):
         """Construct a megakernel instance and build its host-side runtime state."""
-        self.ops = ops
+        self.scheduled_items = tuple(ops)
+        self.ops, self.regions = linearize_scheduled_items(ops)
         self.config = config or MegakernelConfig()
         if self.config.backend == "runtime":
             self.config.backend = "handler"
         self.device = device
         self._scheduler = scheduler
+        ops = self.ops
         if self._ops_use_coalesced_pipeline(ops):
             Megakernel._unload_active_tma_modules()
             Megakernel._drop_cached_tma_kernels()
@@ -430,6 +435,13 @@ class Megakernel:
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
 
+        if (
+            self._scheduler is None
+            and self.config.per_sm_instruction_queues
+            and self._layout.num_pages > 1
+        ):
+            self._scheduler = ReadyScheduler()
+
         # Validate that config page_size is large enough for all ops
         for op in ops:
             op_page = op.static_dims.get('page_size')
@@ -459,7 +471,7 @@ class Megakernel:
 
         # Build instruction stream
         # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
-        self._builder = InstructionStreamBuilder()
+        self._builder = InstructionStreamBuilder(region_records=self.regions)
         for op in ops:
             self._builder.add_op(op)
 
@@ -516,6 +528,7 @@ class Megakernel:
         self._launch_state: Optional[_LaunchState] = None
         self._cached_cu_stream = None
         self._cached_torch_stream_id = None
+        self._max_wait_formulas: int = 1
 
         # Validate barrier formulas eagerly (catches incompatible tile sizes early)
         _ = self._builder.num_barriers
@@ -563,6 +576,8 @@ class Megakernel:
         """Prepare instruction, barrier, wait_info, and config tensors on GPU."""
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
+            if self._ops_use_coalesced_pipeline(self.ops):
+                instructions = self._builder.coalesce_pipeline_instructions(instructions)
             if self.config.per_sm_instruction_queues:
                 (
                     self._instructions_tensor,
@@ -572,6 +587,7 @@ class Megakernel:
                     instructions,
                     self.num_sms,
                     device=self.device,
+                    preserve_instruction_order=isinstance(self._scheduler, ReadyScheduler),
                 )
                 self._num_instructions = queue_len
                 wait_queue_len = queue_len
@@ -590,10 +606,11 @@ class Megakernel:
                 num_blocks=self.num_sms,
                 queue_len=wait_queue_len,
             )
-            self._max_signal_formulas = max(1, self._builder.max_signal_deps)
+            self._max_wait_formulas = max(1, self._wait_info.shape[1] // 2)
             self._signal_metadata_tensor = self._builder.build_signal_info_tensor(
                 materialized_instructions, self.device
             )
+            self._max_signal_formulas = max(1, self._signal_metadata_tensor.shape[1])
 
         if self._barriers_tensor is None:
             self._barriers_tensor = torch.zeros(self.num_barriers, dtype=torch.int32, device=self.device)
@@ -626,7 +643,8 @@ class Megakernel:
         formulas = self._builder.get_op_barrier_formulas()
         self._max_signal_formulas = max(1, self._builder.max_signal_deps)
         threads_per_block = self.config.threads_per_block
-        num_compute_threads = threads_per_block - NUM_DMA_WARPS * 32
+        num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
+        num_compute_threads = threads_per_block - num_dma_warps * 32
         default_num_mma_warps = num_compute_threads // 32
 
         op_meta = []
@@ -672,6 +690,8 @@ class Megakernel:
                 )
             tile_strides = self._tile_linear_strides(op.tile_counts)
             _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
+            wait_count = self._builder._op_wait_counts.get(op_idx, len(_wait_formulas))
+            signal_count = self._builder._op_signal_counts.get(op_idx, len(_signal_formulas))
             # Keep op_config_ptr live for every phase.
             #
             # Phase wrappers may reconstruct tensors from op_config_ptr even
@@ -699,8 +719,8 @@ class Megakernel:
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
                     int(op_handler_indices[op_idx]),
                     *self._phase_local_indices_for_op(op_phase_local_indices, op_idx),
-                    len(_wait_formulas),
-                    len(_signal_formulas),
+                    wait_count,
+                    signal_count,
                     int(op.static_dims.get("barrier_wait_acquire", 0)),
                 ]
             )
@@ -925,6 +945,22 @@ class Megakernel:
         """Validate GPU requirements."""
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
+
+        if self.config.threads_per_block % 32 != 0:
+            raise RuntimeError(
+                "MegakernelConfig.threads_per_block must be a multiple of 32 "
+                f"(got {self.config.threads_per_block})."
+            )
+
+        if not self._use_compute_only_replay():
+            num_mma_warps = self.config.threads_per_block // 32 - NUM_DMA_WARPS
+            if num_mma_warps < 1:
+                raise RuntimeError(
+                    "TMA megakernel replay requires at least one compute warp "
+                    f"in addition to the {NUM_DMA_WARPS} DMA warps. "
+                    f"Increase MegakernelConfig.threads_per_block to at least "
+                    f"{(NUM_DMA_WARPS + 1) * 32}; got {self.config.threads_per_block}."
+                )
 
         device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device)
@@ -1486,6 +1522,30 @@ class Megakernel:
         )
 
     @staticmethod
+    def _op_has_phased_replay(op: ScheduledOp) -> bool:
+        """Return whether an op needs the load/store replay shell."""
+        from .ops import Op
+
+        op_cls = op.op_cls
+        return (
+            getattr(op_cls, "load_phase", None) is not None
+            or getattr(op_cls, "store_phase", None) is not None
+            or getattr(op_cls, "communicate_phase", None) is not None
+            or getattr(op_cls, "load") is not Op.load
+            or getattr(op_cls, "store") is not Op.store
+            or getattr(op_cls, "communicate", None) is not getattr(Op, "communicate", None)
+        )
+
+    def _use_compute_only_replay(self) -> bool:
+        """Use the lighter replay loop when no TMA or peer phases exist."""
+        return (
+            bool(self.config.compute_only_replay)
+            and not self._tma_registry.has_tma
+            and not self._peer_tma_registry.has_peer_tma
+            and not any(self._op_has_phased_replay(op) for op in self.ops)
+        )
+
+    @staticmethod
     def _resolve_warp_register_api():
         """Resolve the CuTe warp register allocation API, with a no-op fallback."""
         try:
@@ -1514,7 +1574,8 @@ class Megakernel:
         """Collect the compile-time constants used to build the persistent kernel."""
         layout = self._layout
         threads_per_block = self.config.threads_per_block
-        num_mma_warps = (threads_per_block // 32) - NUM_DMA_WARPS
+        num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
+        num_mma_warps = (threads_per_block // 32) - num_dma_warps
 
         return {
             "num_sms": self.config.num_sms,
@@ -1531,6 +1592,7 @@ class Megakernel:
             "compute_done_mbar_offset_0": layout.compute_done_mbar_offset(0),
             "num_mma_warps": num_mma_warps,
             "num_compute_threads": num_mma_warps * 32,
+            "num_dma_warps": num_dma_warps,
             "dma_reg_count": self.config.dma_reg_count,
             "mma_reg_count": self.config.mma_reg_count,
             "actual_threads_per_block": threads_per_block,
@@ -1704,7 +1766,7 @@ class Megakernel:
             "phase_uses_desc_slot_selector": phase_uses_desc_slot_selector,
             "has_communicate": has_communicate,
             "needs_warp_transition": any(w < kernel_cfg["num_mma_warps"] for w in per_op_warps),
-            "max_waits": max(1, self._builder.max_wait_deps),
+            "max_waits": self._max_wait_formulas,
             "signal_barriers": _signal_barriers_from_meta,
             "signal_peer_barriers": _signal_peer_barriers_from_meta,
             "trace_exec_globals": trace_exec_globals,
@@ -2409,6 +2471,186 @@ class Megakernel:
 
         return _kernel_loop_ring
 
+    def _build_compute_only_kernel_loop(self, kernel_cfg, runtime):
+        """Build a lighter replay loop for graphs with compute phases only."""
+        tracing = bool(self.config.tracing)
+        dispatch_compute = runtime["dispatch_compute"]
+        signal_barriers = runtime["signal_barriers"]
+        max_waits = runtime["max_waits"]
+        num_mma_warps = kernel_cfg["num_mma_warps"]
+        num_compute_threads = kernel_cfg["num_compute_threads"]
+        mma_reg_count = kernel_cfg["mma_reg_count"]
+        sync_compute_warps_after_tile = bool(self.config.sync_compute_warps_after_tile)
+        relaxed_global_barriers = bool(self.config.relaxed_global_barriers)
+        global_barrier_sleep_ns = int(self.config.global_barrier_sleep_ns)
+
+        @cute.jit
+        def _kernel_loop_compute_only(
+            instructions_ptr: Int64,
+            barriers_ptr: Int64,
+            op_configs_ptr: Int64,
+            op_meta_ptr: Int64,
+            signal_meta_ptr: Int64,
+            num_instructions: Int32,
+            tidx: Int32,
+            block_id: Int32,
+            num_blocks: Int32,
+            smem_base: Int32,
+            trace_buffer_ptr: Int64,
+            wait_info_ptr: Int64,
+        ):
+            warp_id = tidx // Int32(32)
+            lane_id = tidx % Int32(32)
+            if warp_id < Int32(num_mma_warps):
+                setmaxregister_increase(mma_reg_count)
+
+            iq_base = smem_base + Int32(iq_offset)
+            _fetch_idx = block_id
+            _fetch_limit = num_instructions
+            _fetch_stride = num_blocks
+            if const_expr(per_sm_instruction_queues):
+                _fetch_idx = block_id * num_instructions
+                _fetch_limit = _fetch_idx + num_instructions
+                _fetch_stride = Int32(1)
+
+            _cached_op_idx = Int32(-1)
+            _cached_wait_count = Int32(0)
+            _cached_wait_acquire = Int32(0)
+            _cached_signal_count = Int32(0)
+            _cached_wait_barrier = Int32(-2)
+            _cached_wait_expected = Int32(-1)
+            _running = Int32(1)
+            _instruction_idx = Int32(0)
+
+            while _running == Int32(1):
+                if warp_id == Int32(0) and lane_id == Int32(0):
+                    _instr_op = Int32(TileInstruction.END_MARKER)
+                    if _fetch_idx < _fetch_limit:
+                        load_instruction_to_smem(instructions_ptr, _fetch_idx, iq_base)
+                        _instr_op, _lin = ld_shared_v2_b32(iq_base)
+                        _instruction_idx = _fetch_idx
+                        if _instr_op == Int32(TileInstruction.END_MARKER):
+                            _fetch_idx = _fetch_limit
+                        else:
+                            _fetch_idx = _fetch_idx + _fetch_stride
+                    else:
+                        st_shared_i32(iq_base, Int32(TileInstruction.END_MARKER))
+                named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+                op_idx, _lin_idx = ld_shared_v2_b32(iq_base)
+                if op_idx == Int32(TileInstruction.END_MARKER):
+                    _running = Int32(0)
+
+                if op_idx != Int32(TileInstruction.END_MARKER):
+                    _config = Int64(0)
+                    _handler = Int32(0)
+                    _compute_local = Int32(0)
+                    _meta_base = _op_meta_base(op_idx)
+                    _uses_mask = _op_meta_i32_base(
+                        op_meta_ptr, _meta_base, Int32(_OP_META_USES_CONFIG_MASK)
+                    )
+                    if _uses_mask != Int32(0):
+                        _config = ld_global_i64(op_configs_ptr, op_idx)
+                    _handler = _op_meta_i32_base(
+                        op_meta_ptr, _meta_base, Int32(_OP_META_HANDLER_IDX)
+                    )
+                    if const_expr(dispatch_compute_uses_handler_local_idx):
+                        _compute_local = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_COMPUTE_LOCAL_IDX)
+                        )
+
+                    if warp_id == Int32(0) and lane_id == Int32(0):
+                        if op_idx != _cached_op_idx:
+                            _cached_wait_count = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
+                            )
+                            _cached_signal_count = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
+                            )
+                            _cached_wait_acquire = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                            )
+                            _cached_op_idx = op_idx
+
+                        if _cached_wait_count > Int32(0):
+                            _done_waits = Int32(0)
+                            for _w in range_constexpr(max_waits):
+                                if _done_waits == Int32(0):
+                                    if _w < _cached_wait_count:
+                                        _wi_off = _instruction_idx * Int32(max_waits * 2) + Int32(_w * 2)
+                                        _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
+                                        if _bar_idx >= Int32(0):
+                                            _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
+                                            if (
+                                                _bar_idx != _cached_wait_barrier
+                                                or _bar_exp != _cached_wait_expected
+                                            ):
+                                                if const_expr(relaxed_global_barriers):
+                                                    if _cached_wait_acquire != Int32(0):
+                                                        global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                    else:
+                                                        global_barrier_wait_relaxed(
+                                                            barriers_ptr,
+                                                            _bar_idx,
+                                                            _bar_exp,
+                                                            Int32(global_barrier_sleep_ns),
+                                                        )
+                                                else:
+                                                    global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                _cached_wait_barrier = _bar_idx
+                                                _cached_wait_expected = _bar_exp
+                                        else:
+                                            _done_waits = Int32(1)
+                                    else:
+                                        _done_waits = Int32(1)
+
+                    named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+                    tile_0 = ld_shared_i32(iq_base + Int32(8))
+                    tile_1 = ld_shared_i32(iq_base + Int32(12))
+                    tile_2 = ld_shared_i32(iq_base + Int32(16))
+                    tile_3 = ld_shared_i32(iq_base + Int32(20))
+                    tile_4 = ld_shared_i32(iq_base + Int32(24))
+                    page_ptr = _get_page_ptr(smem_base, Int32(0))
+                    if const_expr(dispatch_compute_uses_handler_local_idx):
+                        dispatch_compute(
+                            _handler,
+                            _compute_local,
+                            page_ptr,
+                            tile_0,
+                            tile_1,
+                            tile_2,
+                            tile_3,
+                            tile_4,
+                            _config,
+                        )
+                    else:
+                        dispatch_compute(
+                            _handler,
+                            page_ptr,
+                            tile_0,
+                            tile_1,
+                            tile_2,
+                            tile_3,
+                            tile_4,
+                            _config,
+                        )
+
+                    if const_expr(sync_compute_warps_after_tile):
+                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+                    if warp_id == Int32(0) and lane_id == Int32(0):
+                        if _cached_signal_count > Int32(0):
+                            signal_barriers(
+                                signal_meta_ptr,
+                                _instruction_idx,
+                                _cached_signal_count,
+                                barriers_ptr,
+                            )
+                named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+        return _kernel_loop_compute_only
+
     def _build_kernel(
         self,
         kernel_loop_fn,
@@ -2530,7 +2772,10 @@ class Megakernel:
         """
         kernel_cfg = self._kernel_static_config()
         runtime = self._kernel_runtime_components(kernel_cfg)
-        kernel_loop_fn = self._build_ring_kernel_loop(kernel_cfg, runtime)
+        if self._use_compute_only_replay():
+            kernel_loop_fn = self._build_compute_only_kernel_loop(kernel_cfg, runtime)
+        else:
+            kernel_loop_fn = self._build_ring_kernel_loop(kernel_cfg, runtime)
 
         return self._build_kernel(
             kernel_loop_fn,
@@ -2582,7 +2827,7 @@ class Megakernel:
             for phase in PHASE_NAMES
         )
         signal_shape_key = (
-            self._builder.max_wait_deps,
+            self._max_wait_formulas,
             self._max_signal_formulas,
         )
 
@@ -2600,6 +2845,7 @@ class Megakernel:
             self.config.inline_thin_phases,
             self.config.sync_compute_warps_after_tile,
             self.config.per_sm_instruction_queues,
+            self.config.compute_only_replay,
             self.config.loader_idle_sleep_ns,
             self.config.relaxed_global_barriers,
             self.config.global_barrier_sleep_ns,

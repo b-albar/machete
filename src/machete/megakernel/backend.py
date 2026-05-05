@@ -7,7 +7,13 @@ import inspect
 from functools import lru_cache
 from typing import Any, Dict, List, Tuple
 
-from .backend_ir import BackendIR, HandlerSpec, OpCompileSpec
+from .backend_ir import (
+    BackendIR,
+    HandlerSpec,
+    OpCompileSpec,
+    ProtocolRoleSpec,
+    RegionCompileSpec,
+)
 from .backend_dispatch import compile_phase_dispatch_inputs
 from .ops import build_op_config, is_compile_static_dim
 
@@ -89,10 +95,10 @@ def _callable_param_names(method_target) -> Tuple[str, ...]:
 def _phase_param_names_for_instance(op_obj, phase_name: str) -> Tuple[str, ...]:
     """Return parameter names for the concrete phase bound on one instance.
 
-    Some ops, notably SM120 attention, rebind ``self.compute`` at construction
-    time to a more specialized implementation. The backend must follow that
-    concrete callable rather than the class-level placeholder method when it
-    decides which tensors/TMA args a phase consumes.
+    Some ops expose a specialized implementation through a phase alias or a
+    config-dependent phase choice. The backend must follow that concrete
+    callable rather than the class-level placeholder method when it decides
+    which tensors/TMA args a phase consumes.
     """
     method = getattr(op_obj, phase_name, None)
     if method is None:
@@ -178,6 +184,7 @@ def _build_compile_key(
         )
         if op.static_dims else ()
     )
+    tile_sizes_key = tuple(sorted(op.tile_sizes.items())) if op.tile_sizes else ()
     dtypes_key = (
         tuple(sorted((name, dtype.__name__) for name, dtype in op.tensor_dtypes.items()))
         if op.tensor_dtypes else ()
@@ -188,6 +195,7 @@ def _build_compile_key(
     )
     return (
         op.op_cls,
+        tile_sizes_key,
         static_dims_key,
         dtypes_key,
         strides_key,
@@ -204,6 +212,7 @@ def build_handler_backend_ir(kernel) -> BackendIR:
     peer_tma_registry = kernel._peer_tma_registry
 
     op_specs: List[OpCompileSpec] = []
+    region_specs: List[RegionCompileSpec] = []
     handler_specs: List[HandlerSpec] = []
     op_handler_indices: List[int] = []
     op_phase_local_indices: Dict[str, List[int]] = {phase: [] for phase in PHASE_NAMES}
@@ -215,7 +224,49 @@ def build_handler_backend_ir(kernel) -> BackendIR:
     }
     phase_transport_idx: Dict[str, Dict[Tuple[str, ...], int]] = {phase: {} for phase in PHASE_NAMES}
     phase_transport_records: Dict[str, List[Tuple[str, ...]]] = {phase: [] for phase in PHASE_NAMES}
-    num_compute_threads = kernel.config.threads_per_block - NUM_DMA_WARPS * 32
+    num_dma_warps = 0 if kernel._use_compute_only_replay() else NUM_DMA_WARPS
+    num_compute_threads = kernel.config.threads_per_block - num_dma_warps * 32
+
+    for region_idx, region in enumerate(getattr(kernel, "regions", ())):
+        if region.start_op < 0 or region.end_op > len(kernel.ops) or region.start_op >= region.end_op:
+            raise ValueError(
+                f"invalid persistent region span {region.name!r}: "
+                f"[{region.start_op}, {region.end_op}) for {len(kernel.ops)} ops"
+            )
+        region_specs.append(
+            RegionCompileSpec(
+                region_idx=region_idx,
+                name=region.name,
+                start_op=region.start_op,
+                end_op=region.end_op,
+                lowering=region.lowering,
+                page_roles=tuple(
+                    ProtocolRoleSpec(role.name, role.offset, role.count)
+                    for role in region.protocol.page_roles
+                ),
+                semaphore_roles=tuple(
+                    ProtocolRoleSpec(
+                        role.name,
+                        role.offset,
+                        role.count,
+                        role.participants,
+                    )
+                    for role in region.protocol.semaphore_roles
+                ),
+                page_count=region.protocol.page_count,
+                page_bytes=region.protocol.page_bytes,
+                semaphore_count=region.protocol.semaphore_count,
+                scratch_bytes=region.protocol.scratch_bytes,
+                resource_bytes=region.protocol.resource_bytes,
+                input_stages=region.pipeline.input_stages,
+                output_stages=region.pipeline.output_stages,
+                stage_pages=region.pipeline.stage_pages,
+                range_axis=region.pipeline.range_axis,
+                range_end_axis=region.pipeline.range_end_axis,
+                range_block_size=region.pipeline.range_block_size,
+                coalesce_ranges=region.pipeline.coalesce_ranges,
+            )
+        )
 
     for i, op in enumerate(kernel.ops):
         instance = op.op_cls(**build_op_config(op, kernel_config={"threads_per_row": num_compute_threads}))
@@ -348,6 +399,7 @@ def build_handler_backend_ir(kernel) -> BackendIR:
 
     return BackendIR(
         op_specs=tuple(op_specs),
+        region_specs=tuple(region_specs),
         handler_specs=tuple(handler_specs),
         op_handler_indices=tuple(op_handler_indices),
         op_phase_local_indices={k: tuple(v) for k, v in op_phase_local_indices.items()},
@@ -387,7 +439,7 @@ class HandlerBackend:
         return compile_phase_dispatch_inputs(
             self,
             kernel,
-            num_dma_warps=NUM_DMA_WARPS,
+            num_dma_warps=0 if kernel._use_compute_only_replay() else NUM_DMA_WARPS,
             phase_should_noinline=phase_should_noinline,
         )
 

@@ -111,7 +111,7 @@ class GDNStateRecurrenceOp(Op):
         gbuf_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._gbuf_offset = ((gbuf_start + 15) // 16) * 16
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

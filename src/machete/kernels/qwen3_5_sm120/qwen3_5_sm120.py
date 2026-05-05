@@ -62,7 +62,7 @@ class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
     double-buffered stream through op-local mbarriers.
     """
 
-    pipeline = PipelineSpec.staged_matvec(
+    pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_block_size=16,
     )
@@ -224,8 +224,8 @@ class Qwen3_5LmHeadGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("S", QWEN3_5_DECODE_S)
-        tile_sizes.setdefault("N", 64)
-        tile_sizes.setdefault("K", 64)
+        tile_sizes.setdefault("N", 128)
+        tile_sizes.setdefault("K", 32)
         vocab = tensors["b"].shape[0]
         if vocab % tile_sizes["N"] != 0:
             raise ValueError(
@@ -437,7 +437,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
     warps then reuse that staged tile for all decode rows.
     """
 
-    pipeline = PipelineSpec.staged_matvec(
+    pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_end_axis=3,
         range_block_size=1,
@@ -632,6 +632,12 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
 class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
     """Streaming decode LM head that returns top-1 per row without logits."""
 
+    pipeline = PipelineSpec.streaming(
+        range_axis=2,
+        range_end_axis=3,
+        range_block_size=0,
+        coalesce_ranges=True,
+    )
     reads = {
         "h": (None, ("B", "S", "K")),
         "weight": (None, ("N", "K")),
@@ -776,7 +782,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
 class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
     """Ranged residual-add RMSNorm + projection with normalized activation reuse."""
 
-    pipeline = PipelineSpec.staged_matvec(
+    pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_end_axis=3,
         range_block_size=1,
@@ -1004,7 +1010,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
     coalesced range.
     """
 
-    pipeline = PipelineSpec.staged_matvec(
+    pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_end_axis=3,
         range_block_size=1,
@@ -1489,10 +1495,455 @@ class Qwen3_5DecodeMatvecGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
         return super().schedule(tile_sizes=tile_sizes, page_size=page_size, **tensors)
 
 
+class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
+    """Packed QKV projection chunk with Q/K norm partials for the finalizer."""
+
+    writes = {
+        "c": (None, ("B", "S", "N")),
+        "qk_sumsq": (cutlass.Float32, ("B", "S", "H", "C")),
+    }
+    tma_stores = {"c"}
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        qk_sumsq = tensors.get("qk_sumsq")
+        if qk_sumsq is None:
+            raise ValueError(f"{cls.__name__} requires qk_sumsq")
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("N", 64)
+        tile_sizes.setdefault("K", 64)
+        ops = super().schedule(tile_sizes=tile_sizes, page_size=page_size, **tensors)
+        for op in ops:
+            op.static_dims["num_qk_heads"] = QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS
+            op.static_dims["head_dim"] = QWEN3_5_HEAD_DIM
+            op.static_dims["head_chunks"] = QWEN3_5_HEAD_DIM // op.tile_sizes["N"]
+        return ops
+
+    @cute.jit
+    def store(self, page_ptr, tile_B, tile_S, tile_N, qk_sumsq, c_tma, c_tma_gmem, op_config_ptr):
+        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+        sC = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
+                swz_c,
+                dtype=self.c_dtype,
+            ),
+            cute.make_layout(
+                (self.tile_size_N, self.tile_size_S, 1),
+                stride=(1, self.tile_size_N, self.tile_size_N * self.tile_size_S),
+            ),
+        )
+
+        gC = cute.local_tile(
+            c_tma_gmem,
+            (self.tile_size_N, self.tile_size_S, 1),
+            (None, None, None),
+        )
+        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+            c_tma,
+            Int32(0),
+            cute.make_layout(1),
+            cute.group_modes(sC, 0, 3),
+            cute.group_modes(gC, 0, 3),
+        )
+        with cute.arch.elect_one():
+            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+        head = tile_N // Int32(self.head_chunks)
+        chunk = tile_N - head * Int32(self.head_chunks)
+        if head < Int32(self.num_qk_heads):
+            runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+            row_start = tile_S * Int32(self.tile_size_S)
+            lane_idx = cute.arch.lane_idx()
+            for local_row in range(self.tile_size_S):
+                row_idx = row_start + Int32(local_row)
+                if row_idx < runtime_S:
+                    partial = Float32(0.0)
+                    local_n = lane_idx
+                    while local_n < Int32(self.tile_size_N):
+                        v = sC[(local_n, Int32(local_row), Int32(0))].to(Float32)
+                        partial = partial + v * v
+                        local_n = local_n + Int32(32)
+                    total = cute.arch.warp_reduction(partial, operator.add)
+                    if lane_idx == Int32(0):
+                        qk_sumsq[
+                            (
+                                tile_B,
+                                row_idx,
+                                head,
+                                chunk,
+                            )
+                        ] = total
+
+
+class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDecodeGemmSm120Op):
+    """Compute-driven fused residual-add RMSNorm plus packed QKV projection."""
+
+    pipeline = PipelineSpec.streaming(
+        range_axis=2,
+        range_end_axis=3,
+        range_block_size=1,
+        coalesce_ranges=True,
+    )
+    pipeline_abi = PipelineABI.op_owned()
+    reads = {
+        "a": (None, ("B", "S", "K")),
+        "residual_in": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+        "b": (None, ("N", "K")),
+    }
+    writes = {
+        "residual_out": (None, ("B", "S", "K")),
+        "c": (None, ("B", "S", "N")),
+        "qk_sumsq": (cutlass.Float32, ("B", "S", "H", "C")),
+    }
+    tma_loads = set()
+    tma_compute_loads = {"b"}
+    tma_compute_stores = {"c"}
+    tma_stores = set()
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=QWEN3_5_EPS, **tensors):
+        qk_sumsq = tensors.get("qk_sumsq")
+        if qk_sumsq is None:
+            raise ValueError(f"{cls.__name__} requires qk_sumsq")
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("N", 64)
+        tile_sizes.setdefault("K", 32)
+        ops = super().schedule(tile_sizes=tile_sizes, page_size=page_size, eps=eps, **tensors)
+        for op in ops:
+            op.static_dims["num_qk_heads"] = QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS
+            op.static_dims["head_dim"] = QWEN3_5_HEAD_DIM
+            op.static_dims["head_chunks"] = QWEN3_5_HEAD_DIM // op.tile_sizes["N"]
+        return ops
+
+    @cute.jit
+    def load(self, page_ptr):
+        pass
+
+    @cute.jit
+    def store(self, page_ptr):
+        pass
+
+    @cute.jit
+    def _issue_b_tma(self, page_ptr, stream_idx, k_block, tile_N, b_tma, b_tma_gmem, kr_0, kr_1):
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+        buf_idx = stream_idx % Int32(2)
+        buf_base = page_ptr + buf_idx * Int32(self.buf_stride)
+        sB = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(
+                    self.b_dtype,
+                    buf_base + Int32(self.b_offset),
+                    cute.AddressSpace.smem,
+                    assumed_align=128,
+                ),
+                swz,
+                dtype=self.b_dtype,
+            ),
+            cute.make_layout((self.tile_K, self.tile_size_N), stride=(1, self.tile_K)),
+        )
+        gB = cute.local_tile(b_tma_gmem, (self.tile_K, self.tile_size_N), (None, None))
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            b_tma,
+            Int32(0),
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 2),
+            cute.group_modes(gB, 0, 2),
+        )
+        if cute.arch.warp_idx() == Int32(0):
+            if buf_idx == Int32(0):
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(kr_0, Int32(self.b_tile_bytes))
+                kr_ptr = cute.make_ptr(cutlass.Int64, kr_0, cute.AddressSpace.smem)
+                cute.copy(b_tma, tBgB[(None, k_block, tile_N)], tBsB, tma_bar_ptr=kr_ptr)
+            if buf_idx == Int32(1):
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(kr_1, Int32(self.b_tile_bytes))
+                kr_ptr = cute.make_ptr(cutlass.Int64, kr_1, cute.AddressSpace.smem)
+                cute.copy(b_tma, tBgB[(None, k_block, tile_N)], tBsB, tma_bar_ptr=kr_ptr)
+
+    @cute.jit
+    def _fill_a_block(self, page_ptr, tidx, tile_B, tile_S, k_idx,
+                      a, residual_in, norm_weight, rstd_scratch, op_config_ptr):
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+        buf_idx = k_idx % Int32(2)
+        buf_base = page_ptr + buf_idx * Int32(self.buf_stride)
+        row_start = tile_S * Int32(self.tile_size_S)
+        sA = cute.make_tensor(
+            cute.recast_ptr(
+                cute.make_ptr(self.a_dtype, buf_base, cute.AddressSpace.smem, assumed_align=128),
+                swz,
+                dtype=self.a_dtype,
+            ),
+            cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                             stride=(1, self.tile_K, self.tile_K * self.tile_size_S)),
+        )
+        linear = tidx
+        while linear < Int32(self.tile_K * self.tile_size_S):
+            local_k = linear % Int32(self.tile_K)
+            local_row = linear // Int32(self.tile_K)
+            row_idx = row_start + local_row
+            k = k_idx * Int32(self.tile_K) + local_k
+            if row_idx < runtime_S and k < Int32(self.K):
+                base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
+                res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
+                a_row = cute.make_tensor(a.iterator + base, cute.make_layout(self.K))
+                res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.K))
+                w_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+                val = (
+                    (a_row[k].to(Float32) + res_row[k].to(Float32))
+                    * rstd_scratch[local_row]
+                    * w_row[k].to(Float32)
+                )
+                sA[(local_k, local_row, Int32(0))] = val.to(self.a_dtype)
+            linear = linear + Int32(self.num_mma_threads)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3,
+                a, residual_in, norm_weight, residual_out, qk_sumsq,
+                b_tma, b_tma_gmem, c_tma, c_tma_gmem, op_config_ptr):
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        tidx = cute.arch.thread_idx()[0]
+        if tidx < Int32(self.num_mma_threads):
+            lane_idx = cute.arch.lane_idx()
+            warp_idx = cute.arch.warp_idx()
+            swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+
+            kr_0 = page_ptr + Int32(self.mbar_offset + 16)
+            kr_1 = page_ptr + Int32(self.mbar_offset + 24)
+            with cute.arch.elect_one():
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+            mbarrier_init_fence()
+
+            rstd_scratch = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Float32,
+                    page_ptr + Int32(self.rms_scratch_offset),
+                    cute.AddressSpace.smem,
+                ),
+                cute.make_layout(self.tile_size_S),
+            )
+            row_start = tile_S * Int32(self.tile_size_S)
+            for local_row in range(warp_idx, self.tile_size_S, self.num_mma_warps):
+                row_idx = row_start + Int32(local_row)
+                if row_idx < runtime_S:
+                    partial = Float32(0.0)
+                    base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
+                    res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
+                    out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                    a_row = cute.make_tensor(a.iterator + base, cute.make_layout(self.K))
+                    res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.K))
+                    out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.K))
+                    k = lane_idx
+                    while k < Int32(self.K):
+                        val = a_row[k].to(Float32) + res_row[k].to(Float32)
+                        partial = partial + val * val
+                        out_row[k] = val.to(self.residual_out_dtype)
+                        k = k + Int32(32)
+                    total = cute.arch.warp_reduction(partial, operator.add)
+                    if lane_idx == Int32(0):
+                        rstd_scratch[Int32(local_row)] = cute.math.rsqrt(
+                            total * Float32(1.0 / self.K) + Float32(self.eps),
+                            fastmath=True,
+                        )
+            named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+            mma_op = cute.nvgpu.warp.MmaF16BF16Op(self.a_dtype, Float32, (16, 8, 16))
+            tiled_mma = cute.make_tiled_mma(
+                mma_op,
+                cute.make_layout((self.num_mma_warps, 1, 1)),
+                permutation_mnk=(self.num_mma_warps * 16, 16, 16),
+            )
+            thr_mma = tiled_mma.get_slice(tidx)
+            smem_copy_atom_A = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                self.a_dtype,
+            )
+            smem_tiled_copy_A = cute.make_tiled_copy_A(smem_copy_atom_A, tiled_mma)
+            smem_thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
+            smem_copy_atom_B = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                self.b_dtype,
+            )
+            smem_tiled_copy_B = cute.make_tiled_copy_B(smem_copy_atom_B, tiled_mma)
+            smem_thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
+
+            sA_0 = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
+                    swz,
+                    dtype=self.a_dtype,
+                ),
+                cute.make_layout((self.tile_size_S, self.tile_K), stride=(self.tile_K, 1)),
+            )
+            sB_0 = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.b_dtype, page_ptr + Int32(self.b_offset), cute.AddressSpace.smem, assumed_align=128),
+                    swz,
+                    dtype=self.b_dtype,
+                ),
+                cute.make_layout((self.tile_size_N, self.tile_K), stride=(self.tile_K, 1)),
+            )
+            sA_1 = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.a_dtype, page_ptr + Int32(self.buf_stride), cute.AddressSpace.smem, assumed_align=128),
+                    swz,
+                    dtype=self.a_dtype,
+                ),
+                cute.make_layout((self.tile_size_S, self.tile_K), stride=(self.tile_K, 1)),
+            )
+            sB_1 = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.b_dtype, page_ptr + Int32(self.buf_stride + self.b_offset), cute.AddressSpace.smem, assumed_align=128),
+                    swz,
+                    dtype=self.b_dtype,
+                ),
+                cute.make_layout((self.tile_size_N, self.tile_K), stride=(self.tile_K, 1)),
+            )
+            tCsA = thr_mma.partition_A(sA_0)
+            tCsB = thr_mma.partition_B(sB_0)
+            tCrA = tiled_mma.make_fragment_A(tCsA)
+            tCrB = tiled_mma.make_fragment_B(tCsB)
+            tCrA_ld = smem_thr_copy_A.retile(tCrA)
+            tCrB_ld = smem_thr_copy_B.retile(tCrB)
+            tAsA_ld_0 = smem_thr_copy_A.partition_S(sA_0)
+            tBsB_ld_0 = smem_thr_copy_B.partition_S(sB_0)
+            tAsA_ld_1 = smem_thr_copy_A.partition_S(sA_1)
+            tBsB_ld_1 = smem_thr_copy_B.partition_S(sB_1)
+
+            block_idx = tile_N
+            while block_idx < tile_3:
+                first_blocks = Int32(2)
+                if Int32(self.num_k_blocks) < first_blocks:
+                    first_blocks = Int32(self.num_k_blocks)
+                preload = Int32(0)
+                while preload < first_blocks:
+                    self._issue_b_tma(
+                        page_ptr,
+                        preload,
+                        preload,
+                        block_idx,
+                        b_tma,
+                        b_tma_gmem,
+                        kr_0,
+                        kr_1,
+                    )
+                    preload = preload + Int32(1)
+
+                acc = cute.make_fragment(
+                    tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N)),
+                    Float32,
+                )
+                acc.fill(0.0)
+                kr_phase_0 = Int32(0)
+                kr_phase_1 = Int32(0)
+                k_idx = Int32(0)
+                while k_idx < Int32(self.num_k_blocks):
+                    self._fill_a_block(
+                        page_ptr, tidx, tile_B, tile_S, k_idx,
+                        a, residual_in, norm_weight, rstd_scratch, op_config_ptr,
+                    )
+                    named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+                    if k_idx % Int32(2) == Int32(0):
+                        mbarrier_wait(kr_0, kr_phase_0)
+                        for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                            cute.copy(smem_tiled_copy_A, tAsA_ld_0[None, None, k_block], tCrA_ld[None, None, k_block])
+                            cute.copy(smem_tiled_copy_B, tBsB_ld_0[None, None, k_block], tCrB_ld[None, None, k_block])
+                            cute.gemm(tiled_mma, acc, tCrA[None, None, k_block], tCrB[None, None, k_block], acc)
+                        kr_phase_0 = kr_phase_0 ^ Int32(1)
+                    if k_idx % Int32(2) == Int32(1):
+                        mbarrier_wait(kr_1, kr_phase_1)
+                        for k_block in cutlass.range_constexpr(self.tile_K // 16):
+                            cute.copy(smem_tiled_copy_A, tAsA_ld_1[None, None, k_block], tCrA_ld[None, None, k_block])
+                            cute.copy(smem_tiled_copy_B, tBsB_ld_1[None, None, k_block], tCrB_ld[None, None, k_block])
+                            cute.gemm(tiled_mma, acc, tCrA[None, None, k_block], tCrB[None, None, k_block], acc)
+                        kr_phase_1 = kr_phase_1 ^ Int32(1)
+
+                    next_k = k_idx + Int32(2)
+                    if next_k < Int32(self.num_k_blocks):
+                        self._issue_b_tma(
+                            page_ptr,
+                            next_k,
+                            next_k,
+                            block_idx,
+                            b_tma,
+                            b_tma_gmem,
+                            kr_0,
+                            kr_1,
+                        )
+                    k_idx = k_idx + Int32(1)
+
+                _gemm_epilogue_store_no_mbar_inval_helper(
+                    page_ptr,
+                    tidx,
+                    tiled_mma,
+                    acc,
+                    self.num_mma_threads,
+                    self.swz_B_c,
+                    self.c_dtype,
+                    self.tile_size_S,
+                    self.tile_size_N,
+                    self.activation,
+                )
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+
+                swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+                sC = cute.make_tensor(
+                    cute.recast_ptr(
+                        cute.make_ptr(self.c_dtype, page_ptr, cute.AddressSpace.smem, assumed_align=128),
+                        swz_c,
+                        dtype=self.c_dtype,
+                    ),
+                    cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                                     stride=(1, self.tile_size_N, self.tile_size_N * self.tile_size_S)),
+                )
+                chunk_base = block_idx * Int32(self.tile_size_N // 64)
+                for local_chunk in cutlass.range_constexpr(self.tile_size_N // 64):
+                    qk_chunk = chunk_base + Int32(local_chunk)
+                    head = qk_chunk // Int32(self.head_chunks)
+                    chunk = qk_chunk - head * Int32(self.head_chunks)
+                    if head < Int32(self.num_qk_heads):
+                        if tidx < Int32(32):
+                            for local_row in range(self.tile_size_S):
+                                row_idx = row_start + Int32(local_row)
+                                if row_idx < runtime_S:
+                                    partial = Float32(0.0)
+                                    local_n = lane_idx + Int32(local_chunk * 64)
+                                    while local_n < Int32((local_chunk + 1) * 64):
+                                        v = sC[(local_n, Int32(local_row), Int32(0))].to(Float32)
+                                        partial = partial + v * v
+                                        local_n = local_n + Int32(32)
+                                    total = cute.arch.warp_reduction(partial, operator.add)
+                                    if lane_idx == Int32(0):
+                                        qk_sumsq[(tile_B, row_idx, head, chunk)] = total
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+                gC = cute.local_tile(c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1), (None, None, None))
+                tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+                    c_tma,
+                    Int32(0),
+                    cute.make_layout(1),
+                    cute.group_modes(sC, 0, 3),
+                    cute.group_modes(gC, 0, 3),
+                )
+                with cute.arch.elect_one():
+                    cute.copy(c_tma, tCsC, tCgC[(None, block_idx, tile_S, tile_B)])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+                block_idx = block_idx + Int32(1)
+
+            if tidx == Int32(0):
+                mbarrier_inval(kr_0)
+                mbarrier_inval(kr_1)
+
+
 class Qwen3_5PackedQkvProjectSm120Op(Op):
     """Packed QKV projection with per-head Q/K norm, RoPE, and cache writes."""
 
-    pipeline = PipelineSpec.staged_matvec(
+    pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_block_size=1,
     )
@@ -2067,6 +2518,157 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
                 mbarrier_inval(kr_1)
 
 
+class Qwen3_5PackedQkvFinalizeSm120Op(Op):
+    """Finalize packed QKV chunks: Q/K RMSNorm, RoPE, and K cache write."""
+
+    reads = {
+        "qkv": (None, ("B", "S", "H", "D")),
+        "qk_sumsq": (cutlass.Float32, ("B", "S", "H", "C")),
+        "q_norm_weight": (None, ("D",)),
+        "k_norm_weight": (None, ("D",)),
+        "cos": (None, ("S", "D2")),
+        "sin": (None, ("S", "D2")),
+    }
+    writes = {
+        "qkv": (None, ("B", "S", "H", "D")),
+        "dst_k": (None, ("B", "N", "HK", "D")),
+    }
+    tile = ("B", "S", "H")
+    dynamic_dims = ("B", "S", "N")
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, cache_pos=0, page_size=DEFAULT_PAGE_SIZE, eps=QWEN3_5_EPS, **tensors):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", tensors["qkv"].shape[1])
+        tile_sizes.setdefault("H", 1)
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims["cache_pos"] = cache_pos
+        ops[0].static_dims["page_size"] = page_size
+        ops[0].static_dims["eps"] = eps
+        ops[0].static_dims["num_q_heads"] = QWEN3_5_NUM_Q_HEADS
+        ops[0].static_dims["num_kv_heads"] = QWEN3_5_NUM_KV_HEADS
+        return ops
+
+    @cute.jit
+    def compute(
+        self,
+        page_ptr,
+        tile_B,
+        tile_S,
+        tile_H,
+        qkv,
+        qk_sumsq,
+        q_norm_weight,
+        k_norm_weight,
+        cos,
+        sin,
+        dst_k,
+        op_config_ptr,
+    ):
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        row_start = tile_S * Int32(self.tile_size_S)
+        head = tile_H * Int32(self.tile_size_H)
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.warp_idx()
+        num_warps = self.threads_per_row // 32
+
+        for local_row in range(warp_idx, self.tile_size_S, num_warps):
+            row_idx = row_start + Int32(local_row)
+            if row_idx < runtime_S:
+                qkv_base = (
+                    tile_B * Int32(self.qkv_stride_B)
+                    + row_idx * Int32(self.qkv_stride_S)
+                    + head * Int32(self.qkv_stride_H)
+                )
+                qkv_row = cute.make_tensor(qkv.iterator + qkv_base, cute.make_layout(self.D))
+                if head < Int32(self.num_q_heads):
+                    total = Float32(0.0)
+                    for chunk in cutlass.range_constexpr(QWEN3_5_HEAD_DIM // 64):
+                        total = total + qk_sumsq[(tile_B, row_idx, head, Int32(chunk))]
+                    rstd = cute.math.rsqrt(
+                        total * Float32(1.0 / self.D) + Float32(self.eps),
+                        fastmath=True,
+                    )
+                    w_row = cute.make_tensor(q_norm_weight.iterator, cute.make_layout(self.D))
+                    pair = lane_idx
+                    while pair < Int32(self.D2):
+                        lo = pair
+                        hi = pair + Int32(self.D2)
+                        cos_row = cute.make_tensor(
+                            cos.iterator + row_idx * Int32(self.cos_stride_S),
+                            cute.make_layout(self.D2),
+                        )
+                        sin_row = cute.make_tensor(
+                            sin.iterator + row_idx * Int32(self.sin_stride_S),
+                            cute.make_layout(self.D2),
+                        )
+                        v0 = qkv_row[lo].to(Float32) * rstd * w_row[lo].to(Float32)
+                        v1 = qkv_row[hi].to(Float32) * rstd * w_row[hi].to(Float32)
+                        c = cos_row[pair].to(Float32)
+                        sn = sin_row[pair].to(Float32)
+                        qkv_row[lo] = (v0 * c - v1 * sn).to(self.qkv_dtype)
+                        qkv_row[hi] = (v1 * c + v0 * sn).to(self.qkv_dtype)
+                        pair = pair + Int32(32)
+                    d_norm = lane_idx + Int32(2 * self.D2)
+                    while d_norm < Int32(self.D):
+                        qkv_row[d_norm] = (
+                            qkv_row[d_norm].to(Float32)
+                            * rstd
+                            * w_row[d_norm].to(Float32)
+                        ).to(self.qkv_dtype)
+                        d_norm = d_norm + Int32(32)
+                elif head < Int32(self.num_q_heads + self.num_kv_heads):
+                    kv_h = head - Int32(self.num_q_heads)
+                    dst_base = (
+                        tile_B * Int32(self.dst_k_stride_B)
+                        + (row_idx + Int32(self.cache_pos)) * Int32(self.dst_k_stride_N)
+                        + kv_h * Int32(self.dst_k_stride_HK)
+                    )
+                    dst_row = cute.make_tensor(dst_k.iterator + dst_base, cute.make_layout(self.D))
+                    total = Float32(0.0)
+                    for chunk in cutlass.range_constexpr(QWEN3_5_HEAD_DIM // 64):
+                        total = total + qk_sumsq[(tile_B, row_idx, head, Int32(chunk))]
+                    rstd = cute.math.rsqrt(
+                        total * Float32(1.0 / self.D) + Float32(self.eps),
+                        fastmath=True,
+                    )
+                    w_row = cute.make_tensor(k_norm_weight.iterator, cute.make_layout(self.D))
+                    pair = lane_idx
+                    while pair < Int32(self.D2):
+                        lo = pair
+                        hi = pair + Int32(self.D2)
+                        cos_row = cute.make_tensor(
+                            cos.iterator + row_idx * Int32(self.cos_stride_S),
+                            cute.make_layout(self.D2),
+                        )
+                        sin_row = cute.make_tensor(
+                            sin.iterator + row_idx * Int32(self.sin_stride_S),
+                            cute.make_layout(self.D2),
+                        )
+                        v0 = qkv_row[lo].to(Float32) * rstd * w_row[lo].to(Float32)
+                        v1 = qkv_row[hi].to(Float32) * rstd * w_row[hi].to(Float32)
+                        c = cos_row[pair].to(Float32)
+                        sn = sin_row[pair].to(Float32)
+                        out0 = (v0 * c - v1 * sn).to(self.qkv_dtype)
+                        out1 = (v1 * c + v0 * sn).to(self.qkv_dtype)
+                        qkv_row[lo] = out0
+                        qkv_row[hi] = out1
+                        dst_row[lo] = out0
+                        dst_row[hi] = out1
+                        pair = pair + Int32(32)
+                    d_norm = lane_idx + Int32(2 * self.D2)
+                    while d_norm < Int32(self.D):
+                        out = (
+                            qkv_row[d_norm].to(Float32)
+                            * rstd
+                            * w_row[d_norm].to(Float32)
+                        ).to(self.qkv_dtype)
+                        qkv_row[d_norm] = out
+                        dst_row[d_norm] = out
+                        d_norm = d_norm + Int32(32)
+
+
 class Qwen3_5QKNormRopeKCacheStoreSm120Op(_BaseQKNormRopeOp):
     """QKNorm+partial RoPE for K, then store directly to native BSHD cache."""
 
@@ -2214,6 +2816,7 @@ def schedule_decode_layer_qwen3_5_sm120(
     gate_up_buf,
     mlp_h_buf,
     qkv_buf=None,
+    qk_sumsq_buf=None,
     page_size=DEFAULT_PAGE_SIZE,
     eps=QWEN3_5_EPS,
     fa_num_splits=0,
@@ -2245,35 +2848,29 @@ def schedule_decode_layer_qwen3_5_sm120(
     if packed_qkv:
         if qkv_buf is None:
             raise ValueError("qkv_buf must be provided when packed_qkv is enabled")
-        ops += RMSNormOp.schedule(
-            x=x_in,
-            weight=weights[f"{pfx}.attn_norm"],
-            y=h_buf,
-            residual_in=residual_in,
-            residual_out=residual_out,
-            tile_sizes={"S": rms_tile_s},
-            page_size=page_size,
-        )
+        if qk_sumsq_buf is None:
+            raise ValueError("qk_sumsq_buf must be provided when packed_qkv is enabled")
         k_window = k_cache[:, : cache_pos + seq_len, :, :]
         v_window = v_cache[:, : cache_pos + seq_len, :, :]
-        qkv_ops = Qwen3_5PackedQkvProjectSm120Op.schedule(
-            a=h_buf,
+        qkv_flat = qkv_buf.view(
+            batch,
+            seq_len,
+            (QWEN3_5_NUM_Q_HEADS + 2 * QWEN3_5_NUM_KV_HEADS) * QWEN3_5_HEAD_DIM,
+        )
+        qkv_ops = Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op.schedule(
+            a=x_in,
+            residual_in=residual_in,
+            norm_weight=weights[f"{pfx}.attn_norm"],
+            residual_out=residual_out,
             b=weights[f"{pfx}.W_qkv"],
-            q_norm_weight=weights[f"{pfx}.w_q_norm"],
-            k_norm_weight=weights[f"{pfx}.w_k_norm"],
-            cos=cos,
-            sin=sin,
-            qkv=qkv_buf,
-            dst_k=k_window,
-            dst_v=v_window,
-            cache_pos=cache_pos,
-            tile_sizes={"S": seq_len, "H": 1},
+            c=qkv_flat,
+            qk_sumsq=qk_sumsq_buf,
             page_size=page_size,
             eps=eps,
         )
         for op in qkv_ops:
-            op.dim_aliases["H"] = f"q_head_{layer_idx}"
-            op.static_dims["barrier_tile_size_H"] = QWEN3_5_HEAD_DIM
+            op.dim_aliases["N"] = f"qkv_chunk_{layer_idx}"
+            op.static_dims["barrier_group_count_N"] = QWEN3_5_NUM_Q_HEADS + 2 * QWEN3_5_NUM_KV_HEADS
         ops += qkv_ops
     elif not packed_qkv:
         ops += RMSNormOp.schedule(
@@ -2314,6 +2911,7 @@ def schedule_decode_layer_qwen3_5_sm120(
             (q_block.stride(1), q_block.stride(2), q_block.stride(3)),
         )
         k_block = qkv_buf[:, :, QWEN3_5_NUM_Q_HEADS : QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS, :]
+        qk_block = qkv_buf[:, :, : QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS, :]
         q_fd = qkv_buf[:, :, :QWEN3_5_NUM_Q_HEADS, :]
         v_block = qkv_buf[:, :, QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS :, :]
     else:
@@ -2331,7 +2929,42 @@ def schedule_decode_layer_qwen3_5_sm120(
     o_fd = attn_out_buf.view(batch, seq_len, QWEN3_5_NUM_Q_HEADS, QWEN3_5_HEAD_DIM)
 
     if packed_qkv:
-        pass
+        finalize_ops = Qwen3_5PackedQkvFinalizeSm120Op.schedule(
+            qkv=qk_block,
+            qk_sumsq=qk_sumsq_buf,
+            q_norm_weight=weights[f"{pfx}.w_q_norm"],
+            k_norm_weight=weights[f"{pfx}.w_k_norm"],
+            cos=cos,
+            sin=sin,
+            dst_k=k_window,
+            cache_pos=cache_pos,
+            tile_sizes={"S": seq_len, "H": 1},
+            page_size=page_size,
+            eps=eps,
+        )
+        for op in finalize_ops:
+            op.dim_aliases["H"] = f"q_head_{layer_idx}"
+            op.static_dims["barrier_wait_alias_H"] = f"qkv_chunk_{layer_idx}"
+            op.static_dims["barrier_wait_tile_size_H"] = QWEN3_5_HEAD_DIM
+            op.static_dims["barrier_wait_acquire"] = 1
+            op.static_dims["barrier_signal_alias_H"] = f"q_head_{layer_idx}"
+            op.static_dims["barrier_signal_tile_size_H"] = QWEN3_5_HEAD_DIM
+        ops += finalize_ops
+
+        v_cache_ops = Qwen3_5VCacheStoreSm120Op.schedule(
+            src_v=v_block,
+            dst_v=v_window,
+            cache_pos=cache_pos,
+            tile_sizes={"S": seq_len, "H": 1},
+        )
+        for op in v_cache_ops:
+            op.dim_aliases["H"] = f"qkv_v_{layer_idx}"
+            op.static_dims["barrier_wait_alias_H"] = f"qkv_chunk_{layer_idx}"
+            op.static_dims["barrier_wait_tile_size_H"] = QWEN3_5_HEAD_DIM
+            op.static_dims["barrier_wait_index_offset_H"] = QWEN3_5_NUM_Q_HEADS + QWEN3_5_NUM_KV_HEADS
+            op.static_dims["barrier_wait_acquire"] = 1
+        ops += v_cache_ops
+
     else:
         q_norm_ops = QKNormRopeOp.schedule(
             q=q_4d,
@@ -2382,7 +3015,7 @@ def schedule_decode_layer_qwen3_5_sm120(
                 op.static_dims["barrier_signal_tile_size_H"] = QWEN3_5_HEAD_DIM * QWEN3_5_KV_GROUP_SIZE
         ops += v_cache_ops
 
-    if k_window.shape[1] <= 256:
+    if k_window.shape[1] <= 256 or page_size <= 16 * 1024:
         fa_ops = FlashAttentionOp.schedule(
             q=q_fd,
             k=k_window,
@@ -2444,6 +3077,9 @@ def schedule_decode_layer_qwen3_5_sm120(
     )
 
     keep_alive = [cos, sin, q_4d, k_block, k_4d, q_fd, v_block, k_window, v_window, o_fd]
+    if packed_qkv:
+        keep_alive.append(qk_block)
+        keep_alive.append(qk_sumsq_buf)
     if not packed_qkv:
         keep_alive.append(kv_buf.view(batch, seq_len, 2 * QWEN3_5_KV_DIM))
     return Qwen3_5DecodeLayerSchedule(ops=ops, attention_config=fa_config, keep_alive=keep_alive)
@@ -2526,8 +3162,11 @@ __all__ = [
     "QWEN3_5_DECODE_S",
     "QWEN3_5_GATE_UP_TILE",
     "Qwen3_5DecodeLayerSchedule",
+    "Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op",
     "Qwen3_5DecodeMatvecGemmSm120Op",
     "Qwen3_5LmHeadGemmSm120Op",
+    "Qwen3_5PackedQkvChunkProjectSm120Op",
+    "Qwen3_5PackedQkvFinalizeSm120Op",
     "Qwen3_5PackedQkvProjectSm120Op",
     "Qwen3_5QKNormRopeKCacheStoreSm120Op",
     "Qwen3_5RMSAddRangedDecodeGemmSm120Op",

@@ -18,7 +18,7 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
 from .ops import MAX_TILE_DIMS, Op, ScheduledOp, tensor_meta_overlaps
 
@@ -307,7 +307,8 @@ def _coalesce_pipeline_ranges(
         first = instructions[idx]
         tiles = list(first.tiles) + [0] * (MAX_TILE_DIMS - len(first.tiles))
         start = tiles[range_axis]
-        end = start + 1
+        existing_end = tiles[range_end_axis]
+        end = existing_end if existing_end > start else start + 1
         idx += 1
 
         while idx < len(instructions):
@@ -556,21 +557,71 @@ class InstructionStreamBuilder:
     Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
     """
 
-    def __init__(self):
+    def __init__(self, region_records: Optional[Tuple[Any, ...]] = None):
         """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
+        self._region_records: Tuple[Any, ...] = tuple(region_records or ())
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
         self._barrier_count: Optional[int] = None
+        self._op_wait_counts: Dict[int, int] = {}
+        self._op_signal_counts: Dict[int, int] = {}
 
     def _invalidate_resolution_cache(self) -> None:
         """Clear cached formulas after the op list changes."""
         self._cached_formulas = None
         self._barrier_count = None
 
+    def set_region_records(self, region_records: Optional[Tuple[Any, ...]]) -> None:
+        """Set persistent region spans used by queue materialization."""
+        self._region_records = tuple(region_records or ())
+
+    def _range_axis_for_op_idx(self, op_idx: int) -> Tuple[int, int]:
+        pipeline = self._pipeline_for_op_idx(op_idx)
+        if pipeline is None or not pipeline.coalesce_ranges or pipeline.range_axis < 0:
+            return -1, -1
+        end_axis = pipeline.range_end_axis
+        if end_axis < 0:
+            end_axis = pipeline.range_axis + 1
+        if end_axis >= MAX_TILE_DIMS or end_axis == pipeline.range_axis:
+            return -1, -1
+        return pipeline.range_axis, end_axis
+
+    def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
+        """Return logical tiles covered by one possibly range-owned instruction."""
+        if instr.op_idx == TileInstruction.END_MARKER:
+            return []
+        range_axis, end_axis = self._range_axis_for_op_idx(instr.op_idx)
+        if range_axis < 0:
+            return [instr.tiles]
+        tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
+        start = tiles[range_axis]
+        end = tiles[end_axis]
+        if end <= start:
+            return [instr.tiles]
+        out: List[Tuple[int, ...]] = []
+        for axis_value in range(start, end):
+            logical = list(tiles)
+            logical[range_axis] = axis_value
+            logical[end_axis] = 0
+            out.append(tuple(logical))
+        return out
+
     @property
     def ops(self) -> List[ScheduledOp]:
         """Scheduled ops in order."""
         return [r.op for r in self._op_records]
+
+    def _pipeline_for_op_idx(self, op_idx: int):
+        op_pipeline = getattr(self._op_records[op_idx].op.op_cls, "pipeline", None)
+        if op_pipeline is not None:
+            return op_pipeline
+        for region in self._region_records:
+            if (
+                region.start_op <= op_idx < region.end_op
+                and getattr(region.pipeline, "coalesce_ranges", False)
+            ):
+                return region.pipeline
+        return None
 
     def add_op(
         self,
@@ -1324,11 +1375,39 @@ class InstructionStreamBuilder:
         ]
         return torch.tensor(packed, dtype=torch.int32, device=device)
 
+    def coalesce_pipeline_instructions(
+        self,
+        instructions: List[TileInstruction],
+    ) -> List[TileInstruction]:
+        """Coalesce adjacent range-owned instructions in a flat stream."""
+        out: List[TileInstruction] = []
+        non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+        idx = 0
+        while idx < len(non_end):
+            op_idx = non_end[idx].op_idx
+            run_end = idx + 1
+            while run_end < len(non_end) and non_end[run_end].op_idx == op_idx:
+                run_end += 1
+            run = non_end[idx:run_end]
+            pipeline = self._pipeline_for_op_idx(op_idx)
+            if pipeline is not None and pipeline.coalesce_ranges:
+                run = _coalesce_pipeline_ranges(
+                    run,
+                    range_axis=pipeline.range_axis,
+                    range_end_axis=pipeline.range_end_axis,
+                    max_range_tiles=pipeline.range_block_size,
+                )
+            out.extend(run)
+            idx = run_end
+        out.append(TileInstruction.end_instruction())
+        return out
+
     def build_queued_tensors(
         self,
         instructions: List[TileInstruction],
         num_blocks: int,
         device: str = "cuda",
+        preserve_instruction_order: bool = False,
     ):
         """Pack work into contiguous per-block instruction queues.
 
@@ -1348,6 +1427,26 @@ class InstructionStreamBuilder:
         non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
         queues: List[List[TileInstruction]] = [[] for _ in range(num_blocks)]
 
+        if preserve_instruction_order:
+            for global_idx, instr in enumerate(non_end):
+                queues[global_idx % num_blocks].append(instr)
+            queue_len = 1
+            end = TileInstruction.end_instruction()
+            for block_idx, queue in enumerate(queues):
+                queue.append(end)
+                queue_len = max(queue_len, len(queue))
+
+            queued_instructions: List[TileInstruction] = []
+            for queue in queues:
+                padded = queue + [end] * (queue_len - len(queue))
+                queued_instructions.extend(padded)
+
+            tensor = self.build_tensor(
+                device=device,
+                instructions=queued_instructions,
+            )
+            return tensor, queued_instructions, queue_len
+
         run_start = 0
         while run_start < len(non_end):
             op_idx = non_end[run_start].op_idx
@@ -1356,32 +1455,37 @@ class InstructionStreamBuilder:
                 run_end += 1
 
             run = non_end[run_start:run_end]
-            op = self._op_records[op_idx].op
-            pipeline = getattr(op.op_cls, "pipeline", None)
+            pipeline = self._pipeline_for_op_idx(op_idx)
             if pipeline is not None:
                 # Staged pipeline instructions can own contiguous output ranges
                 # per resident CTA instead of striping every Nth tile.
-                if pipeline.coalesce_ranges and num_blocks > len(run):
-                    coalesced_run = _coalesce_pipeline_ranges(
-                        run,
-                        range_axis=pipeline.range_axis,
-                        range_end_axis=pipeline.range_end_axis,
-                        max_range_tiles=pipeline.range_block_size,
-                    )
-                    for local_idx, instr in enumerate(coalesced_run):
-                        queues[local_idx % num_blocks].append(instr)
-                else:
+                if pipeline.coalesce_ranges:
+                    if pipeline.range_block_size == 0:
+                        range_run = _coalesce_pipeline_ranges(
+                            run,
+                            range_axis=pipeline.range_axis,
+                            range_end_axis=pipeline.range_end_axis,
+                        )
+                        for local_idx, instr in enumerate(range_run):
+                            queues[local_idx % num_blocks].append(instr)
+                        run_start = run_end
+                        continue
                     for block_idx in range(num_blocks):
                         begin = (len(run) * block_idx) // num_blocks
                         end = (len(run) * (block_idx + 1)) // num_blocks
-                        block_run = run[begin:end]
-                        if pipeline.coalesce_ranges:
-                            block_run = _coalesce_pipeline_ranges(
-                                block_run,
-                                range_axis=pipeline.range_axis,
-                                range_end_axis=pipeline.range_end_axis,
-                            )
+                        block_run = _coalesce_pipeline_ranges(
+                            run[begin:end],
+                            range_axis=pipeline.range_axis,
+                            range_end_axis=pipeline.range_end_axis,
+                            max_range_tiles=pipeline.range_block_size,
+                        )
                         queues[block_idx].extend(block_run)
+                    run_start = run_end
+                    continue
+                for block_idx in range(num_blocks):
+                    begin = (len(run) * block_idx) // num_blocks
+                    end = (len(run) * (block_idx + 1)) // num_blocks
+                    queues[block_idx].extend(run[begin:end])
             else:
                 for local_idx, instr in enumerate(run):
                     queues[local_idx % num_blocks].append(instr)
@@ -1444,12 +1548,18 @@ class InstructionStreamBuilder:
         import torch
 
         formulas, _ = self._resolve()
-        max_waits = max(1, self.max_wait_deps)
-
-        wait_data = [
-            self._build_wait_info_entry(instr, formulas, max_waits)
+        raw_wait_data = [
+            self._build_wait_info_entry(instr, formulas)
             for instr in instructions
         ]
+        max_waits = max(1, max((len(entry) // 2 for entry in raw_wait_data), default=0))
+        wait_data = []
+        for entry in raw_wait_data:
+            padded = list(entry)
+            while len(padded) < max_waits * 2:
+                padded.extend([-1, 0])
+            wait_data.append(padded)
+        self._op_wait_counts = self._max_counts_by_op(instructions, raw_wait_data, pair_width=2)
         if num_blocks is not None and num_blocks > 0:
             empty = [-1, 0] * max_waits
             seen_waits = [dict() for _ in range(num_blocks)]
@@ -1483,53 +1593,75 @@ class InstructionStreamBuilder:
         import torch
 
         formulas, _ = self._resolve()
-        max_signals = max(1, self.max_signal_deps)
-
-        signal_data = [
-            self._build_signal_info_entry(instr, formulas, max_signals)
+        raw_signal_data = [
+            self._build_signal_info_entry(instr, formulas)
             for instr in instructions
         ]
+        max_signals = max(1, max((len(entry) for entry in raw_signal_data), default=0))
+        signal_data = []
+        for entry in raw_signal_data:
+            padded = list(entry)
+            while len(padded) < max_signals:
+                padded.append(-1)
+            signal_data.append(padded)
+        self._op_signal_counts = self._max_counts_by_op(instructions, raw_signal_data, pair_width=1)
 
         return torch.tensor(signal_data, dtype=torch.int32, device=device)
 
     @staticmethod
+    def _max_counts_by_op(
+        instructions: List[TileInstruction],
+        entries: List[List[int]],
+        *,
+        pair_width: int,
+    ) -> Dict[int, int]:
+        counts: Dict[int, int] = {}
+        for instr, entry in zip(instructions, entries):
+            if instr.op_idx == TileInstruction.END_MARKER:
+                continue
+            counts[instr.op_idx] = max(counts.get(instr.op_idx, 0), len(entry) // pair_width)
+        return counts
+
     def _build_wait_info_entry(
+        self,
         instr: TileInstruction,
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        max_waits: int,
     ) -> List[int]:
         """Pack wait metadata for one instruction into `[barrier, expected, ...]`."""
         if instr.op_idx == TileInstruction.END_MARKER:
-            return [-1, 0] * max_waits
+            return []
 
         entry: List[int] = []
+        seen = set()
         wait_formulas = formulas.get(instr.op_idx, ([], []))[0]
-        for formula in wait_formulas:
-            if not (formula.has_guard and not formula.is_guarded(instr.tiles)):
-                entry.extend([formula.compute_index(instr.tiles), formula.expected])
-
-        while len(entry) < max_waits * 2:
-            entry.extend([-1, 0])
+        for tile in self._logical_tiles_for_instruction(instr):
+            for formula in wait_formulas:
+                if not (formula.has_guard and not formula.is_guarded(tile)):
+                    pair = (formula.compute_index(tile), formula.expected)
+                    if pair not in seen:
+                        seen.add(pair)
+                        entry.extend(pair)
         return entry
 
-    @staticmethod
     def _build_signal_info_entry(
+        self,
         instr: TileInstruction,
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        max_signals: int,
     ) -> List[int]:
         """Pack signal metadata for one instruction into barrier indices."""
         if instr.op_idx == TileInstruction.END_MARKER:
-            return [-1] * max_signals
+            return []
 
         entry: List[int] = []
+        seen = set()
         signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
-        for formula in signal_formulas:
-            if not (formula.has_guard and not formula.is_guarded(instr.tiles)):
-                entry.append(formula.compute_index(instr.tiles))
-
-        while len(entry) < max_signals:
-            entry.append(-1)
+        for tile in self._logical_tiles_for_instruction(instr):
+            for formula in signal_formulas:
+                if not (formula.has_guard and not formula.is_guarded(tile)):
+                    barrier_idx = formula.compute_index(tile)
+                    if barrier_idx not in seen:
+                        seen.add(barrier_idx)
+                        entry.append(barrier_idx)
         return entry
 
     def get_op_barrier_formulas(self) -> Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]:

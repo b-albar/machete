@@ -8,7 +8,7 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.backend import _build_compile_key
+from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
 from machete.megakernel.ops import MAX_TILE_DIMS, Op, ScheduledOp, build_op_config
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
@@ -18,6 +18,7 @@ from machete.megakernel.scheduling import (
     INSTRUCTION_WORDS,
     TileScheduler,
     BackwardScheduler,
+    ReadyScheduler,
     get_default_scheduler,
     set_default_scheduler,
 )
@@ -27,6 +28,41 @@ from typing import ClassVar, List
 class _NOPOp(Op):
     """Test-only no-op for barrier formula and instruction stream tests."""
     pass
+
+
+class _AliasPhaseOp(Op):
+    load_phase = "load_impl"
+    compute_phase = "compute_impl"
+
+    def load_impl(self, page_ptr, tile_M, x):
+        pass
+
+    def compute_impl(self, page_ptr, tile_M, y):
+        pass
+
+
+class _ComputeTmaLoadOp(Op):
+    reads = {"x": (torch.float16, ("M", "K"))}
+    writes = {"y": (torch.float16, ("M", "K"))}
+    tile = ("M",)
+    tma_compute_loads = {"x"}
+
+
+def test_phase_aliases_bind_concrete_instance_methods():
+    op = _AliasPhaseOp()
+
+    assert op.load.__func__ is _AliasPhaseOp.load_impl
+    assert op.compute.__func__ is _AliasPhaseOp.compute_impl
+    assert _phase_param_names_for_instance(op, "load") == ("page_ptr", "tile_M", "x")
+    assert _phase_param_names_for_instance(op, "compute") == ("page_ptr", "tile_M", "y")
+
+
+def test_compute_phase_tma_load_declaration_is_registered():
+    assert _ComputeTmaLoadOp._TMA_COMPUTE_LOADS == {"x"}
+    assert _ComputeTmaLoadOp._TMA_LOADS == set()
+    assert _ComputeTmaLoadOp.gen_tma_param_names("compute") == [
+        ("x_tma", "x_tma_gmem", "x")
+    ]
 
 
 def test_barrier_static_dims_do_not_specialize_device_code():
@@ -60,6 +96,24 @@ def test_barrier_static_dims_do_not_specialize_device_code():
     assert key_a == key_b
     assert build_op_config(op_a)["M"] == 16
     assert "barrier_wait_alias_H" not in build_op_config(op_a)
+
+
+def test_tile_sizes_specialize_device_code():
+    """Tile sizes are used in CuTe compile-time loops and must key handlers."""
+    op_a = ScheduledOp(_NOPOp, tile_sizes={"M": 16})
+    op_b = ScheduledOp(_NOPOp, tile_sizes={"M": 64})
+
+    common = {
+        "all_local_tensor_names": (),
+        "local_tensor_names": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "local_tma_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "tensor_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "tma_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+    }
+
+    assert _build_compile_key(op_a, **common) != _build_compile_key(op_b, **common)
+    assert build_op_config(op_a)["tile_size_M"] == 16
+    assert build_op_config(op_b)["tile_size_M"] == 64
 
 
 # =============================================================================
@@ -877,6 +931,42 @@ class TestSchedulerAPI:
         for block_idx in range(3):
             queue_end = queued[block_idx * queue_len + queue_len - 1]
             assert queue_end.op_idx == TileInstruction.END_MARKER
+
+    def test_per_sm_queues_can_preserve_ready_order(self):
+        """Interleaved ready-list schedules should keep global strided order."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        instructions = builder.build(scheduler=ReadyScheduler())
+
+        _tensor, queued, queue_len = builder.build_queued_tensors(
+            instructions,
+            num_blocks=2,
+            device="cpu",
+            preserve_instruction_order=True,
+        )
+
+        block0 = [
+            instr
+            for instr in queued[:queue_len]
+            if instr.op_idx != TileInstruction.END_MARKER
+        ]
+        block1 = [
+            instr
+            for instr in queued[queue_len : 2 * queue_len]
+            if instr.op_idx != TileInstruction.END_MARKER
+        ]
+        expected = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+        reconstructed = []
+        for i in range(max(len(block0), len(block1))):
+            if i < len(block0):
+                reconstructed.append(block0[i])
+            if i < len(block1):
+                reconstructed.append(block1[i])
+
+        assert [(i.op_idx, i.tiles) for i in reconstructed] == [
+            (i.op_idx, i.tiles) for i in expected
+        ]
 
     def test_scheduler_is_abstract(self):
         """TileScheduler base class cannot be instantiated directly."""

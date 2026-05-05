@@ -540,7 +540,7 @@ def _schedule_layer_ops(
             op.static_dims["barrier_signal_tile_size_H"] = HEAD_DIM * KV_GROUP_SIZE
     ops += v_cache_ops
 
-    if k_fd.shape[1] <= 256:
+    if k_fd.shape[1] <= 256 or page_size <= 16 * 1024:
         fa_ops = FlashAttentionOp.schedule(
             q=q_fd,
             k=k_fd,
@@ -632,7 +632,6 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     # FA/FD require M >= 16 (MMA tile). Use S=16 for all ops — GEMMs are still
     # weight-dominated (16 rows × 2KB << 31MB weights), so overhead is negligible.
     S = 16
-
     # --- Shared activation buffers (ping-pong across layers) ---
     x_buf = [torch.empty(batch, S, HIDDEN, dtype=dtype, device=device) for _ in range(2)]
     res_buf = [torch.empty(batch, S, HIDDEN, dtype=dtype, device=device) for _ in range(2)]
@@ -646,10 +645,19 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     q_buf = torch.empty(batch, S, Q_DIM, dtype=dtype, device=device)
     packed_qkv = use_qwen_sm120_ops or os.environ.get("QWEN_DECODE_PACKED_QKV", "0") == "1"
     qkv_buf = None
+    qk_sumsq_buf = None
     if packed_qkv:
         qkv_buf = torch.empty(
             batch, S, NUM_Q_HEADS + 2 * NUM_KV_HEADS, HEAD_DIM,
             dtype=dtype, device=device,
+        )
+        qk_sumsq_buf = torch.empty(
+            batch,
+            S,
+            NUM_Q_HEADS + NUM_KV_HEADS,
+            HEAD_DIM // 64,
+            dtype=torch.float32,
+            device=device,
         )
         for i in range(num_layers):
             pfx = f"layer.{i}"
@@ -676,6 +684,8 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     ]
     if qkv_buf is not None:
         keep_alive.append(qkv_buf)
+    if qk_sumsq_buf is not None:
+        keep_alive.append(qk_sumsq_buf)
 
     all_ops = []
     max_fa_tpb = 0
@@ -708,6 +718,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
                 gate_up_buf=gate_up_buf,
                 mlp_h_buf=mlp_h_buf,
                 qkv_buf=qkv_buf,
+                qk_sumsq_buf=qk_sumsq_buf,
                 page_size=page_size,
                 fa_num_splits=int(os.environ.get("QWEN_DECODE_FA_SPLITS", "0")),
                 rms_tile_s=int(os.environ.get("QWEN_DECODE_RMS_TILE_S", "1")),
@@ -764,8 +775,10 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     effective_page_size = max(
         op.static_dims.get('page_size', page_size) for op in all_ops
     )
-    default_tpb = max(224, gemm_config.threads_per_block, max_fa_tpb)
+    qwen_min_tpb = 256 if use_qwen_sm120_ops else 224
+    default_tpb = max(qwen_min_tpb, gemm_config.threads_per_block, max_fa_tpb)
     threads_per_block = int(os.environ.get("QWEN_DECODE_THREADS", str(default_tpb)))
+    default_noinline = "1" if use_qwen_sm120_ops else "0"
     config = MegakernelConfig(
         num_sms=int(os.environ["QWEN_DECODE_NUM_SMS"]) if "QWEN_DECODE_NUM_SMS" in os.environ else None,
         threads_per_block=threads_per_block,
@@ -773,7 +786,7 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
         num_pages=num_pages,
         sync_compute_warps_after_tile=False,
         per_sm_instruction_queues=os.environ.get("QWEN_DECODE_PER_SM_QUEUES", "1") != "0",
-        noinline=os.environ.get("QWEN_DECODE_NOINLINE", "0") != "0",
+        noinline=os.environ.get("QWEN_DECODE_NOINLINE", default_noinline) != "0",
         inline_thin_phases=os.environ.get("QWEN_DECODE_INLINE_THIN", "1") != "0",
         loader_idle_sleep_ns=int(os.environ.get("QWEN_DECODE_LOADER_SLEEP", "0")),
         relaxed_global_barriers=os.environ.get("QWEN_DECODE_RELAXED_BARRIER", "1") == "1",

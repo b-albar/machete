@@ -32,10 +32,50 @@ class HandlerSpec:
 
 
 @dataclass(frozen=True)
+class ProtocolRoleSpec:
+    """One page or semaphore role in an instruction-owned protocol."""
+
+    name: str
+    offset: int
+    count: int
+    participants: int = 1
+
+
+@dataclass(frozen=True)
+class RegionCompileSpec:
+    """Compile-relevant signature for one persistent region."""
+
+    region_idx: int
+    name: str
+    start_op: int
+    end_op: int
+    lowering: str
+    page_roles: Tuple[ProtocolRoleSpec, ...]
+    semaphore_roles: Tuple[ProtocolRoleSpec, ...]
+    page_count: int
+    page_bytes: int
+    semaphore_count: int
+    scratch_bytes: int
+    resource_bytes: int
+    input_stages: int
+    output_stages: int
+    stage_pages: int
+    range_axis: int
+    range_end_axis: int
+    range_block_size: int
+    coalesce_ranges: bool
+
+    @property
+    def op_count(self) -> int:
+        return self.end_op - self.start_op
+
+
+@dataclass(frozen=True)
 class BackendIR:
     """Static backend IR used by handler-based dispatch."""
 
     op_specs: Tuple[OpCompileSpec, ...]
+    region_specs: Tuple[RegionCompileSpec, ...]
     handler_specs: Tuple[HandlerSpec, ...]
     op_handler_indices: Tuple[int, ...]
     op_phase_local_indices: Dict[str, Tuple[int, ...]]
@@ -48,5 +88,7 @@ __all__ = [
     "PHASE_NAMES",
     "OpCompileSpec",
     "HandlerSpec",
+    "ProtocolRoleSpec",
+    "RegionCompileSpec",
     "BackendIR",
 ]

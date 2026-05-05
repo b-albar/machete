@@ -217,10 +217,7 @@ class FlashAttentionSm120Op(Op):
         self.swizzle_M = 4
         self.swizzle_S = 3
 
-        # --- KV row padding (replaces swizzle to avoid address precomputation regs) ---
-        # Pad each row by 8 elements (16 bytes) so consecutive rows hit different banks.
-        # Bank offset per row = (D+pad)*elem_bytes/4 % 32 = 4 → 8 rows span 8 bank groups.
-        self.smem_pad = 8  # bf16/fp16 elements
+        self.smem_pad = 8
         self.smem_stride = self.D + self.smem_pad
 
         # cpasync thread layout for K/V loading — compute copy_dim0 BEFORE
@@ -230,21 +227,26 @@ class FlashAttentionSm120Op(Op):
         self.copy_dim1 = self.D // self.async_copy_elems
         self.copy_dim0 = self.num_mma_threads // self.copy_dim1
 
-        # --- n_block: max KV rows per double-buffer slot (padded stride) ---
+        min_kv_rows = 16
         if self.q_in_smem:
-            # Q stays in smem: KV uses remaining page space
             kv_budget = self.page_size - self.q_tile_bytes
-            max_n_block = kv_budget // (2 * self.smem_stride * self.elem_bytes)
         else:
-            # Q preloaded to registers: full page available for KV
-            max_n_block = self.page_size // (2 * self.smem_stride * self.elem_bytes)
+            kv_budget = self.page_size
+        max_n_block = kv_budget // (2 * self.smem_stride * self.elem_bytes)
+        if max_n_block < min_kv_rows:
+            compact_stride = self.D
+            compact_max_n_block = kv_budget // (2 * compact_stride * self.elem_bytes)
+            if compact_max_n_block >= min_kv_rows:
+                self.smem_pad = 0
+                self.smem_stride = compact_stride
+                max_n_block = compact_max_n_block
 
         # Dynamic-N path uses a fixed KV block size so one compiled kernel can
         # be reused across sequence lengths safely. Keep it static, but use a
         # less conservative tile when page budget allows it: 32 rows halves the
         # KV-loop trip count versus 16 without making the shape runtime-
         # dependent. Round down to the legal cpasync/MMA granularity.
-        n_block_granularity = max(16, self.copy_dim0)
+        n_block_granularity = max(min_kv_rows, self.copy_dim0)
         max_fixed_n_block = min(32, max_n_block)
         self.n_block = (max_fixed_n_block // n_block_granularity) * n_block_granularity
         if self.n_block < 16:
@@ -268,8 +270,10 @@ class FlashAttentionSm120Op(Op):
 
         # exp2-based softmax
         self.scale_log2e = self.scale_val * 1.4426950408889634074
-        # Override compute method (select Q-in-smem vs Q-preload path)
-        self.compute = self.compute_mma_q_smem if self.q_in_smem else self.compute_mma
+        self._bind_phase(
+            "compute",
+            "compute_mma_q_smem" if self.q_in_smem else "compute_mma",
+        )
 
     # =========================================================================
     # Scheduling

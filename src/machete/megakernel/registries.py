@@ -26,6 +26,7 @@ from .ops import (
 
 TMA_PHASE_SPECS = (
     ("load", "_TMA_LOADS", "g2s"),
+    ("compute", "_TMA_COMPUTE_LOADS", "g2s"),
     ("compute", "_TMA_COMPUTE_STORES", "s2g"),
     ("store", "_TMA_STORES", "s2g"),
     ("store", "_TMA_REDUCE_STORES", "s2g_reduce"),

@@ -134,7 +134,10 @@ def _extract_body(fn):
             if stripped.startswith("def ") or stripped.startswith("async def "):
                 def_lineno = start_lineno + offset
                 break
-        return _extract_body_from_file(source_file, fn.__name__, def_lineno)
+        try:
+            return _extract_body_from_file(source_file, fn.__name__, def_lineno)
+        except ValueError:
+            pass
 
     source = textwrap.dedent(inspect.getsource(fn))
     tree = ast.parse(source)

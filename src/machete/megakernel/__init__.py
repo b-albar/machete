@@ -17,13 +17,22 @@ Usage:
 
 from .ops import (
     DEFAULT_PAGE_SIZE,
+    InstructionPageProtocol,
     Op,
+    PageRole,
+    PersistentRegion,
+    PipelineABI,
+    PipelineSpec,
+    RegionRecord,
     ScheduledOp,
+    SemaphoreRole,
     TensorMeta,
     build_op_config,
     config_dim_i32,
     config_ptr_i64,
     config_flat_tensor,
+    flatten_scheduled_items,
+    linearize_scheduled_items,
 )
 
 from .registries import (
@@ -62,10 +71,18 @@ from .autograd import MegakernelFunction
 from .kernel_cache import KernelCache
 from .functional import megakernel_apply, MegakernelModule
 from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
+from .regions import region
 
 __all__ = [
     # Operation Protocol
     "Op",
+    "PageRole",
+    "SemaphoreRole",
+    "InstructionPageProtocol",
+    "PipelineSpec",
+    "PipelineABI",
+    "PersistentRegion",
+    "RegionRecord",
     "ScheduledOp",
     "TensorMeta",
     "PeerBufferRegistry",
@@ -75,6 +92,8 @@ __all__ = [
     "config_dim_i32",
     "config_ptr_i64",
     "config_flat_tensor",
+    "flatten_scheduled_items",
+    "linearize_scheduled_items",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
@@ -102,6 +121,7 @@ __all__ = [
     "KernelCache",
     "megakernel_apply",
     "MegakernelModule",
+    "region",
     # Debug utilities
     "dump_ptx",
     "dump_sass",

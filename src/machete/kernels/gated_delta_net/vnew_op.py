@@ -136,7 +136,7 @@ class GDNVNewOp(Op):
         mbar_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._mbar_offset = ((mbar_start + 7) // 8) * 8
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

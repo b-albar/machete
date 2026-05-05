@@ -124,8 +124,7 @@ class GDNSolveOp(Op):
         # Phase 3: a_smem[BT, BT] fp32 at offset 0 (reuses K buffer area)
         self._a_base = 0
 
-        # Override compute method
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

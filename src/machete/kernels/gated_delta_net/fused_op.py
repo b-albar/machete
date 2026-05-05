@@ -231,7 +231,7 @@ class GDNFusedOp(Op):
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16)
         self.q_tile_bytes = _BT * self.K * 2
         _fused_init(self)
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
@@ -841,7 +841,7 @@ class GDNFusedBwdOp(Op):
         self._primary_bytes = _BT * BV * 2
         self.do_tile_bytes = self._primary_bytes
         _fused_init(self)
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):

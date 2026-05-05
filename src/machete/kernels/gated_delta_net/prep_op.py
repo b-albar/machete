@@ -154,8 +154,7 @@ class GDNPrepOp(Op):
         self._src_base = ((max(a_end, scalars_end) + 127) // 128) * 128
         self._src_base2 = self._src_base + self.BT * max(self.BK_PAD, self.BV_PAD) * self.elem_bytes
 
-        # Override compute method
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

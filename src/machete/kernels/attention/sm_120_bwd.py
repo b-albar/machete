@@ -223,8 +223,7 @@ class FlashAttentionSm120BwdOp(Op):
             f"m_block={self.m_block} must be divisible by copy_dim0={self.copy_dim0}"
         )
 
-        # Override compute method
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

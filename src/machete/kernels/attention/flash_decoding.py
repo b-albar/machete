@@ -177,8 +177,7 @@ class _FlashDecodingSplitTmaOp(Op):
         self.scale_log2e = self.scale_val * 1.4426950408889634074
         self.rescale_threshold = 8.0
 
-        # Override compute
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling
@@ -752,7 +751,7 @@ class _FlashDecodingSplitCpAsyncBase(_FlashDecodingSplitTmaOp):
         self.blocks_per_split = (self.num_kv_blocks + self.num_splits - 1) // self.num_splits
         self.scale_log2e = self.scale_val * 1.4426950408889634074
         self.rescale_threshold = 8.0
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @cute.jit
     def load(self, page_ptr, tile_B, tile_H, tile_SPLIT, q_tma, q_tma_gmem, work_mbar):

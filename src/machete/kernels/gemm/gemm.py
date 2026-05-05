@@ -410,8 +410,15 @@ class GemmOp(Op):
         # where S tiles are very small and compile scaling matters more than the
         # extra device-call boundary. For larger standalone GEMMs it is a pure
         # runtime cost, so keep the original direct compute path there.
-        if not self.has_a_scale and self.tile_size_S <= 16:
-            self.compute = self.compute_unscaled
+        compute_owner = next(
+            cls for cls in type(self).__mro__ if "compute" in cls.__dict__
+        )
+        if (
+            not self.has_a_scale
+            and self.tile_size_S <= 16
+            and compute_owner is GemmOp
+        ):
+            self._bind_phase("compute", "compute_unscaled")
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,

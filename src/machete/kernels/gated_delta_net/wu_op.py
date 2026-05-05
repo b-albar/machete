@@ -182,8 +182,7 @@ class GDNWUOp(Op):
         else:
             self._v_buf1_offset = self._src_base  # single-buf fallback
 
-        # Override compute method
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

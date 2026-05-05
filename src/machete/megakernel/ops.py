@@ -34,7 +34,7 @@ Shared config helpers intentionally mirror common CuTe DSL patterns:
 import math
 import struct
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -104,8 +104,8 @@ class PipelineSpec:
             and self.range_end_axis == self.range_axis
         ):
             raise ValueError("PipelineSpec.range_end_axis must differ from range_axis")
-        if self.range_block_size < 1:
-            raise ValueError("PipelineSpec.range_block_size must be >= 1")
+        if self.range_block_size < 0:
+            raise ValueError("PipelineSpec.range_block_size must be >= 0")
 
     @property
     def resource_bytes(self) -> int:
@@ -130,7 +130,7 @@ class PipelineSpec:
         return PipelineSpec(**values)
 
     @classmethod
-    def staged_matvec(
+    def streaming(
         cls,
         *,
         input_stages: int = 3,
@@ -143,7 +143,7 @@ class PipelineSpec:
         range_block_size: int = 1,
         coalesce_ranges: bool = False,
     ) -> "PipelineSpec":
-        """Return the page/semaphore contract used by staged matvec pipelines."""
+        """Return a staged load/compute/store page-ring contract."""
         return cls(
             page_count=1 + input_stages * stage_pages,
             page_bytes=page_bytes,
@@ -157,6 +157,324 @@ class PipelineSpec:
             range_block_size=range_block_size,
             coalesce_ranges=coalesce_ranges,
         )
+
+    def page_protocol(self) -> "InstructionPageProtocol":
+        """Return the named instruction-owned page/semaphore protocol.
+
+        ``PipelineSpec`` is intentionally compact because it is carried on every
+        scheduled op.  The named protocol is host-side structure used by region
+        lowering and tests to reason about staged handlers without growing
+        the device metadata stream.
+        """
+        staged_page_count = 1 + self.input_stages * self.stage_pages
+        staged_semaphore_count = 1 + 2 * (self.input_stages + self.output_stages)
+        if (
+            self.page_count == staged_page_count
+            and self.semaphore_count == staged_semaphore_count
+        ):
+            return InstructionPageProtocol.streaming(
+                input_stages=self.input_stages,
+                output_stages=self.output_stages,
+                stage_pages=self.stage_pages,
+                page_bytes=self.page_bytes,
+                scratch_bytes=self.scratch_bytes,
+            )
+        return InstructionPageProtocol.generic(
+            page_count=self.page_count,
+            semaphore_count=self.semaphore_count,
+            page_bytes=self.page_bytes,
+            scratch_bytes=self.scratch_bytes,
+        )
+
+
+@dataclass(frozen=True)
+class PageRole:
+    """A contiguous set of pages owned by one specialized instruction."""
+
+    name: str
+    offset: int
+    count: int
+
+    def page(self, local_idx: int = 0) -> int:
+        if local_idx < 0 or local_idx >= self.count:
+            raise IndexError(
+                f"page role {self.name!r} index {local_idx} out of range for {self.count} pages"
+            )
+        return self.offset + local_idx
+
+
+@dataclass(frozen=True)
+class SemaphoreRole:
+    """A contiguous set of instruction-local semaphores."""
+
+    name: str
+    offset: int
+    count: int
+    participants: int = 1
+
+    def semaphore(self, local_idx: int = 0) -> int:
+        if local_idx < 0 or local_idx >= self.count:
+            raise IndexError(
+                f"semaphore role {self.name!r} index {local_idx} out of range for {self.count} semaphores"
+            )
+        return self.offset + local_idx
+
+
+@dataclass(frozen=True)
+class InstructionPageProtocol:
+    """Named page/semaphore ABI for specialized staged instructions.
+
+    This is host-side protocol metadata.  A generated persistent handler can use
+    the names to emit a static page ring and semaphores, while the current replay
+    backend can ignore the names and continue using the compact counts from
+    ``PipelineSpec``.
+    """
+
+    page_roles: Tuple[PageRole, ...]
+    semaphore_roles: Tuple[SemaphoreRole, ...] = ()
+    page_bytes: int = 0
+    scratch_bytes: int = 0
+
+    def __post_init__(self):
+        seen_pages = set()
+        for role in self.page_roles:
+            if role.count < 1:
+                raise ValueError(f"page role {role.name!r} must have at least one page")
+            if role.name in seen_pages:
+                raise ValueError(f"duplicate page role {role.name!r}")
+            seen_pages.add(role.name)
+        seen_sems = set()
+        for role in self.semaphore_roles:
+            if role.count < 1:
+                raise ValueError(f"semaphore role {role.name!r} must have at least one semaphore")
+            if role.participants < 1:
+                raise ValueError(f"semaphore role {role.name!r} must have participants >= 1")
+            if role.name in seen_sems:
+                raise ValueError(f"duplicate semaphore role {role.name!r}")
+            seen_sems.add(role.name)
+        if self.page_bytes < 0 or self.scratch_bytes < 0:
+            raise ValueError("page_bytes and scratch_bytes must be non-negative")
+
+    @property
+    def page_count(self) -> int:
+        return sum(role.count for role in self.page_roles)
+
+    @property
+    def semaphore_count(self) -> int:
+        return sum(role.count for role in self.semaphore_roles)
+
+    @property
+    def resource_bytes(self) -> int:
+        return self.page_count * self.page_bytes + self.semaphore_count * 8 + self.scratch_bytes
+
+    def page_role(self, name: str) -> PageRole:
+        for role in self.page_roles:
+            if role.name == name:
+                return role
+        raise KeyError(name)
+
+    def semaphore_role(self, name: str) -> SemaphoreRole:
+        for role in self.semaphore_roles:
+            if role.name == name:
+                return role
+        raise KeyError(name)
+
+    def page(self, name: str, local_idx: int = 0) -> int:
+        return self.page_role(name).page(local_idx)
+
+    def semaphore(self, name: str, local_idx: int = 0) -> int:
+        return self.semaphore_role(name).semaphore(local_idx)
+
+    @classmethod
+    def streaming(
+        cls,
+        *,
+        input_stages: int = 3,
+        output_stages: int = 3,
+        stage_pages: int = 4,
+        page_bytes: int = 0,
+        scratch_bytes: int = 0,
+    ) -> "InstructionPageProtocol":
+        if input_stages < 0 or output_stages < 0:
+            raise ValueError("stages must be non-negative")
+        if stage_pages < 1:
+            raise ValueError("stage_pages must be >= 1")
+
+        page_roles = [PageRole("activation", 0, 1)]
+        page_offset = 1
+        for stage in range(input_stages):
+            page_roles.append(PageRole(f"input_stage_{stage}", page_offset, stage_pages))
+            page_offset += stage_pages
+
+        sem_roles = [SemaphoreRole("activations_arrived", 0, 1)]
+        sem_offset = 1
+        for stage in range(input_stages):
+            sem_roles.append(SemaphoreRole(f"weights_arrived_{stage}", sem_offset, 1))
+            sem_offset += 1
+        for stage in range(input_stages):
+            sem_roles.append(SemaphoreRole(f"weights_finished_{stage}", sem_offset, 1))
+            sem_offset += 1
+        for stage in range(output_stages):
+            sem_roles.append(SemaphoreRole(f"outputs_arrived_{stage}", sem_offset, 1))
+            sem_offset += 1
+        for stage in range(output_stages):
+            sem_roles.append(SemaphoreRole(f"outputs_finished_{stage}", sem_offset, 1))
+            sem_offset += 1
+
+        return cls(
+            page_roles=tuple(page_roles),
+            semaphore_roles=tuple(sem_roles),
+            page_bytes=page_bytes,
+            scratch_bytes=scratch_bytes,
+        )
+
+    @classmethod
+    def generic(
+        cls,
+        *,
+        page_count: int,
+        semaphore_count: int = 0,
+        page_bytes: int = 0,
+        scratch_bytes: int = 0,
+    ) -> "InstructionPageProtocol":
+        page_roles = tuple(PageRole(f"page_{idx}", idx, 1) for idx in range(page_count))
+        sem_roles = tuple(
+            SemaphoreRole(f"semaphore_{idx}", idx, 1)
+            for idx in range(semaphore_count)
+        )
+        return cls(
+            page_roles=page_roles,
+            semaphore_roles=sem_roles,
+            page_bytes=page_bytes,
+            scratch_bytes=scratch_bytes,
+        )
+
+
+@dataclass(frozen=True)
+class PersistentRegion:
+    """A scheduled region that lowers as one persistent instruction boundary."""
+
+    name: str
+    ops: Tuple["ScheduledOp", ...]
+    pipeline: PipelineSpec
+    protocol: InstructionPageProtocol
+    lowering: str = "replay"
+    generated_op: Optional["ScheduledOp"] = None
+
+    LOWER_REPLAY: ClassVar[str] = "replay"
+    LOWER_HANDLER: ClassVar[str] = "handler"
+
+    def __post_init__(self):
+        if not self.name:
+            raise ValueError("PersistentRegion.name must be non-empty")
+        if not self.ops:
+            raise ValueError("PersistentRegion.ops must be non-empty")
+        if self.lowering not in (self.LOWER_REPLAY, self.LOWER_HANDLER):
+            raise ValueError(f"unsupported region lowering {self.lowering!r}")
+        if self.lowering == self.LOWER_HANDLER and self.generated_op is None:
+            raise ValueError(
+                "handler-backed PersistentRegion requires a generated scheduled op"
+            )
+        if self.lowering == self.LOWER_REPLAY and self.generated_op is not None:
+            raise ValueError("replay-backed PersistentRegion cannot carry generated_op")
+        if self.protocol.page_count != self.pipeline.page_count:
+            raise ValueError(
+                f"region protocol has {self.protocol.page_count} pages but pipeline declares "
+                f"{self.pipeline.page_count}"
+            )
+        if self.protocol.semaphore_count != self.pipeline.semaphore_count:
+            raise ValueError(
+                f"region protocol has {self.protocol.semaphore_count} semaphores but pipeline declares "
+                f"{self.pipeline.semaphore_count}"
+            )
+
+    @classmethod
+    def from_ops(
+        cls,
+        name: str,
+        ops: Iterable["ScheduledOp"],
+        *,
+        pipeline: Optional[PipelineSpec] = None,
+        protocol: Optional[InstructionPageProtocol] = None,
+        lowering: str = LOWER_REPLAY,
+        generated_op: Optional["ScheduledOp"] = None,
+    ) -> "PersistentRegion":
+        ops_tuple = tuple(ops)
+        pipe = pipeline or PipelineSpec.streaming()
+        proto = protocol or pipe.page_protocol()
+        return cls(
+            name=name,
+            ops=ops_tuple,
+            pipeline=pipe,
+            protocol=proto,
+            lowering=lowering,
+            generated_op=generated_op,
+        )
+
+    @property
+    def total_tiles(self) -> int:
+        if self.generated_op is not None:
+            return self.generated_op.total_tiles
+        return sum(op.total_tiles for op in self.ops)
+
+    def as_replay_ops(self) -> List["ScheduledOp"]:
+        if self.generated_op is not None:
+            return [self.generated_op]
+        return list(self.ops)
+
+
+@dataclass(frozen=True)
+class RegionRecord:
+    """A persistent region mapped onto the flattened replay op list."""
+
+    name: str
+    start_op: int
+    end_op: int
+    pipeline: PipelineSpec
+    protocol: InstructionPageProtocol
+    lowering: str
+
+    @property
+    def op_count(self) -> int:
+        return self.end_op - self.start_op
+
+
+ScheduledItem = Union["ScheduledOp", PersistentRegion]
+
+
+def linearize_scheduled_items(
+    items: Iterable[ScheduledItem],
+) -> Tuple[List["ScheduledOp"], Tuple[RegionRecord, ...]]:
+    """Flatten scheduled items while preserving persistent region boundaries.
+
+    Handler-backed regions lower to the explicit generated op supplied by the
+    scheduler.  Mixed-op codegen is intentionally not inferred here.
+    """
+    flattened: List["ScheduledOp"] = []
+    regions: List[RegionRecord] = []
+    for item in items:
+        if isinstance(item, PersistentRegion):
+            start = len(flattened)
+            flattened.extend(item.as_replay_ops())
+            regions.append(
+                RegionRecord(
+                    name=item.name,
+                    start_op=start,
+                    end_op=len(flattened),
+                    pipeline=item.pipeline,
+                    protocol=item.protocol,
+                    lowering=item.lowering,
+                )
+            )
+        else:
+            flattened.append(item)
+    return flattened, tuple(regions)
+
+
+def flatten_scheduled_items(items: Iterable[ScheduledItem]) -> List["ScheduledOp"]:
+    """Flatten scheduled ops and replay-backed persistent regions."""
+    flattened, _regions = linearize_scheduled_items(items)
+    return flattened
 
 
 @dataclass(frozen=True)
@@ -628,6 +946,7 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
 
     transfer_sets = {
         "_TMA_LOADS": set(getattr(cls, "tma_loads", set())),
+        "_TMA_COMPUTE_LOADS": set(getattr(cls, "tma_compute_loads", set())),
         "_TMA_STORES": set(getattr(cls, "tma_stores", set())),
         "_TMA_COMPUTE_STORES": set(getattr(cls, "tma_compute_stores", set())),
         "_TMA_REDUCE_STORES": set(getattr(cls, "tma_reduce_stores", set())),
@@ -636,6 +955,12 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
     }
 
     _validate_tensor_set(transfer_sets["_TMA_LOADS"], read_names, "tma_loads", "reads")
+    _validate_tensor_set(
+        transfer_sets["_TMA_COMPUTE_LOADS"],
+        read_names,
+        "tma_compute_loads",
+        "reads",
+    )
     _validate_tensor_set(transfer_sets["_TMA_STORES"], write_names, "tma_stores", "writes")
     _validate_tensor_set(
         transfer_sets["_TMA_COMPUTE_STORES"],
@@ -664,6 +989,7 @@ def _collect_tma_tensor_dims(unique_tensors, transfer_sets):
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
     tma_tensor_names = (
         transfer_sets["_TMA_LOADS"]
+        | transfer_sets["_TMA_COMPUTE_LOADS"]
         | transfer_sets["_TMA_STORES"]
         | transfer_sets["_TMA_COMPUTE_STORES"]
         | transfer_sets["_TMA_REDUCE_STORES"]
@@ -837,7 +1163,7 @@ def _process_op_declarations(cls):
         if phase == "load":
             tma_names = cls._TMA_LOADS
         elif phase == "compute":
-            tma_names = cls._TMA_COMPUTE_STORES
+            tma_names = cls._TMA_COMPUTE_LOADS | cls._TMA_COMPUTE_STORES
         elif phase == "store":
             tma_names = cls._TMA_STORES | cls._TMA_REDUCE_STORES
         else:
@@ -942,6 +1268,10 @@ class Op:
     OUTPUTS: ClassVar[List[str]] = []
     pipeline: ClassVar[Optional[PipelineSpec]] = None
     pipeline_abi: ClassVar[Optional[PipelineABI]] = None
+    load_phase: ClassVar[Optional[str]] = None
+    compute_phase: ClassVar[Optional[str]] = None
+    store_phase: ClassVar[Optional[str]] = None
+    communicate_phase: ClassVar[Optional[str]] = None
 
     def __init__(self, **config):
         """Initialize Op instance with compile-time configuration.
@@ -955,6 +1285,21 @@ class Op:
         """
         for key, value in config.items():
             setattr(self, key, value)
+        self._bind_declared_phases()
+
+    def _bind_phase(self, phase_name: str, implementation_name: Optional[str]) -> None:
+        """Expose a named implementation method as a standard execution phase."""
+        if implementation_name is None:
+            return
+        implementation = getattr(self, implementation_name)
+        setattr(self, phase_name, implementation)
+
+    def _bind_declared_phases(self) -> None:
+        """Bind class-declared phase aliases on this concrete op instance."""
+        self._bind_phase("load", type(self).load_phase)
+        self._bind_phase("compute", type(self).compute_phase)
+        self._bind_phase("store", type(self).store_phase)
+        self._bind_phase("communicate", type(self).communicate_phase)
 
     def __init_subclass__(cls, **kwargs):
         """Process op declarations when subclasses define reads and writes."""
@@ -1148,13 +1493,20 @@ __all__ = [
     "DEFAULT_PAGE_SIZE",
     "TORCH_TO_CUTLASS_DTYPE",
     # Metadata
+    "InstructionPageProtocol",
+    "PageRole",
+    "PersistentRegion",
     "PipelineSpec",
     "PipelineABI",
+    "SemaphoreRole",
     "TensorMeta",
+    "RegionRecord",
     # Protocol
     "Op",
     "build_op_config",
     "is_compile_static_dim",
     # Scheduling
     "ScheduledOp",
+    "flatten_scheduled_items",
+    "linearize_scheduled_items",
 ]

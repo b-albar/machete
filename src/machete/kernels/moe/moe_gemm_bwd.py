@@ -150,7 +150,7 @@ class MoeGemmBwdOp(Op):
             f"tile_M={self.tile_size_M}, tile_K={self.tile_size_K}, tile_N={self.tile_N}"
         )
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
