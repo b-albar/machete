@@ -95,7 +95,7 @@ def _print_table(rows: list[dict], key_fields: list[str]) -> None:
 def _track_decode(args: argparse.Namespace) -> None:
     rows = []
     for layers in args.layers:
-        rows.append(_run_worker([
+        worker_args = [
             "decode-worker",
             "--layers", str(layers),
             "--batch", str(args.batch),
@@ -103,21 +103,25 @@ def _track_decode(args: argparse.Namespace) -> None:
             "--page-size", str(args.page_size),
             "--warmup", str(args.warmup),
             "--rep", str(args.rep),
-        ]))
+        ]
+        if args.qwen_sm120:
+            worker_args.append("--qwen-sm120")
+        rows.append(_run_worker(worker_args))
     _print_table(rows, ["mode", "layers", "batch", "context_len", "page_size"])
 
 
 def _track_prefill(args: argparse.Namespace) -> None:
     rows = []
     for seq_len in args.seq_lens:
-        rows.append(_run_worker([
+        worker_args = [
             "prefill-worker",
             "--batch", str(args.batch),
             "--seq-len", str(seq_len),
             "--page-size", str(args.page_size),
             "--warmup", str(args.warmup),
             "--rep", str(args.rep),
-        ]))
+        ]
+        rows.append(_run_worker(worker_args))
     _print_table(rows, ["mode", "batch", "seq_len", "page_size"])
 
 
@@ -183,12 +187,13 @@ def _measure_decode(args: argparse.Namespace) -> dict:
         residual_init=residual,
         page_size=args.page_size,
         num_layers=args.layers,
+        use_qwen_sm120_ops=args.qwen_sm120,
     )
     torch.cuda.synchronize()
     build_ms = (time.perf_counter() - t0) * 1000.0
     runtime_ms = Benchmark()._bench_kernel_func(spec, warmup=args.warmup, rep=args.rep)
     return {
-        "mode": "decode",
+        "mode": "decode-qwen-sm120" if args.qwen_sm120 else "decode",
         "layers": args.layers,
         "batch": args.batch,
         "context_len": args.context_len,
@@ -307,7 +312,7 @@ def _measure_layer_fwd(args: argparse.Namespace) -> dict:
     W_down = torch.randn(HIDDEN, INTERMEDIATE, dtype=dtype, device="cuda") * 0.02
 
     t0 = time.perf_counter()
-    spec, _spec3k, _out, _res = megakernel_forward_build(
+    spec, _out, _res = megakernel_forward_build(
         batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
         w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
         page_size=args.page_size,
@@ -360,7 +365,7 @@ def _measure_layer_bwd(args: argparse.Namespace) -> dict:
     W_down = torch.randn(HIDDEN, INTERMEDIATE, dtype=dtype, device="cuda") * 0.02
 
     t0 = time.perf_counter()
-    spec, _spec2k, _errs = megakernel_layer_bwd_build(
+    spec, _errs = megakernel_layer_bwd_build(
         batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
         w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
         page_size=args.page_size,
@@ -391,6 +396,7 @@ def _build_parser() -> argparse.ArgumentParser:
     decode.add_argument("--page-size", type=int, default=32768)
     decode.add_argument("--warmup", type=int, default=5)
     decode.add_argument("--rep", type=int, default=20)
+    decode.add_argument("--qwen-sm120", action="store_true")
 
     prefill = sub.add_parser("prefill")
     prefill.add_argument("--seq-lens", nargs="+", type=int, default=[128, 512, 1024])
@@ -428,6 +434,7 @@ def _build_parser() -> argparse.ArgumentParser:
     worker_decode.add_argument("--page-size", type=int, required=True)
     worker_decode.add_argument("--warmup", type=int, required=True)
     worker_decode.add_argument("--rep", type=int, required=True)
+    worker_decode.add_argument("--qwen-sm120", action="store_true")
 
     worker_prefill = sub.add_parser("prefill-worker")
     worker_prefill.add_argument("--batch", type=int, required=True)

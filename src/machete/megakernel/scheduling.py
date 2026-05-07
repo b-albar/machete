@@ -18,8 +18,18 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
+from .instruction_layout import (
+    INSTR_BARRIER_META_IDX,
+    INSTR_OP_IDX,
+    INSTR_TILE_0,
+    INSTR_TILE_1,
+    INSTR_TILE_2,
+    INSTR_TILE_3,
+    INSTR_TILE_4,
+    INSTRUCTION_WORDS,
+)
 from .ops import MAX_TILE_DIMS, Op, ScheduledOp, tensor_meta_overlaps
 
 
@@ -82,20 +92,17 @@ class BarrierFormula:
 # Instruction Stream (Lightweight — barriers baked into handlers)
 # =============================================================================
 
-INSTRUCTION_WORDS = 2 + MAX_TILE_DIMS  # op_idx + linear_tile_idx + expanded tile coords
-
-
 @dataclass
 class TileInstruction:
     """A single tile work instruction for the persistent megakernel.
 
-    Flat encoding in global memory (7 x int32):
+    Flat encoding in global memory:
     [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
-    [1]  linear_tile_idx: Row-major linearized tile index
-    [2:] tile coordinates padded to MAX_TILE_DIMS
+    [1:] tile coordinates followed by the barrier metadata row index
 
-    Barrier wait/signal logic is baked into op handlers at compile time
-    via BarrierFormula, not encoded in the instruction stream.
+    Barrier wait/signal formulas stay in compact side tensors. The instruction
+    carries the row index into those side tensors so replay does not need to
+    derive it from scheduler shape in the hot loop.
     """
 
     op_idx: int
@@ -104,18 +111,24 @@ class TileInstruction:
     # Sentinel for end of stream
     END_MARKER: int = -1
 
-    def pack(self, strides: Optional[Tuple[int, ...]] = None) -> List[int]:
-        """Pack into list of int32: [op_idx, linear_tile_idx, tile_0..tile_4].
+    def pack(
+        self,
+        barrier_meta_idx: int = 0,
+    ) -> List[int]:
+        """Pack into the replay instruction row.
 
         Args:
-            strides: Row-major strides for linearization. If None (e.g., end
-                marker), linear index is 0.
+            barrier_meta_idx: Row in the wait/signal side metadata tensors.
         """
-        if self.op_idx == self.END_MARKER or strides is None:
-            return [self.op_idx, 0] + [0] * MAX_TILE_DIMS
-        linear = sum(t * s for t, s in zip(self.tiles, strides))
+        if self.op_idx == self.END_MARKER:
+            return [self.op_idx] + [0] * (INSTRUCTION_WORDS - 1)
         padded_tiles = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
-        return [self.op_idx, linear] + padded_tiles
+        return [
+            self.op_idx,
+            *padded_tiles,
+            barrier_meta_idx,
+            0,
+        ]
 
     @classmethod
     def end_instruction(cls) -> "TileInstruction":
@@ -290,8 +303,10 @@ def _coalesce_pipeline_ranges(
     range_axis: int,
     range_end_axis: int,
     max_range_tiles: int = 0,
+    range_stride: int = 1,
+    range_stride_axis: int = -1,
 ) -> List[TileInstruction]:
-    """Coalesce adjacent single-block instructions into [start, end) ranges."""
+    """Coalesce single-block instructions into contiguous or strided ranges."""
     if not instructions:
         return []
     if range_axis < 0:
@@ -300,6 +315,56 @@ def _coalesce_pipeline_ranges(
         range_end_axis = range_axis + 1
     if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
         return instructions
+    if range_stride < 1:
+        range_stride = 1
+    if range_stride == 1:
+        range_stride_axis = -1
+    elif range_stride_axis < 0:
+        range_stride_axis = range_end_axis + 1
+    if range_stride > 1 and (
+        range_stride_axis >= MAX_TILE_DIMS
+        or range_stride_axis in (range_axis, range_end_axis)
+    ):
+        return instructions
+
+    if range_stride > 1:
+        groups: Dict[Tuple[int, ...], List[Tuple[int, TileInstruction]]] = {}
+        for original_idx, instr in enumerate(instructions):
+            tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
+            key = []
+            for axis in range(MAX_TILE_DIMS):
+                if axis in (range_axis, range_end_axis, range_stride_axis):
+                    continue
+                key.append(tiles[axis])
+            key.append(tiles[range_axis] % range_stride)
+            groups.setdefault(tuple(key), []).append((original_idx, instr))
+
+        out_with_order: List[Tuple[int, TileInstruction]] = []
+        for group in groups.values():
+            group.sort(key=lambda item: (item[1].tiles[range_axis], item[0]))
+            idx = 0
+            while idx < len(group):
+                first_order, first = group[idx]
+                tiles = list(first.tiles) + [0] * (MAX_TILE_DIMS - len(first.tiles))
+                start = tiles[range_axis]
+                count = 1
+                idx += 1
+                while idx < len(group):
+                    _, candidate = group[idx]
+                    cand_tiles = list(candidate.tiles) + [0] * (
+                        MAX_TILE_DIMS - len(candidate.tiles)
+                    )
+                    if max_range_tiles > 0 and count >= max_range_tiles:
+                        break
+                    if cand_tiles[range_axis] != start + count * range_stride:
+                        break
+                    count += 1
+                    idx += 1
+                tiles[range_end_axis] = count
+                tiles[range_stride_axis] = range_stride
+                out_with_order.append((first_order, TileInstruction(first.op_idx, tuple(tiles))))
+        out_with_order.sort(key=lambda item: item[0])
+        return [instr for _, instr in out_with_order]
 
     out: List[TileInstruction] = []
     idx = 0
@@ -361,173 +426,6 @@ class BackwardScheduler(TileScheduler):
         return _depth_sorted_instructions(op_records, depth)
 
 
-class GroupedScheduler(TileScheduler):
-    """Interleaved scheduler that groups tiles by shared dimensions.
-
-    For ops with many-to-one dependencies (e.g., PrepOp(B,H,T) → FusedOp(B,H,V)),
-    groups tiles by the shared dims (B,H) and interleaves groups:
-
-    Instead of: all PrepOp(b,h,*) then all FusedOp(b,h,*)
-    Produces:   PrepOp(0,0,*) FusedOp(0,0,*) PrepOp(0,1,*) FusedOp(0,1,*) ...
-
-    This enables FusedOp(0,0,*) to start as soon as PrepOp(0,0,*) completes,
-    while PrepOp(0,1,*) runs on other SMs — overlapping producer and consumer
-    across groups.
-
-    Falls back to BackwardScheduler ordering when no shared dimensions exist.
-    """
-
-    @staticmethod
-    def _find_shared_dims(
-        op_records: List["_OpRecord"],
-        edges: List["_DepEdge"],
-    ) -> Optional[Set[str]]:
-        """Find dimensions shared across all dependency edges."""
-        shared_dims: Optional[Set[str]] = None
-        for edge in edges:
-            p_dims = set(op_records[edge.producer_idx].op.dim_names.keys())
-            c_dims = set(op_records[edge.consumer_idx].op.dim_names.keys())
-            edge_shared = p_dims & c_dims
-            if shared_dims is None:
-                shared_dims = edge_shared
-            else:
-                shared_dims &= edge_shared
-        return shared_dims if shared_dims else None
-
-    def schedule(
-        self,
-        op_records: List["_OpRecord"],
-        consumer_deps: Dict[int, List["_DepEdge"]],
-        edges: List["_DepEdge"],
-    ) -> List[TileInstruction]:
-        """Interleave tile groups that share common dependency dimensions."""
-        if not op_records:
-            return []
-
-        depth = _compute_op_depths(len(op_records), edges)
-        shared_dims = self._find_shared_dims(op_records, edges)
-
-        if not shared_dims:
-            return _depth_sorted_instructions(op_records, depth)
-
-        # Map shared dims to tile axes for each op
-        sorted_shared = sorted(shared_dims)
-        op_group_axes: Dict[int, List[Optional[int]]] = {}
-        for rec in op_records:
-            op_group_axes[rec.op_idx] = [
-                rec.op.dim_names.get(dim) for dim in sorted_shared
-            ]
-
-        # Build (group_key, -depth, op_idx, tile_idx) and sort
-        entries = []
-        for rec in op_records:
-            axes = op_group_axes[rec.op_idx]
-            op_depth = depth[rec.op_idx]
-            for tile_idx, tile in enumerate(rec.tiles):
-                group_key = tuple(
-                    tile[ax] if ax is not None else 0 for ax in axes
-                )
-                entries.append(
-                    (group_key, -op_depth, rec.op_idx, tile_idx, tile)
-                )
-
-        entries.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
-
-        return [
-            TileInstruction(op_idx=op_idx, tiles=tile)
-            for _, _, op_idx, _, tile in entries
-        ]
-
-
-class ReadyScheduler(TileScheduler):
-    """Host-side ready-list scheduler using resolved barrier formulas.
-
-    Unlike BackwardScheduler, this can emit a consumer tile as soon as its
-    specific producer counters are satisfied, instead of batching all tiles of
-    each producer op first.
-    """
-
-    def schedule(
-        self,
-        op_records: List["_OpRecord"],
-        consumer_deps: Dict[int, List["_DepEdge"]],
-        edges: List["_DepEdge"],
-    ) -> List[TileInstruction]:
-        return _depth_sorted_instructions(op_records, _compute_op_depths(len(op_records), edges))
-
-    def schedule_with_formulas(
-        self,
-        op_records: List["_OpRecord"],
-        edges: List["_DepEdge"],
-        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-    ) -> List[TileInstruction]:
-        if not op_records:
-            return []
-
-        depths = _compute_op_depths(len(op_records), edges)
-        next_tile_idx = [0 for _ in op_records]
-        total_remaining = sum(len(rec.tiles) for rec in op_records)
-        signal_counts: Dict[int, int] = {}
-        out: List[TileInstruction] = []
-
-        def tile_ready(op_idx: int, tile: Tuple[int, ...]) -> bool:
-            wait_formulas = formulas.get(op_idx, ([], []))[0]
-            for formula in wait_formulas:
-                if formula.has_guard and not formula.is_guarded(tile):
-                    continue
-                barrier_idx = formula.compute_index(tile)
-                if signal_counts.get(barrier_idx, 0) < formula.expected:
-                    return False
-            return True
-
-        def emit_signals(op_idx: int, tile: Tuple[int, ...]) -> None:
-            signal_formulas = formulas.get(op_idx, ([], []))[1]
-            for formula in signal_formulas:
-                if formula.has_guard and not formula.is_guarded(tile):
-                    continue
-                barrier_idx = formula.compute_index(tile)
-                signal_counts[barrier_idx] = signal_counts.get(barrier_idx, 0) + 1
-
-        while total_remaining:
-            ready_ops = []
-            for op_idx, rec in enumerate(op_records):
-                tile_idx = next_tile_idx[op_idx]
-                if tile_idx >= len(rec.tiles):
-                    continue
-                tile = rec.tiles[tile_idx]
-                if tile_ready(op_idx, tile):
-                    # Prefer consumers once they become ready; this exposes
-                    # chunk-level overlap instead of draining producers first.
-                    ready_ops.append((depths[op_idx], op_idx))
-
-            if not ready_ops:
-                raise RuntimeError("ReadyScheduler deadlocked: no tile is ready")
-
-            _depth, op_idx = min(ready_ops)
-            tile = op_records[op_idx].tiles[next_tile_idx[op_idx]]
-            out.append(TileInstruction(op_idx=op_idx, tiles=tile))
-            emit_signals(op_idx, tile)
-            next_tile_idx[op_idx] += 1
-            total_remaining -= 1
-
-        return out
-
-
-# Default scheduler instance
-_default_scheduler: TileScheduler = BackwardScheduler()
-
-
-def get_default_scheduler() -> TileScheduler:
-    """Get the default tile scheduler."""
-    return _default_scheduler
-
-
-def set_default_scheduler(scheduler: TileScheduler) -> None:
-    """Set the default tile scheduler."""
-    global _default_scheduler
-    _default_scheduler = scheduler
-
-
 # =============================================================================
 # Instruction Stream Builder
 # =============================================================================
@@ -557,10 +455,9 @@ class InstructionStreamBuilder:
     Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
     """
 
-    def __init__(self, region_records: Optional[Tuple[Any, ...]] = None):
+    def __init__(self):
         """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
-        self._region_records: Tuple[Any, ...] = tuple(region_records or ())
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
         self._barrier_count: Optional[int] = None
         self._op_wait_counts: Dict[int, int] = {}
@@ -570,10 +467,6 @@ class InstructionStreamBuilder:
         """Clear cached formulas after the op list changes."""
         self._cached_formulas = None
         self._barrier_count = None
-
-    def set_region_records(self, region_records: Optional[Tuple[Any, ...]]) -> None:
-        """Set persistent region spans used by queue materialization."""
-        self._region_records = tuple(region_records or ())
 
     def _range_axis_for_op_idx(self, op_idx: int) -> Tuple[int, int]:
         pipeline = self._pipeline_for_op_idx(op_idx)
@@ -586,6 +479,18 @@ class InstructionStreamBuilder:
             return -1, -1
         return pipeline.range_axis, end_axis
 
+    def _range_stride_for_op_idx(self, op_idx: int) -> Tuple[int, int]:
+        if op_idx < 0 or op_idx >= len(self._op_records):
+            return 1, -1
+        static_dims = self._op_records[op_idx].op.static_dims
+        stride = int(static_dims.get("pipeline_range_stride", 1))
+        stride_axis = int(static_dims.get("pipeline_range_stride_axis", -1))
+        if stride < 1:
+            stride = 1
+        if stride == 1:
+            return 1, -1
+        return stride, stride_axis
+
     def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
         """Return logical tiles covered by one possibly range-owned instruction."""
         if instr.op_idx == TileInstruction.END_MARKER:
@@ -593,16 +498,25 @@ class InstructionStreamBuilder:
         range_axis, end_axis = self._range_axis_for_op_idx(instr.op_idx)
         if range_axis < 0:
             return [instr.tiles]
+        range_stride, stride_axis = self._range_stride_for_op_idx(instr.op_idx)
         tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
         start = tiles[range_axis]
-        end = tiles[end_axis]
-        if end <= start:
-            return [instr.tiles]
+        if range_stride > 1:
+            count = tiles[end_axis]
+            if count <= 1:
+                return [instr.tiles]
+            end = start + count * range_stride
+        else:
+            end = tiles[end_axis]
+            if end <= start:
+                return [instr.tiles]
         out: List[Tuple[int, ...]] = []
-        for axis_value in range(start, end):
+        for axis_value in range(start, end, range_stride):
             logical = list(tiles)
             logical[range_axis] = axis_value
             logical[end_axis] = 0
+            if stride_axis >= 0 and stride_axis < MAX_TILE_DIMS:
+                logical[stride_axis] = 0
             out.append(tuple(logical))
         return out
 
@@ -612,15 +526,22 @@ class InstructionStreamBuilder:
         return [r.op for r in self._op_records]
 
     def _pipeline_for_op_idx(self, op_idx: int):
-        op_pipeline = getattr(self._op_records[op_idx].op.op_cls, "pipeline", None)
+        op = self._op_records[op_idx].op
+        op_pipeline = getattr(op.op_cls, "pipeline", None)
         if op_pipeline is not None:
-            return op_pipeline
-        for region in self._region_records:
-            if (
-                region.start_op <= op_idx < region.end_op
-                and getattr(region.pipeline, "coalesce_ranges", False)
-            ):
-                return region.pipeline
+            return op_pipeline.with_overrides(
+                page_count=op.static_dims.get("pipeline_page_count"),
+                page_bytes=op.static_dims.get("pipeline_page_bytes"),
+                semaphore_count=op.static_dims.get("pipeline_semaphore_count"),
+                scratch_bytes=op.static_dims.get("pipeline_scratch_bytes"),
+                input_stages=op.static_dims.get("pipeline_input_stages"),
+                output_stages=op.static_dims.get("pipeline_output_stages"),
+                stage_pages=op.static_dims.get("pipeline_stage_pages"),
+                range_axis=op.static_dims.get("pipeline_range_axis"),
+                range_end_axis=op.static_dims.get("pipeline_range_end_axis"),
+                range_block_size=op.static_dims.get("pipeline_range_block_size"),
+                coalesce_ranges=op.static_dims.get("pipeline_coalesce_ranges"),
+            )
         return None
 
     def add_op(
@@ -1333,9 +1254,8 @@ class InstructionStreamBuilder:
 
         edges, consumer_deps = self._resolve_edges_and_consumers()
 
-        # Use provided scheduler or default
         if scheduler is None:
-            scheduler = get_default_scheduler()
+            scheduler = BackwardScheduler()
 
         if hasattr(scheduler, "schedule_with_formulas"):
             formulas, _ = self._resolve()
@@ -1354,6 +1274,7 @@ class InstructionStreamBuilder:
         device: str = "cuda",
         scheduler: Optional[TileScheduler] = None,
         instructions: Optional[List[TileInstruction]] = None,
+        barrier_meta_indices: Optional[List[int]] = None,
     ):
         """Build instruction stream as GPU tensor.
 
@@ -1364,16 +1285,55 @@ class InstructionStreamBuilder:
 
         if instructions is None:
             instructions = self.build(scheduler=scheduler)
-        # Precompute row-major strides per op for linearization
-        strides_by_op = {
-            r.op_idx: _linear_strides(r.op.tile_counts)
-            for r in self._op_records
-        }
-        packed = [
-            instr.pack(strides=strides_by_op.get(instr.op_idx))
-            for instr in instructions
-        ]
+        packed = []
+        for row_idx, instr in enumerate(instructions):
+            barrier_meta_idx = (
+                barrier_meta_indices[row_idx]
+                if barrier_meta_indices is not None
+                else row_idx
+            )
+            packed.append(
+                instr.pack(
+                    barrier_meta_idx=barrier_meta_idx,
+                )
+            )
         return torch.tensor(packed, dtype=torch.int32, device=device)
+
+    def expand_pipeline_instructions(
+        self,
+        instructions: List[TileInstruction],
+    ) -> List[TileInstruction]:
+        """Expand coalesced range instructions into logical per-tile rows."""
+        out: List[TileInstruction] = []
+        for instr in instructions:
+            if instr.op_idx == TileInstruction.END_MARKER:
+                out.append(instr)
+                continue
+            for logical_tile in self._logical_tiles_for_instruction(instr):
+                out.append(TileInstruction(instr.op_idx, logical_tile))
+        return out
+
+    def pipeline_barrier_meta_indices(
+        self,
+        instructions: List[TileInstruction],
+    ) -> Tuple[List[int], List[TileInstruction]]:
+        """Return coalesced-instruction metadata row bases and expanded rows.
+
+        The replay stream may keep one coalesced instruction while the runtime
+        expands its subtiles into ring slots. Wait/signal metadata remains
+        per logical subtile, so the controller can use ``base + subtile_offset``
+        for each emitted ring slot.
+        """
+        meta_indices: List[int] = []
+        expanded: List[TileInstruction] = []
+        for instr in instructions:
+            meta_indices.append(len(expanded))
+            if instr.op_idx == TileInstruction.END_MARKER:
+                expanded.append(instr)
+                continue
+            for logical_tile in self._logical_tiles_for_instruction(instr):
+                expanded.append(TileInstruction(instr.op_idx, logical_tile))
+        return meta_indices, expanded
 
     def coalesce_pipeline_instructions(
         self,
@@ -1391,130 +1351,19 @@ class InstructionStreamBuilder:
             run = non_end[idx:run_end]
             pipeline = self._pipeline_for_op_idx(op_idx)
             if pipeline is not None and pipeline.coalesce_ranges:
+                static_dims = self._op_records[op_idx].op.static_dims
                 run = _coalesce_pipeline_ranges(
                     run,
                     range_axis=pipeline.range_axis,
                     range_end_axis=pipeline.range_end_axis,
                     max_range_tiles=pipeline.range_block_size,
+                    range_stride=int(static_dims.get("pipeline_range_stride", 1)),
+                    range_stride_axis=int(static_dims.get("pipeline_range_stride_axis", -1)),
                 )
             out.extend(run)
             idx = run_end
         out.append(TileInstruction.end_instruction())
         return out
-
-    def build_queued_tensors(
-        self,
-        instructions: List[TileInstruction],
-        num_blocks: int,
-        device: str = "cuda",
-        preserve_instruction_order: bool = False,
-    ):
-        """Pack work into contiguous per-block instruction queues.
-
-        The C++ megakernel feeds each persistent CTA from its own instruction
-        queue. This preserves the measured-best strided assignment
-        (`i % num_blocks`) while making each CTA's fetch stream contiguous and
-        giving every queue an explicit END marker.
-
-        Returns:
-            (instructions_tensor, queued_instructions, queue_len)
-        """
-        import torch
-
-        if num_blocks <= 0:
-            raise ValueError(f"num_blocks must be positive, got {num_blocks}")
-
-        non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
-        queues: List[List[TileInstruction]] = [[] for _ in range(num_blocks)]
-
-        if preserve_instruction_order:
-            for global_idx, instr in enumerate(non_end):
-                queues[global_idx % num_blocks].append(instr)
-            queue_len = 1
-            end = TileInstruction.end_instruction()
-            for block_idx, queue in enumerate(queues):
-                queue.append(end)
-                queue_len = max(queue_len, len(queue))
-
-            queued_instructions: List[TileInstruction] = []
-            for queue in queues:
-                padded = queue + [end] * (queue_len - len(queue))
-                queued_instructions.extend(padded)
-
-            tensor = self.build_tensor(
-                device=device,
-                instructions=queued_instructions,
-            )
-            return tensor, queued_instructions, queue_len
-
-        run_start = 0
-        while run_start < len(non_end):
-            op_idx = non_end[run_start].op_idx
-            run_end = run_start + 1
-            while run_end < len(non_end) and non_end[run_end].op_idx == op_idx:
-                run_end += 1
-
-            run = non_end[run_start:run_end]
-            pipeline = self._pipeline_for_op_idx(op_idx)
-            if pipeline is not None:
-                # Staged pipeline instructions can own contiguous output ranges
-                # per resident CTA instead of striping every Nth tile.
-                if pipeline.coalesce_ranges:
-                    if pipeline.range_block_size == 0:
-                        range_run = _coalesce_pipeline_ranges(
-                            run,
-                            range_axis=pipeline.range_axis,
-                            range_end_axis=pipeline.range_end_axis,
-                        )
-                        for local_idx, instr in enumerate(range_run):
-                            queues[local_idx % num_blocks].append(instr)
-                        run_start = run_end
-                        continue
-                    for block_idx in range(num_blocks):
-                        begin = (len(run) * block_idx) // num_blocks
-                        end = (len(run) * (block_idx + 1)) // num_blocks
-                        block_run = _coalesce_pipeline_ranges(
-                            run[begin:end],
-                            range_axis=pipeline.range_axis,
-                            range_end_axis=pipeline.range_end_axis,
-                            max_range_tiles=pipeline.range_block_size,
-                        )
-                        queues[block_idx].extend(block_run)
-                    run_start = run_end
-                    continue
-                for block_idx in range(num_blocks):
-                    begin = (len(run) * block_idx) // num_blocks
-                    end = (len(run) * (block_idx + 1)) // num_blocks
-                    queues[block_idx].extend(run[begin:end])
-            else:
-                for local_idx, instr in enumerate(run):
-                    queues[local_idx % num_blocks].append(instr)
-            run_start = run_end
-
-        queue_len = 1
-        end = TileInstruction.end_instruction()
-        for block_idx, queue in enumerate(queues):
-            queue.append(end)
-            queue_len = max(queue_len, len(queue))
-
-        queued_instructions: List[TileInstruction] = []
-        for queue in queues:
-            padded = queue + [end] * (queue_len - len(queue))
-            queued_instructions.extend(padded)
-
-        strides_by_op = {
-            r.op_idx: _linear_strides(r.op.tile_counts)
-            for r in self._op_records
-        }
-        packed = [
-            instr.pack(strides=strides_by_op.get(instr.op_idx))
-            for instr in queued_instructions
-        ]
-        return (
-            torch.tensor(packed, dtype=torch.int32, device=device),
-            queued_instructions,
-            queue_len,
-        )
 
     @property
     def max_wait_deps(self) -> int:
@@ -1533,7 +1382,6 @@ class InstructionStreamBuilder:
         instructions,
         device="cuda",
         num_blocks: Optional[int] = None,
-        queue_len: Optional[int] = None,
     ):
         """Pre-compute (barrier_idx, expected) per instruction.
 
@@ -1542,8 +1390,7 @@ class InstructionStreamBuilder:
         barrier_idx = -1 means skip.
 
         When num_blocks is provided, repeated waits along each persistent CTA's
-        instruction stream are removed. Use queue_len for contiguous per-CTA
-        queues; omit it for the legacy strided layout.
+        strided instruction stream are removed.
         """
         import torch
 
@@ -1564,9 +1411,7 @@ class InstructionStreamBuilder:
             empty = [-1, 0] * max_waits
             seen_waits = [dict() for _ in range(num_blocks)]
             for idx, entry in enumerate(wait_data):
-                block_idx = idx // queue_len if queue_len is not None else idx % num_blocks
-                if block_idx >= num_blocks:
-                    block_idx = num_blocks - 1
+                block_idx = idx % num_blocks
                 if entry == empty:
                     continue
                 compacted: List[int] = []
@@ -1653,13 +1498,16 @@ class InstructionStreamBuilder:
             return []
 
         entry: List[int] = []
-        seen = set()
         signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
-        for tile in self._logical_tiles_for_instruction(instr):
-            for formula in signal_formulas:
+        logical_tiles = self._logical_tiles_for_instruction(instr)
+        range_axis, _end_axis = self._range_axis_for_op_idx(instr.op_idx)
+        for formula in signal_formulas:
+            seen = set()
+            preserve_range_multiplicity = range_axis >= 0 and formula.coeffs[range_axis] != 0
+            for tile in logical_tiles:
                 if not (formula.has_guard and not formula.is_guarded(tile)):
                     barrier_idx = formula.compute_index(tile)
-                    if barrier_idx not in seen:
+                    if preserve_range_multiplicity or barrier_idx not in seen:
                         seen.add(barrier_idx)
                         entry.append(barrier_idx)
         return entry
@@ -1690,12 +1538,15 @@ class InstructionStreamBuilder:
 __all__ = [
     "BarrierFormula",
     "INSTRUCTION_WORDS",
+    "INSTR_BARRIER_META_IDX",
+    "INSTR_OP_IDX",
+    "INSTR_TILE_0",
+    "INSTR_TILE_1",
+    "INSTR_TILE_2",
+    "INSTR_TILE_3",
+    "INSTR_TILE_4",
     "TileInstruction",
     "TileScheduler",
     "BackwardScheduler",
-    "GroupedScheduler",
-    "ReadyScheduler",
-    "get_default_scheduler",
-    "set_default_scheduler",
     "InstructionStreamBuilder",
 ]

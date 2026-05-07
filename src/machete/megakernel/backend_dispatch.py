@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 import cutlass.cute as cute
@@ -16,6 +17,23 @@ from .compile import compile_phase
 from .interpreter import ld_global_i32
 from .noinline import _flatten_ir_values, _rebuild
 from .ops import build_op_config
+
+
+@dataclass(frozen=True)
+class TMARuntimeLayout:
+    """Runtime TMA binding tables shared by metadata prep and dispatch codegen."""
+
+    op_phase_tma_args: Dict[str, List[List[str]]]
+    phase_tma_names: Dict[str, List[str]]
+    kernel_tma_arg_names: List[str]
+    runtime_op_phase_transport_indices: Dict[str, List[int]]
+    runtime_phase_transport_records: Dict[str, List[Tuple[str, ...]]]
+    runtime_phase_local_transport_positions: Dict[str, Tuple[Tuple[Tuple[int, ...], ...], ...]]
+    runtime_phase_local_desc_slots: Dict[str, Tuple[Tuple[Tuple[int, ...], ...], ...]]
+    handler_rebind_specs: Dict[int, Dict[str, List[Dict[str, Any]]]]
+    phase_uses_local_idx: Dict[str, bool]
+    phase_uses_transport_selector: Dict[str, bool]
+    phase_uses_desc_slot_selector: Dict[str, bool]
 
 
 def _tma_field_namespace_and_mbar(direction: str) -> Tuple[str, bool]:
@@ -166,8 +184,8 @@ def _build_tma_runtime_layout(backend, kernel):
             op_phase_tma_args[phase_name][op_idx] = phase_args
             op_phase_desc_slots[phase_name][op_idx] = phase_desc_slots
 
-    phase_transport_records = {phase: [] for phase in PHASE_NAMES}
-    op_phase_transport_indices = {phase: [] for phase in PHASE_NAMES}
+    runtime_phase_transport_records = {phase: [] for phase in PHASE_NAMES}
+    runtime_op_phase_transport_indices = {phase: [] for phase in PHASE_NAMES}
     phase_transport_idx = {phase: {} for phase in PHASE_NAMES}
     phase_desc_slot_records = {phase: [] for phase in PHASE_NAMES}
     for phase_name in PHASE_NAMES:
@@ -178,16 +196,16 @@ def _build_tma_runtime_layout(backend, kernel):
             )
             record_idx = phase_transport_idx[phase_name].get(key)
             if record_idx is None:
-                record_idx = len(phase_transport_records[phase_name])
+                record_idx = len(runtime_phase_transport_records[phase_name])
                 phase_transport_idx[phase_name][key] = record_idx
-                phase_transport_records[phase_name].append(tuple(phase_args))
+                runtime_phase_transport_records[phase_name].append(tuple(phase_args))
                 phase_desc_slot_records[phase_name].append(
                     tuple(op_phase_desc_slots[phase_name][op_idx])
                 )
-            op_phase_transport_indices[phase_name].append(record_idx)
+            runtime_op_phase_transport_indices[phase_name].append(record_idx)
 
-    phase_local_transport_positions = {}
-    phase_local_desc_slots = {}
+    runtime_phase_local_transport_positions = {}
+    runtime_phase_local_desc_slots = {}
     for phase_name in PHASE_NAMES:
         arg_index_by_name = {
             name: idx for idx, name in enumerate(phase_tma_names[phase_name])
@@ -195,11 +213,11 @@ def _build_tma_runtime_layout(backend, kernel):
         if getattr(backend, "runtime_transport_records", False):
             global_positions = tuple(
                 tuple(arg_index_by_name[name] for name in record)
-                for record in phase_transport_records[phase_name]
+                for record in runtime_phase_transport_records[phase_name]
             )
             global_desc_slots = tuple(phase_desc_slot_records[phase_name])
-            phase_local_transport_positions[phase_name] = (global_positions,)
-            phase_local_desc_slots[phase_name] = (global_desc_slots,)
+            runtime_phase_local_transport_positions[phase_name] = (global_positions,)
+            runtime_phase_local_desc_slots[phase_name] = (global_desc_slots,)
             continue
         handler_tables: List[Tuple[Tuple[int, ...], ...]] = []
         handler_desc_slot_tables: List[Tuple[Tuple[int, ...], ...]] = []
@@ -226,8 +244,8 @@ def _build_tma_runtime_layout(backend, kernel):
             handler_desc_slot_tables.append(
                 tuple(local_desc_slots.get(i, ()) for i in range(num_variants))
             )
-        phase_local_transport_positions[phase_name] = tuple(handler_tables)
-        phase_local_desc_slots[phase_name] = tuple(handler_desc_slot_tables)
+        runtime_phase_local_transport_positions[phase_name] = tuple(handler_tables)
+        runtime_phase_local_desc_slots[phase_name] = tuple(handler_desc_slot_tables)
 
     phase_uses_local_idx = {}
     phase_uses_transport_selector = {}
@@ -244,21 +262,21 @@ def _build_tma_runtime_layout(backend, kernel):
         for handler_idx, op_indices in by_handler.items():
             handler_local_ids = [
                 (
-                    op_phase_transport_indices[phase_name][op_idx]
+                    runtime_op_phase_transport_indices[phase_name][op_idx]
                     if runtime_transport_records
                     else backend.ir.op_phase_local_indices[phase_name][op_idx]
                 )
                 for op_idx in op_indices
             ]
             transport_table = (
-                phase_local_transport_positions[phase_name][0]
+                runtime_phase_local_transport_positions[phase_name][0]
                 if runtime_transport_records
-                else phase_local_transport_positions[phase_name][handler_idx]
+                else runtime_phase_local_transport_positions[phase_name][handler_idx]
             )
             desc_slot_table = (
-                phase_local_desc_slots[phase_name][0]
+                runtime_phase_local_desc_slots[phase_name][0]
                 if runtime_transport_records
-                else phase_local_desc_slots[phase_name][handler_idx]
+                else runtime_phase_local_desc_slots[phase_name][handler_idx]
             )
             handler_uses_local_idx = group_uses_handler_local_idx(
                 handler_local_ids=handler_local_ids,
@@ -290,18 +308,18 @@ def _build_tma_runtime_layout(backend, kernel):
         phase_uses_transport_selector[phase_name] = uses_transport_selector
         phase_uses_desc_slot_selector[phase_name] = uses_desc_slot_selector
 
-    result = (
-        op_phase_tma_args,
-        phase_tma_names,
-        kernel_tma_arg_names,
-        op_phase_transport_indices,
-        phase_transport_records,
-        phase_local_transport_positions,
-        phase_local_desc_slots,
-        handler_rebind_specs,
-        phase_uses_local_idx,
-        phase_uses_transport_selector,
-        phase_uses_desc_slot_selector,
+    result = TMARuntimeLayout(
+        op_phase_tma_args=op_phase_tma_args,
+        phase_tma_names=phase_tma_names,
+        kernel_tma_arg_names=kernel_tma_arg_names,
+        runtime_op_phase_transport_indices=runtime_op_phase_transport_indices,
+        runtime_phase_transport_records=runtime_phase_transport_records,
+        runtime_phase_local_transport_positions=runtime_phase_local_transport_positions,
+        runtime_phase_local_desc_slots=runtime_phase_local_desc_slots,
+        handler_rebind_specs=handler_rebind_specs,
+        phase_uses_local_idx=phase_uses_local_idx,
+        phase_uses_transport_selector=phase_uses_transport_selector,
+        phase_uses_desc_slot_selector=phase_uses_desc_slot_selector,
     )
     if cache is not None:
         cache[cache_key] = result
@@ -920,22 +938,10 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
         phase: backend.phase_local_indices(phase)
         for phase in PHASE_NAMES
     }
-    (
-        op_tma_args,
-        phase_tma_names,
-        kernel_tma_arg_names,
-        op_phase_transport_indices,
-        phase_transport_records,
-        phase_local_transport_positions,
-        phase_local_desc_slots,
-        handler_rebind_specs,
-        _phase_uses_local_idx,
-        _phase_uses_runtime_transport_selector,
-        _phase_uses_desc_slot_selector,
-    ) = _build_tma_runtime_layout(backend, kernel)
+    tma_layout = _build_tma_runtime_layout(backend, kernel)
     if getattr(backend, "runtime_transport_records", False):
         op_phase_local_indices = {
-            phase: list(op_phase_transport_indices[phase])
+            phase: list(tma_layout.runtime_op_phase_transport_indices[phase])
             for phase in PHASE_NAMES
         }
     load_fns: List[Any] = [None] * len(backend.ir.handler_specs)
@@ -957,13 +963,13 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
             instance = op.op_cls(**build_op_config(op, kernel_config=kernel_config))
             handler_spec = backend.ir.handler_specs[handler_idx]
             handler_warps[handler_idx] = getattr(instance, "num_mma_warps", num_mma_warps)
-            instance._machete_tma_rebind_specs = handler_rebind_specs.get(
+            instance._machete_tma_rebind_specs = tma_layout.handler_rebind_specs.get(
                 handler_idx,
                 {phase: [] for phase in PHASE_NAMES},
             )
             handler_op_indices = ops_by_handler[handler_idx]
             for phase_name, fn_list in phase_fn_lists.items():
-                handler_phase_rebinds = handler_rebind_specs.get(handler_idx, {}).get(phase_name, [])
+                handler_phase_rebinds = tma_layout.handler_rebind_specs.get(handler_idx, {}).get(phase_name, [])
                 handler_local_ids = [
                     op_phase_local_indices[phase_name][op_idx]
                     for op_idx in handler_op_indices
@@ -972,7 +978,7 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
                     handler_local_ids=handler_local_ids,
                     op_indices=handler_op_indices,
                     op_phase_tensor_args=phase_op_tensor_args[phase_name],
-                    op_phase_tma_args=op_tma_args[phase_name],
+                    op_phase_tma_args=tma_layout.op_phase_tma_args[phase_name],
                 )
                 effective_rebinds = handler_phase_rebinds
                 handler_phase_tma_params = []
@@ -1040,11 +1046,11 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
             op_handler_indices=op_handler_indices,
             op_phase_local_indices=op_phase_local_indices[phase_name],
             op_phase_tensor_args=phase_op_tensor_args[phase_name],
-            op_phase_tma_args=op_tma_args[phase_name],
-            phase_handler_local_transport_positions=phase_local_transport_positions[phase_name],
-            phase_handler_local_desc_slots=phase_local_desc_slots[phase_name],
+            op_phase_tma_args=tma_layout.op_phase_tma_args[phase_name],
+            phase_handler_local_transport_positions=tma_layout.runtime_phase_local_transport_positions[phase_name],
+            phase_handler_local_desc_slots=tma_layout.runtime_phase_local_desc_slots[phase_name],
             all_canonical=phase_tensor_names[phase_name],
-            all_tma_canonical=phase_tma_names[phase_name],
+            all_tma_canonical=tma_layout.phase_tma_names[phase_name],
             runtime_transport_records=getattr(backend, "runtime_transport_records", False),
         )
 
@@ -1087,16 +1093,16 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
         "has_communicate": has_communicate,
         "per_op_warps": [handler_warps[h] for h in op_handler_indices],
         "op_tensor_args": phase_op_tensor_args,
-        "op_tma_args": op_tma_args,
+        "op_tma_args": tma_layout.op_phase_tma_args,
         "op_weights": op_weights,
         "compile_keys": compile_keys,
         "op_handler_indices": op_handler_indices,
         "op_phase_local_indices": op_phase_local_indices,
-        "op_phase_transport_indices": op_phase_transport_indices,
+        "runtime_op_phase_transport_indices": tma_layout.runtime_op_phase_transport_indices,
         "all_canonical": all_canonical,
-        "all_tma_canonical": kernel_tma_arg_names,
+        "all_tma_canonical": tma_layout.kernel_tma_arg_names,
         "phase_tensor_names": phase_tensor_names,
-        "phase_tma_names": phase_tma_names,
+        "phase_tma_names": tma_layout.phase_tma_names,
     }
 
 
@@ -1107,4 +1113,5 @@ __all__ = [
     "group_uses_handler_local_idx_from_transport",
     "make_local_switch_binder",
     "make_switch_dispatch_callable",
+    "TMARuntimeLayout",
 ]

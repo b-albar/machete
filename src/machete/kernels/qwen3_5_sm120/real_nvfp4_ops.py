@@ -17,6 +17,8 @@ from machete.kernels.decode_matvec import (
     DecodeLayerScheduleSm120,
     MatvecResidualNvfp4Sm120Op,
     MatvecNvfp4Sm120Op,
+    MatvecPairNvfp4Sm120Op,
+    MatvecQuadNvfp4Sm120Op,
     RmsAddNormSm120Op,
     RmsGateUpSiluNvfp4Sm120Op,
     RmsKMatvecRopeCacheNvfp4Sm120Op,
@@ -29,8 +31,7 @@ from machete.kernels.decode_matvec import (
 )
 from machete.kernels.attention.flash_decoding import FlashDecodingCombineBSHDOp, flash_decoding_schedule
 from machete.megakernel.interpreter import named_barrier_sync
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec
-from machete.megakernel.regions import region
+from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec, TileRange
 
 
 QWEN3_5_REAL_NUM_LAYERS = 24
@@ -42,6 +43,7 @@ QWEN3_5_REAL_NUM_KV_HEADS = 2
 QWEN3_5_REAL_HEAD_DIM = 256
 QWEN3_5_REAL_ROTARY_D2 = 32
 QWEN3_5_REAL_Q_DIM = QWEN3_5_REAL_NUM_Q_HEADS * QWEN3_5_REAL_HEAD_DIM
+QWEN3_5_REAL_Q_RAW_DIM = 2 * QWEN3_5_REAL_Q_DIM
 QWEN3_5_REAL_KV_DIM = QWEN3_5_REAL_NUM_KV_HEADS * QWEN3_5_REAL_HEAD_DIM
 QWEN3_5_REAL_KV_GROUP_SIZE = QWEN3_5_REAL_NUM_Q_HEADS // QWEN3_5_REAL_NUM_KV_HEADS
 QWEN3_5_REAL_DECODE_S = 1
@@ -66,21 +68,90 @@ QWEN3_5_REAL_LAYER_TYPES = (
 )
 
 
-_QWEN3_5_REAL_DECODE_REGION_PIPELINE = PipelineSpec(page_count=1)
-
-
-def _decode_region(name, ops):
-    return region(
-        name,
-        ops,
-        pipeline=_QWEN3_5_REAL_DECODE_REGION_PIPELINE,
-    )
-
-
 @cute.jit
 def _silu(x):
     neg = Float32(0.0) - x
     return x / (Float32(1.0) + cute.math.exp(neg, fastmath=True))
+
+
+def _row_slice(tensor, start: int, stop: int):
+    return tensor[start:stop]
+
+
+def _last_dim_slice(tensor, start: int, stop: int):
+    return tensor[:, :, start:stop]
+
+
+def _schedule_nvfp4_pair_projection(
+    *,
+    x,
+    weights0,
+    weights1,
+    y0,
+    y1,
+    seq_len,
+    matvec_block,
+    page_size,
+    group_size,
+    tile_range=None,
+):
+    packed0, scales0 = weights0
+    packed1, scales1 = weights1
+    return MatvecPairNvfp4Sm120Op.schedule(
+        a=x,
+        weight0_packed=packed0,
+        weight0_scales=scales0,
+        weight1_packed=packed1,
+        weight1_scales=scales1,
+        y0=y0,
+        y1=y1,
+        tile_sizes={"S": seq_len, "O": matvec_block},
+        page_size=page_size,
+        group_size=group_size,
+        tile_range=tile_range,
+    )
+
+
+def _schedule_nvfp4_quad_projection(
+    *,
+    x,
+    weights0,
+    weights1,
+    weights2,
+    weights3,
+    y0,
+    y1,
+    y2,
+    y3,
+    seq_len,
+    matvec_block,
+    page_size,
+    group_size,
+    tile_range=None,
+):
+    packed0, scales0 = weights0
+    packed1, scales1 = weights1
+    packed2, scales2 = weights2
+    packed3, scales3 = weights3
+    return MatvecQuadNvfp4Sm120Op.schedule(
+        a=x,
+        weight0_packed=packed0,
+        weight0_scales=scales0,
+        weight1_packed=packed1,
+        weight1_scales=scales1,
+        weight2_packed=packed2,
+        weight2_scales=scales2,
+        weight3_packed=packed3,
+        weight3_scales=scales3,
+        y0=y0,
+        y1=y1,
+        y2=y2,
+        y3=y3,
+        tile_sizes={"S": seq_len, "O": matvec_block},
+        page_size=page_size,
+        group_size=group_size,
+        tile_range=tile_range,
+    )
 
 
 class Qwen3_5DeltaNetCoreSm120Op(Op):
@@ -489,6 +560,128 @@ class Qwen3_5SingleTokenAttentionSm120Op(Op):
                 acc_o = acc_o + scores[n3] * v_row[d_out].to(Float32)
                 n3 = n3 + Int32(1)
             out_row[d_out] = acc_o.to(self.o_dtype)
+            d_out = d_out + Int32(self.threads_per_row)
+
+
+class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op):
+    """S=1 decode attention that applies Qwen3.5's output gate before storing."""
+
+    reads = {
+        "q": (None, ("B", "S", "QH", "HD")),
+        "k": (None, ("B", "T", "KVH", "HD")),
+        "v": (None, ("B", "T", "KVH", "HD")),
+        "gate": (None, ("B", "S", "Q")),
+    }
+    writes = {"o": (None, ("B", "S", "QH", "HD"))}
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_QH, tile_2, q, k, v, gate, o):
+        tidx = cute.arch.thread_idx()[0]
+        lane_idx = cute.arch.lane_idx()
+        warp_idx = cute.arch.warp_idx()
+        num_warps = self.threads_per_row // 32
+        scores = cute.make_tensor(self._scores_ptr(page_ptr), cute.make_layout(self.T))
+        scratch = cute.make_tensor(
+            self._scratch_ptr(page_ptr),
+            cute.make_layout(Int32(num_warps)),
+        )
+
+        kv_head = tile_QH // Int32(self.kv_group_size)
+        q_base = (
+            tile_B * Int32(self.q_stride_B)
+            + tile_QH * Int32(self.q_stride_QH)
+        )
+        q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.HD))
+
+        row_max = Float32(-3.4028234663852886e38)
+        n = warp_idx
+        while n < Int32(self.T):
+            k_base = (
+                tile_B * Int32(self.k_stride_B)
+                + n * Int32(self.k_stride_T)
+                + kv_head * Int32(self.k_stride_KVH)
+            )
+            k_row = cute.make_tensor(k.iterator + k_base, cute.make_layout(self.HD))
+            acc = Float32(0.0)
+            d = lane_idx
+            while d < Int32(self.HD):
+                acc = acc + q_row[d].to(Float32) * k_row[d].to(Float32)
+                d = d + Int32(32)
+            score = cute.arch.warp_reduction(acc, operator.add) * Float32(0.0625)
+            if lane_idx == Int32(0):
+                scores[n] = score
+                if score > row_max:
+                    row_max = score
+            n = n + Int32(num_warps)
+        if lane_idx == Int32(0):
+            scratch[warp_idx] = row_max
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if warp_idx == Int32(0):
+            partial_max = Float32(-3.4028234663852886e38)
+            w = lane_idx
+            while w < Int32(num_warps):
+                val = scratch[w]
+                if val > partial_max:
+                    partial_max = val
+                w = w + Int32(32)
+            row_max = cute.arch.warp_reduction(partial_max, cute.arch.fmax)
+            if lane_idx == Int32(0):
+                scratch[Int32(0)] = row_max
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        rmax = scratch[Int32(0)]
+        row_sum_part = Float32(0.0)
+        n2 = warp_idx * Int32(32) + lane_idx
+        while n2 < Int32(self.T):
+            row_sum_part = row_sum_part + cute.math.exp(scores[n2] - rmax, fastmath=True)
+            n2 = n2 + Int32(self.threads_per_row)
+        row_sum_part = cute.arch.warp_reduction(row_sum_part, operator.add)
+        if lane_idx == Int32(0):
+            scratch[warp_idx] = row_sum_part
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if warp_idx == Int32(0):
+            row_sum = Float32(0.0)
+            w2 = lane_idx
+            while w2 < Int32(num_warps):
+                row_sum = row_sum + scratch[w2]
+                w2 = w2 + Int32(32)
+            row_sum = cute.arch.warp_reduction(row_sum, operator.add)
+            if lane_idx == Int32(0):
+                scratch[Int32(1)] = Float32(1.0) / row_sum
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        rinv = scratch[Int32(1)]
+        n_prob = tidx
+        while n_prob < Int32(self.T):
+            scores[n_prob] = cute.math.exp(scores[n_prob] - rmax, fastmath=True) * rinv
+            n_prob = n_prob + Int32(self.threads_per_row)
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        out_base = (
+            tile_B * Int32(self.o_stride_B)
+            + tile_QH * Int32(self.o_stride_QH)
+        )
+        gate_base = tile_B * Int32(self.gate_stride_B) + tile_QH * Int32(self.HD)
+        out_row = cute.make_tensor(o.iterator + out_base, cute.make_layout(self.HD))
+        gate_row = cute.make_tensor(gate.iterator + gate_base, cute.make_layout(self.HD))
+        d_out = tidx
+        while d_out < Int32(self.HD):
+            acc_o = Float32(0.0)
+            n3 = Int32(0)
+            while n3 < Int32(self.T):
+                v_base = (
+                    tile_B * Int32(self.v_stride_B)
+                    + n3 * Int32(self.v_stride_T)
+                    + kv_head * Int32(self.v_stride_KVH)
+                )
+                v_row = cute.make_tensor(v.iterator + v_base, cute.make_layout(self.HD))
+                acc_o = acc_o + scores[n3] * v_row[d_out].to(Float32)
+                n3 = n3 + Int32(1)
+            g = gate_row[d_out].to(Float32)
+            sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(Float32(0.0) - g, fastmath=True))
+            out_row[d_out] = (acc_o * sigmoid).to(self.o_dtype)
             d_out = d_out + Int32(self.threads_per_row)
 
 
@@ -952,6 +1145,182 @@ class Qwen3_5QkvRopeCacheSm120Op(Op):
             kv = kv + Int32(self.threads_per_row)
 
 
+class Qwen3_5QGateRopeCacheSm120Op(Op):
+    """Normalize/split Q projection, materialize the attention gate, and cache K/V."""
+
+    reads = {
+        "q_raw": (None, ("B", "S", "QR")),
+        "k_raw": (None, ("B", "S", "KV")),
+        "v_raw": (None, ("B", "S", "KV")),
+        "cos": (None, ("S", "D2")),
+        "sin": (None, ("S", "D2")),
+        "q_norm_weight": (None, ("HD",)),
+        "k_norm_weight": (None, ("HD",)),
+    }
+    writes = {
+        "q": (None, ("B", "S", "Q")),
+        "gate": (None, ("B", "S", "Q")),
+        "k_cache": (None, ("B", "T", "KVH", "HD")),
+        "v_cache": (None, ("B", "T", "KVH", "HD")),
+    }
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, cache_pos=0, **tensors):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 1)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        op.static_dims["page_size"] = page_size
+        op.static_dims["cache_pos"] = cache_pos
+        op.static_dims["q_heads"] = tensors["q"].shape[2] // tensors["k_cache"].shape[3]
+        op.static_dims["kv_heads"] = tensors["k_cache"].shape[2]
+        op.static_dims["head_dim"] = tensors["k_cache"].shape[3]
+        return [op]
+
+    @cute.jit
+    def _norm_scratch(self, page_ptr):
+        return cute.make_tensor(
+            cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout(32),
+        )
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_2,
+                q_raw, k_raw, v_raw, cos, sin, q_norm_weight, k_norm_weight,
+                q, gate, k_cache, v_cache):
+        tidx = cute.arch.thread_idx()[0]
+        row_idx = tile_S * Int32(self.tile_size_S)
+        q_raw_base = tile_B * Int32(self.q_raw_stride_B) + row_idx * Int32(self.q_raw_stride_S)
+        k_raw_base = tile_B * Int32(self.k_raw_stride_B) + row_idx * Int32(self.k_raw_stride_S)
+        v_raw_base = tile_B * Int32(self.v_raw_stride_B) + row_idx * Int32(self.v_raw_stride_S)
+        q_base = tile_B * Int32(self.q_stride_B) + row_idx * Int32(self.q_stride_S)
+        gate_base = tile_B * Int32(self.gate_stride_B) + row_idx * Int32(self.gate_stride_S)
+        cos_row = cute.make_tensor(cos.iterator + row_idx * Int32(self.cos_stride_S), cute.make_layout(self.D2))
+        sin_row = cute.make_tensor(sin.iterator + row_idx * Int32(self.sin_stride_S), cute.make_layout(self.D2))
+        q_raw_row = cute.make_tensor(q_raw.iterator + q_raw_base, cute.make_layout(self.QR))
+        k_raw_row = cute.make_tensor(k_raw.iterator + k_raw_base, cute.make_layout(self.KV))
+        v_raw_row = cute.make_tensor(v_raw.iterator + v_raw_base, cute.make_layout(self.KV))
+        q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.Q))
+        gate_row = cute.make_tensor(gate.iterator + gate_base, cute.make_layout(self.Q))
+        q_norm = cute.make_tensor(q_norm_weight.iterator, cute.make_layout(self.HD))
+        k_norm = cute.make_tensor(k_norm_weight.iterator, cute.make_layout(self.HD))
+        scratch = self._norm_scratch(page_ptr)
+
+        if tidx < Int32(self.q_heads):
+            ss_q = Float32(0.0)
+            d = Int32(0)
+            raw_head = tidx * Int32(2 * self.head_dim)
+            while d < Int32(self.head_dim):
+                qv = q_raw_row[raw_head + d].to(Float32)
+                ss_q = ss_q + qv * qv
+                d = d + Int32(1)
+            scratch[tidx] = cute.math.rsqrt(
+                ss_q * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_REAL_EPS),
+                fastmath=True,
+            )
+        if tidx < Int32(self.kv_heads):
+            ss_k = Float32(0.0)
+            kd = Int32(0)
+            k_head = tidx * Int32(self.head_dim)
+            while kd < Int32(self.head_dim):
+                kv = k_raw_row[k_head + kd].to(Float32)
+                ss_k = ss_k + kv * kv
+                kd = kd + Int32(1)
+            scratch[Int32(self.q_heads) + tidx] = cute.math.rsqrt(
+                ss_k * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_REAL_EPS),
+                fastmath=True,
+            )
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        elem = tidx
+        while elem < Int32(self.Q):
+            head = elem // Int32(self.head_dim)
+            dim = elem % Int32(self.head_dim)
+            raw_head = head * Int32(2 * self.head_dim)
+            raw_q = q_raw_row[raw_head + dim].to(Float32) * scratch[head] * q_norm[dim].to(Float32)
+            gate_row[elem] = q_raw_row[raw_head + Int32(self.head_dim) + dim]
+            if dim < Int32(self.D2):
+                low = raw_q
+                high = q_raw_row[raw_head + dim + Int32(self.D2)].to(Float32)
+                high = high * scratch[head] * q_norm[dim + Int32(self.D2)].to(Float32)
+                c = cos_row[dim].to(Float32)
+                s = sin_row[dim].to(Float32)
+                q_row[head * Int32(self.head_dim) + dim] = (low * c - high * s).to(self.q_dtype)
+                q_row[head * Int32(self.head_dim) + dim + Int32(self.D2)] = (high * c + low * s).to(self.q_dtype)
+            elif dim >= Int32(2 * self.D2):
+                q_row[elem] = raw_q.to(self.q_dtype)
+            elem = elem + Int32(self.threads_per_row)
+
+        kv_dim = Int32(self.kv_heads * self.head_dim)
+        kv = tidx
+        while kv < kv_dim:
+            head = kv // Int32(self.head_dim)
+            dim = kv % Int32(self.head_dim)
+            head_base = head * Int32(self.head_dim)
+            k_out = k_raw_row[kv].to(Float32) * scratch[Int32(self.q_heads) + head] * k_norm[dim].to(Float32)
+            k_base = (
+                tile_B * Int32(self.k_cache_stride_B)
+                + (row_idx + Int32(self.cache_pos)) * Int32(self.k_cache_stride_T)
+                + head * Int32(self.k_cache_stride_KVH)
+            )
+            k_row = cute.make_tensor(k_cache.iterator + k_base, cute.make_layout(self.HD))
+            if dim < Int32(self.D2):
+                low = k_out
+                high = k_raw_row[head_base + dim + Int32(self.D2)].to(Float32)
+                high = high * scratch[Int32(self.q_heads) + head] * k_norm[dim + Int32(self.D2)].to(Float32)
+                c = cos_row[dim].to(Float32)
+                s = sin_row[dim].to(Float32)
+                k_row[dim] = (low * c - high * s).to(self.k_cache_dtype)
+                k_row[dim + Int32(self.D2)] = (high * c + low * s).to(self.k_cache_dtype)
+            elif dim >= Int32(2 * self.D2):
+                k_row[dim] = k_out.to(self.k_cache_dtype)
+
+            v_base = (
+                tile_B * Int32(self.v_cache_stride_B)
+                + (row_idx + Int32(self.cache_pos)) * Int32(self.v_cache_stride_T)
+                + head * Int32(self.v_cache_stride_KVH)
+            )
+            v_row = cute.make_tensor(v_cache.iterator + v_base, cute.make_layout(self.HD))
+            v_row[dim] = v_raw_row[kv].to(self.v_cache_dtype)
+            kv = kv + Int32(self.threads_per_row)
+
+
+class Qwen3_5ApplyAttentionGateSm120Op(Op):
+    """Apply the full-attention output gate before the output projection."""
+
+    reads = {
+        "gate": (None, ("B", "S", "Q")),
+        "attn_out": (None, ("B", "S", "Q")),
+    }
+    writes = {"attn_out": (None, ("B", "S", "Q"))}
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 1)
+        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_2, gate, attn_out):
+        tidx = cute.arch.thread_idx()[0]
+        row_idx = tile_S * Int32(self.tile_size_S)
+        gate_base = tile_B * Int32(self.gate_stride_B) + row_idx * Int32(self.gate_stride_S)
+        out_base = tile_B * Int32(self.attn_out_stride_B) + row_idx * Int32(self.attn_out_stride_S)
+        gate_row = cute.make_tensor(gate.iterator + gate_base, cute.make_layout(self.Q))
+        out_row = cute.make_tensor(attn_out.iterator + out_base, cute.make_layout(self.Q))
+        elem = tidx
+        while elem < Int32(self.Q):
+            g = gate_row[elem].to(Float32)
+            sigmoid = Float32(1.0) / (Float32(1.0) + cute.math.exp(Float32(0.0) - g, fastmath=True))
+            out_row[elem] = (out_row[elem].to(Float32) * sigmoid).to(self.attn_out_dtype)
+            elem = elem + Int32(self.threads_per_row)
+
+
 def schedule_qwen3_5_deltanet_nvfp4_sm120(
     *,
     layer_idx,
@@ -1014,39 +1383,41 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
         page_size=page_size,
         eps=QWEN3_5_REAL_EPS,
     )
-    ops += MatvecNvfp4Sm120Op.schedule(
-        a=norm_buf,
-        weight_packed=qkv_packed,
-        weight_scales=qkv_scales,
-        y=qkv_buf,
-        tile_sizes={"S": seq_len, "O": matvec_block},
+    q0 = 0
+    k0 = QWEN3_5_REAL_DN_QK_SIZE
+    v0 = 2 * QWEN3_5_REAL_DN_QK_SIZE
+    end = QWEN3_5_REAL_DN_CONV_CHANNELS
+    qkv_q_buf = _last_dim_slice(qkv_buf, q0, k0)
+    qkv_k_buf = _last_dim_slice(qkv_buf, k0, v0)
+    qkv_v_buf = _last_dim_slice(qkv_buf, v0, end)
+    q_packed, q_scales = _row_slice(qkv_packed, q0, k0), _row_slice(qkv_scales, q0, k0)
+    k_packed, k_scales = _row_slice(qkv_packed, k0, v0), _row_slice(qkv_scales, k0, v0)
+    v_packed, v_scales = _row_slice(qkv_packed, v0, end), _row_slice(qkv_scales, v0, end)
+
+    ops += _schedule_nvfp4_quad_projection(
+        x=norm_buf,
+        weights0=(q_packed, q_scales),
+        weights1=(k_packed, k_scales),
+        weights2=(v_packed, v_scales),
+        weights3=(z_packed, z_scales),
+        y0=qkv_q_buf,
+        y1=qkv_k_buf,
+        y2=qkv_v_buf,
+        y3=z_buf,
+        seq_len=seq_len,
+        matvec_block=matvec_block,
         page_size=page_size,
         group_size=group_size,
+        tile_range=TileRange.coalesced("O", block_size=2),
     )
-    ops += MatvecNvfp4Sm120Op.schedule(
-        a=norm_buf,
-        weight_packed=z_packed,
-        weight_scales=z_scales,
-        y=z_buf,
-        tile_sizes={"S": seq_len, "O": matvec_block},
-        page_size=page_size,
-        group_size=group_size,
-    )
-    ops += MatvecNvfp4Sm120Op.schedule(
-        a=norm_buf,
-        weight_packed=beta_packed,
-        weight_scales=beta_scales,
-        y=beta_buf,
-        tile_sizes={"S": seq_len, "O": matvec_block},
-        page_size=page_size,
-        group_size=group_size,
-    )
-    ops += MatvecNvfp4Sm120Op.schedule(
-        a=norm_buf,
-        weight_packed=alpha_packed,
-        weight_scales=alpha_scales,
-        y=alpha_buf,
-        tile_sizes={"S": seq_len, "O": matvec_block},
+    ops += _schedule_nvfp4_pair_projection(
+        x=norm_buf,
+        weights0=(beta_packed, beta_scales),
+        weights1=(alpha_packed, alpha_scales),
+        y0=beta_buf,
+        y1=alpha_buf,
+        seq_len=seq_len,
+        matvec_block=matvec_block,
         page_size=page_size,
         group_size=group_size,
     )
@@ -1100,6 +1471,8 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
 
     keep = [
         qkv_packed, qkv_scales, z_packed, z_scales,
+        qkv_q_buf, qkv_k_buf, qkv_v_buf,
+        q_packed, q_scales, k_packed, k_scales, v_packed, v_scales,
         beta_packed, beta_scales, alpha_packed, alpha_scales,
         out_packed, out_scales, gate_packed, gate_scales,
         up_packed, up_scales, down_packed, down_scales,
@@ -1122,6 +1495,9 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
     residual_out,
     norm_buf,
     q_buf,
+    q_raw_buf=None,
+    kv_raw_buf=None,
+    q_gate_buf=None,
     attn_out_buf,
     mlp_h_buf,
     page_size=DEFAULT_PAGE_SIZE,
@@ -1138,9 +1514,17 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
     """
 
     if seq_len == 1:
+        import torch
+
         pfx = f"layer.{layer_idx}"
         cos = weights["cos"][cache_pos : cache_pos + seq_len]
         sin = weights["sin"][cache_pos : cache_pos + seq_len]
+        if q_raw_buf is None:
+            q_raw_buf = torch.empty(batch, seq_len, QWEN3_5_REAL_Q_RAW_DIM, dtype=q_buf.dtype, device=q_buf.device)
+        if kv_raw_buf is None:
+            kv_raw_buf = torch.empty(batch, seq_len, 2 * QWEN3_5_REAL_KV_DIM, dtype=q_buf.dtype, device=q_buf.device)
+        if q_gate_buf is None:
+            q_gate_buf = torch.empty_like(q_buf)
         q_4d = q_buf.view(batch, seq_len, QWEN3_5_REAL_NUM_Q_HEADS, QWEN3_5_REAL_HEAD_DIM)
         k_window = k_cache[:, : cache_pos + seq_len]
         v_window = v_cache[:, : cache_pos + seq_len]
@@ -1159,8 +1543,8 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
         down_packed, down_scales = qparts("W_down")
 
         ops = []
-        k_raw_buf = q_buf[:, :, :QWEN3_5_REAL_KV_DIM]
-        v_raw_buf = q_buf[:, :, QWEN3_5_REAL_KV_DIM : 2 * QWEN3_5_REAL_KV_DIM]
+        k_raw_buf = kv_raw_buf[:, :, :QWEN3_5_REAL_KV_DIM]
+        v_raw_buf = kv_raw_buf[:, :, QWEN3_5_REAL_KV_DIM : 2 * QWEN3_5_REAL_KV_DIM]
 
         ops += RmsAddNormSm120Op.schedule(
             x=x_in,
@@ -1176,7 +1560,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             a=norm_buf,
             weight_packed=q_packed,
             weight_scales=q_scales,
-            y=attn_out_buf,
+            y=q_raw_buf,
             tile_sizes={"S": seq_len, "O": matvec_block},
             page_size=page_size,
             group_size=group_size,
@@ -1199,12 +1583,16 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             page_size=page_size,
             group_size=group_size,
         )
-        ops += Qwen3_5QkvRopeCacheSm120Op.schedule(
-            q_raw=attn_out_buf,
-            kv_raw=q_buf,
+        ops += Qwen3_5QGateRopeCacheSm120Op.schedule(
+            q_raw=q_raw_buf,
+            k_raw=k_raw_buf,
+            v_raw=v_raw_buf,
             cos=cos,
             sin=sin,
+            q_norm_weight=weights[f"{pfx}.q_norm"],
+            k_norm_weight=weights[f"{pfx}.k_norm"],
             q=q_buf,
+            gate=q_gate_buf,
             k_cache=k_window,
             v_cache=v_window,
             cache_pos=cache_pos,
@@ -1224,13 +1612,20 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             )
             ops += attention_ops
         else:
-            ops += Qwen3_5SingleTokenAttentionSm120Op.schedule(
+            ops += Qwen3_5GatedSingleTokenAttentionSm120Op.schedule(
                 q=q_4d,
                 k=k_window,
                 v=v_window,
+                gate=q_gate_buf,
                 o=o_4d,
                 kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
                 page_size=page_size,
+            )
+        if use_flash_attention:
+            ops += Qwen3_5ApplyAttentionGateSm120Op.schedule(
+                gate=q_gate_buf,
+                attn_out=attn_out_buf,
+                tile_sizes={"S": seq_len},
             )
         ops += MatvecResidualNvfp4Sm120Op.schedule(
             a=attn_out_buf,
@@ -1266,7 +1661,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
         )
         keep = [
             cos, sin, q_4d, k_window, v_window, o_4d,
-            k_raw_buf, v_raw_buf, *attention_keep,
+            q_raw_buf, kv_raw_buf, q_gate_buf, k_raw_buf, v_raw_buf, *attention_keep,
             q_packed, q_scales, k_packed, k_scales, v_packed, v_scales,
             o_packed, o_scales, gate_packed, gate_scales, up_packed, up_scales,
             down_packed, down_scales,
@@ -1360,6 +1755,9 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     k_cache,
     v_cache,
     q_buf,
+    q_raw_buf=None,
+    kv_raw_buf=None,
+    q_gate_buf=None,
     attn_out_buf,
     norm_buf,
     qkv_buf,
@@ -1415,6 +1813,9 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
                 x_out=x_buffers[layer_idx + 1],
                 residual_out=residual_buffers[layer_idx + 1],
                 norm_buf=_layer_resource(norm_buf, layer_idx),
+                q_raw_buf=None if q_raw_buf is None else _layer_resource(q_raw_buf, layer_idx),
+                kv_raw_buf=None if kv_raw_buf is None else _layer_resource(kv_raw_buf, layer_idx),
+                q_gate_buf=None if q_gate_buf is None else _layer_resource(q_gate_buf, layer_idx),
                 q_buf=_layer_resource(q_buf, layer_idx),
                 attn_out_buf=_layer_resource(attn_out_buf, layer_idx),
                 mlp_h_buf=_layer_resource(mlp_h_buf, layer_idx),
@@ -1450,7 +1851,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
             linear_slot += 1
         else:
             raise ValueError(f"unknown Qwen3.5 layer type {layer_type!r}")
-        ops.append(_decode_region(f"qwen3_5_real_layer_{layer_idx}", layer.ops))
+        ops.extend(layer.ops)
         keep.extend(layer.keep_alive)
         attention_configs.append(layer.attention_config)
 
@@ -1470,7 +1871,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
             page_size=page_size,
             group_size=group_size,
         )
-        ops.append(_decode_region("qwen3_5_real_final", final_ops))
+        ops.extend(final_ops)
 
     return DecodeLayerScheduleSm120(
         ops=ops,
@@ -1481,6 +1882,9 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
 
 __all__ = [
     "Qwen3_5DeltaNetCoreSm120Op",
+    "Qwen3_5ApplyAttentionGateSm120Op",
+    "Qwen3_5QGateRopeCacheSm120Op",
+    "Qwen3_5GatedSingleTokenAttentionSm120Op",
     "Qwen3_5QkvRopeCacheSm120Op",
     "Qwen3_5SingleTokenAttentionSm120Op",
     "QWEN3_5_REAL_DECODE_S",
@@ -1500,6 +1904,7 @@ __all__ = [
     "QWEN3_5_REAL_NUM_LAYERS",
     "QWEN3_5_REAL_NUM_Q_HEADS",
     "QWEN3_5_REAL_Q_DIM",
+    "QWEN3_5_REAL_Q_RAW_DIM",
     "QWEN3_5_REAL_ROTARY_D2",
     "QWEN3_5_REAL_VOCAB",
     "schedule_qwen3_5_final_nvfp4_sm120",

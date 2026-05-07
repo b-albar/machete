@@ -5,8 +5,7 @@ Machete is a CuTe DSL kernel framework for building persistent GPU kernels from 
 ## Core Ideas
 
 - **Ops stay local.** Each op owns its math and tensor interface.
-- **The framework owns replay.** Tile scheduling, dependencies, page allocation, barriers, and TMA metadata are generated once for the whole megakernel.
-- **Regions express fast paths.** A `region(...)` groups semantic ops. It can replay those ops, or lower to one generated op that owns a fused persistent loop.
+- **The framework owns replay.** Tile scheduling, dependencies, page allocation, barriers, and TMA metadata are prepared once for the whole megakernel.
 - **Streaming is explicit.** `PipelineSpec.streaming(...)` declares a load/compute/store page ring for ops that can overlap data movement with compute.
 
 ## Install
@@ -80,37 +79,13 @@ class StreamingOp(Op):
     # def store(...):   write staged output
 ```
 
-`inner_iter_idx` is intentionally not part of the op API. Long ranges should be expressed inside the op body or by a generated region so the load/compute/store protocol remains owned by one implementation.
-
-## Persistent Regions
-
-Use `region(...)` when several ops should be treated as one instruction boundary. Without `generated_op`, the region replays the child ops. With `generated_op`, it lowers to that single specialized op while keeping the child ops as the semantic schedule.
-
-```python
-from machete.megakernel import PipelineSpec, region
-
-semantic_ops = op_a + op_b + op_c
-generated = FusedRegionOp.schedule(...)[0]
-
-items = [
-    region(
-        "fused_block",
-        semantic_ops,
-        generated_op=generated,
-        pipeline=PipelineSpec.streaming(page_bytes=16 * 1024),
-    )
-]
-
-kernel = Megakernel(items)
-```
-
-This is the intended path for decode kernels that need a custom persistent loop: normalize once, stream weights or cache blocks through pages, compute, and store/reduce without returning to a generic per-op replay loop.
+`inner_iter_idx` is intentionally not part of the op API. Long ranges should be expressed inside the op body so the load/compute/store protocol remains owned by one implementation.
 
 ## Built-In Areas
 
 - Attention kernels for SM100/SM120.
 - GEMM, RMSNorm, RoPE, GLU, MoE, and cross entropy ops.
-- Decode-oriented Qwen 3.5 SM120/NVFP4 experiments.
+- Decode-oriented Qwen 3.5 SM120/NVFP4 kernels.
 - Autograd helpers for composing megakernel-backed modules.
 - Trace export helpers for profiling persistent-kernel replay.
 

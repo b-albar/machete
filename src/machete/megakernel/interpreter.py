@@ -13,15 +13,16 @@ from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from .instruction_layout import INSTRUCTION_ROW_BYTES
+
 # Counter for unique PTX labels across inline asm invocations.
 # PTX labels are function-scoped (not block-scoped), so multiple
 # inlined copies of the same asm template would collide without
 # unique names.
 _ptx_label_counter = 0
 
-# The instruction tensor is stored as [op_idx, linear_tile_idx, tile_0..tile_4]
-# i.e. 7 int32 words per row.
-_INSTRUCTION_ROW_STRIDE_BYTES = 7 * 4
+# The instruction tensor stores one compact replay header plus tile coords.
+_INSTRUCTION_ROW_STRIDE_BYTES = INSTRUCTION_ROW_BYTES
 
 
 # =============================================================================
@@ -301,9 +302,7 @@ def load_instruction_to_smem(
     """Load one packed instruction row from global memory to shared memory.
 
     The instruction tensor is laid out as
-    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values. The row stride is
-    28 bytes, so alternate rows are only 4-byte aligned; use scalar loads
-    rather than vectorized global loads that require wider alignment.
+    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values.
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
@@ -321,7 +320,7 @@ def load_instruction_to_smem(
         """
         {
             .reg .u64 %gaddr;
-            .reg .u32 %w0, %w1, %w2, %w3, %w4, %w5, %w6;
+            .reg .u32 %w0, %w1, %w2, %w3, %w4, %w5, %w6, %w7;
             mad.wide.u32 %gaddr, $1, $3, $0;
             ld.global.b32 %w0, [%gaddr];
             ld.global.b32 %w1, [%gaddr+4];
@@ -330,10 +329,11 @@ def load_instruction_to_smem(
             ld.global.b32 %w4, [%gaddr+16];
             ld.global.b32 %w5, [%gaddr+20];
             ld.global.b32 %w6, [%gaddr+24];
+            ld.global.b32 %w7, [%gaddr+28];
             st.shared.v2.b32 [$2], {%w0, %w1};
             st.shared.v2.b32 [$2+8], {%w2, %w3};
             st.shared.v2.b32 [$2+16], {%w4, %w5};
-            st.shared.b32 [$2+24], %w6;
+            st.shared.v2.b32 [$2+24], {%w6, %w7};
         }
         """,
         "l,r,r,r",
@@ -814,22 +814,23 @@ def prefetch_instruction(
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
-        instr_idx: Instruction index (byte offset = instr_idx * 8)
+        instr_idx: Instruction row index
     """
     llvm.inline_asm(
         None,
         [
             instr_ptr.ir_value(loc=loc, ip=ip),
             instr_idx.ir_value(loc=loc, ip=ip),
+            Int32(_INSTRUCTION_ROW_STRIDE_BYTES).ir_value(loc=loc, ip=ip),
         ],
         """
         {
             .reg .u64 %gaddr;
-            mad.wide.u32 %gaddr, $1, 8, $0;
+            mad.wide.u32 %gaddr, $1, $2, $0;
             prefetch.global.L2 [%gaddr];
         }
         """,
-        "l,r",
+        "l,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

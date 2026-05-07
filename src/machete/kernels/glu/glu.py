@@ -323,6 +323,7 @@ class GLUOp(Op):
     }
     tile = ("B", "S", "D")
     dynamic_dims = ("B", "S")
+    inline_phases = ("load", "compute", "store")
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -404,6 +405,17 @@ class GLUOp(Op):
             f"GLU: x last dim ({x.shape[-1]}) must be 2 * y last dim ({y.shape[-1]})")
 
         tile_sizes = dict(tile_sizes or {})
+        if (
+            activation in ("silu", "swish")
+            and y.shape[-1] >= 1024
+            and "D" not in tile_sizes
+        ):
+            return DirectGLUOp.schedule(
+                tile_sizes=tile_sizes,
+                activation=activation,
+                page_size=page_size,
+                **tensors,
+            )
         if "S" not in tile_sizes:
             tile_sizes["S"] = _pick_forward_tile_size_s(
                 x, y, ACT_MAP.get(activation, ACT_SILU), page_size
@@ -544,6 +556,144 @@ class GLUOp(Op):
             cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
+class DirectGLUOp(Op):
+    """Direct-global GLU for wide elementwise SwiGLU-style forwards.
+
+    The staged GLU path is useful when a row fits well in shared memory. For
+    wide model MLPs, tiling only by rows creates tiny row tiles and excessive
+    TMA/barrier traffic. This op tiles both rows and hidden dimension and does
+    the elementwise work directly from global memory.
+    """
+
+    reads = {
+        "x": (None, ("B", "S", "N")),
+    }
+    writes = {
+        "y": (None, ("B", "S", "D")),
+    }
+    tile = ("B", "S", "D")
+    dynamic_dims = ("B", "S")
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.activation = getattr(self, "activation", ACT_SILU)
+        self.num_warps = self.threads_per_row // 32
+        self.rows_per_warp = (
+            self.tile_size_S + self.num_warps - 1
+        ) // self.num_warps
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, activation="silu", page_size=DEFAULT_PAGE_SIZE, **tensors):
+        x = tensors["x"]
+        y = tensors["y"]
+        assert x.shape[-1] == 2 * y.shape[-1], (
+            f"DirectGLU: x last dim ({x.shape[-1]}) must be 2 * y last dim ({y.shape[-1]})"
+        )
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 16)
+        if "D" not in tile_sizes:
+            D = y.shape[-1]
+            for tile_d in (512, 256, 128, 64, 32):
+                if D % tile_d == 0:
+                    tile_sizes["D"] = tile_d
+                    break
+            else:
+                tile_sizes["D"] = min(D, 256)
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims["activation"] = ACT_MAP.get(activation, ACT_SILU)
+        ops[0].static_dims["page_size"] = page_size
+        return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        from machete.megakernel import MegakernelConfig
+
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+        return MegakernelConfig(page_size=page_size)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, op_config_ptr):
+        x_ptr = config_ptr_i64(op_config_ptr, "x", type(self))
+        y_ptr = config_ptr_i64(op_config_ptr, "y", type(self))
+        batch_size = config_dim_i32(op_config_ptr, "B", type(self))
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+
+        x = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, x_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (batch_size, runtime_S, self.N),
+                stride=(self.x_stride_B, self.x_stride_S, self.x_stride_N),
+            ),
+        )
+        y = cute.make_tensor(
+            cute.make_ptr(self.y_dtype, y_ptr, cute.AddressSpace.gmem, assumed_align=16),
+            cute.make_layout(
+                (batch_size, runtime_S, self.D),
+                stride=(self.y_stride_B, self.y_stride_S, self.y_stride_D),
+            ),
+        )
+
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        thr_layout = cute.make_layout(32)
+        row_start = tile_S * Int32(self.tile_size_S)
+        col_start = tile_D * Int32(self.tile_size_D)
+
+        for ri in cutlass.range_constexpr(self.rows_per_warp):
+            local_row = warp_idx + Int32(ri * self.num_warps)
+            row_idx = row_start + local_row
+            if local_row < Int32(self.tile_size_S) and row_idx < runtime_S:
+                gate_row = cute.make_tensor(
+                    x.iterator
+                    + tile_B * Int32(self.x_stride_B)
+                    + row_idx * Int32(self.x_stride_S)
+                    + col_start * Int32(self.x_stride_N),
+                    cute.make_layout(self.tile_size_D, stride=self.x_stride_N),
+                )
+                up_row = cute.make_tensor(
+                    x.iterator
+                    + tile_B * Int32(self.x_stride_B)
+                    + row_idx * Int32(self.x_stride_S)
+                    + (Int32(self.D) + col_start) * Int32(self.x_stride_N),
+                    cute.make_layout(self.tile_size_D, stride=self.x_stride_N),
+                )
+                y_row = cute.make_tensor(
+                    y.iterator
+                    + tile_B * Int32(self.y_stride_B)
+                    + row_idx * Int32(self.y_stride_S)
+                    + col_start * Int32(self.y_stride_D),
+                    cute.make_layout(self.tile_size_D, stride=self.y_stride_D),
+                )
+
+                gate_part = cute.local_partition(gate_row, thr_layout, lane_idx)
+                up_part = cute.local_partition(up_row, thr_layout, lane_idx)
+                y_part = cute.local_partition(y_row, thr_layout, lane_idx)
+                gate_reg = cute.make_fragment_like(gate_part)
+                up_reg = cute.make_fragment_like(up_part)
+                y_reg = cute.make_fragment_like(y_part)
+                cute.autovec_copy(gate_part, gate_reg)
+                cute.autovec_copy(up_part, up_reg)
+
+                for i in range(cute.size(gate_reg)):
+                    g = gate_reg[i].to(Float32)
+                    u = up_reg[i].to(Float32)
+                    act_val = g
+                    if self.activation == ACT_RELU:
+                        act_val = g
+                        if g < Float32(0.0):
+                            act_val = Float32(0.0)
+                    elif self.activation == ACT_IDENTITY:
+                        act_val = g
+                    else:
+                        neg_g = Float32(0.0) - g
+                        exp_neg = cute.math.exp(neg_g, fastmath=True)
+                        act_val = g / (Float32(1.0) + exp_neg)
+                    y_reg[i] = (act_val * u).to(self.y_dtype)
+
+                cute.autovec_copy(y_reg, y_part)
+
+
 # =============================================================================
 # Backward Op
 # =============================================================================
@@ -571,6 +721,7 @@ class GLUBwdOp(Op):
     }
     tile = ("B", "S", "D")
     dynamic_dims = ("B", "S")
+    inline_phases = ("compute",)
 
     tma_loads = {"x"}
     tma_stores = {"dx"}

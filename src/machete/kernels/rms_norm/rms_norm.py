@@ -185,6 +185,7 @@ class RMSNormOp(Op):
     }
     tile = ("B", "S", "D")
     dynamic_dims = ("B", "S")
+    inline_phases = ("load", "compute", "store")
 
     tma_loads = {"x"}
     tma_stores = {"y"}

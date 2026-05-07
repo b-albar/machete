@@ -20,19 +20,16 @@ from .ops import (
     InstructionPageProtocol,
     Op,
     PageRole,
-    PersistentRegion,
     PipelineABI,
     PipelineSpec,
-    RegionRecord,
     ScheduledOp,
     SemaphoreRole,
     TensorMeta,
+    TileRange,
     build_op_config,
     config_dim_i32,
     config_ptr_i64,
     config_flat_tensor,
-    flatten_scheduled_items,
-    linearize_scheduled_items,
 )
 
 from .registries import (
@@ -44,6 +41,13 @@ from .registries import (
 from .scheduling import (
     BarrierFormula,
     INSTRUCTION_WORDS,
+    INSTR_BARRIER_META_IDX,
+    INSTR_OP_IDX,
+    INSTR_TILE_0,
+    INSTR_TILE_1,
+    INSTR_TILE_2,
+    INSTR_TILE_3,
+    INSTR_TILE_4,
     TileInstruction,
     InstructionStreamBuilder,
 )
@@ -71,7 +75,6 @@ from .autograd import MegakernelFunction
 from .kernel_cache import KernelCache
 from .functional import megakernel_apply, MegakernelModule
 from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
-from .regions import region
 
 __all__ = [
     # Operation Protocol
@@ -80,9 +83,8 @@ __all__ = [
     "SemaphoreRole",
     "InstructionPageProtocol",
     "PipelineSpec",
+    "TileRange",
     "PipelineABI",
-    "PersistentRegion",
-    "RegionRecord",
     "ScheduledOp",
     "TensorMeta",
     "PeerBufferRegistry",
@@ -92,14 +94,19 @@ __all__ = [
     "config_dim_i32",
     "config_ptr_i64",
     "config_flat_tensor",
-    "flatten_scheduled_items",
-    "linearize_scheduled_items",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
     "cleanup_linecache",
     # Instruction Stream
     "INSTRUCTION_WORDS",
+    "INSTR_BARRIER_META_IDX",
+    "INSTR_OP_IDX",
+    "INSTR_TILE_0",
+    "INSTR_TILE_1",
+    "INSTR_TILE_2",
+    "INSTR_TILE_3",
+    "INSTR_TILE_4",
     "TileInstruction",
     "InstructionStreamBuilder",
     # Configuration & Megakernel
@@ -121,7 +128,6 @@ __all__ = [
     "KernelCache",
     "megakernel_apply",
     "MegakernelModule",
-    "region",
     # Debug utilities
     "dump_ptx",
     "dump_sass",

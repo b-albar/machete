@@ -7,7 +7,12 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 
-from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
+from machete.megakernel.interpreter import (
+    mbarrier_arrive_expect_tx,
+    mbarrier_init,
+    mbarrier_init_fence,
+    mbarrier_wait,
+)
 from machete.megakernel.ops import Op
 
 
@@ -22,7 +27,7 @@ class SyntheticTMAAddOneOp(Op):
     The op intentionally keeps the compute body trivial. The goal is to stress:
     - TMA descriptor plumbing
     - runtime transport selection
-    - handler/runtime backend scaling
+    - handler backend scaling
     rather than math throughput.
     """
 

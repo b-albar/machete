@@ -410,7 +410,7 @@ class Benchmark:
         else:
             names_seen = set()
             names_ordered = []
-        _header_printed = False
+        _header_printed_for = None
 
         for combination in all_combinations:
             params = dict(zip(param_names, combination))
@@ -501,11 +501,12 @@ class Benchmark:
 
             # Line-by-line printing for kernel mode
             if mode == "kernel":
-                if not _header_printed and names_ordered:
+                header_key = tuple(names_ordered)
+                if _header_printed_for != header_key and names_ordered:
                     self._current_kernel_funcs = funcs
                     self._print_kernel_header(names_ordered, bytes_fn)
                     del self._current_kernel_funcs
-                    _header_printed = True
+                    _header_printed_for = header_key
                 if str(params) in results:
                     self._print_kernel_row(
                         params, results[str(params)], names_ordered, bytes_fn,

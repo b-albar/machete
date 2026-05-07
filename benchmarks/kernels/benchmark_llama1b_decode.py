@@ -484,7 +484,6 @@ def megakernel_decode_build(
         page_size=max(op.static_dims.get("page_size", page_size) for op in all_ops),
         num_pages=num_pages,
         sync_compute_warps_after_tile=False,
-        per_sm_instruction_queues=os.environ.get("LLAMA1B_DECODE_PER_SM_QUEUES", "1") != "0",
         noinline=os.environ.get("LLAMA1B_DECODE_NOINLINE", "0") != "0",
         inline_thin_phases=os.environ.get("LLAMA1B_DECODE_INLINE_THIN", "1") != "0",
         loader_idle_sleep_ns=int(os.environ.get("LLAMA1B_DECODE_LOADER_SLEEP", "0")),

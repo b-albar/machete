@@ -8,19 +8,20 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
+import cutlass.cute as cute
 from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
-from machete.megakernel.ops import MAX_TILE_DIMS, Op, ScheduledOp, build_op_config
+from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, TileRange, build_op_config
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
-    TileInstruction,
-    InstructionStreamBuilder,
+    INSTR_BARRIER_META_IDX,
+    INSTR_OP_IDX,
+    INSTR_TILE_0,
     INSTRUCTION_WORDS,
+    InstructionStreamBuilder,
+    TileInstruction,
     TileScheduler,
     BackwardScheduler,
-    ReadyScheduler,
-    get_default_scheduler,
-    set_default_scheduler,
 )
 from typing import ClassVar, List
 
@@ -28,6 +29,10 @@ from typing import ClassVar, List
 class _NOPOp(Op):
     """Test-only no-op for barrier formula and instruction stream tests."""
     pass
+
+
+class _RangeCapableNOPOp(_NOPOp):
+    pipeline = PipelineSpec(page_count=1)
 
 
 class _AliasPhaseOp(Op):
@@ -48,6 +53,139 @@ class _ComputeTmaLoadOp(Op):
     tma_compute_loads = {"x"}
 
 
+class _SerialNonTmaLoadOp(Op):
+    reads = {"x": (torch.float16, ("M",))}
+    writes = {"y": (torch.float16, ("M",))}
+    tile = ("M",)
+
+    @cute.jit
+    def load(self, page_ptr, tile_M, x, work_mbar):
+        pass
+
+
+class _CollectiveNonTmaLoadOp(_SerialNonTmaLoadOp):
+    collective_non_tma_load = True
+
+
+class _RangeCapableSerialNonTmaLoadOp(_SerialNonTmaLoadOp):
+    pipeline = PipelineSpec(page_count=1)
+
+
+def test_tile_range_applies_semantic_axis_to_scheduled_op():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(2, 3, 4),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+
+    assert op.with_tile_range(TileRange.coalesced("O", block_size=2)) is op
+    assert op.static_dims["pipeline_coalesce_ranges"] is True
+    assert op.static_dims["pipeline_range_axis"] == 2
+    assert op.static_dims["pipeline_range_end_axis"] == 3
+    assert op.static_dims["pipeline_range_block_size"] == 2
+
+
+def test_strided_tile_range_records_stride_metadata():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(2, 3, 8),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+
+    op.with_tile_range(TileRange.strided("O", stride=4, block_size=3))
+
+    assert op.static_dims["pipeline_coalesce_ranges"] is True
+    assert op.static_dims["pipeline_range_axis"] == 2
+    assert op.static_dims["pipeline_range_end_axis"] == 3
+    assert op.static_dims["pipeline_range_stride"] == 4
+    assert op.static_dims["pipeline_range_stride_axis"] == 4
+
+
+def test_range_capable_pipeline_is_opt_in():
+    spec = PipelineSpec.range_capable(range_axis=2, range_end_axis=3)
+
+    assert spec.page_count == 1
+    assert spec.range_axis == 2
+    assert spec.range_end_axis == 3
+    assert spec.range_block_size == 1
+    assert spec.coalesce_ranges is False
+
+
+def test_tile_range_rejects_unknown_semantic_axis():
+    op = ScheduledOp(_RangeCapableNOPOp, tile_counts=(2,), dim_names={"B": 0})
+
+    with pytest.raises(ValueError, match="Range axis 'O'"):
+        op.with_tile_range(TileRange.coalesced("O"))
+
+
+def test_tile_range_rejects_ops_without_pipeline_spec():
+    op = ScheduledOp(_NOPOp, tile_counts=(2,), dim_names={"M": 0})
+
+    with pytest.raises(ValueError, match="does not declare a PipelineSpec"):
+        op.with_tile_range(TileRange.coalesced("M"))
+
+
+def test_tile_range_rejects_negative_block_size():
+    with pytest.raises(ValueError, match="TileRange.block_size"):
+        TileRange.coalesced("M", block_size=-1)
+
+
+def test_tile_range_rejects_negative_stride():
+    with pytest.raises(ValueError, match="TileRange.stride"):
+        TileRange.strided("M", stride=0)
+
+
+def test_base_schedule_accepts_tile_range_option():
+    x = torch.empty(8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    ops = _RangeCapableSerialNonTmaLoadOp.schedule(
+        x=x,
+        y=y,
+        tile_sizes={"M": 1},
+        tile_range=TileRange.coalesced("M", block_size=4),
+    )
+
+    assert ops[0].static_dims["pipeline_coalesce_ranges"] is True
+    assert ops[0].static_dims["pipeline_range_axis"] == 0
+    assert ops[0].static_dims["pipeline_range_block_size"] == 4
+
+
+def test_strided_tile_range_coalesces_by_residue_and_expands_logical_tiles():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 10),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    ).with_tile_range(TileRange.strided("O", stride=4, block_size=3))
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+
+    instructions = builder.coalesce_pipeline_instructions(builder.build())
+    non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+
+    assert [instr.tiles for instr in non_end] == [
+        (0, 0, 0, 3, 4),
+        (0, 0, 1, 3, 4),
+        (0, 0, 2, 2, 4),
+        (0, 0, 3, 2, 4),
+    ]
+    assert [
+        instr.tiles for instr in builder.expand_pipeline_instructions(instructions)
+        if instr.op_idx != TileInstruction.END_MARKER
+    ] == [
+        (0, 0, 0, 0, 0),
+        (0, 0, 4, 0, 0),
+        (0, 0, 8, 0, 0),
+        (0, 0, 1, 0, 0),
+        (0, 0, 5, 0, 0),
+        (0, 0, 9, 0, 0),
+        (0, 0, 2, 0, 0),
+        (0, 0, 6, 0, 0),
+        (0, 0, 3, 0, 0),
+        (0, 0, 7, 0, 0),
+    ]
+
+
 def test_phase_aliases_bind_concrete_instance_methods():
     op = _AliasPhaseOp()
 
@@ -63,6 +201,27 @@ def test_compute_phase_tma_load_declaration_is_registered():
     assert _ComputeTmaLoadOp.gen_tma_param_names("compute") == [
         ("x_tma", "x_tma_gmem", "x")
     ]
+
+
+def test_non_tma_loads_default_to_elect_one_wrapper():
+    from machete.megakernel.compile import compile_phase, _linecache_entries
+    import linecache
+
+    compile_phase(_SerialNonTmaLoadOp(), "load", tensor_param_names=["x"])
+    source = "".join(linecache.cache[_linecache_entries[-1]][2])
+
+    assert "with cute.arch.elect_one():" in source
+
+
+def test_collective_non_tma_load_owns_dma_warp_and_mbarrier():
+    from machete.megakernel.compile import compile_phase, _linecache_entries
+    import linecache
+
+    compile_phase(_CollectiveNonTmaLoadOp(), "load", tensor_param_names=["x"])
+    source = "".join(linecache.cache[_linecache_entries[-1]][2])
+
+    assert "with cute.arch.elect_one():" not in source
+    assert "_instance.load(page_ptr, tile_0, x, work_mbar)" in source
 
 
 def test_barrier_static_dims_do_not_specialize_device_code():
@@ -312,16 +471,15 @@ class TestTileInstructionPacking:
         instr = TileInstruction(op_idx=1, tiles=(5, 2, 0))
         packed = instr.pack()
         assert len(packed) == INSTRUCTION_WORDS
-        assert INSTRUCTION_WORDS == 2 + MAX_TILE_DIMS
+        assert INSTRUCTION_WORDS == 8
 
     def test_pack_fields(self):
-        """Fields should pack as [op_idx, linear_tile_idx]."""
-        # tiles=(7, 1, 2) with tile_counts needed for strides
+        """Fields should pack op index, tile coordinates, and barrier metadata."""
         instr = TileInstruction(op_idx=3, tiles=(7, 1, 2))
-        # strides for tile_counts (8, 3, 4) → (12, 4, 1)
-        packed = instr.pack(strides=(12, 4, 1))
-        assert packed[0] == 3  # op_idx
-        assert packed[1] == 7 * 12 + 1 * 4 + 2 * 1  # linear = 90
+        packed = instr.pack(barrier_meta_idx=99)
+        assert packed[INSTR_OP_IDX] == 3
+        assert packed[INSTR_TILE_0:INSTR_TILE_0 + MAX_TILE_DIMS] == [7, 1, 2, 0, 0]
+        assert packed[INSTR_BARRIER_META_IDX] == 99
 
     def test_end_marker_packs_correctly(self):
         """End marker should have op_idx == END_MARKER."""
@@ -340,7 +498,7 @@ class TestTileInstructionPacking:
         assert tensor.dtype == torch.int32
 
     def test_build_tensor_roundtrip(self):
-        """Packed tensor values should encode [op_idx, linear_tile_idx]."""
+        """Packed tensor values should encode op index and tile coordinates."""
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         builder.add_op(_NOPOp, tile_counts=(4,))
@@ -351,8 +509,7 @@ class TestTileInstructionPacking:
             row = tensor[i].tolist()
             assert row[0] == instr.op_idx, f"Instruction {i} op_idx mismatch"
             if instr.op_idx != TileInstruction.END_MARKER:
-                # Linear index should match the tile index for 1D ops
-                assert row[1] == instr.tiles[0], f"Instruction {i} linear mismatch"
+                assert row[INSTR_TILE_0] == instr.tiles[0], f"Instruction {i} tile mismatch"
 
 
 # =============================================================================
@@ -843,21 +1000,6 @@ class TestLevelBatchedScheduling:
 class TestSchedulerAPI:
     """Test the tile scheduler abstraction and different schedulers."""
 
-    def test_default_scheduler_is_backward(self):
-        """Default scheduler should be BackwardScheduler."""
-        scheduler = get_default_scheduler()
-        assert isinstance(scheduler, BackwardScheduler)
-
-    def test_set_default_scheduler(self):
-        """Can change the default scheduler globally."""
-        original = get_default_scheduler()
-        try:
-            backward = BackwardScheduler()
-            set_default_scheduler(backward)
-            assert get_default_scheduler() is backward
-        finally:
-            set_default_scheduler(original)
-
     def test_explicit_scheduler_parameter(self):
         """Can pass scheduler directly to build()."""
         builder = InstructionStreamBuilder()
@@ -908,65 +1050,6 @@ class TestSchedulerAPI:
         # Check op 1 has all 6 tiles
         op1_tiles = {(i.tiles[0], i.tiles[1]) for i in instructions if i.op_idx == 1}
         assert op1_tiles == {(m, n) for m in range(3) for n in range(2)}
-
-    def test_per_sm_queues_preserve_tiles(self):
-        """Per-SM queues must not drop or duplicate work tiles."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        instructions = builder.build()
-
-        _tensor, queued, queue_len = builder.build_queued_tensors(
-            instructions,
-            num_blocks=3,
-            device="cpu",
-        )
-
-        non_end = [instr for instr in queued if instr.op_idx != TileInstruction.END_MARKER]
-        keys = [(instr.op_idx, instr.tiles) for instr in non_end]
-        assert len(keys) == 12
-        assert len(set(keys)) == 12
-        assert queue_len >= 2
-
-        for block_idx in range(3):
-            queue_end = queued[block_idx * queue_len + queue_len - 1]
-            assert queue_end.op_idx == TileInstruction.END_MARKER
-
-    def test_per_sm_queues_can_preserve_ready_order(self):
-        """Interleaved ready-list schedules should keep global strided order."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        instructions = builder.build(scheduler=ReadyScheduler())
-
-        _tensor, queued, queue_len = builder.build_queued_tensors(
-            instructions,
-            num_blocks=2,
-            device="cpu",
-            preserve_instruction_order=True,
-        )
-
-        block0 = [
-            instr
-            for instr in queued[:queue_len]
-            if instr.op_idx != TileInstruction.END_MARKER
-        ]
-        block1 = [
-            instr
-            for instr in queued[queue_len : 2 * queue_len]
-            if instr.op_idx != TileInstruction.END_MARKER
-        ]
-        expected = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
-        reconstructed = []
-        for i in range(max(len(block0), len(block1))):
-            if i < len(block0):
-                reconstructed.append(block0[i])
-            if i < len(block1):
-                reconstructed.append(block1[i])
-
-        assert [(i.op_idx, i.tiles) for i in reconstructed] == [
-            (i.op_idx, i.tiles) for i in expected
-        ]
 
     def test_scheduler_is_abstract(self):
         """TileScheduler base class cannot be instantiated directly."""

@@ -73,6 +73,7 @@ class QKNormRopeOp(Op):
     writes = {"q": (None, ("M", "H", "D"))}
     tile = ("M", "H")
     dynamic_dims = ("M",)
+    inline_phases = ("load", "compute", "store")
 
     def __init__(self, **config):
         super().__init__(**config)

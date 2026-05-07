@@ -7,8 +7,8 @@ This benchmark intentionally focuses on host/runtime framework work:
 - selector-table growth
 
 It does not compile or launch the GPU kernel. The goal is to catch framework
-scaling regressions early while runtime-backend transport selection is being
-refactored toward layer-count-independent behavior.
+scaling regressions early while transport selection stays
+layer-count-independent.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def selector_size_bytes(kernel: Megakernel, phase: str, kind: str) -> int:
     return 0 if tensor is None else tensor.numel() * tensor.element_size()
 
 
-def benchmark_case(num_layers: int, backend: str, repeats: int, device: str):
+def benchmark_case(num_layers: int, repeats: int, device: str):
     make_ops_samples_ms = []
     init_samples_ms = []
     prepare_samples_ms = []
@@ -68,7 +68,7 @@ def benchmark_case(num_layers: int, backend: str, repeats: int, device: str):
         t1 = time.perf_counter()
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend=backend),
+            config=MegakernelConfig(num_sms=1),
             device=device,
         )
         t2 = time.perf_counter()
@@ -124,33 +124,32 @@ def main() -> None:
     args = parser.parse_args()
 
     print(
-        "backend,layers,make_ops_mean_ms,init_mean_ms,prepare_mean_ms,"
+        "layers,make_ops_mean_ms,init_mean_ms,prepare_mean_ms,"
         "dispatch_mean_ms,create_mean_ms,"
         "total_mean_ms,total_min_ms,total_max_ms,handlers,load_records,"
         "store_records,load_transport_B,store_transport_B,load_desc_B,store_desc_B"
     )
-    for backend in ("handler", "runtime"):
-        for num_layers in args.layers:
-            result = benchmark_case(num_layers, backend, args.repeats, args.device)
-            summary = result["summary"]
-            print(
-                f"{backend},{num_layers},"
-                f"{result['make_ops_mean_ms']:.3f},"
-                f"{result['init_mean_ms']:.3f},"
-                f"{result['prepare_mean_ms']:.3f},"
-                f"{result['dispatch_mean_ms']:.3f},"
-                f"{result['create_mean_ms']:.3f},"
-                f"{result['total_mean_ms']:.3f},"
-                f"{result['total_min_ms']:.3f},"
-                f"{result['total_max_ms']:.3f},"
-                f"{summary['handlers']},"
-                f"{summary['transport_records']['load']},"
-                f"{summary['transport_records']['store']},"
-                f"{summary['transport_table_bytes']['load']},"
-                f"{summary['transport_table_bytes']['store']},"
-                f"{summary['desc_slot_table_bytes']['load']},"
-                f"{summary['desc_slot_table_bytes']['store']}"
-            )
+    for num_layers in args.layers:
+        result = benchmark_case(num_layers, args.repeats, args.device)
+        summary = result["summary"]
+        print(
+            f"{num_layers},"
+            f"{result['make_ops_mean_ms']:.3f},"
+            f"{result['init_mean_ms']:.3f},"
+            f"{result['prepare_mean_ms']:.3f},"
+            f"{result['dispatch_mean_ms']:.3f},"
+            f"{result['create_mean_ms']:.3f},"
+            f"{result['total_mean_ms']:.3f},"
+            f"{result['total_min_ms']:.3f},"
+            f"{result['total_max_ms']:.3f},"
+            f"{summary['handlers']},"
+            f"{summary['transport_records']['load']},"
+            f"{summary['transport_records']['store']},"
+            f"{summary['transport_table_bytes']['load']},"
+            f"{summary['transport_table_bytes']['store']},"
+            f"{summary['desc_slot_table_bytes']['load']},"
+            f"{summary['desc_slot_table_bytes']['store']}"
+        )
 
 
 if __name__ == "__main__":

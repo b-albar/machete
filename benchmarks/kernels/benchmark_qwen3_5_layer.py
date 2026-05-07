@@ -29,7 +29,6 @@ import torch
 import torch.nn.functional as F
 
 from machete.utils.benchmark import Benchmark
-from machete.utils.benchmark_utils import combine_megakernel_bench_spec
 
 try:
     import cutlass  # noqa: F401
@@ -50,21 +49,21 @@ def _is_sm120_single_batch_long_seq(batch, seq_len, threshold):
 def _pick_single_layer_forward_tpb(batch, seq_len, gemm_tpb, fa_tpb):
     """Choose the fused forward thread geometry for the Qwen layer benchmark.
 
-    On SM120, the single-kernel path regresses in the low-batch, long-sequence
-    regime when it inherits the larger GEMM warp count. For higher-throughput
-    regimes the original GEMM-heavy geometry is still better.
+    Long prefill is GEMM-heavy even when attention is present. Keeping the GEMM
+    warp geometry avoids starving the projection and MLP tiles once launch
+    overhead is already amortized by sequence length.
     """
-    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
-        # The persistent TMA replay shell reserves three DMA warps. Keep at
-        # least one compute warp in the long-sequence geometry.
-        return max(fa_tpb, 128)
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=2048):
+        return fa_tpb
     return max(gemm_tpb, fa_tpb)
 
 
 def _pick_single_layer_forward_mma_reg_count(batch, seq_len, default_mma_regs=232):
     """Tune the fused forward runtime MMA register budget on SM120."""
+    if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=2048):
+        return 176
     if _is_sm120_single_batch_long_seq(batch, seq_len, threshold=1024):
-        return 192
+        return 224
     return default_mma_regs
 
 
@@ -253,14 +252,14 @@ def megakernel_forward_build(
     W_down,
     page_size=32768,
 ):
-    """Build megakernel(s) for full layer forward.
+    """Build the single-megakernel full layer forward.
 
     Uses view+permute so FlashAttention reads/writes directly from/to
     GEMM output buffers with correct strided layout — no inter-kernel copies.
 
     Returns:
-        (spec_1k, spec_3k, out, residual_out2) — single-kernel spec,
-        3-kernel split spec, and output tensors for correctness verification.
+        (spec, out, residual_out2) — single-kernel spec and output tensors for
+        correctness verification.
     """
     from machete.megakernel import Megakernel, MegakernelConfig
     from machete.kernels.gemm import GemmOp
@@ -307,6 +306,7 @@ def megakernel_forward_build(
     fa_ops, fa_config = flash_attention_schedule(
         q=q_fa, k=k_fa, v=v_fa, o=o_fa, lse=lse,
         causal=True, kv_group_size=KV_GROUP_SIZE, page_size=page_size,
+        write_lse=False,
     )
     fa_page_size = fa_config.page_size
     gemm_tiles = _pick_single_layer_fused_gemm_tiles(B, S, fa_page_size)
@@ -377,7 +377,7 @@ def megakernel_forward_build(
     pre_attn_ops = rmsnorm1_ops + gemm_qkv_ops + qknorm_qk_ops
     post_attn_ops = gemm_o_ops + rmsnorm2_ops + gemm_gu_ops + glu_ops + gemm_down_ops
 
-    # --- Single kernel: all ops in one megakernel (FA page_size, num_pages=1) ---
+    # --- Single kernel: all ops in one megakernel (two-page overlap) ---
     all_ops = pre_attn_ops + fa_ops + post_attn_ops
     gemm_config = GemmOp.kernel_config(pre_attn_ops + post_attn_ops)
     single_config = MegakernelConfig(
@@ -388,7 +388,7 @@ def megakernel_forward_build(
             fa_config.threads_per_block,
         ),
         page_size=fa_page_size,
-        num_pages=1,
+        num_pages=2,
         mma_reg_count=_pick_single_layer_forward_mma_reg_count(B, S),
     )
     single_kernel = Megakernel(all_ops, config=single_config)
@@ -401,26 +401,7 @@ def megakernel_forward_build(
 
     spec_1k = single_kernel.bench_spec(keep_alive=keep_alive)
 
-    # --- 3-kernel split: pre-attn (small page) + FA (large page) + post-attn ---
-    pre_kernel = Megakernel(pre_attn_ops, config=GemmOp.kernel_config(pre_attn_ops))
-    fa_kernel = Megakernel(fa_ops, config=fa_config)
-    post_kernel = Megakernel(post_attn_ops, config=GemmOp.kernel_config(post_attn_ops))
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        pre_kernel.run()
-    torch.cuda.synchronize()
-    with contextlib.redirect_stdout(io.StringIO()):
-        fa_kernel.run()
-    torch.cuda.synchronize()
-    with contextlib.redirect_stdout(io.StringIO()):
-        post_kernel.run()
-    torch.cuda.synchronize()
-
-    spec_3k = combine_megakernel_bench_spec(
-        [pre_kernel, fa_kernel, post_kernel],
-        keep_alive=keep_alive,
-    )
-    return spec_1k, spec_3k, out_1k, residual_out2_1k
+    return spec_1k, out_1k, residual_out2_1k
 
 
 # =============================================================================
@@ -687,7 +668,7 @@ def megakernel_layer_bwd_build(
     )
 
     # =========================================================================
-    # Build kernels: single-kernel + 2-kernel split (reference)
+    # Build single backward megakernel
     # =========================================================================
     mlp_ops = (gemm_down_bwd_ops + glu_bwd_ops + gemm_gu_bwd_ops
                + rmsnorm2_bwd_ops + gemm_o_bwd_ops)
@@ -769,37 +750,9 @@ def megakernel_layer_bwd_build(
         setup_fn=setup_fn, keep_alive=keep_alive,
     )
 
-    # --- 2-kernel split: MLP chain + FA bwd + tail ---
-    mlp_kernel = Megakernel(mlp_ops, config=GemmOp.kernel_config(mlp_ops))
-    fa_kernel = Megakernel(fa_bwd_ops, config=fa_bwd_config)
-    tail_kernel = Megakernel(tail_ops, config=GemmOp.kernel_config(gemm_q_bwd_ops + gemm_k_bwd_ops + gemm_v_bwd_ops))
-
-    with contextlib.redirect_stdout(io.StringIO()):
-        mlp_kernel.run()
-    torch.cuda.synchronize()
-    dpsum[:] = (d_attn_fa.float() * o_fa.float()).sum(dim=-1).permute(0, 2, 1)
-    dq_fa.zero_()
-    dk_fa.zero_()
-    dv_fa.zero_()
-    d_res2.zero_()
-    d_h1.zero_()
-    dx.zero_()
-    d_res1.zero_()
-    with contextlib.redirect_stdout(io.StringIO()):
-        fa_kernel.run()
-    torch.cuda.synchronize()
-    with contextlib.redirect_stdout(io.StringIO()):
-        tail_kernel.run()
-    torch.cuda.synchronize()
-
-    spec_2k = combine_megakernel_bench_spec(
-        [mlp_kernel, fa_kernel, tail_kernel],
-        setup_fn=setup_fn,
-        keep_alive=keep_alive,
-    )
     if return_state:
-        return spec_1k, spec_2k, d_out, single_state
-    return spec_1k, spec_2k, d_out
+        return spec_1k, d_out, single_state
+    return spec_1k, d_out
 
 
 def _layer_bwd_flops(seq_len, batch, page_size=32768):
@@ -977,7 +930,7 @@ def verify_layer_backward(B, S):
         x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
         cos, sin, W_o, w_mlp_norm, W_gate_up, W_down, d_out,
     )
-    _, _, _, single_state = megakernel_layer_bwd_build(
+    _, _, single_state = megakernel_layer_bwd_build(
         B, S, x, residual, w_attn_norm, W_q, W_k, W_v, w_q_norm, w_k_norm,
         cos, sin, W_o, w_mlp_norm, W_gate_up, W_down, page_size=page_size,
         d_out=d_out, return_state=True,
@@ -1035,16 +988,15 @@ def bench_qwen35_layer_bwd(seq_len, batch, page_size):
     torch.cuda.synchronize()
     funcs["sequential"] = lambda: sequential_layer_bwd(*args)
 
-    # --- Megakernel backward: single kernel + 2-kernel split ---
+    # --- Megakernel backward: single kernel ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         try:
-            spec_1k, spec_2k, _ = megakernel_layer_bwd_build(
+            spec_1k, _ = megakernel_layer_bwd_build(
                 batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
                 w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down,
                 page_size=page_size,
             )
             funcs["megakernel"] = spec_1k
-            funcs["megakernel_2k"] = spec_2k
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1141,14 +1093,13 @@ def bench_qwen35_layer_fwd(seq_len, batch, page_size):
     if compiled_forward is not None:
         funcs["torch_compile"] = lambda: compiled_forward(*args)
 
-    # --- Megakernel: single kernel + 3-kernel split ---
+    # --- Megakernel: single kernel ---
     if is_sm90_or_newer() and CUTLASS_AVAILABLE:
         build_args = (batch, seq_len, x, residual, w_attn_norm, W_q, W_k, W_v,
                       w_q_norm, w_k_norm, cos, sin, W_o, w_mlp_norm, W_gate_up, W_down)
         try:
-            spec_1k, spec_3k, _, _ = megakernel_forward_build(*build_args, page_size=page_size)
+            spec_1k, _, _ = megakernel_forward_build(*build_args, page_size=page_size)
             funcs["megakernel"] = spec_1k
-            funcs["megakernel_3k"] = spec_3k
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1366,7 +1317,7 @@ def verify_correctness(B, S):
     torch.cuda.synchronize()
 
     # Megakernel (outputs populated during build's warmup run)
-    _, _, mk_out, mk_res = megakernel_forward_build(B, S, *args)
+    _, mk_out, mk_res = megakernel_forward_build(B, S, *args)
 
     out_err = (mk_out.float() - ref_out.float()).abs().max().item()
     res_err = (mk_res.float() - ref_res.float()).abs().max().item()

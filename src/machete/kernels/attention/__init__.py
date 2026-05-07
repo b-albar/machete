@@ -2,7 +2,7 @@
 """Flash Attention kernels for the megakernel framework."""
 
 from .sm_100 import FlashAttentionSm100Op
-from .sm_120 import FlashAttentionSm120Op
+from .sm_120 import FlashAttentionSm120Op, FlashAttentionSm120PackGQAOp, FlashAttentionSm120DirectOp
 from .sm_120_bwd import FlashAttentionSm120BwdOp
 from .dpsum import AttentionDPSumOp
 from .flash_decoding import (
@@ -46,7 +46,8 @@ def _max_attention_page_size(device=None):
 
 
 def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
-                             kv_group_size=1, lse=None):
+                             kv_group_size=1, lse=None, write_lse=None,
+                             num_mma_warps=None):
     """Schedule attention with auto-dispatch between FA and FlashDecoding.
 
     Uses FlashDecoding for decode-like workloads where there aren't enough
@@ -120,6 +121,8 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
     else:
         ops = FlashAttentionOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,
+            write_lse=write_lse,
+            num_mma_warps=num_mma_warps,
             **tensors,
         )
         config = FlashAttentionOp.kernel_config(ops)
@@ -128,7 +131,7 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
 
 __all__ = [
-    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120BwdOp",
+    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120DirectOp", "FlashAttentionSm120BwdOp",
     "AttentionDPSumOp",
     "FlashDecodingSplitOp", "flash_decoding_schedule",
     "flash_attention_schedule",

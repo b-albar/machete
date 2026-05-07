@@ -43,6 +43,17 @@ SM120_DECODE_CONSUMER_WARPS_DEFAULT = SM120_DECODE_HIDDEN_DEFAULT // SM120_DECOD
 SM120_DECODE_NUM_Q_HEADS_DEFAULT = SM120_DECODE_Q_DIM_DEFAULT // SM120_DECODE_HEAD_DIM_DEFAULT
 SM120_DECODE_NUM_KV_HEADS_DEFAULT = SM120_DECODE_KV_DIM_DEFAULT // SM120_DECODE_HEAD_DIM_DEFAULT
 SM120_DECODE_KV_GROUP_SIZE_DEFAULT = SM120_DECODE_NUM_Q_HEADS_DEFAULT // SM120_DECODE_NUM_KV_HEADS_DEFAULT
+SM120_OUTPUT_RANGE_PIPELINE = PipelineSpec.range_capable(
+    range_axis=2,
+    range_end_axis=3,
+)
+
+
+def _finalize_nvfp4_matvec_schedule(op, *, page_size, group_size, k_dim):
+    op.static_dims["page_size"] = page_size
+    op.static_dims["group_size"] = group_size
+    op.static_dims["reduction_tile_K"] = min(SM120_DECODE_REDUCTION_DIM_PER_WARP, k_dim)
+    return [op]
 
 
 @cute.jit
@@ -97,9 +108,7 @@ class _Nvfp4WeightMixin:
 
     @cute.jit
     def _nvfp4_weight_value(self, packed_row, scale_row, k):
-        byte = packed_row[k >> Int32(1)].to(Int32)
-        if byte < Int32(0):
-            byte = byte + Int32(256)
+        byte = packed_row[k >> Int32(1)].to(Int32) & Int32(255)
         code = byte & Int32(15)
         if (k & Int32(1)) != Int32(0):
             code = byte >> Int32(4)
@@ -113,18 +122,10 @@ class _Nvfp4WeightMixin:
     @cute.jit
     def _dot8_nvfp4_values(self, packed_row, scale_row, k, v0, v1, v2, v3, v4, v5, v6, v7):
         byte_idx = k >> Int32(1)
-        b0 = packed_row[byte_idx].to(Int32)
-        b1 = packed_row[byte_idx + Int32(1)].to(Int32)
-        b2 = packed_row[byte_idx + Int32(2)].to(Int32)
-        b3 = packed_row[byte_idx + Int32(3)].to(Int32)
-        if b0 < Int32(0):
-            b0 = b0 + Int32(256)
-        if b1 < Int32(0):
-            b1 = b1 + Int32(256)
-        if b2 < Int32(0):
-            b2 = b2 + Int32(256)
-        if b3 < Int32(0):
-            b3 = b3 + Int32(256)
+        b0 = packed_row[byte_idx].to(Int32) & Int32(255)
+        b1 = packed_row[byte_idx + Int32(1)].to(Int32) & Int32(255)
+        b2 = packed_row[byte_idx + Int32(2)].to(Int32) & Int32(255)
+        b3 = packed_row[byte_idx + Int32(3)].to(Int32) & Int32(255)
         if const_expr(self.group_size == 32):
             scale_idx = k >> Int32(5)
         else:
@@ -889,7 +890,7 @@ class MatvecSm120Op(_DecodeMatvecSm120Base):
 class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Packed NVFP4 projection matvec base."""
 
-    pipeline = None
+    pipeline = SM120_OUTPUT_RANGE_PIPELINE
     reads = {
         "a": (None, ("B", "S", "K")),
         "weight_packed": (cutlass.Uint8, ("O", "K2")),
@@ -899,7 +900,14 @@ class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, group_size=32, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        group_size=32,
+        tile_range=None,
+        **tensors,
+    ):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 16)
@@ -908,13 +916,13 @@ class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             raise ValueError("weight_packed K2 must equal a.K / 2")
         if tensors["weight_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
             raise ValueError("weight_scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["a"].shape[-1]
+        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        return _finalize_nvfp4_matvec_schedule(
+            op,
+            page_size=page_size,
+            group_size=group_size,
+            k_dim=tensors["a"].shape[-1],
         )
-        return [op]
 
     @cute.jit
     def _dot_output(self, tile_B, row_idx, out_idx, a, weight_packed, weight_scales):
@@ -933,269 +941,7 @@ class MatvecNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
     writes = {"y": (None, ("B", "S", "O"))}
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, tile_3, a, weight_packed, weight_scales, y):
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
-        row_start = tile_S * Int32(self.tile_size_S)
-        block_o = tile_O
-        block_end = tile_3
-        if block_end <= block_o:
-            block_end = block_o + Int32(1)
-        while block_o < block_end:
-            out_start = block_o * Int32(self.tile_size_O)
-            for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
-                local_row = local_work // self.tile_size_O
-                local_o = local_work - local_row * self.tile_size_O
-                row_idx = row_start + Int32(local_row)
-                if row_idx < Int32(self.S):
-                    out_idx = out_start + Int32(local_o)
-                    if out_idx < Int32(self.O):
-                        total = self._dot_output(tile_B, row_idx, out_idx, a, weight_packed, weight_scales)
-                        if lane_idx == Int32(0):
-                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                            y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
-                            y_tile[local_o] = total.to(self.y_dtype)
-            block_o = block_o + Int32(1)
-
-
-class StagedActivationMatvecNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
-    """Packed NVFP4 matvec with framework-managed activation staging.
-
-    The op follows the standard load/compute/store contract: ``load`` stages
-    the decode activation tile into the page ring with TMA, and ``compute``
-    reuses that shared-memory activation for all output channels in the tile.
-    Weight streaming is still direct-global; this isolates the first framework
-    overlap step without changing the op declaration model.
-    """
-
-    writes = {"y": (None, ("B", "S", "O"))}
-    tma_loads = {"a"}
-
-    @classmethod
-    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
-        if tensor_name == "a":
-            return (1, tile_sizes["S"], static_dims["K"])
-        return None
-
-    @classmethod
-    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
-        if tensor_name == "a":
-            tile_k, tile_s, tile_b = tma_tile_shape
-            return f"cute.make_layout(({tile_k}, {tile_s}, {tile_b}))"
-        return None
-
-    def __init__(self, **config):
-        super().__init__(**config)
-        self.elem_bytes = 2 if self.a_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
-        self.a_tile_bytes = self.tile_size_S * self.K * self.elem_bytes
-        assert self.a_tile_bytes <= self.page_size, (
-            f"{type(self).__name__}: activation tile {self.a_tile_bytes}B exceeds "
-            f"page_size {self.page_size}B. Reduce tile_size_S or increase page_size."
-        )
-
-    @cute.jit
-    def load(self, page_ptr, tile_B, tile_S, tile_O, tile_3, a_tma, a_tma_gmem, work_mbar):
-        mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-        with cute.arch.elect_one():
-            mbarrier_arrive_expect_tx(work_mbar, Int32(self.a_tile_bytes))
-        gA = cute.local_tile(
-            a_tma_gmem,
-            (self.K, self.tile_size_S, 1),
-            (Int32(0), tile_S, tile_B),
-        )
-        sA = cute.make_tensor(
-            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.K, self.tile_size_S, 1)),
-        )
-        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
-            a_tma,
-            Int32(0),
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(gA, 0, 3),
-        )
-        cute.copy(a_tma, tAgA, tAsA, tma_bar_ptr=mbar_ptr)
-
-    @cute.jit
-    def _dot_output_smem(self, page_ptr, local_row, out_idx, weight_packed, weight_scales):
-        packed_base = out_idx * Int32(self.weight_packed_stride_O)
-        scale_base = out_idx * Int32(self.weight_scales_stride_O)
-        a_row = cute.make_tensor(
-            cute.make_ptr(self.a_dtype, page_ptr, cute.AddressSpace.smem)
-            + local_row * Int32(self.K),
-            cute.make_layout(self.K),
-        )
-        packed_row = cute.make_tensor(
-            weight_packed.iterator + packed_base,
-            cute.make_layout(self.K2),
-        )
-        scale_row = cute.make_tensor(
-            weight_scales.iterator + scale_base,
-            cute.make_layout(self.G),
-        )
-        return self._dot_nvfp4(a_row, packed_row, scale_row)
-
-    @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, tile_3, weight_packed, weight_scales, y):
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
-        row_start = tile_S * Int32(self.tile_size_S)
-        block_o = tile_O
-        block_end = tile_3
-        if block_end <= block_o:
-            block_end = block_o + Int32(1)
-        while block_o < block_end:
-            out_start = block_o * Int32(self.tile_size_O)
-            for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
-                local_row = local_work // self.tile_size_O
-                local_o = local_work - local_row * self.tile_size_O
-                row_idx = row_start + Int32(local_row)
-                if row_idx < Int32(self.S):
-                    out_idx = out_start + Int32(local_o)
-                    if out_idx < Int32(self.O):
-                        total = self._dot_output_smem(
-                            page_ptr,
-                            Int32(local_row),
-                            out_idx,
-                            weight_packed,
-                            weight_scales,
-                        )
-                        if lane_idx == Int32(0):
-                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                            y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
-                            y_tile[local_o] = total.to(self.y_dtype)
-            block_o = block_o + Int32(1)
-
-
-class StagedWeightMatvecNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
-    """Packed NVFP4 matvec with framework-managed weight/scale staging.
-
-    Decode activations are tiny and heavily reused, while packed weights and
-    scales dominate memory traffic. This phased op exposes that dominant stream
-    through ``load`` so the framework page ring can overlap weight staging with
-    compute without changing the user-facing op contract.
-    """
-
-    writes = {"y": (None, ("B", "S", "O"))}
-    tma_loads = {"weight_packed", "weight_scales"}
-
-    @classmethod
-    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
-        if tensor_name == "weight_packed":
-            return (tile_sizes["O"], static_dims["K2"])
-        if tensor_name == "weight_scales":
-            return (tile_sizes["O"], static_dims["G"])
-        return None
-
-    @classmethod
-    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
-        if tensor_name == "weight_packed":
-            k2, tile_o = tma_tile_shape
-            return f"cute.make_layout(({k2}, {tile_o}), stride=(1, {k2}))"
-        if tensor_name == "weight_scales":
-            g, tile_o = tma_tile_shape
-            return f"cute.make_layout(({g}, {tile_o}), stride=(1, {g}))"
-        return None
-
-    @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, group_size=32, **tensors):
-        ops = super().schedule(
-            tile_sizes=tile_sizes,
-            page_size=page_size,
-            group_size=group_size,
-            **tensors,
-        )
-        op = ops[0]
-        tile_o = op.tile_sizes["O"]
-        packed_bytes = tile_o * int(tensors["weight_packed"].shape[1])
-        scale_offset = ((packed_bytes + 127) // 128) * 128
-        scale_bytes = tile_o * int(tensors["weight_scales"].shape[1]) * tensors["weight_scales"].element_size()
-        required = scale_offset + scale_bytes
-        if required > page_size:
-            raise ValueError(
-                f"{cls.__name__} needs page_size >= {required}B for staged "
-                f"weights/scales, got {page_size}B"
-            )
-        op.static_dims["packed_bytes"] = packed_bytes
-        op.static_dims["scale_offset"] = scale_offset
-        op.static_dims["scale_bytes"] = scale_bytes
-        op.static_dims["staged_weight_bytes"] = required
-        return ops
-
-    @cute.jit
-    def load(self, page_ptr, tile_B, tile_S, tile_O, tile_3,
-             weight_packed_tma, weight_packed_tma_gmem,
-             weight_scales_tma, weight_scales_tma_gmem,
-             work_mbar):
-        total_bytes = Int32(self.staged_weight_bytes)
-        mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-        with cute.arch.elect_one():
-            mbarrier_arrive_expect_tx(work_mbar, total_bytes)
-
-        sP = cute.make_tensor(
-            cute.make_ptr(self.weight_packed_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.K2, self.tile_size_O), stride=(1, self.K2)),
-        )
-        gP = cute.local_tile(
-            weight_packed_tma_gmem,
-            (self.K2, self.tile_size_O),
-            (None, None),
-        )
-        tPsP, tPgP = cute.nvgpu.cpasync.tma_partition(
-            weight_packed_tma,
-            Int32(0),
-            cute.make_layout(1),
-            cute.group_modes(sP, 0, 2),
-            cute.group_modes(gP, 0, 2),
-        )
-        cute.copy(weight_packed_tma, tPgP[(None, Int32(0), tile_O)], tPsP, tma_bar_ptr=mbar_ptr)
-
-        sS = cute.make_tensor(
-            cute.make_ptr(
-                self.weight_scales_dtype,
-                page_ptr + Int32(self.scale_offset),
-                cute.AddressSpace.smem,
-            ),
-            cute.make_layout((self.G, self.tile_size_O), stride=(1, self.G)),
-        )
-        gS = cute.local_tile(
-            weight_scales_tma_gmem,
-            (self.G, self.tile_size_O),
-            (None, None),
-        )
-        tSsS, tSgS = cute.nvgpu.cpasync.tma_partition(
-            weight_scales_tma,
-            Int32(0),
-            cute.make_layout(1),
-            cute.group_modes(sS, 0, 2),
-            cute.group_modes(gS, 0, 2),
-        )
-        cute.copy(weight_scales_tma, tSgS[(None, Int32(0), tile_O)], tSsS, tma_bar_ptr=mbar_ptr)
-
-    @cute.jit
-    def _dot_output_staged_weight(self, tile_B, row_idx, local_o, a, page_ptr):
-        a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
-        a_row = cute.make_tensor(a.iterator + a_base, cute.make_layout(self.K))
-        packed_row = cute.make_tensor(
-            cute.make_ptr(self.weight_packed_dtype, page_ptr, cute.AddressSpace.smem)
-            + local_o * Int32(self.K2),
-            cute.make_layout(self.K2),
-        )
-        scale_row = cute.make_tensor(
-            cute.make_ptr(
-                self.weight_scales_dtype,
-                page_ptr + Int32(self.scale_offset),
-                cute.AddressSpace.smem,
-            )
-            + local_o * Int32(self.G),
-            cute.make_layout(self.G),
-        )
-        return self._dot_nvfp4(a_row, packed_row, scale_row)
-
-    @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, tile_3, a, y):
+    def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight_packed, weight_scales, y):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
@@ -1208,17 +954,261 @@ class StagedWeightMatvecNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
             if row_idx < Int32(self.S):
                 out_idx = out_start + Int32(local_o)
                 if out_idx < Int32(self.O):
-                    total = self._dot_output_staged_weight(
-                        tile_B,
-                        row_idx,
-                        Int32(local_o),
-                        a,
-                        page_ptr,
-                    )
+                    total = self._dot_output(tile_B, row_idx, out_idx, a, weight_packed, weight_scales)
                     if lane_idx == Int32(0):
                         y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
                         y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
                         y_tile[local_o] = total.to(self.y_dtype)
+
+
+class MatvecPairNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
+    """Packed NVFP4 matvec for two same-sized projections sharing one input."""
+
+    pipeline = SM120_OUTPUT_RANGE_PIPELINE
+    reads = {
+        "a": (None, ("B", "S", "K")),
+        "weight0_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight0_scales": (cutlass.Float16, ("O", "G")),
+        "weight1_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight1_scales": (cutlass.Float16, ("O", "G")),
+    }
+    writes = {
+        "y0": (None, ("B", "S", "O")),
+        "y1": (None, ("B", "S", "O")),
+    }
+    tile = ("B", "S", "O")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        group_size=32,
+        tile_range=None,
+        **tensors,
+    ):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 16)
+        tile_sizes.setdefault("O", 16)
+        if tensors["weight0_packed"].shape != tensors["weight1_packed"].shape:
+            raise ValueError("paired NVFP4 projections must have matching packed shapes")
+        if tensors["weight0_scales"].shape != tensors["weight1_scales"].shape:
+            raise ValueError("paired NVFP4 projections must have matching scale shapes")
+        if tensors["weight0_packed"].shape[1] * 2 != tensors["a"].shape[-1]:
+            raise ValueError("weight K2 must equal a.K / 2")
+        if tensors["weight0_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
+            raise ValueError("weight scales G must equal a.K / group_size")
+        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        return _finalize_nvfp4_matvec_schedule(
+            op,
+            page_size=page_size,
+            group_size=group_size,
+            k_dim=tensors["a"].shape[-1],
+        )
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_O, a,
+                weight0_packed, weight0_scales, weight1_packed, weight1_scales,
+                y0, y1):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        out_start = tile_O * Int32(self.tile_size_O)
+        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
+            local_row = local_work // self.tile_size_O
+            local_o = local_work - local_row * self.tile_size_O
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                out_idx = out_start + Int32(local_o)
+                if out_idx < Int32(self.O):
+                    a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
+                    a_row = cute.make_tensor(a.iterator + a_base, cute.make_layout(self.K))
+                    packed0_row = cute.make_tensor(
+                        weight0_packed.iterator + out_idx * Int32(self.weight0_packed_stride_O),
+                        cute.make_layout(self.K2),
+                    )
+                    scale0_row = cute.make_tensor(
+                        weight0_scales.iterator + out_idx * Int32(self.weight0_scales_stride_O),
+                        cute.make_layout(self.G),
+                    )
+                    packed1_row = cute.make_tensor(
+                        weight1_packed.iterator + out_idx * Int32(self.weight1_packed_stride_O),
+                        cute.make_layout(self.K2),
+                    )
+                    scale1_row = cute.make_tensor(
+                        weight1_scales.iterator + out_idx * Int32(self.weight1_scales_stride_O),
+                        cute.make_layout(self.G),
+                    )
+                    acc0 = Float32(0.0)
+                    acc1 = Float32(0.0)
+                    full_k = Int32((self.K // 8) * 8)
+                    k = lane_idx * Int32(8)
+                    while k < full_k:
+                        v0 = a_row[k].to(Float32)
+                        v1 = a_row[k + Int32(1)].to(Float32)
+                        v2 = a_row[k + Int32(2)].to(Float32)
+                        v3 = a_row[k + Int32(3)].to(Float32)
+                        v4 = a_row[k + Int32(4)].to(Float32)
+                        v5 = a_row[k + Int32(5)].to(Float32)
+                        v6 = a_row[k + Int32(6)].to(Float32)
+                        v7 = a_row[k + Int32(7)].to(Float32)
+                        acc0 = acc0 + self._dot8_nvfp4_values(
+                            packed0_row, scale0_row, k,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        )
+                        acc1 = acc1 + self._dot8_nvfp4_values(
+                            packed1_row, scale1_row, k,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        )
+                        k = k + Int32(256)
+                    k = full_k + lane_idx
+                    while k < Int32(self.K):
+                        av = a_row[k].to(Float32)
+                        acc0 = acc0 + av * self._nvfp4_weight_value(packed0_row, scale0_row, k)
+                        acc1 = acc1 + av * self._nvfp4_weight_value(packed1_row, scale1_row, k)
+                        k = k + Int32(32)
+                    total0 = cute.arch.warp_reduction(acc0, operator.add)
+                    total1 = cute.arch.warp_reduction(acc1, operator.add)
+                    if lane_idx == Int32(0):
+                        y0_base = tile_B * Int32(self.y0_stride_B) + row_idx * Int32(self.y0_stride_S)
+                        y1_base = tile_B * Int32(self.y1_stride_B) + row_idx * Int32(self.y1_stride_S)
+                        y0_tile = cute.make_tensor(y0.iterator + y0_base + out_start, cute.make_layout(self.tile_size_O))
+                        y1_tile = cute.make_tensor(y1.iterator + y1_base + out_start, cute.make_layout(self.tile_size_O))
+                        y0_tile[local_o] = total0.to(self.y0_dtype)
+                        y1_tile[local_o] = total1.to(self.y1_dtype)
+
+
+class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
+    """Packed NVFP4 matvec for four same-sized projections sharing one input."""
+
+    pipeline = SM120_OUTPUT_RANGE_PIPELINE
+    reads = {
+        "a": (None, ("B", "S", "K")),
+        "weight0_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight0_scales": (cutlass.Float16, ("O", "G")),
+        "weight1_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight1_scales": (cutlass.Float16, ("O", "G")),
+        "weight2_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight2_scales": (cutlass.Float16, ("O", "G")),
+        "weight3_packed": (cutlass.Uint8, ("O", "K2")),
+        "weight3_scales": (cutlass.Float16, ("O", "G")),
+    }
+    writes = {
+        "y0": (None, ("B", "S", "O")),
+        "y1": (None, ("B", "S", "O")),
+        "y2": (None, ("B", "S", "O")),
+        "y3": (None, ("B", "S", "O")),
+    }
+    tile = ("B", "S", "O")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        group_size=32,
+        tile_range=None,
+        **tensors,
+    ):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 16)
+        tile_sizes.setdefault("O", 16)
+        packed_shape = tensors["weight0_packed"].shape
+        scale_shape = tensors["weight0_scales"].shape
+        for idx in range(1, 4):
+            if tensors[f"weight{idx}_packed"].shape != packed_shape:
+                raise ValueError("quad NVFP4 projections must have matching packed shapes")
+            if tensors[f"weight{idx}_scales"].shape != scale_shape:
+                raise ValueError("quad NVFP4 projections must have matching scale shapes")
+        if packed_shape[1] * 2 != tensors["a"].shape[-1]:
+            raise ValueError("weight K2 must equal a.K / 2")
+        if scale_shape[1] != tensors["a"].shape[-1] // group_size:
+            raise ValueError("weight scales G must equal a.K / group_size")
+        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        return _finalize_nvfp4_matvec_schedule(
+            op,
+            page_size=page_size,
+            group_size=group_size,
+            k_dim=tensors["a"].shape[-1],
+        )
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_O, a,
+                weight0_packed, weight0_scales, weight1_packed, weight1_scales,
+                weight2_packed, weight2_scales, weight3_packed, weight3_scales,
+                y0, y1, y2, y3):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        out_start = tile_O * Int32(self.tile_size_O)
+        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
+            local_row = local_work // self.tile_size_O
+            local_o = local_work - local_row * self.tile_size_O
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                out_idx = out_start + Int32(local_o)
+                if out_idx < Int32(self.O):
+                    a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
+                    a_row = cute.make_tensor(a.iterator + a_base, cute.make_layout(self.K))
+                    packed0_row = cute.make_tensor(weight0_packed.iterator + out_idx * Int32(self.weight0_packed_stride_O), cute.make_layout(self.K2))
+                    scale0_row = cute.make_tensor(weight0_scales.iterator + out_idx * Int32(self.weight0_scales_stride_O), cute.make_layout(self.G))
+                    packed1_row = cute.make_tensor(weight1_packed.iterator + out_idx * Int32(self.weight1_packed_stride_O), cute.make_layout(self.K2))
+                    scale1_row = cute.make_tensor(weight1_scales.iterator + out_idx * Int32(self.weight1_scales_stride_O), cute.make_layout(self.G))
+                    packed2_row = cute.make_tensor(weight2_packed.iterator + out_idx * Int32(self.weight2_packed_stride_O), cute.make_layout(self.K2))
+                    scale2_row = cute.make_tensor(weight2_scales.iterator + out_idx * Int32(self.weight2_scales_stride_O), cute.make_layout(self.G))
+                    packed3_row = cute.make_tensor(weight3_packed.iterator + out_idx * Int32(self.weight3_packed_stride_O), cute.make_layout(self.K2))
+                    scale3_row = cute.make_tensor(weight3_scales.iterator + out_idx * Int32(self.weight3_scales_stride_O), cute.make_layout(self.G))
+                    acc0 = Float32(0.0)
+                    acc1 = Float32(0.0)
+                    acc2 = Float32(0.0)
+                    acc3 = Float32(0.0)
+                    full_k = Int32((self.K // 8) * 8)
+                    k = lane_idx * Int32(8)
+                    while k < full_k:
+                        v0 = a_row[k].to(Float32)
+                        v1 = a_row[k + Int32(1)].to(Float32)
+                        v2 = a_row[k + Int32(2)].to(Float32)
+                        v3 = a_row[k + Int32(3)].to(Float32)
+                        v4 = a_row[k + Int32(4)].to(Float32)
+                        v5 = a_row[k + Int32(5)].to(Float32)
+                        v6 = a_row[k + Int32(6)].to(Float32)
+                        v7 = a_row[k + Int32(7)].to(Float32)
+                        acc0 = acc0 + self._dot8_nvfp4_values(packed0_row, scale0_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc1 = acc1 + self._dot8_nvfp4_values(packed1_row, scale1_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc2 = acc2 + self._dot8_nvfp4_values(packed2_row, scale2_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc3 = acc3 + self._dot8_nvfp4_values(packed3_row, scale3_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        k = k + Int32(256)
+                    k = full_k + lane_idx
+                    while k < Int32(self.K):
+                        av = a_row[k].to(Float32)
+                        acc0 = acc0 + av * self._nvfp4_weight_value(packed0_row, scale0_row, k)
+                        acc1 = acc1 + av * self._nvfp4_weight_value(packed1_row, scale1_row, k)
+                        acc2 = acc2 + av * self._nvfp4_weight_value(packed2_row, scale2_row, k)
+                        acc3 = acc3 + av * self._nvfp4_weight_value(packed3_row, scale3_row, k)
+                        k = k + Int32(32)
+                    total0 = cute.arch.warp_reduction(acc0, operator.add)
+                    total1 = cute.arch.warp_reduction(acc1, operator.add)
+                    total2 = cute.arch.warp_reduction(acc2, operator.add)
+                    total3 = cute.arch.warp_reduction(acc3, operator.add)
+                    if lane_idx == Int32(0):
+                        y0_base = tile_B * Int32(self.y0_stride_B) + row_idx * Int32(self.y0_stride_S)
+                        y1_base = tile_B * Int32(self.y1_stride_B) + row_idx * Int32(self.y1_stride_S)
+                        y2_base = tile_B * Int32(self.y2_stride_B) + row_idx * Int32(self.y2_stride_S)
+                        y3_base = tile_B * Int32(self.y3_stride_B) + row_idx * Int32(self.y3_stride_S)
+                        y0_tile = cute.make_tensor(y0.iterator + y0_base + out_start, cute.make_layout(self.tile_size_O))
+                        y1_tile = cute.make_tensor(y1.iterator + y1_base + out_start, cute.make_layout(self.tile_size_O))
+                        y2_tile = cute.make_tensor(y2.iterator + y2_base + out_start, cute.make_layout(self.tile_size_O))
+                        y3_tile = cute.make_tensor(y3.iterator + y3_base + out_start, cute.make_layout(self.tile_size_O))
+                        y0_tile[local_o] = total0.to(self.y0_dtype)
+                        y1_tile[local_o] = total1.to(self.y1_dtype)
+                        y2_tile[local_o] = total2.to(self.y2_dtype)
+                        y3_tile[local_o] = total3.to(self.y3_dtype)
 
 
 class MatvecResidualNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
@@ -1233,33 +1223,27 @@ class MatvecResidualNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
     writes = {"residual_out": (None, ("B", "S", "O"))}
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, tile_3, a, weight_packed,
+    def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight_packed,
                 weight_scales, residual_in, residual_out):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
         row_start = tile_S * Int32(self.tile_size_S)
-        block_o = tile_O
-        block_end = tile_3
-        if block_end <= block_o:
-            block_end = block_o + Int32(1)
-        while block_o < block_end:
-            out_start = block_o * Int32(self.tile_size_O)
-            for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
-                local_row = local_work // self.tile_size_O
-                local_o = local_work - local_row * self.tile_size_O
-                row_idx = row_start + Int32(local_row)
-                if row_idx < Int32(self.S):
-                    out_idx = out_start + Int32(local_o)
-                    if out_idx < Int32(self.O):
-                        total = self._dot_output(tile_B, row_idx, out_idx, a, weight_packed, weight_scales)
-                        if lane_idx == Int32(0):
-                            out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
-                            res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
-                            res_tile = cute.make_tensor(residual_in.iterator + res_base + out_start, cute.make_layout(self.tile_size_O))
-                            out_tile = cute.make_tensor(residual_out.iterator + out_base + out_start, cute.make_layout(self.tile_size_O))
-                            out_tile[local_o] = (total + res_tile[local_o].to(Float32)).to(self.residual_out_dtype)
-            block_o = block_o + Int32(1)
+        out_start = tile_O * Int32(self.tile_size_O)
+        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
+            local_row = local_work // self.tile_size_O
+            local_o = local_work - local_row * self.tile_size_O
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                out_idx = out_start + Int32(local_o)
+                if out_idx < Int32(self.O):
+                    total = self._dot_output(tile_B, row_idx, out_idx, a, weight_packed, weight_scales)
+                    if lane_idx == Int32(0):
+                        out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                        res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
+                        res_tile = cute.make_tensor(residual_in.iterator + res_base + out_start, cute.make_layout(self.tile_size_O))
+                        out_tile = cute.make_tensor(residual_out.iterator + out_base + out_start, cute.make_layout(self.tile_size_O))
+                        out_tile[local_o] = (total + res_tile[local_o].to(Float32)).to(self.residual_out_dtype)
 
 
 class ResidualAddSm120Op(_DecodeMatvecSm120Base):
@@ -1463,7 +1447,7 @@ class RmsGateUpSiluSm120Op(_DecodeMatvecSm120Base):
 class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Fused RMS + packed NVFP4 gate/up matvec + SiLU."""
 
-    pipeline = None
+    pipeline = SM120_OUTPUT_RANGE_PIPELINE
     reads = {
         "x": (None, ("B", "S", "K")),
         "norm_weight": (None, ("K",)),
@@ -1481,8 +1465,15 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         self.eps = getattr(self, "eps", 1e-5)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        tile_range=None,
+        **tensors,
+    ):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 16)
@@ -1494,17 +1485,17 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         expected_g = tensors["x"].shape[-1] // group_size
         if tensors["gate_scales"].shape[1] != expected_g or tensors["up_scales"].shape[1] != expected_g:
             raise ValueError("gate/up scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
+        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
         op.static_dims["eps"] = eps
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+        return _finalize_nvfp4_matvec_schedule(
+            op,
+            page_size=page_size,
+            group_size=group_size,
+            k_dim=tensors["x"].shape[-1],
         )
-        return [op]
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_D, tile_3, x, norm_weight,
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, x, norm_weight,
                 gate_packed, gate_scales, up_packed, up_scales, y):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -1532,74 +1523,68 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
 
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
-        block_d = tile_D
-        block_end = tile_3
-        if block_end <= block_d:
-            block_end = block_d + Int32(1)
-        while block_d < block_end:
-            d_start = block_d * Int32(self.tile_size_D)
-            for local_work in range(warp_idx, self.tile_size_S * self.tile_size_D, num_warps):
-                local_row = local_work // self.tile_size_D
-                local_d = local_work - local_row * self.tile_size_D
-                row_idx = row_start + Int32(local_row)
-                if row_idx < Int32(self.S):
-                    x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
-                    x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
-                    d = d_start + Int32(local_d)
-                    if d < Int32(self.D):
-                        rstd = rstd_smem[local_row]
-                        gate_packed_row = cute.make_tensor(
-                            gate_packed.iterator + d * Int32(self.gate_packed_stride_D),
-                            cute.make_layout(self.K2),
+        d_start = tile_D * Int32(self.tile_size_D)
+        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_D, num_warps):
+            local_row = local_work // self.tile_size_D
+            local_d = local_work - local_row * self.tile_size_D
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+                d = d_start + Int32(local_d)
+                if d < Int32(self.D):
+                    rstd = rstd_smem[local_row]
+                    gate_packed_row = cute.make_tensor(
+                        gate_packed.iterator + d * Int32(self.gate_packed_stride_D),
+                        cute.make_layout(self.K2),
+                    )
+                    gate_scale_row = cute.make_tensor(
+                        gate_scales.iterator + d * Int32(self.gate_scales_stride_D),
+                        cute.make_layout(self.G),
+                    )
+                    up_packed_row = cute.make_tensor(
+                        up_packed.iterator + d * Int32(self.up_packed_stride_D),
+                        cute.make_layout(self.K2),
+                    )
+                    up_scale_row = cute.make_tensor(
+                        up_scales.iterator + d * Int32(self.up_scales_stride_D),
+                        cute.make_layout(self.G),
+                    )
+                    norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+                    gate_acc = Float32(0.0)
+                    up_acc = Float32(0.0)
+                    full_k = Int32((self.K // 8) * 8)
+                    k2 = lane_idx * Int32(8)
+                    while k2 < full_k:
+                        v0 = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
+                        v1 = x_row[k2 + Int32(1)].to(Float32) * rstd * norm_row[k2 + Int32(1)].to(Float32)
+                        v2 = x_row[k2 + Int32(2)].to(Float32) * rstd * norm_row[k2 + Int32(2)].to(Float32)
+                        v3 = x_row[k2 + Int32(3)].to(Float32) * rstd * norm_row[k2 + Int32(3)].to(Float32)
+                        v4 = x_row[k2 + Int32(4)].to(Float32) * rstd * norm_row[k2 + Int32(4)].to(Float32)
+                        v5 = x_row[k2 + Int32(5)].to(Float32) * rstd * norm_row[k2 + Int32(5)].to(Float32)
+                        v6 = x_row[k2 + Int32(6)].to(Float32) * rstd * norm_row[k2 + Int32(6)].to(Float32)
+                        v7 = x_row[k2 + Int32(7)].to(Float32) * rstd * norm_row[k2 + Int32(7)].to(Float32)
+                        gate_acc = gate_acc + self._dot8_nvfp4_values(
+                            gate_packed_row, gate_scale_row, k2,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
                         )
-                        gate_scale_row = cute.make_tensor(
-                            gate_scales.iterator + d * Int32(self.gate_scales_stride_D),
-                            cute.make_layout(self.G),
+                        up_acc = up_acc + self._dot8_nvfp4_values(
+                            up_packed_row, up_scale_row, k2,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
                         )
-                        up_packed_row = cute.make_tensor(
-                            up_packed.iterator + d * Int32(self.up_packed_stride_D),
-                            cute.make_layout(self.K2),
-                        )
-                        up_scale_row = cute.make_tensor(
-                            up_scales.iterator + d * Int32(self.up_scales_stride_D),
-                            cute.make_layout(self.G),
-                        )
-                        norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
-                        gate_acc = Float32(0.0)
-                        up_acc = Float32(0.0)
-                        full_k = Int32((self.K // 8) * 8)
-                        k2 = lane_idx * Int32(8)
-                        while k2 < full_k:
-                            v0 = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
-                            v1 = x_row[k2 + Int32(1)].to(Float32) * rstd * norm_row[k2 + Int32(1)].to(Float32)
-                            v2 = x_row[k2 + Int32(2)].to(Float32) * rstd * norm_row[k2 + Int32(2)].to(Float32)
-                            v3 = x_row[k2 + Int32(3)].to(Float32) * rstd * norm_row[k2 + Int32(3)].to(Float32)
-                            v4 = x_row[k2 + Int32(4)].to(Float32) * rstd * norm_row[k2 + Int32(4)].to(Float32)
-                            v5 = x_row[k2 + Int32(5)].to(Float32) * rstd * norm_row[k2 + Int32(5)].to(Float32)
-                            v6 = x_row[k2 + Int32(6)].to(Float32) * rstd * norm_row[k2 + Int32(6)].to(Float32)
-                            v7 = x_row[k2 + Int32(7)].to(Float32) * rstd * norm_row[k2 + Int32(7)].to(Float32)
-                            gate_acc = gate_acc + self._dot8_nvfp4_values(
-                                gate_packed_row, gate_scale_row, k2,
-                                v0, v1, v2, v3, v4, v5, v6, v7,
-                            )
-                            up_acc = up_acc + self._dot8_nvfp4_values(
-                                up_packed_row, up_scale_row, k2,
-                                v0, v1, v2, v3, v4, v5, v6, v7,
-                            )
-                            k2 = k2 + Int32(256)
-                        k2 = full_k + lane_idx
-                        while k2 < Int32(self.K):
-                            nv = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
-                            gate_acc = gate_acc + nv * self._nvfp4_weight_value(gate_packed_row, gate_scale_row, k2)
-                            up_acc = up_acc + nv * self._nvfp4_weight_value(up_packed_row, up_scale_row, k2)
-                            k2 = k2 + Int32(32)
-                        gate_total = cute.arch.warp_reduction(gate_acc, operator.add)
-                        up_total = cute.arch.warp_reduction(up_acc, operator.add)
-                        if lane_idx == Int32(0):
-                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                            y_tile = cute.make_tensor(y.iterator + y_base + d_start, cute.make_layout(self.tile_size_D))
-                            y_tile[local_d] = (_silu(gate_total) * up_total).to(self.y_dtype)
-            block_d = block_d + Int32(1)
+                        k2 = k2 + Int32(256)
+                    k2 = full_k + lane_idx
+                    while k2 < Int32(self.K):
+                        nv = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
+                        gate_acc = gate_acc + nv * self._nvfp4_weight_value(gate_packed_row, gate_scale_row, k2)
+                        up_acc = up_acc + nv * self._nvfp4_weight_value(up_packed_row, up_scale_row, k2)
+                        k2 = k2 + Int32(32)
+                    gate_total = cute.arch.warp_reduction(gate_acc, operator.add)
+                    up_total = cute.arch.warp_reduction(up_acc, operator.add)
+                    if lane_idx == Int32(0):
+                        y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                        y_tile = cute.make_tensor(y.iterator + y_base + d_start, cute.make_layout(self.tile_size_D))
+                        y_tile[local_d] = (_silu(gate_total) * up_total).to(self.y_dtype)
 
 
 class FinalRmsLmHeadSm120Op(RmsGateUpSiluSm120Op):
@@ -1994,7 +1979,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
         )
         norm_smem = cute.make_tensor(
             cute.make_ptr(
-                cutlass.Float32,
+                self.x_dtype,
                 page_ptr + Int32(self.threads_per_row * 8),
                 cute.AddressSpace.smem,
             ),
@@ -2015,7 +2000,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
             norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
             nk = tidx
             while nk < Int32(self.K):
-                norm_smem[nk] = x_row[nk].to(Float32) * rstd * norm_row[nk].to(Float32)
+                norm_smem[nk] = (x_row[nk].to(Float32) * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
                 nk = nk + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
@@ -2038,14 +2023,14 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
                 full_k = Int32((self.K // 8) * 8)
                 k2 = lane_idx * Int32(8)
                 while k2 < full_k:
-                    v0 = norm_smem[k2]
-                    v1 = norm_smem[k2 + Int32(1)]
-                    v2 = norm_smem[k2 + Int32(2)]
-                    v3 = norm_smem[k2 + Int32(3)]
-                    v4 = norm_smem[k2 + Int32(4)]
-                    v5 = norm_smem[k2 + Int32(5)]
-                    v6 = norm_smem[k2 + Int32(6)]
-                    v7 = norm_smem[k2 + Int32(7)]
+                    v0 = norm_smem[k2].to(Float32)
+                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
+                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
+                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
+                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
+                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
+                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
+                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
                     acc = acc + self._dot8_nvfp4_values(
                         packed_row, scale_row, k2,
                         v0, v1, v2, v3, v4, v5, v6, v7,
@@ -2053,7 +2038,145 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
                     k2 = k2 + Int32(256)
                 k2 = full_k + lane_idx
                 while k2 < Int32(self.K):
-                    acc = acc + norm_smem[k2] * self._nvfp4_weight_value(packed_row, scale_row, k2)
+                    acc = acc + norm_smem[k2].to(Float32) * self._nvfp4_weight_value(packed_row, scale_row, k2)
+                    k2 = k2 + Int32(32)
+                total = cute.arch.warp_reduction(acc, operator.add)
+                if total > best_val:
+                    best_val = total
+                    best_idx = v
+                v = v + num_warps
+
+            if lane_idx == Int32(0):
+                value_smem[warp_idx] = best_val
+                index_smem[warp_idx] = best_idx
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions) and cute.arch.thread_idx()[0] == Int32(0):
+            part_val = Float32(-3.4028234663852886e38)
+            part_idx = Int32(-1)
+            wi = Int32(0)
+            while wi < num_warps:
+                other_val = value_smem[wi]
+                other_idx = index_smem[wi]
+                if other_val > part_val:
+                    part_val = other_val
+                    part_idx = other_idx
+                wi = wi + Int32(1)
+            out_base = (
+                tile_B * Int32(self.partial_values_stride_B)
+                + row_idx * Int32(self.partial_values_stride_S)
+            )
+            val_row = cute.make_tensor(
+                partial_values.iterator + out_base,
+                cute.make_layout(self.P),
+            )
+            idx_row = cute.make_tensor(
+                partial_indices.iterator
+                + tile_B * Int32(self.partial_indices_stride_B)
+                + row_idx * Int32(self.partial_indices_stride_S),
+                cute.make_layout(self.P),
+            )
+            val_row[partition] = part_val
+            idx_row[partition] = part_idx
+
+
+class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm120Op):
+    """Per-partition final residual add + RMS + packed NVFP4 LM-head top-1."""
+
+    reads = {
+        "x": (None, ("B", "S", "K")),
+        "residual_in": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+        "weight_packed": (cutlass.Uint8, ("V", "K2")),
+        "weight_scales": (cutlass.Float16, ("V", "G")),
+    }
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_P, x, residual_in, norm_weight,
+                weight_packed, weight_scales, partial_values, partial_indices):
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_idx = tile_S * Int32(self.tile_size_S)
+        partition = tile_P
+
+        value_smem = cute.make_tensor(
+            cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout(self.threads_per_row),
+        )
+        index_smem = cute.make_tensor(
+            cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
+            cute.make_layout(self.threads_per_row),
+        )
+        norm_smem = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.threads_per_row * 8),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout(self.K),
+        )
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions):
+            x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+            residual_base = (
+                tile_B * Int32(self.residual_in_stride_B)
+                + row_idx * Int32(self.residual_in_stride_S)
+            )
+            x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+            residual_row = cute.make_tensor(residual_in.iterator + residual_base, cute.make_layout(self.K))
+            sum_sq = Float32(0.0)
+            k = lane_idx
+            while k < Int32(self.K):
+                xv = x_row[k].to(Float32) + residual_row[k].to(Float32)
+                sum_sq = sum_sq + xv * xv
+                k = k + Int32(32)
+            total_sq = cute.arch.warp_reduction(sum_sq, operator.add)
+            rstd = cute.math.rsqrt(total_sq * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
+            norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+            nk = tidx
+            while nk < Int32(self.K):
+                xv = x_row[nk].to(Float32) + residual_row[nk].to(Float32)
+                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
+                nk = nk + Int32(self.threads_per_row)
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions):
+            vocab_start = (Int32(self.V) * partition) // Int32(self.partitions)
+            vocab_end = (Int32(self.V) * (partition + Int32(1))) // Int32(self.partitions)
+            best_val = Float32(-3.4028234663852886e38)
+            best_idx = Int32(-1)
+            v = vocab_start + warp_idx
+            while v < vocab_end:
+                packed_row = cute.make_tensor(
+                    weight_packed.iterator + v * Int32(self.weight_packed_stride_V),
+                    cute.make_layout(self.K2),
+                )
+                scale_row = cute.make_tensor(
+                    weight_scales.iterator + v * Int32(self.weight_scales_stride_V),
+                    cute.make_layout(self.G),
+                )
+                acc = Float32(0.0)
+                full_k = Int32((self.K // 8) * 8)
+                k2 = lane_idx * Int32(8)
+                while k2 < full_k:
+                    v0 = norm_smem[k2].to(Float32)
+                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
+                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
+                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
+                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
+                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
+                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
+                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
+                    acc = acc + self._dot8_nvfp4_values(
+                        packed_row, scale_row, k2,
+                        v0, v1, v2, v3, v4, v5, v6, v7,
+                    )
+                    k2 = k2 + Int32(256)
+                k2 = full_k + lane_idx
+                while k2 < Int32(self.K):
+                    acc = acc + norm_smem[k2].to(Float32) * self._nvfp4_weight_value(packed_row, scale_row, k2)
                     k2 = k2 + Int32(32)
                 total = cute.arch.warp_reduction(acc, operator.add)
                 if total > best_val:
@@ -2121,50 +2244,23 @@ class ReduceTop1PartialsSm120Op(_DecodeMatvecSm120Base):
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, partial_values, partial_indices, top_values, top_indices):
         tidx = cute.arch.thread_idx()[0]
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
         row_idx = tile_S * Int32(self.tile_size_S)
 
-        value_smem = cute.make_tensor(
-            cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout(self.threads_per_row),
-        )
-        index_smem = cute.make_tensor(
-            cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
-            cute.make_layout(self.threads_per_row),
-        )
-
-        best_val = Float32(-3.4028234663852886e38)
-        best_idx = Int32(-1)
-        if row_idx < Int32(self.S):
+        if row_idx < Int32(self.S) and tidx == Int32(0):
             val_base = tile_B * Int32(self.partial_values_stride_B) + row_idx * Int32(self.partial_values_stride_S)
             idx_base = tile_B * Int32(self.partial_indices_stride_B) + row_idx * Int32(self.partial_indices_stride_S)
             val_row = cute.make_tensor(partial_values.iterator + val_base, cute.make_layout(self.P))
             idx_row = cute.make_tensor(partial_indices.iterator + idx_base, cute.make_layout(self.P))
-            p = tidx
+            final_val = Float32(-3.4028234663852886e38)
+            final_idx = Int32(-1)
+            p = Int32(0)
             while p < Int32(self.P):
                 val = val_row[p]
                 idx = idx_row[p]
-                if val > best_val:
-                    best_val = val
-                    best_idx = idx
-                p = p + Int32(self.threads_per_row)
-        value_smem[tidx] = best_val
-        index_smem[tidx] = best_idx
-        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
-
-        if row_idx < Int32(self.S) and tidx == Int32(0):
-            final_val = Float32(-3.4028234663852886e38)
-            final_idx = Int32(-1)
-            ti = Int32(0)
-            while ti < Int32(self.threads_per_row):
-                other_val = value_smem[ti]
-                other_idx = index_smem[ti]
-                if other_val > final_val:
-                    final_val = other_val
-                    final_idx = other_idx
-                ti = ti + Int32(1)
+                if val > final_val:
+                    final_val = val
+                    final_idx = idx
+                p = p + Int32(1)
             out_base = tile_B * Int32(self.top_values_stride_B) + row_idx
             val_out = cute.make_tensor(top_values.iterator + out_base, cute.make_layout(1))
             idx_out = cute.make_tensor(
@@ -2564,13 +2660,7 @@ def schedule_final_nvfp4_sm120(
     group_size=32,
 ):
     """Schedule final residual plus optional packed NVFP4 LM-head."""
-    ops = ResidualAddSm120Op.schedule(
-        x=x,
-        residual_in=residual_in,
-        residual_out=residual_out,
-        tile_sizes={"S": seq_len, "K": SM120_DECODE_REDUCTION_DIM_PER_WARP},
-        page_size=page_size,
-    )
+    ops = []
     if lm_head_nvfp4 is not None:
         if top_values is not None or top_indices is not None:
             if top_values is None or top_indices is None:
@@ -2578,8 +2668,9 @@ def schedule_final_nvfp4_sm120(
             if top_partial_values is not None or top_partial_indices is not None:
                 if top_partial_values is None or top_partial_indices is None:
                     raise ValueError("top_partial_values and top_partial_indices must be provided together")
-                ops += FinalRmsTop1PartialLmHeadNvfp4Sm120Op.schedule(
-                    x=residual_out,
+                ops += FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op.schedule(
+                    x=x,
+                    residual_in=residual_in,
                     norm_weight=final_norm,
                     weight_packed=lm_head_nvfp4.packed,
                     weight_scales=lm_head_nvfp4.scales,
@@ -2599,6 +2690,13 @@ def schedule_final_nvfp4_sm120(
                     page_size=page_size,
                 )
             else:
+                ops += ResidualAddSm120Op.schedule(
+                    x=x,
+                    residual_in=residual_in,
+                    residual_out=residual_out,
+                    tile_sizes={"S": seq_len, "K": SM120_DECODE_REDUCTION_DIM_PER_WARP},
+                    page_size=page_size,
+                )
                 ops += FinalRmsTop1LmHeadNvfp4Sm120Op.schedule(
                     x=residual_out,
                     norm_weight=final_norm,
@@ -2616,6 +2714,13 @@ def schedule_final_nvfp4_sm120(
                 raise ValueError(
                     "logits or top_values/top_indices must be provided when lm_head_nvfp4 is scheduled"
                 )
+            ops += ResidualAddSm120Op.schedule(
+                x=x,
+                residual_in=residual_in,
+                residual_out=residual_out,
+                tile_sizes={"S": seq_len, "K": SM120_DECODE_REDUCTION_DIM_PER_WARP},
+                page_size=page_size,
+            )
             ops += FinalRmsLmHeadNvfp4Sm120Op.schedule(
                 x=residual_out,
                 norm_weight=final_norm,
@@ -2627,14 +2732,25 @@ def schedule_final_nvfp4_sm120(
                 eps=eps,
                 group_size=group_size,
             )
+    else:
+        ops += ResidualAddSm120Op.schedule(
+            x=x,
+            residual_in=residual_in,
+            residual_out=residual_out,
+            tile_sizes={"S": seq_len, "K": SM120_DECODE_REDUCTION_DIM_PER_WARP},
+            page_size=page_size,
+        )
     return ops
 
 
 __all__ = [
     "FinalRmsLmHeadSm120Op",
     "FinalRmsLmHeadNvfp4Sm120Op",
+    "FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1LmHeadNvfp4Sm120Op",
+    "MatvecPairNvfp4Sm120Op",
+    "MatvecQuadNvfp4Sm120Op",
     "MatvecResidualSm120Op",
     "MatvecResidualNvfp4Sm120Op",
     "MatvecSm120Op",

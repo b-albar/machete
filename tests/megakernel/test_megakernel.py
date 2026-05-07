@@ -9,18 +9,19 @@ import pytest
 import torch
 
 from machete.kernels.attention import FlashAttentionSm120Op
-from machete.kernels.gemm import GemmOp
-from machete.kernels.glu import GLUOp
+from machete.kernels.gemm import GemmOp, GemmSm100Op
+from machete.kernels.glu import GLUBwdOp, GLUOp
 from machete.kernels.qknorm_rope import QKNormRopeOp
 from machete.kernels.rms_norm import RMSNormOp
+from machete.megakernel.backend import _phase_should_noinline
 from tests.megakernel.support import get_nop_op
 from tests.megakernel.support_tma import (
     SYNTHETIC_TMA_N,
     SYNTHETIC_TMA_TILE_M,
     SyntheticTMAAddOneOp,
 )
-from machete.megakernel.backend import HandlerBackend
-from machete.megakernel.backend_dispatch import _build_tma_runtime_layout
+from machete.megakernel.backend_dispatch import TMARuntimeLayout, _build_tma_runtime_layout
+from machete.megakernel.ops import Op
 
 
 class TestMegakernel:
@@ -45,42 +46,6 @@ class TestMegakernel:
         assert kernel.grid == (8, 1, 1)  # Now based on num_sms (persistent blocks)
         assert kernel.block == (256, 1, 1)
 
-    def test_backend_selection_uses_config(self):
-        """Megakernel should honor MegakernelConfig.backend."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
-
-        ops = [ScheduledOp(NopOp, tile_counts=(4,))]
-
-        handler_kernel = Megakernel(
-            ops,
-            config=MegakernelConfig(num_sms=1, backend="handler"),
-            device="cpu",
-        )
-        runtime_kernel = Megakernel(
-            ops,
-            config=MegakernelConfig(num_sms=1, backend="runtime"),
-            device="cpu",
-        )
-
-        assert isinstance(handler_kernel._backend, HandlerBackend)
-        assert isinstance(runtime_kernel._backend, HandlerBackend)
-        assert runtime_kernel.config.backend == "handler"
-
-    def test_unknown_backend_raises(self):
-        """Unknown backend names should fail eagerly."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
-
-        ops = [ScheduledOp(NopOp, tile_counts=(1,))]
-
-        with pytest.raises(ValueError, match="Unknown megakernel backend"):
-            Megakernel(
-                ops,
-                config=MegakernelConfig(num_sms=1, backend="does-not-exist"),
-                device="cpu",
-            )
-
     def test_backend_does_not_duplicate_identical_handlers(self):
         """Repeated identical ops should share one emitted handler body."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
@@ -94,43 +59,12 @@ class TestMegakernel:
 
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend="handler"),
+            config=MegakernelConfig(num_sms=1),
             device="cpu",
         )
 
         assert len(kernel._backend_ir.handler_specs) == 1
         assert list(kernel._backend_ir.op_handler_indices) == [0, 0, 0]
-
-    def test_runtime_backend_alias_matches_handler_ir(self):
-        """The deprecated runtime alias should build the same backend IR as handler."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
-
-        ops = [
-            ScheduledOp(NopOp, tile_counts=(4,)),
-            ScheduledOp(NopOp, tile_counts=(2,)),
-        ]
-
-        handler_kernel = Megakernel(
-            ops,
-            config=MegakernelConfig(num_sms=1, backend="handler"),
-            device="cpu",
-        )
-        runtime_kernel = Megakernel(
-            ops,
-            config=MegakernelConfig(num_sms=1, backend="runtime"),
-            device="cpu",
-        )
-
-        for phase in ("load", "compute", "store", "communicate"):
-            assert (
-                list(handler_kernel._backend_ir.op_phase_local_indices[phase])
-                == list(runtime_kernel._backend_ir.op_phase_local_indices[phase])
-            )
-            assert (
-                list(handler_kernel._backend_ir.op_phase_transport_indices[phase])
-                == list(runtime_kernel._backend_ir.op_phase_transport_indices[phase])
-            )
 
     def test_identical_tma_layers_share_handlers_but_keep_selector_metadata(self):
         """Repeated TMA layers should share handlers while preserving per-op bindings."""
@@ -150,7 +84,7 @@ class TestMegakernel:
                 )
             kernel = Megakernel(
                 ops,
-                config=MegakernelConfig(num_sms=1, backend="handler"),
+                config=MegakernelConfig(num_sms=1),
                 device="cpu",
             )
             kernel._prepare_tensors()
@@ -195,7 +129,7 @@ class TestMegakernel:
         )
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend="handler"),
+            config=MegakernelConfig(num_sms=1),
             device="cpu",
         )
 
@@ -203,6 +137,8 @@ class TestMegakernel:
         layout1 = _build_tma_runtime_layout(kernel._backend, kernel)
 
         assert layout0 is layout1
+        assert isinstance(layout0, TMARuntimeLayout)
+        assert layout0.op_phase_tma_args["load"]
         assert len(kernel._tma_runtime_layout_cache) == 1
 
     def test_qwen_forward_ops_expose_sequence_as_dynamic_dim(self):
@@ -212,6 +148,34 @@ class TestMegakernel:
         assert GLUOp.dynamic_dims == ("B", "S")
         assert QKNormRopeOp.dynamic_dims == ("M",)
         assert FlashAttentionSm120Op.dynamic_dims == ("B", "M", "N")
+
+    def test_phase_inline_policy_is_op_owned_and_defaults_to_noinline(self):
+        """Phase outlining defaults to noinline unless an op opts in."""
+        class DefaultPolicyOp(Op):
+            pass
+
+        class InlineComputeOp(Op):
+            inline_phases = ("compute",)
+
+        assert _phase_should_noinline(DefaultPolicyOp(), "compute")
+        assert not _phase_should_noinline(InlineComputeOp(), "compute")
+        assert _phase_should_noinline(InlineComputeOp(), "load")
+        assert _phase_should_noinline(
+            InlineComputeOp(),
+            "compute",
+            inline_thin_phases=False,
+        )
+
+    def test_migrated_thin_phase_policies(self):
+        """Ops that used backend allowlists now declare their own inline phases."""
+        all_thin = ("load", "compute", "store")
+        assert GemmOp.inline_phases == all_thin
+        assert GemmSm100Op.inline_phases == all_thin
+        assert GLUOp.inline_phases == all_thin
+        assert FlashAttentionSm120Op.inline_phases == all_thin
+        assert QKNormRopeOp.inline_phases == all_thin
+        assert RMSNormOp.inline_phases == all_thin
+        assert GLUBwdOp.inline_phases == ("compute",)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):

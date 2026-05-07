@@ -307,13 +307,19 @@ def _tensor_reconstruction_preamble(instance, tensor_names: List[str]) -> Tuple[
     return "\n".join(preamble_lines) + "\n", fallback_names
 
 
-def _wrapper_body(phase_name, call_str, append_mbar: bool, has_tma: bool) -> str:
+def _wrapper_body(
+    phase_name,
+    call_str,
+    append_mbar: bool,
+    has_tma: bool,
+    collective_non_tma_load: bool = False,
+) -> str:
     """Build the wrapper body for one phase method."""
     is_load_phase = phase_name == "load"
     is_compute = phase_name == "compute"
     is_store = phase_name in ("store", "communicate")
 
-    if is_load_phase and not has_tma:
+    if is_load_phase and not has_tma and not collective_non_tma_load:
         body = "    with cute.arch.elect_one():\n"
         body += f"        _instance.{phase_name}({call_str})\n"
         if append_mbar:
@@ -387,6 +393,10 @@ def _build_phase_wrapper(
     # default methods only take page_ptr).
     call_args = ["page_ptr"]
     tma_reverse = tma_local_mapping or {}
+    if "start_linear" in method_params:
+        call_args.append("start_linear")
+    if "tile_count" in method_params:
+        call_args.append("tile_count")
     call_args.extend(_tile_call_args(op_cls, method_params))
     reconstruct_preamble = ""
     wrapper_tensor_param_names = list(tensor_param_names or [])
@@ -407,11 +417,13 @@ def _build_phase_wrapper(
             name for name in reconstruct_names if name not in set(remaining_tensor_names)
         ]
 
-    if tensor_param_names:
+    if tensor_param_names or reconstructed_tensor_names:
         known_special = {
             "page_ptr",
             "op_config_ptr",
             "work_mbar",
+            "start_linear",
+            "tile_count",
         }
         tma_local_names = set(tma_reverse)
         expects_tensors = any(
@@ -425,7 +437,7 @@ def _build_phase_wrapper(
             reconstructed_tensor_name_set = set(reconstructed_tensor_names)
             call_args.extend(
                 name
-                for name in tensor_param_names
+                for name in reconstruct_names
                 if name in wrapper_tensor_param_name_set or name in reconstructed_tensor_name_set
             )
 
@@ -461,7 +473,18 @@ def _build_phase_wrapper(
     if phase_name == "communicate" and not has_tma and not tma_rebind_specs:
         body = "    pass\n"
     else:
-        body = _wrapper_body(phase_name, call_str, append_mbar, has_tma)
+        collective_non_tma_load = bool(
+            getattr(instance, "collective_non_tma_load", False)
+            and phase_name == "load"
+            and "work_mbar" in method_params
+        )
+        body = _wrapper_body(
+            phase_name,
+            call_str,
+            append_mbar,
+            has_tma,
+            collective_non_tma_load=collective_non_tma_load,
+        )
     if tma_local_mapping and not tma_rebind_specs:
         alias_lines = [
             f"    {local_name} = {canonical_name}"
@@ -539,7 +562,8 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
                   tma_param_names=None, tma_local_mapping=None,
                   noinline=False,
                   reconstruct_tensors=False,
-                  extra_reconstruct_tensor_names=None):
+                  extra_reconstruct_tensor_names=None,
+                  extra_params=None):
     """Compile any Op phase method into a @cute.jit dispatch wrapper.
 
     For load phases, detects async vs sync from method
@@ -574,6 +598,7 @@ def compile_phase(instance, phase_name, tensor_param_names=None,
             phase_name,
             tensor_param_names,
             filename=f"<compile_{phase_name}>",
+            extra_params=extra_params,
             tma_param_names=tma_param_names,
             tma_local_mapping=tma_local_mapping,
             reconstruct_tensors=reconstruct_tensors,

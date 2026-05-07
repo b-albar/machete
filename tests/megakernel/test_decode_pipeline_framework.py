@@ -14,16 +14,18 @@ from machete.megakernel import megakernel as mk
 from machete.megakernel.ops import (
     DEFAULT_PAGE_SIZE,
     InstructionPageProtocol,
-    PersistentRegion,
+    PageRole,
     PipelineABI,
     PipelineSpec,
     Op,
+    SemaphoreRole,
     build_op_config,
-    flatten_scheduled_items,
-    linearize_scheduled_items,
 )
 from machete.megakernel.paged_memory import PipelinePageLayout
-from machete.megakernel.scheduling import InstructionStreamBuilder, TileInstruction
+from machete.megakernel.scheduling import (
+    InstructionStreamBuilder,
+    TileInstruction,
+)
 
 
 class _PipelineNoop(Op):
@@ -31,6 +33,14 @@ class _PipelineNoop(Op):
         page_bytes=256,
         scratch_bytes=64,
     )
+
+
+class _OpOwnedPipelineNoop(Op):
+    pipeline = PipelineSpec.streaming(
+        page_bytes=256,
+        scratch_bytes=64,
+    )
+    pipeline_abi = PipelineABI.op_owned()
 
 
 class _PlainNoop(Op):
@@ -43,6 +53,27 @@ class _TooLargePipelineNoop(Op):
         page_bytes=1024,
         semaphore_count=2,
         scratch_bytes=512,
+    )
+
+
+class _CustomProtocolNoop(Op):
+    pipeline = PipelineSpec(
+        page_count=2,
+        page_bytes=128,
+        semaphore_count=2,
+        scratch_bytes=32,
+    )
+    pipeline_page_protocol = InstructionPageProtocol(
+        page_roles=(
+            PageRole("activation", 0, 1),
+            PageRole("weights", 1, 1),
+        ),
+        semaphore_roles=(
+            SemaphoreRole("loaded", 0, 1, participants=1),
+            SemaphoreRole("computed", 1, 1, participants=4),
+        ),
+        page_bytes=128,
+        scratch_bytes=32,
     )
 
 
@@ -80,6 +111,60 @@ class _CoalescedRangeFillOp(Op):
             idx = idx + Int32(self.threads_per_row)
 
 
+class _AddOneOp(Op):
+    reads = {"x": (None, ("N",))}
+    writes = {"y": (None, ("N",))}
+    tile = ("N",)
+
+    @classmethod
+    def schedule(cls, *, x, y, tile_n=16):
+        return [cls._schedule_single(tile_sizes={"N": tile_n}, x=x, y=y)]
+
+    @cute.jit
+    def compute(self, page_ptr, tile_N, x, y):
+        tidx = cute.arch.thread_idx()[0]
+        x_flat = cute.make_tensor(x.iterator, cute.make_layout(Int32(self.N)))
+        y_flat = cute.make_tensor(y.iterator, cute.make_layout(Int32(self.N)))
+        base = tile_N * Int32(self.tile_size_N)
+        for offset in range(tidx, self.tile_size_N, self.threads_per_row):
+            idx = base + offset
+            if idx < Int32(self.N):
+                y_flat[idx] = (x_flat[idx].to(Float32) + Float32(1.0)).to(self.y_dtype)
+
+
+class _RangeLoopAddOneOp(_AddOneOp):
+    pipeline = PipelineSpec.streaming(
+        range_axis=0,
+        range_end_axis=1,
+        range_block_size=16,
+        coalesce_ranges=True,
+    )
+
+
+class _StaticSingleWriterProducerOp(Op):
+    reads = {"x": (None, ("N",))}
+    writes = {"y": (None, ("N",))}
+    tile = ("N",)
+
+
+class _StaticSingleWriterConsumerOp(Op):
+    reads = {"y": (None, ("N",))}
+    writes = {"z": (None, ("N",))}
+    tile = ("N",)
+
+
+class _StaticReadScratchOp(Op):
+    reads = {"x": (None, ("N",))}
+    writes = {"y": (None, ("N",))}
+    tile = ("N",)
+
+
+class _StaticOverwriteScratchOp(Op):
+    reads = {}
+    writes = {"x": (None, ("N",))}
+    tile = ("N",)
+
+
 class _InvalidStagedLoadLoopOp(Op):
     pipeline = PipelineSpec.streaming(range_axis=0)
     reads = {}
@@ -98,6 +183,26 @@ class _InvalidPlainLoadLoopOp(Op):
 
     @cute.jit
     def load(self, page_ptr, y, inner_iter_idx):
+        pass
+
+
+class _PartialRangeOwnershipStagedOp(Op):
+    pipeline = PipelineSpec.streaming(
+        range_axis=0,
+        range_end_axis=1,
+        range_block_size=4,
+        coalesce_ranges=True,
+    )
+    reads = {}
+    writes = {"y": (None, ("N",))}
+    tile = ("N",)
+
+    @cute.jit
+    def load(self, page_ptr, tile_N, y, work_mbar):
+        pass
+
+    @cute.jit
+    def compute(self, page_ptr, tile_N, tile_1, y):
         pass
 
 
@@ -178,154 +283,37 @@ def test_pipeline_abi_is_op_owned():
     assert op_owned.execution == "op_owned"
 
 
-def test_persistent_region_wraps_ops_and_flattens_to_replay():
-    op_a = ScheduledOp(_PipelineNoop, tile_counts=(2,))
-    op_b = ScheduledOp(_PipelineNoop, tile_counts=(3,))
-    pipeline = PipelineSpec.streaming(page_bytes=256, scratch_bytes=64)
-    region = PersistentRegion.from_ops(
-        "decode_matvec_region",
-        [op_a, op_b],
-        pipeline=pipeline,
+
+def test_op_owned_pipeline_exposes_named_resource_offsets():
+    op = ScheduledOp(_CustomProtocolNoop, tile_counts=(1,))
+    Megakernel(
+        [op],
+        config=MegakernelConfig(num_sms=1, num_pages=1, page_size=1024),
     )
+    instance = _CustomProtocolNoop(**build_op_config(op))
 
-    assert region.name == "decode_matvec_region"
-    assert region.total_tiles == 5
-    assert region.pipeline is pipeline
-    assert region.protocol.page_count == pipeline.page_count
-    assert flatten_scheduled_items([region]) == [op_a, op_b]
-    flat, records = linearize_scheduled_items([op_a, region])
-    assert flat == [op_a, op_a, op_b]
-    assert len(records) == 1
-    assert records[0].name == "decode_matvec_region"
-    assert records[0].start_op == 1
-    assert records[0].end_op == 3
-    assert records[0].protocol.page("activation") == 0
+    assert _CustomProtocolNoop.pipeline_protocol().page("weights") == 1
+    assert instance.pipeline_page_offset("activation") == 0
+    assert instance.pipeline_page_offset("weights") == 128
+    assert instance.pipeline_semaphore_offset("loaded") == 256
+    assert instance.pipeline_semaphore_offset("computed") == 264
+    assert instance.pipeline_semaphore_participants("computed") == 4
+    assert instance.pipeline_scratch_offset() == 272
 
 
-def test_persistent_region_handler_lowering_requires_generated_op():
-    with pytest.raises(ValueError, match="generated scheduled op"):
-        PersistentRegion.from_ops(
-            "future_handler",
-            [ScheduledOp(_PipelineNoop, tile_counts=(1,))],
-            lowering=PersistentRegion.LOWER_HANDLER,
-        )
+def test_op_pipeline_drives_flat_range_coalescing():
+    op = ScheduledOp(_CoalescedPipelineNoop, tile_counts=(16,))
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+    instructions = builder.coalesce_pipeline_instructions(builder.build())
 
-
-def test_persistent_region_handler_lowering_uses_generated_op():
-    from machete.megakernel import region
-
-    op_a = ScheduledOp(_PipelineNoop, tile_counts=(2,))
-    op_b = ScheduledOp(_PipelineNoop, tile_counts=(3,))
-    generated = ScheduledOp(_PipelineNoop, tile_counts=(1,))
-    fused = region(
-        "generated_handler",
-        [op_a, op_b],
-        generated_op=generated,
-    )
-
-    flat, records = linearize_scheduled_items([fused])
-    assert flat == [generated]
-    assert records[0].name == "generated_handler"
-    assert records[0].start_op == 0
-    assert records[0].end_op == 1
-    assert records[0].lowering == PersistentRegion.LOWER_HANDLER
-
-
-def test_megakernel_accepts_replay_backed_persistent_region():
-    region = PersistentRegion.from_ops(
-        "replay_region",
-        [ScheduledOp(_PipelineNoop, tile_counts=(2,))],
-    )
-    kernel = Megakernel(
-        [region],
-        config=MegakernelConfig(num_sms=1, page_size=4096),
-        device="cpu",
-    )
-
-    assert len(kernel.ops) == 1
-    assert kernel.ops[0].op_cls is _PipelineNoop
-    assert len(kernel.regions) == 1
-    assert kernel.regions[0].name == "replay_region"
-    assert kernel.regions[0].start_op == 0
-    assert kernel.regions[0].end_op == 1
-    assert len(kernel._backend_ir.region_specs) == 1
-    spec = kernel._backend_ir.region_specs[0]
-    assert spec.name == "replay_region"
-    assert spec.start_op == 0
-    assert spec.end_op == 1
-    assert spec.op_count == 1
-    assert spec.lowering == PersistentRegion.LOWER_REPLAY
-    assert spec.page_count == region.pipeline.page_count
-    assert spec.semaphore_count == region.pipeline.semaphore_count
-    assert spec.page_roles[0].name == "activation"
-    assert spec.semaphore_roles[0].name == "activations_arrived"
-
-
-def test_region_preserves_span_for_later_handler_lowering():
-    from machete.megakernel import region
-
-    op_a = ScheduledOp(_PipelineNoop, tile_counts=(1,))
-    op_b = ScheduledOp(_PipelineNoop, tile_counts=(2,))
-    op_c = ScheduledOp(_PipelineNoop, tile_counts=(3,))
-    items = [op_a, region("tail_region", [op_b, op_c])]
-    kernel = Megakernel(
-        items,
-        config=MegakernelConfig(num_sms=1, page_size=4096),
-        device="cpu",
-    )
-
-    assert kernel.ops == [op_a, op_b, op_c]
-    assert len(kernel.regions) == 1
-    assert kernel.regions[0].name == "tail_region"
-    assert kernel.regions[0].start_op == 1
-    assert kernel.regions[0].end_op == 3
-    assert len(kernel._backend_ir.region_specs) == 1
-    spec = kernel._backend_ir.region_specs[0]
-    assert spec.name == "tail_region"
-    assert spec.start_op == 1
-    assert spec.end_op == 3
-    assert spec.op_count == 2
-
-
-def test_region_pipeline_drives_queue_coalescing_for_plain_ops():
-    op = ScheduledOp(_PlainNoop, tile_counts=(16,))
-    pipeline = PipelineSpec.streaming(
-        range_axis=0,
-        range_end_axis=1,
-        range_block_size=4,
-        coalesce_ranges=True,
-    )
-    region = PersistentRegion.from_ops("plain_decode_region", [op], pipeline=pipeline)
-    flat, records = linearize_scheduled_items([region])
-
-    plain_builder = InstructionStreamBuilder()
-    plain_builder.add_op(op)
-    plain_instructions = plain_builder.build()
-    _plain_tensor, plain_queued, plain_queue_len = plain_builder.build_queued_tensors(
-        plain_instructions,
-        num_blocks=2,
-        device="cpu",
-    )
-
-    region_builder = InstructionStreamBuilder(region_records=records)
-    region_builder.add_op(flat[0])
-    region_instructions = region_builder.build()
-    _region_tensor, region_queued, region_queue_len = region_builder.build_queued_tensors(
-        region_instructions,
-        num_blocks=2,
-        device="cpu",
-    )
-
-    assert plain_queue_len == 9
-    assert region_queue_len == 3
-    region_work = [
+    work = [
         instr
-        for instr in region_queued
+        for instr in instructions
         if instr.op_idx != TileInstruction.END_MARKER
     ]
-    assert len(region_work) == 4
-    assert [instr.tiles[0] for instr in region_work] == [0, 4, 8, 12]
-    assert all(instr.tiles[1] - instr.tiles[0] == 4 for instr in region_work)
+    assert len(work) == 1
+    assert work[0].tiles[:2] == (0, 16)
 
 
 def test_pipeline_is_resource_metadata_not_a_second_phase_api():
@@ -462,58 +450,14 @@ def test_plain_op_rejects_runtime_load_loop_signature():
         kernel._prepare_tensors()
 
 
-def test_pipeline_ops_use_contiguous_per_sm_ranges():
-    op = ScheduledOp(_PipelineNoop, tile_counts=(10,))
-    builder = InstructionStreamBuilder()
-    builder.add_op(op)
-    instructions = builder.build()
-
-    _tensor, queued, queue_len = builder.build_queued_tensors(
-        instructions,
-        num_blocks=3,
-        device="cpu",
-    )
-
-    queues = [queued[i * queue_len : (i + 1) * queue_len] for i in range(3)]
-    queue_tiles = [
-        [instr.tiles[0] for instr in queue if instr.op_idx != TileInstruction.END_MARKER]
-        for queue in queues
-    ]
-
-    assert queue_tiles == [
-        [0, 1, 2],
-        [3, 4, 5],
-        [6, 7, 8, 9],
-    ]
-
-
-def test_pipeline_ops_can_coalesce_ranges_per_sm():
-    op = ScheduledOp(_CoalescedPipelineNoop, tile_counts=(10,))
-    builder = InstructionStreamBuilder()
-    builder.add_op(op)
-    instructions = builder.build()
-
-    _tensor, queued, queue_len = builder.build_queued_tensors(
-        instructions,
-        num_blocks=3,
-        device="cpu",
-    )
-
-    queues = [queued[i * queue_len : (i + 1) * queue_len] for i in range(3)]
-    queue_ranges = [
-        [
-            (instr.tiles[0], instr.tiles[1])
-            for instr in queue
-            if instr.op_idx != TileInstruction.END_MARKER
-        ]
-        for queue in queues
-    ]
-
-    assert queue_ranges == [
-        [(0, 3)],
-        [(3, 6)],
-        [(6, 10)],
-    ]
+def test_staged_range_rejects_partial_phase_ownership():
+    with pytest.raises(ValueError, match="partial coalesced-range ownership"):
+        kernel = Megakernel(
+            [ScheduledOp(_PartialRangeOwnershipStagedOp, tile_counts=(8,))],
+            config=MegakernelConfig(num_sms=1, page_size=4096),
+            device="cpu",
+        )
+        kernel._prepare_tensors()
 
 
 def test_pipeline_ops_can_coalesce_flat_instruction_stream():
@@ -540,7 +484,6 @@ def test_coalesced_range_instruction_reaches_device_code():
             num_sms=3,
             num_pages=1,
             page_size=4096,
-            per_sm_instruction_queues=True,
         ),
     )
 
@@ -548,6 +491,34 @@ def test_coalesced_range_instruction_reaches_device_code():
     torch.cuda.synchronize()
 
     assert torch.all(y == 1.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_coalesced_range_instruction_can_use_framework_fast_loop():
+    x = torch.arange(32, device="cuda", dtype=torch.float32)
+    y = torch.zeros_like(x)
+    kernel = Megakernel(
+        _RangeLoopAddOneOp.schedule(x=x, y=y, tile_n=1),
+        config=MegakernelConfig(
+            num_sms=2,
+            num_pages=1,
+            page_size=4096,
+        ),
+    )
+
+    kernel.run()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(y, x + 1.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+
+
+
+
 
 
 def test_qwen_final_head_public_api_does_not_expose_scalar_lm_head_variant():
@@ -640,7 +611,6 @@ kernel = Megakernel(
         num_pages=1,
         page_size=ops[0].static_dims["page_size"],
         threads_per_block=224,
-        per_sm_instruction_queues=True,
     ),
 )
 kernel.run()
@@ -735,6 +705,19 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     assert layer.ops[1].static_dims["barrier_wait_alias_H"] == "qkv_chunk_0"
     assert layer.ops[1].static_dims["barrier_signal_alias_H"] == "q_head_0"
 
+    layer.ops[0].static_dims["pipeline_range_block_size"] = 4
+    builder = InstructionStreamBuilder()
+    for op in layer.ops[:2]:
+        builder.add_op(op)
+    instructions = builder.coalesce_pipeline_instructions(builder.build())
+    formulas = builder.get_op_barrier_formulas()
+    first_qkv = next(instr for instr in instructions if instr.op_idx == 0)
+    first_finalize = next(instr for instr in instructions if instr.op_idx == 1)
+
+    assert first_qkv.tiles == (0, 0, 0, 4, 0)
+    assert builder._build_signal_info_entry(first_qkv, formulas) == [0, 0, 0, 0]
+    assert builder._build_wait_info_entry(first_finalize, formulas) == [0, 4]
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_fused_rms_add_staged_decode_gemm_matches_torch_small():
@@ -767,7 +750,6 @@ def test_qwen_fused_rms_add_staged_decode_gemm_matches_torch_small():
             num_pages=1,
             page_size=32768,
             threads_per_block=224,
-            per_sm_instruction_queues=True,
         ),
     )
     kernel.run()
@@ -818,7 +800,6 @@ kernel = Megakernel(
         num_pages=1,
         page_size=32768,
         threads_per_block=224,
-        per_sm_instruction_queues=True,
     ),
 )
 kernel.run()
@@ -876,7 +857,6 @@ kernel = Megakernel(
         num_pages=1,
         page_size=ops[0].static_dims["page_size"],
         threads_per_block=224,
-        per_sm_instruction_queues=True,
     ),
 )
 kernel.run()
@@ -898,6 +878,8 @@ torch.testing.assert_close(c.float(), ref, rtol=2e-2, atol=3e-1)
         timeout=180,
     )
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 def test_qwen_ranged_rms_add_decode_gemm_rejects_unstable_tile_k():
     from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import (
@@ -953,7 +935,6 @@ def test_qwen_staged_decode_gemm_matches_torch_small():
             num_pages=1,
             page_size=32768,
             threads_per_block=224,
-            per_sm_instruction_queues=True,
         ),
     )
     kernel.run()
@@ -983,7 +964,13 @@ def test_qwen_ranged_lm_head_matches_torch_small():
     assert ops[0].tile_sizes["N"] == 16
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+
+
+
+
+
 def test_qwen_ranged_lm_head_handles_long_coalesced_ranges():
     script = r"""
 import torch
@@ -1007,7 +994,6 @@ kernel = Megakernel(
         num_sms=8,
         num_pages=1,
         page_size=8192,
-        per_sm_instruction_queues=True,
     ),
 )
 kernel.run()

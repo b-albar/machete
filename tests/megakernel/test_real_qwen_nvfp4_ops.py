@@ -21,18 +21,22 @@ def _qweight(rows, cols, group_size=32):
 def test_real_qwen_full_attention_nvfp4_schedule_uses_native_ops():
     from machete.kernels.decode_matvec import (
         MatvecNvfp4Sm120Op,
+        MatvecPairNvfp4Sm120Op,
+        MatvecQuadNvfp4Sm120Op,
         MatvecResidualNvfp4Sm120Op,
         RmsAddNormSm120Op,
         RmsGateUpSiluNvfp4Sm120Op,
     )
     from machete.kernels.qwen3_5_sm120 import (
-        Qwen3_5QkvRopeCacheSm120Op,
+        Qwen3_5GatedSingleTokenAttentionSm120Op,
+        Qwen3_5QGateRopeCacheSm120Op,
         QWEN3_5_REAL_HEAD_DIM,
         QWEN3_5_REAL_HIDDEN,
         QWEN3_5_REAL_INTERMEDIATE,
         QWEN3_5_REAL_KV_DIM,
         QWEN3_5_REAL_NUM_KV_HEADS,
         QWEN3_5_REAL_Q_DIM,
+        QWEN3_5_REAL_Q_RAW_DIM,
         QWEN3_5_REAL_ROTARY_D2,
         schedule_qwen3_5_full_attention_nvfp4_sm120,
     )
@@ -46,7 +50,9 @@ def test_real_qwen_full_attention_nvfp4_schedule_uses_native_ops():
         "sin": torch.empty(128, QWEN3_5_REAL_ROTARY_D2, device="cuda", dtype=dtype),
         f"{pfx}.attn_norm": torch.empty(QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype),
         f"{pfx}.mlp_norm": torch.empty(QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype),
-        f"{pfx}.W_q_nvfp4": _qweight(QWEN3_5_REAL_Q_DIM, QWEN3_5_REAL_HIDDEN),
+        f"{pfx}.q_norm": torch.empty(QWEN3_5_REAL_HEAD_DIM, device="cuda", dtype=dtype),
+        f"{pfx}.k_norm": torch.empty(QWEN3_5_REAL_HEAD_DIM, device="cuda", dtype=dtype),
+        f"{pfx}.W_q_nvfp4": _qweight(QWEN3_5_REAL_Q_RAW_DIM, QWEN3_5_REAL_HIDDEN),
         f"{pfx}.W_k_nvfp4": _qweight(QWEN3_5_REAL_KV_DIM, QWEN3_5_REAL_HIDDEN),
         f"{pfx}.W_v_nvfp4": _qweight(QWEN3_5_REAL_KV_DIM, QWEN3_5_REAL_HIDDEN),
         f"{pfx}.W_o_nvfp4": _qweight(QWEN3_5_REAL_HIDDEN, QWEN3_5_REAL_Q_DIM),
@@ -92,12 +98,14 @@ def test_real_qwen_full_attention_nvfp4_schedule_uses_native_ops():
 
     op_classes = [op.op_cls for op in layer.ops]
     assert op_classes[0] is RmsAddNormSm120Op
+    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 0
     assert op_classes.count(MatvecNvfp4Sm120Op) >= 4
-    assert Qwen3_5QkvRopeCacheSm120Op in op_classes
+    assert Qwen3_5QGateRopeCacheSm120Op in op_classes
+    assert Qwen3_5GatedSingleTokenAttentionSm120Op in op_classes
     assert MatvecResidualNvfp4Sm120Op in op_classes
     assert RmsGateUpSiluNvfp4Sm120Op in op_classes
     post = layer.ops[4]
-    assert post.op_cls is Qwen3_5QkvRopeCacheSm120Op
+    assert post.op_cls is Qwen3_5QGateRopeCacheSm120Op
     assert post.static_dims["head_dim"] == QWEN3_5_REAL_HEAD_DIM
 
 
@@ -158,6 +166,83 @@ def test_real_qwen_qkv_rope_cache_postprocess_matches_reference():
     torch.testing.assert_close(v_cache[0, cache_pos, 0].float(), v_ref.to(dtype).float(), rtol=0, atol=0)
 
 
+def test_real_qwen_q_gate_rope_cache_postprocess_matches_reference():
+    from machete.kernels.qwen3_5_sm120 import Qwen3_5QGateRopeCacheSm120Op
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    torch.manual_seed(37)
+    dtype = torch.bfloat16
+    batch, seq, q_heads, kv_heads, head_dim, d2 = 1, 1, 2, 1, 8, 2
+    q_dim = q_heads * head_dim
+    kv_dim = kv_heads * head_dim
+    q_raw_dim = 2 * q_dim
+    cache_pos = 3
+
+    q_raw = torch.randn(batch, seq, q_raw_dim, device="cuda", dtype=dtype)
+    k_raw = torch.randn(batch, seq, kv_dim, device="cuda", dtype=dtype)
+    v_raw = torch.randn(batch, seq, kv_dim, device="cuda", dtype=dtype)
+    cos = torch.randn(seq, d2, device="cuda", dtype=dtype)
+    sin = torch.randn(seq, d2, device="cuda", dtype=dtype)
+    q_norm = torch.randn(head_dim, device="cuda", dtype=dtype)
+    k_norm = torch.randn(head_dim, device="cuda", dtype=dtype)
+    q = torch.empty(batch, seq, q_dim, device="cuda", dtype=dtype)
+    gate = torch.empty_like(q)
+    k_cache = torch.zeros(batch, 8, kv_heads, head_dim, device="cuda", dtype=dtype)
+    v_cache = torch.zeros_like(k_cache)
+
+    kernel = Megakernel(
+        Qwen3_5QGateRopeCacheSm120Op.schedule(
+            q_raw=q_raw,
+            k_raw=k_raw,
+            v_raw=v_raw,
+            cos=cos,
+            sin=sin,
+            q_norm_weight=q_norm,
+            k_norm_weight=k_norm,
+            q=q,
+            gate=gate,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_pos=cache_pos,
+            tile_sizes={"S": 1},
+            page_size=32768,
+        ),
+        config=MegakernelConfig(num_sms=1, page_size=32768, threads_per_block=128),
+    )
+    kernel.run()
+    torch.cuda.synchronize()
+
+    q_ref = torch.empty_like(q).float()
+    gate_ref = torch.empty_like(q).float()
+    q_raw_f = q_raw.float()
+    for head in range(q_heads):
+        raw_base = head * 2 * head_dim
+        out_base = head * head_dim
+        q_head = q_raw_f[0, 0, raw_base : raw_base + head_dim]
+        scale = torch.rsqrt(q_head.square().mean() + 1e-6)
+        q_normed = q_head * scale * q_norm.float()
+        q_ref[0, 0, out_base : out_base + head_dim] = q_normed
+        gate_ref[0, 0, out_base : out_base + head_dim] = q_raw_f[
+            0, 0, raw_base + head_dim : raw_base + 2 * head_dim
+        ]
+        low = q_normed[:d2]
+        high = q_normed[d2 : 2 * d2]
+        q_ref[0, 0, out_base : out_base + d2] = low * cos.float()[0] - high * sin.float()[0]
+        q_ref[0, 0, out_base + d2 : out_base + 2 * d2] = high * cos.float()[0] + low * sin.float()[0]
+
+    k_ref = k_raw.float()[0, 0].clone()
+    k_ref = k_ref * torch.rsqrt(k_ref.square().mean() + 1e-6) * k_norm.float()
+    low = k_ref[:d2].clone()
+    high = k_ref[d2 : 2 * d2].clone()
+    k_ref[:d2] = low * cos.float()[0] - high * sin.float()[0]
+    k_ref[d2 : 2 * d2] = high * cos.float()[0] + low * sin.float()[0]
+
+    torch.testing.assert_close(q.float(), q_ref.to(dtype).float(), rtol=0, atol=0)
+    torch.testing.assert_close(gate.float(), gate_ref.to(dtype).float(), rtol=0, atol=0)
+    torch.testing.assert_close(k_cache[0, cache_pos, 0].float(), k_ref.to(dtype).float(), rtol=0, atol=0)
+    torch.testing.assert_close(v_cache[0, cache_pos, 0].float(), v_raw[0, 0].float(), rtol=0, atol=0)
+
+
 def test_real_qwen_single_token_attention_matches_reference():
     from machete.kernels.qwen3_5_sm120 import Qwen3_5SingleTokenAttentionSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
@@ -195,6 +280,50 @@ def test_real_qwen_single_token_attention_matches_reference():
         ) * 0.0625
         probs = torch.softmax(scores, dim=0)
         ref[0, 0, qh] = torch.einsum("t,td->d", probs, v[0, :, kvh].float())
+
+    torch.testing.assert_close(o.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_real_qwen_gated_single_token_attention_matches_reference():
+    from machete.kernels.qwen3_5_sm120 import Qwen3_5GatedSingleTokenAttentionSm120Op
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    torch.manual_seed(41)
+    dtype = torch.bfloat16
+    batch, seq, q_heads, kv_heads, head_dim, context = 1, 1, 4, 2, 16, 13
+    kv_group_size = q_heads // kv_heads
+    q = torch.randn(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch, context, kv_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    gate = torch.randn(batch, seq, q_heads * head_dim, device="cuda", dtype=dtype)
+    o = torch.empty(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+
+    kernel = Megakernel(
+        Qwen3_5GatedSingleTokenAttentionSm120Op.schedule(
+            q=q,
+            k=k,
+            v=v,
+            gate=gate,
+            o=o,
+            kv_group_size=kv_group_size,
+            page_size=32768,
+        ),
+        config=MegakernelConfig(num_sms=1, page_size=32768, threads_per_block=128),
+    )
+    kernel.run()
+    torch.cuda.synchronize()
+
+    ref = torch.empty_like(o, dtype=torch.float32)
+    for qh in range(q_heads):
+        kvh = qh // kv_group_size
+        scores = torch.einsum(
+            "d,td->t",
+            q[0, 0, qh].float(),
+            k[0, :, kvh].float(),
+        ) * 0.0625
+        probs = torch.softmax(scores, dim=0)
+        attn = torch.einsum("t,td->d", probs, v[0, :, kvh].float())
+        ref[0, 0, qh] = attn * torch.sigmoid(gate[0, 0, qh * head_dim : (qh + 1) * head_dim].float())
 
     torch.testing.assert_close(o.float(), ref, rtol=2e-2, atol=2e-2)
 
@@ -245,6 +374,8 @@ def test_real_qwen_flash_decode_attention_matches_reference():
 def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
     from machete.kernels.decode_matvec import (
         MatvecNvfp4Sm120Op,
+        MatvecPairNvfp4Sm120Op,
+        MatvecQuadNvfp4Sm120Op,
         MatvecResidualNvfp4Sm120Op,
         RmsAddNormSm120Op,
         RmsGateUpSiluNvfp4Sm120Op,
@@ -322,12 +453,14 @@ def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
     assert op_classes[0] is RmsAddNormSm120Op
     assert op_classes.count(RmsMatvecNvfp4Sm120Op) == 0
     assert op_classes.count(RmsReadMatvecNvfp4Sm120Op) == 0
-    assert op_classes.count(MatvecNvfp4Sm120Op) >= 5
+    assert op_classes.count(MatvecQuadNvfp4Sm120Op) == 1
+    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 1
+    assert op_classes.count(MatvecNvfp4Sm120Op) >= 1
     assert Qwen3_5DeltaNetCoreSm120Op in op_classes
     assert MatvecResidualNvfp4Sm120Op in op_classes
     assert RmsGateUpSiluNvfp4Sm120Op in op_classes
     assert op_classes[-1] is MatvecNvfp4Sm120Op
-    assert layer.ops[5].op_cls is Qwen3_5DeltaNetCoreSm120Op
+    assert layer.ops[3].op_cls is Qwen3_5DeltaNetCoreSm120Op
 
 
 def test_real_qwen_deltanet_core_matches_reference():
@@ -461,7 +594,6 @@ def test_final_nvfp4_top1_lm_head_matches_dequantized_reference():
             threads_per_block=128,
             page_size=8192,
             num_pages=1,
-            per_sm_instruction_queues=True,
         ),
     )
     kernel.run()
@@ -469,6 +601,67 @@ def test_final_nvfp4_top1_lm_head_matches_dequantized_reference():
 
     rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + 1e-5)
     h = x.float() * rstd * norm_weight.float()
+    ref = torch.matmul(h, dequantize_nvfp4_weight(qweight).float().t())
+    ref_values, ref_indices = ref.max(dim=-1)
+    torch.testing.assert_close(top_values, ref_values, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(top_indices, ref_indices.to(torch.int32), atol=0, rtol=0)
+
+
+def test_final_nvfp4_partial_top1_fuses_residual_add():
+    from machete.kernels.decode_matvec import (
+        FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op,
+        ReduceTop1PartialsSm120Op,
+        schedule_final_nvfp4_sm120,
+    )
+    from machete.megakernel import Megakernel, MegakernelConfig
+    from machete.quantization import dequantize_nvfp4_weight, quantize_nvfp4_weight
+
+    torch.manual_seed(12)
+    batch, seq, hidden, vocab, parts = 1, 1, 64, 256, 4
+    x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
+    residual_out = torch.empty_like(residual)
+    norm_weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(vocab, hidden, device="cuda", dtype=torch.bfloat16) * 0.02
+    qweight = quantize_nvfp4_weight(weight, group_size=32)
+    top_values = torch.empty(batch, seq, device="cuda", dtype=torch.float32)
+    top_indices = torch.empty(batch, seq, device="cuda", dtype=torch.int32)
+    partial_values = torch.empty(batch, seq, parts, device="cuda", dtype=torch.float32)
+    partial_indices = torch.empty(batch, seq, parts, device="cuda", dtype=torch.int32)
+
+    ops = schedule_final_nvfp4_sm120(
+        x=x,
+        residual_in=residual,
+        residual_out=residual_out,
+        final_norm=norm_weight,
+        lm_head_nvfp4=qweight,
+        top_values=top_values,
+        top_indices=top_indices,
+        top_partial_values=partial_values,
+        top_partial_indices=partial_indices,
+        seq_len=seq,
+        page_size=8192,
+        group_size=32,
+    )
+    assert [op.op_cls for op in ops] == [
+        FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op,
+        ReduceTop1PartialsSm120Op,
+    ]
+    kernel = Megakernel(
+        ops,
+        config=MegakernelConfig(
+            num_sms=4,
+            threads_per_block=128,
+            page_size=8192,
+            num_pages=1,
+        ),
+    )
+    kernel.run()
+    torch.cuda.synchronize()
+
+    summed = x.float() + residual.float()
+    rstd = torch.rsqrt(summed.square().mean(dim=-1, keepdim=True) + 1e-5)
+    h = summed * rstd * norm_weight.float()
     ref = torch.matmul(h, dequantize_nvfp4_weight(qweight).float().t())
     ref_values, ref_indices = ref.max(dim=-1)
     torch.testing.assert_close(top_values, ref_values, atol=2e-2, rtol=2e-2)

@@ -70,6 +70,7 @@ class GemmSm100Op(Op):
         "b": (None, ("N", "K")),
     }
     writes = {"c": (None, ("B", "S", "N"))}
+    inline_phases = ("load", "compute", "store")
     tile = ("B", "S", "N")
     dynamic_dims = ("B", "S")
 

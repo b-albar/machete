@@ -11,8 +11,6 @@ from .backend_ir import (
     BackendIR,
     HandlerSpec,
     OpCompileSpec,
-    ProtocolRoleSpec,
-    RegionCompileSpec,
 )
 from .backend_dispatch import compile_phase_dispatch_inputs
 from .ops import build_op_config, is_compile_static_dim
@@ -23,51 +21,11 @@ PHASE_NAMES = ("load", "compute", "store", "communicate")
 
 
 def _phase_should_noinline(instance, phase_name: str, inline_thin_phases: bool = True) -> bool:
-    """Return whether one phase should stay behind a noinline boundary.
-
-    The handler backend defaults to noinline for every phase. A small set of
-    thin wrapper phases are forced inline because they repeatedly became the
-    dominant overhead in small GEMM-like kernels while adding little useful
-    isolation. The heavy lifting either already lives in deeper helpers or is
-    small enough that outlining only adds dispatch shell cost.
-    """
-    op_name = type(instance).__name__
-    compute_name = getattr(getattr(instance, phase_name, None), "__name__", "")
-
-    inline_phase_ops = {
-        "load": {
-            "GemmOp",
-            "GemmSm100Op",
-            "GLUOp",
-            "FlashAttentionSm120Op",
-            "QKNormRopeOp",
-            "RMSNormOp",
-        },
-        "store": {
-            "GemmOp",
-            "GemmSm100Op",
-            "GLUOp",
-            "FlashAttentionSm120Op",
-            "QKNormRopeOp",
-            "RMSNormOp",
-        },
-        "compute": {
-            "GemmOp",
-            "GemmSm100Op",
-            "GLUOp",
-            "GLUBwdOp",
-            "FlashAttentionSm120Op",
-            "QKNormRopeOp",
-            "RMSNormOp",
-        },
-    }
-
-    if inline_thin_phases:
-        if op_name in inline_phase_ops.get(phase_name, set()):
-            return False
-        if phase_name == "compute" and op_name == "GemmOp" and compute_name == "compute_unscaled":
-            return False
-    return True
+    """Return whether one phase should stay behind a noinline boundary."""
+    policy = getattr(instance, "should_noinline_phase", None)
+    if policy is None:
+        return True
+    return policy(phase_name, allow_inline_phases=inline_thin_phases)
 
 
 def _get_local_tensor_names(op_cls, tensor_mapping: Dict[str, str]) -> Tuple[str, ...]:
@@ -212,61 +170,19 @@ def build_handler_backend_ir(kernel) -> BackendIR:
     peer_tma_registry = kernel._peer_tma_registry
 
     op_specs: List[OpCompileSpec] = []
-    region_specs: List[RegionCompileSpec] = []
     handler_specs: List[HandlerSpec] = []
     op_handler_indices: List[int] = []
     op_phase_local_indices: Dict[str, List[int]] = {phase: [] for phase in PHASE_NAMES}
-    op_phase_transport_indices: Dict[str, List[int]] = {phase: [] for phase in PHASE_NAMES}
+    op_phase_compile_transport_indices: Dict[str, List[int]] = {phase: [] for phase in PHASE_NAMES}
     handler_index_by_key: Dict[Tuple[Any, ...], int] = {}
     phase_variant_idx_by_handler: Dict[str, Dict[int, Dict[Tuple[Any, ...], int]]] = {
         phase: {}
         for phase in PHASE_NAMES
     }
     phase_transport_idx: Dict[str, Dict[Tuple[str, ...], int]] = {phase: {} for phase in PHASE_NAMES}
-    phase_transport_records: Dict[str, List[Tuple[str, ...]]] = {phase: [] for phase in PHASE_NAMES}
+    phase_compile_transport_records: Dict[str, List[Tuple[str, ...]]] = {phase: [] for phase in PHASE_NAMES}
     num_dma_warps = 0 if kernel._use_compute_only_replay() else NUM_DMA_WARPS
     num_compute_threads = kernel.config.threads_per_block - num_dma_warps * 32
-
-    for region_idx, region in enumerate(getattr(kernel, "regions", ())):
-        if region.start_op < 0 or region.end_op > len(kernel.ops) or region.start_op >= region.end_op:
-            raise ValueError(
-                f"invalid persistent region span {region.name!r}: "
-                f"[{region.start_op}, {region.end_op}) for {len(kernel.ops)} ops"
-            )
-        region_specs.append(
-            RegionCompileSpec(
-                region_idx=region_idx,
-                name=region.name,
-                start_op=region.start_op,
-                end_op=region.end_op,
-                lowering=region.lowering,
-                page_roles=tuple(
-                    ProtocolRoleSpec(role.name, role.offset, role.count)
-                    for role in region.protocol.page_roles
-                ),
-                semaphore_roles=tuple(
-                    ProtocolRoleSpec(
-                        role.name,
-                        role.offset,
-                        role.count,
-                        role.participants,
-                    )
-                    for role in region.protocol.semaphore_roles
-                ),
-                page_count=region.protocol.page_count,
-                page_bytes=region.protocol.page_bytes,
-                semaphore_count=region.protocol.semaphore_count,
-                scratch_bytes=region.protocol.scratch_bytes,
-                resource_bytes=region.protocol.resource_bytes,
-                input_stages=region.pipeline.input_stages,
-                output_stages=region.pipeline.output_stages,
-                stage_pages=region.pipeline.stage_pages,
-                range_axis=region.pipeline.range_axis,
-                range_end_axis=region.pipeline.range_end_axis,
-                range_block_size=region.pipeline.range_block_size,
-                coalesce_ranges=region.pipeline.coalesce_ranges,
-            )
-        )
 
     for i, op in enumerate(kernel.ops):
         instance = op.op_cls(**build_op_config(op, kernel_config={"threads_per_row": num_compute_threads}))
@@ -348,10 +264,10 @@ def build_handler_backend_ir(kernel) -> BackendIR:
             transport_key = op_specs[-1].tma_args[phase]
             transport_idx = phase_transport_idx[phase].get(transport_key)
             if transport_idx is None:
-                transport_idx = len(phase_transport_records[phase])
+                transport_idx = len(phase_compile_transport_records[phase])
                 phase_transport_idx[phase][transport_key] = transport_idx
-                phase_transport_records[phase].append(transport_key)
-            op_phase_transport_indices[phase].append(transport_idx)
+                phase_compile_transport_records[phase].append(transport_key)
+            op_phase_compile_transport_indices[phase].append(transport_idx)
 
             phase_variant_map = phase_variant_idx_by_handler[phase].setdefault(handler_idx, {})
             phase_binding_key = (
@@ -363,15 +279,16 @@ def build_handler_backend_ir(kernel) -> BackendIR:
             phase_local_idx = phase_variant_map.get(phase_binding_key)
             if phase_local_idx is None:
                 # Keep hot-path dispatch keyed by compact handler-local ids.
-                # Transport identity is tracked separately in
-                # op_phase_transport_indices / phase_transport_records and can
+                # Compile-level transport identity is tracked separately in
+                # op_phase_compile_transport_indices /
+                # phase_compile_transport_records and can
                 # later drive a transport-record-based dispatch path without
                 # perturbing the current switch-based fast path.
                 phase_local_idx = len(phase_variant_map)
                 phase_variant_map[phase_binding_key] = phase_local_idx
             op_phase_local_indices[phase].append(phase_local_idx)
 
-    phase_local_transport_positions: Dict[str, Tuple[Tuple[Tuple[int, ...], ...], ...]] = {}
+    phase_compile_local_transport_positions: Dict[str, Tuple[Tuple[Tuple[int, ...], ...], ...]] = {}
     for phase in PHASE_NAMES:
         phase_names: List[str] = []
         seen_names = set()
@@ -395,17 +312,20 @@ def build_handler_backend_ir(kernel) -> BackendIR:
             handler_variant_tables.append(
                 tuple(() if pos is None else pos for pos in variant_positions)
             )
-        phase_local_transport_positions[phase] = tuple(handler_variant_tables)
+        phase_compile_local_transport_positions[phase] = tuple(handler_variant_tables)
 
     return BackendIR(
         op_specs=tuple(op_specs),
-        region_specs=tuple(region_specs),
         handler_specs=tuple(handler_specs),
         op_handler_indices=tuple(op_handler_indices),
         op_phase_local_indices={k: tuple(v) for k, v in op_phase_local_indices.items()},
-        op_phase_transport_indices={k: tuple(v) for k, v in op_phase_transport_indices.items()},
-        phase_transport_records={k: tuple(v) for k, v in phase_transport_records.items()},
-        phase_local_transport_positions=phase_local_transport_positions,
+        op_phase_compile_transport_indices={
+            k: tuple(v) for k, v in op_phase_compile_transport_indices.items()
+        },
+        phase_compile_transport_records={
+            k: tuple(v) for k, v in phase_compile_transport_records.items()
+        },
+        phase_compile_local_transport_positions=phase_compile_local_transport_positions,
     )
 
 
@@ -444,15 +364,10 @@ class HandlerBackend:
         )
 
 
-def build_backend(kernel, backend_name: str):
-    """Construct the configured backend and its IR.
-
-    ``runtime`` remains accepted as a compatibility alias for ``handler``.
-    """
-    if backend_name in ("handler", "runtime"):
-        ir = build_handler_backend_ir(kernel)
-        return ir, HandlerBackend(ir)
-    raise ValueError(f"Unknown megakernel backend: {backend_name}")
+def build_backend(kernel):
+    """Construct the handler backend and its IR."""
+    ir = build_handler_backend_ir(kernel)
+    return ir, HandlerBackend(ir)
 
 
 __all__ = [

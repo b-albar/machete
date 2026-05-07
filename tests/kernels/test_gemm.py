@@ -146,6 +146,20 @@ FORWARD_CASES = [
 ]
 
 
+def test_shape_aware_auto_tiles_long_rows_use_wide_spatial_tile():
+    """Long-row BF16 GEMMs on 32KB pages prefer fewer, wider spatial tiles."""
+    from machete.kernels.gemm import GemmOp
+
+    assert GemmOp._shape_aware_auto_tiles(
+        32768,
+        input_k=1024,
+        output_n=151936,
+        rows=1024,
+        elem_bytes=2,
+        has_a_scale=False,
+    ) == (128, 128, 16)
+
+
 @requires_sm90_cutlass
 class TestGemmForward:
     """GEMM forward pass correctness tests."""

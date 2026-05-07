@@ -52,7 +52,7 @@ def make_ops_from_chain(tensors):
     return ops
 
 
-def build_kernels(num_layers: int, backend: str, device: str, *, compile_kernels: bool):
+def build_kernels(num_layers: int, device: str, *, compile_kernels: bool):
     seq_tensors = make_chain_tensors(num_layers, device=device)
     fused_tensors = make_chain_tensors(num_layers, device=device)
 
@@ -65,7 +65,7 @@ def build_kernels(num_layers: int, backend: str, device: str, *, compile_kernels
         )
         kernel = Megakernel(
             ops,
-            config=MegakernelConfig(num_sms=1, backend=backend),
+            config=MegakernelConfig(num_sms=1),
             device=device,
         )
         if compile_kernels:
@@ -74,7 +74,7 @@ def build_kernels(num_layers: int, backend: str, device: str, *, compile_kernels
 
     fused_kernel = Megakernel(
         make_ops_from_chain(fused_tensors),
-        config=MegakernelConfig(num_sms=1, backend=backend),
+        config=MegakernelConfig(num_sms=1),
         device=device,
     )
     if compile_kernels:
@@ -152,7 +152,6 @@ def bench_prepare_ms(seq_kernels, fused_kernel, warmup: int, rep: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
-    parser.add_argument("--backend", choices=("handler", "runtime", "both"), default="both")
     parser.add_argument("--metric", choices=("run", "prepare"), default="run")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--rep", type=int, default=100)
@@ -162,35 +161,32 @@ def main():
     if args.metric == "run" and not torch.cuda.is_available():
         raise SystemExit("CUDA required for --metric run")
 
-    backends = ("handler", "runtime") if args.backend == "both" else (args.backend,)
-    print("backend,layers,sequential_ms,fused_ms,speedup_x,seq_min_ms,fused_min_ms,seq_max_ms,fused_max_ms")
-    for backend in backends:
-        for layers in args.layers:
-            try:
-                seq_kernels, fused_kernel, _seq_tensors, _fused_tensors = build_kernels(
-                    layers,
-                    backend,
-                    args.device,
-                    compile_kernels=args.metric == "run",
+    print("layers,sequential_ms,fused_ms,speedup_x,seq_min_ms,fused_min_ms,seq_max_ms,fused_max_ms")
+    for layers in args.layers:
+        try:
+            seq_kernels, fused_kernel, _seq_tensors, _fused_tensors = build_kernels(
+                layers,
+                args.device,
+                compile_kernels=args.metric == "run",
+            )
+            if args.metric == "run":
+                seq_mean, seq_min, seq_max = bench_run_ms(
+                    lambda: run_seq(seq_kernels), args.warmup, args.rep
                 )
-                if args.metric == "run":
-                    seq_mean, seq_min, seq_max = bench_run_ms(
-                        lambda: run_seq(seq_kernels), args.warmup, args.rep
-                    )
-                    fused_mean, fused_min, fused_max = bench_run_ms(
-                        lambda: run_fused(fused_kernel), args.warmup, args.rep
-                    )
-                else:
-                    seq_mean, seq_min, seq_max, fused_mean, fused_min, fused_max = bench_prepare_ms(
-                        seq_kernels, fused_kernel, args.warmup, args.rep
-                    )
-                speedup = seq_mean / fused_mean if fused_mean else float("inf")
-                print(
-                    f"{backend},{layers},{seq_mean:.4f},{fused_mean:.4f},{speedup:.3f},"
-                    f"{seq_min:.4f},{fused_min:.4f},{seq_max:.4f},{fused_max:.4f}"
+                fused_mean, fused_min, fused_max = bench_run_ms(
+                    lambda: run_fused(fused_kernel), args.warmup, args.rep
                 )
-            except Exception as exc:
-                print(f"{backend},{layers},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR  # {exc}")
+            else:
+                seq_mean, seq_min, seq_max, fused_mean, fused_min, fused_max = bench_prepare_ms(
+                    seq_kernels, fused_kernel, args.warmup, args.rep
+                )
+            speedup = seq_mean / fused_mean if fused_mean else float("inf")
+            print(
+                f"{layers},{seq_mean:.4f},{fused_mean:.4f},{speedup:.3f},"
+                f"{seq_min:.4f},{fused_min:.4f},{seq_max:.4f},{fused_max:.4f}"
+            )
+        except Exception as exc:
+            print(f"{layers},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR  # {exc}")
 
 
 if __name__ == "__main__":

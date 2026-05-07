@@ -25,9 +25,9 @@ from cutlass import Int32, Int64, const_expr, range_constexpr
 
 from .ops import (
     MAX_TILE_DIMS,
+    Op,
     ScheduledOp,
     build_op_config,
-    linearize_scheduled_items,
 )
 from .registries import (
     TensorRegistry,
@@ -38,8 +38,13 @@ from .registries import (
 )
 from .scheduling import (
     BarrierFormula,
+    INSTR_BARRIER_META_IDX,
+    INSTR_TILE_0,
+    INSTR_TILE_1,
+    INSTR_TILE_2,
+    INSTR_TILE_3,
+    INSTR_TILE_4,
     InstructionStreamBuilder,
-    ReadyScheduler,
     TileInstruction,
 )
 from .compile import exec_generated_source
@@ -51,6 +56,7 @@ from .interpreter import (
     global_barrier_wait,
     global_barrier_wait_relaxed,
     load_instruction_to_smem,
+    prefetch_instruction,
     ld_global_i32,
     ld_global_i64,
     mbarrier_init,
@@ -63,6 +69,7 @@ from .interpreter import (
 )
 from .paged_memory import (
     NPageLayout,
+    PipelinePageLayout,
     st_shared_i32,
     ld_shared_i32,
     st_shared_i64,
@@ -77,9 +84,7 @@ from .paged_memory import (
     FLAG_LOAD_DONE,
     TILE_INFO_HANDLER_IDX as _TILE_INFO_HANDLER_IDX,
     TILE_INFO_INSTRUCTION_IDX as _TILE_INFO_INSTRUCTION_IDX,
-    TILE_INFO_LINEAR_IDX as _TILE_INFO_LINEAR_IDX,
     TILE_INFO_OP_CONFIG as _TILE_INFO_OP_CONFIG,
-    TILE_INFO_NUM_WARPS as _TILE_INFO_NUM_WARPS,
     TILE_INFO_TILE_0 as _TILE_INFO_TILE_0,
     TILE_INFO_TILE_1 as _TILE_INFO_TILE_1,
     TILE_INFO_TILE_2 as _TILE_INFO_TILE_2,
@@ -119,26 +124,35 @@ _PHASE_DESC_SLOT_PTR_ATTRS = {
 
 # Per-op metadata layout (int32 entries).
 _OP_META_NUM_WARPS = 0
-_OP_META_USES_CONFIG_MASK = 1
-_OP_META_STRIDE_0 = 2
-_OP_META_STRIDE_1 = 3
-_OP_META_STRIDE_2 = 4
-_OP_META_STRIDE_3 = 5
-_OP_META_STRIDE_4 = 6
-_OP_META_COUNT_0 = 7
-_OP_META_COUNT_1 = 8
-_OP_META_COUNT_2 = 9
-_OP_META_COUNT_3 = 10
-_OP_META_COUNT_4 = 11
-_OP_META_HANDLER_IDX = 12
-_OP_META_LOAD_LOCAL_IDX = 13
-_OP_META_COMPUTE_LOCAL_IDX = 14
-_OP_META_STORE_LOCAL_IDX = 15
-_OP_META_COMM_LOCAL_IDX = 16
-_OP_META_WAIT_COUNT = 17
-_OP_META_SIGNAL_COUNT = 18
-_OP_META_WAIT_ACQUIRE = 19
+_OP_META_STRIDE_0 = 1
+_OP_META_STRIDE_1 = 2
+_OP_META_STRIDE_2 = 3
+_OP_META_STRIDE_3 = 4
+_OP_META_STRIDE_4 = 5
+_OP_META_COUNT_0 = 6
+_OP_META_COUNT_1 = 7
+_OP_META_COUNT_2 = 8
+_OP_META_COUNT_3 = 9
+_OP_META_COUNT_4 = 10
+_OP_META_HANDLER_IDX = 11
+_OP_META_LOAD_LOCAL_IDX = 12
+_OP_META_COMPUTE_LOCAL_IDX = 13
+_OP_META_STORE_LOCAL_IDX = 14
+_OP_META_COMM_LOCAL_IDX = 15
+_OP_META_WAIT_COUNT = 16
+_OP_META_SIGNAL_COUNT = 17
+_OP_META_WAIT_ACQUIRE = 18
+_OP_META_PHASE_MASK = 19
 _OP_META_STRIDE = 20
+
+_OP_PHASE_LOAD = 1
+_OP_PHASE_COMPUTE = 2
+_OP_PHASE_STORE = 4
+_OP_PHASE_COMMUNICATE = 8
+
+_INSTR_RANGE_AXIS_SHIFT = 4
+_INSTR_RANGE_END_AXIS_SHIFT = 8
+_INSTR_RANGE_STRIDED_BIT = 12
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -193,14 +207,11 @@ class MegakernelConfig:
     mma_reg_count: int = 232
     noinline: bool = True
     inline_thin_phases: bool = True
-    sync_compute_warps_after_tile: bool = True
-    per_sm_instruction_queues: bool = False
-    compute_only_replay: bool = True
+    sync_compute_warps_after_tile: bool = False
     loader_idle_sleep_ns: int = 100
     relaxed_global_barriers: bool = True
     global_barrier_sleep_ns: int = 8
     opt_level: int = 2
-    backend: str = "handler"
 
     # Multi-GPU communication
     peer_buffers: Optional[Dict[str, List[Any]]] = None
@@ -385,6 +396,68 @@ class Megakernel:
             coalesce_ranges=cls._pipeline_static_dim(op, "coalesce_ranges"),
         )
 
+    @classmethod
+    def _inject_pipeline_resource_static_dims(cls, op: ScheduledOp, pipeline) -> None:
+        """Expose op-owned page/semaphore offsets as compile-time op attrs."""
+        protocol = getattr(op.op_cls, "pipeline_page_protocol", None)
+        if protocol is None:
+            protocol = pipeline.page_protocol()
+        if protocol is None:
+            return
+        if protocol.page_count != pipeline.page_count:
+            raise ValueError(
+                f"Op {op.op_cls.__name__} pipeline protocol declares "
+                f"{protocol.page_count} pages, but PipelineSpec declares "
+                f"{pipeline.page_count}."
+            )
+        if protocol.semaphore_count != pipeline.semaphore_count:
+            raise ValueError(
+                f"Op {op.op_cls.__name__} pipeline protocol declares "
+                f"{protocol.semaphore_count} semaphores, but PipelineSpec declares "
+                f"{pipeline.semaphore_count}."
+            )
+        layout = PipelinePageLayout(
+            page_count=pipeline.page_count,
+            page_bytes=pipeline.page_bytes,
+            semaphore_count=pipeline.semaphore_count,
+            scratch_bytes=pipeline.scratch_bytes,
+        )
+        op.static_dims.setdefault("machete_pipeline_page_count", pipeline.page_count)
+        op.static_dims.setdefault("machete_pipeline_page_bytes", pipeline.page_bytes)
+        op.static_dims.setdefault("machete_pipeline_semaphore_count", pipeline.semaphore_count)
+        op.static_dims.setdefault("machete_pipeline_scratch_offset", layout.scratch_offset)
+        op.static_dims.setdefault("machete_pipeline_total_size", layout.total_size)
+        for page_idx in range(pipeline.page_count):
+            op.static_dims.setdefault(
+                f"machete_pipeline_page_{page_idx}_offset",
+                layout.page_offset(page_idx),
+            )
+        for sem_idx in range(pipeline.semaphore_count):
+            op.static_dims.setdefault(
+                f"machete_pipeline_semaphore_{sem_idx}_offset",
+                layout.semaphore_offset(sem_idx),
+            )
+
+    @staticmethod
+    def _active_range_phase_ownership(instance, range_end_param: str) -> Dict[str, bool]:
+        """Return which active phases explicitly consume the coalesced range end.
+
+        A staged op may use a framework-owned range, where the runtime expands
+        each subtile through load/compute/store, or an op-owned range, where
+        every active phase understands the same range end. Mixing the two is
+        ambiguous: one phase sees a range while another still sees only the
+        first subtile.
+        """
+        active: Dict[str, bool] = {}
+        for phase_name in PHASE_NAMES:
+            method = getattr(instance.__class__, phase_name, None)
+            base_method = getattr(Op, phase_name, None)
+            if phase_name == "compute" or method is not base_method:
+                active[phase_name] = range_end_param in inspect.signature(
+                    getattr(instance, phase_name)
+                ).parameters
+        return active
+
     def __init__(
         self,
         ops: List[ScheduledOp],
@@ -394,10 +467,8 @@ class Megakernel:
     ):
         """Construct a megakernel instance and build its host-side runtime state."""
         self.scheduled_items = tuple(ops)
-        self.ops, self.regions = linearize_scheduled_items(ops)
+        self.ops = list(ops)
         self.config = config or MegakernelConfig()
-        if self.config.backend == "runtime":
-            self.config.backend = "handler"
         self.device = device
         self._scheduler = scheduler
         ops = self.ops
@@ -435,13 +506,6 @@ class Megakernel:
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
 
-        if (
-            self._scheduler is None
-            and self.config.per_sm_instruction_queues
-            and self._layout.num_pages > 1
-        ):
-            self._scheduler = ReadyScheduler()
-
         # Validate that config page_size is large enough for all ops
         for op in ops:
             op_page = op.static_dims.get('page_size')
@@ -454,6 +518,7 @@ class Megakernel:
                 )
             pipeline = self._pipeline_spec_for_op(op)
             if pipeline is not None:
+                self._inject_pipeline_resource_static_dims(op, pipeline)
                 if "inner_iter_idx" in inspect.signature(op.op_cls.load).parameters:
                     raise ValueError(
                         f"Op {op.op_cls.__name__} load phases must own staged "
@@ -471,7 +536,7 @@ class Megakernel:
 
         # Build instruction stream
         # Pass ScheduledOp directly to preserve tensor_ptrs for automatic dependency detection
-        self._builder = InstructionStreamBuilder(region_records=self.regions)
+        self._builder = InstructionStreamBuilder()
         for op in ops:
             self._builder.add_op(op)
 
@@ -479,6 +544,7 @@ class Megakernel:
         self._barriers_tensor: Optional[torch.Tensor] = None
         self._op_configs_tensor: Optional[torch.Tensor] = None
         self._num_instructions: Optional[int] = None
+        self._num_instructions_i32: Optional[Int32] = None
         self._compiled_kernel = None
         self._has_pending_async_launch = False
         self._needs_tma_desc_pool_init = True
@@ -523,8 +589,8 @@ class Megakernel:
             self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
             self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
         self._peer_tma_cute_tensors: Optional[List] = None
-        self._tma_runtime_layout_cache: Dict[int, tuple] = {}
-        self._backend_ir, self._backend = build_backend(self, self.config.backend)
+        self._tma_runtime_layout_cache: Dict[int, Any] = {}
+        self._backend_ir, self._backend = build_backend(self)
         self._launch_state: Optional[_LaunchState] = None
         self._cached_cu_stream = None
         self._cached_torch_stream_id = None
@@ -576,41 +642,36 @@ class Megakernel:
         """Prepare instruction, barrier, wait_info, and config tensors on GPU."""
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
+            barrier_meta_indices = None
+            materialized_instructions = instructions
             if self._ops_use_coalesced_pipeline(self.ops):
                 instructions = self._builder.coalesce_pipeline_instructions(instructions)
-            if self.config.per_sm_instruction_queues:
                 (
-                    self._instructions_tensor,
+                    barrier_meta_indices,
                     materialized_instructions,
-                    queue_len,
-                ) = self._builder.build_queued_tensors(
-                    instructions,
-                    self.num_sms,
-                    device=self.device,
-                    preserve_instruction_order=isinstance(self._scheduler, ReadyScheduler),
-                )
-                self._num_instructions = queue_len
-                wait_queue_len = queue_len
-            else:
-                materialized_instructions = instructions
-                wait_queue_len = None
-                self._instructions_tensor = self._builder.build_tensor(
-                    self.device, scheduler=self._scheduler, instructions=instructions
-                )
-                self._num_instructions = self._instructions_tensor.shape[0]
-            self._num_instructions_i32 = Int32(self._num_instructions)
-            # Pre-computed barrier indices for controller warp
+                ) = self._builder.pipeline_barrier_meta_indices(instructions)
             self._wait_info = self._builder.build_wait_info_tensor(
                 materialized_instructions,
                 self.device,
                 num_blocks=self.num_sms,
-                queue_len=wait_queue_len,
             )
             self._max_wait_formulas = max(1, self._wait_info.shape[1] // 2)
             self._signal_metadata_tensor = self._builder.build_signal_info_tensor(
                 materialized_instructions, self.device
             )
             self._max_signal_formulas = max(1, self._signal_metadata_tensor.shape[1])
+            if self._op_metadata_tensor is None:
+                self._prepare_op_metadata_tensors()
+            self._instructions_tensor = self._builder.build_tensor(
+                self.device,
+                scheduler=self._scheduler,
+                instructions=instructions,
+                barrier_meta_indices=barrier_meta_indices,
+            )
+            self._num_instructions = self._instructions_tensor.shape[0]
+            self._num_instructions_i32 = Int32(self._num_instructions)
+        elif self._op_metadata_tensor is None:
+            self._prepare_op_metadata_tensors()
 
         if self._barriers_tensor is None:
             self._barriers_tensor = torch.zeros(self.num_barriers, dtype=torch.int32, device=self.device)
@@ -625,9 +686,6 @@ class Megakernel:
                     config_ptrs.append(0)
             self._op_configs_tensor = torch.tensor(config_ptrs, dtype=torch.int64, device=self.device)
 
-        if self._op_metadata_tensor is None:
-            self._prepare_op_metadata_tensors()
-
     @staticmethod
     def _tile_linear_strides(tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
         """Return row-major strides padded to MAX_TILE_DIMS."""
@@ -641,7 +699,6 @@ class Megakernel:
     def _prepare_op_metadata_tensors(self) -> None:
         """Build runtime metadata tables for the persistent shell."""
         formulas = self._builder.get_op_barrier_formulas()
-        self._max_signal_formulas = max(1, self._builder.max_signal_deps)
         threads_per_block = self.config.threads_per_block
         num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
         num_compute_threads = threads_per_block - num_dma_warps * 32
@@ -659,23 +716,11 @@ class Megakernel:
         from .backend_dispatch import (
             _build_tma_runtime_layout,
         )
-        (
-            op_phase_tma_args,
-            _phase_tma_names,
-            _kernel_tma_arg_names,
-            _op_phase_transport_indices,
-            _phase_transport_records,
-            phase_local_transport_positions,
-            phase_local_desc_slots,
-            _handler_rebind_specs,
-            phase_uses_local_idx,
-            phase_uses_transport_selector,
-            phase_uses_desc_slot_selector,
-        ) = _build_tma_runtime_layout(self._backend, self)
+        tma_layout = _build_tma_runtime_layout(self._backend, self)
         runtime_transport_records = getattr(self._backend, "runtime_transport_records", False)
         if runtime_transport_records:
             op_phase_local_indices = {
-                phase: list(_op_phase_transport_indices[phase])
+                phase: list(tma_layout.runtime_op_phase_transport_indices[phase])
                 for phase in PHASE_NAMES
             }
 
@@ -692,36 +737,60 @@ class Megakernel:
             _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
             wait_count = self._builder._op_wait_counts.get(op_idx, len(_wait_formulas))
             signal_count = self._builder._op_signal_counts.get(op_idx, len(_signal_formulas))
-            # Keep op_config_ptr live for every phase.
-            #
-            # Phase wrappers may reconstruct tensors from op_config_ptr even
-            # when the original op method signature does not mention it.
-            # Inferring "uses config" from the raw method signature is
-            # therefore not stable once wrapper generation changes. Always
-            # materializing the config pointer keeps the runtime contract
-            # simple and avoids null-config bugs in load/store wrappers.
-            load_uses = 1
-            compute_uses = 1
-            store_uses = 1
-            communicate_uses = 1 if has_communicate else 0
-            uses_mask = (
-                load_uses
-                + compute_uses * 2
-                + store_uses * 4
-                + communicate_uses * 8
-            )
-
+            phase_mask = _OP_PHASE_COMPUTE
+            if getattr(op.op_cls, "load") is not Op.load:
+                phase_mask |= _OP_PHASE_LOAD
+            if getattr(op.op_cls, "store") is not Op.store:
+                phase_mask |= _OP_PHASE_STORE
+            if getattr(op.op_cls, "communicate") is not Op.communicate:
+                phase_mask |= _OP_PHASE_COMMUNICATE
+            pipeline = self._pipeline_spec_for_op(op)
+            instruction_phase_mask = phase_mask
+            if pipeline is not None and pipeline.coalesce_ranges and pipeline.range_axis >= 0:
+                range_axis = int(pipeline.range_axis)
+                range_end_axis = int(pipeline.range_end_axis)
+                if range_end_axis < 0:
+                    range_end_axis = range_axis + 1
+                range_end_param = f"tile_{range_end_axis}"
+                range_phase_owners = self._active_range_phase_ownership(instance, range_end_param)
+                range_owner_count = sum(1 for owns in range_phase_owners.values() if owns)
+                if (
+                    len(range_phase_owners) > 1
+                    and range_owner_count > 0
+                    and range_owner_count != len(range_phase_owners)
+                ):
+                    owners = ", ".join(
+                        f"{phase}={'range' if owns else 'single'}"
+                        for phase, owns in range_phase_owners.items()
+                    )
+                    raise ValueError(
+                        f"{op.op_cls.__name__} has partial coalesced-range ownership "
+                        f"({owners}). Staged range ops must either let the framework "
+                        "expand every subtile through all phases, or every active "
+                        f"phase must accept {range_end_param}."
+                    )
+                if (
+                    range_end_axis < MAX_TILE_DIMS
+                    and range_end_axis != range_axis
+                    and range_owner_count == 0
+                ):
+                    instruction_phase_mask |= (range_axis + 1) << _INSTR_RANGE_AXIS_SHIFT
+                    instruction_phase_mask |= (range_end_axis + 1) << _INSTR_RANGE_END_AXIS_SHIFT
+                    if int(op.static_dims.get("pipeline_range_stride", 1)) > 1:
+                        instruction_phase_mask |= 1 << _INSTR_RANGE_STRIDED_BIT
+            num_warps = int(getattr(instance, "num_mma_warps", default_num_mma_warps))
+            handler_idx = int(op_handler_indices[op_idx])
             op_meta.extend(
                 [
-                    int(getattr(instance, "num_mma_warps", default_num_mma_warps)),
-                    uses_mask,
+                    num_warps,
                     *tile_strides,
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
-                    int(op_handler_indices[op_idx]),
+                    handler_idx,
                     *self._phase_local_indices_for_op(op_phase_local_indices, op_idx),
                     wait_count,
                     signal_count,
                     int(op.static_dims.get("barrier_wait_acquire", 0)),
+                    instruction_phase_mask,
                 ]
             )
 
@@ -736,29 +805,29 @@ class Megakernel:
             op_meta, dtype=torch.int32, device=self.device
         )
         for phase in PHASE_NAMES:
-            if phase_uses_local_idx.get(phase, False):
+            if tma_layout.phase_uses_local_idx.get(phase, False):
                 self._phase_local_idx_tensors[phase] = torch.tensor(
                     op_phase_local_indices[phase], dtype=torch.int32, device=self.device
                 )
             else:
                 self._phase_local_idx_tensors[phase] = None
 
-            local_transport_positions = phase_local_transport_positions[phase]
+            local_transport_positions = tma_layout.runtime_phase_local_transport_positions[phase]
             width, flat_positions = self._encode_phase_selector_table(local_transport_positions)
             self._set_phase_i32_table(
                 phase,
-                phase_uses_transport_selector[phase],
+                tma_layout.phase_uses_transport_selector[phase],
                 flat_positions,
                 width,
                 self._phase_local_transport_position_widths,
                 self._phase_local_transport_position_tensors,
             )
 
-            local_desc_slots = phase_local_desc_slots[phase]
+            local_desc_slots = tma_layout.runtime_phase_local_desc_slots[phase]
             width, flat_slots = self._encode_phase_selector_table(local_desc_slots)
             self._set_phase_i32_table(
                 phase,
-                phase_uses_desc_slot_selector[phase],
+                tma_layout.phase_uses_desc_slot_selector[phase],
                 flat_slots,
                 width,
                 self._phase_local_desc_slot_widths,
@@ -1063,6 +1132,7 @@ class Megakernel:
 
         peer_signal_sig = ", peer_signal_ptr" if has_communicate else ""
         peer_signal_init = "" if has_communicate else "    peer_signal_ptr = Int64(0)\n"
+        static_sig = ""
         trace_sig = ", trace_buffer_ptr" if tracing else ""
         trace_init = "" if tracing else "    trace_buffer_ptr = Int64(0)\n"
         local_sig_parts = []
@@ -1093,7 +1163,7 @@ class Megakernel:
         return (
             "@cute.jit\n"
             "def _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                  op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig},\n"
+            f"                  op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig}{static_sig},\n"
             "                  num_instructions, tidx, block_id, num_blocks,\n"
             f"                  smem_base{trace_sig}, wait_info_ptr{tensor_sig}{tma_sig}{peer_tma_sig}):\n"
             f"{local_init}"
@@ -1138,6 +1208,7 @@ class Megakernel:
             "st_shared_release_cta_i32": st_shared_release_cta_i32,
             "ld_shared_acquire_cta_i32": ld_shared_acquire_cta_i32,
             "load_instruction_to_smem": load_instruction_to_smem,
+            "prefetch_instruction": prefetch_instruction,
             "ld_global_i64": ld_global_i64,
             "mbarrier_init": mbarrier_init,
             "mbarrier_init_fence": mbarrier_init_fence,
@@ -1145,11 +1216,11 @@ class Megakernel:
             "mbarrier_wait": mbarrier_wait,
             "nanosleep": nanosleep,
             "named_barrier_sync": named_barrier_sync,
+            "global_barrier_signal": global_barrier_signal,
             "num_pages": num_pages,
             "iq_offset": iq_offset,
             "flags_offset": flags_offset,
             "ring_state_offset": ring_state_offset,
-            "per_sm_instruction_queues": bool(self.config.per_sm_instruction_queues),
         }
         if extra_exec_globals:
             exec_globals.update(extra_exec_globals)
@@ -1365,6 +1436,8 @@ class Megakernel:
         peer_signal_sig = ", peer_signal_ptr" if has_communicate else ""
         peer_signal_arg = ", peer_signal_ptr" if has_communicate else ""
         peer_signal_init = "" if has_communicate else "        peer_signal_ptr = Int64(0)\n"
+        static_sig = ""
+        static_arg = ""
         trace_sig = ", trace_buffer_ptr" if tracing else ""
         trace_arg = ", trace_buffer_ptr" if tracing else ""
         trace_init = "" if tracing else "        trace_buffer_ptr = Int64(0)\n"
@@ -1377,7 +1450,7 @@ class Megakernel:
         local_init = ""
         selector_init = ""
         desc_slot_init = ""
-        for phase in ("load", "compute", "store", "communicate"):
+        for phase in PHASE_NAMES:
             ptr_name = f"{phase}_local_idx_ptr"
             if self._phase_local_idx_tensors[phase] is not None:
                 local_sig_parts.append(ptr_name)
@@ -1417,7 +1490,7 @@ class Megakernel:
             "\n"
             "    @cute.jit\n"
             "    def __call__(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                 op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig},\n"
+            f"                 op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig}{static_sig},\n"
             f"                 wait_info_ptr, num_instructions{trace_sig}"
             f"{tensor_sig}{tma_components['desc_pool_sig']}{tma_components['tma_tensor_sig']}{tma_components['peer_tma_tensor_input_sig']}, desc_pool_init_needed, stream):\n"
             f"{local_init}"
@@ -1432,20 +1505,21 @@ class Megakernel:
             "                peer_tma_desc_pool_ptr"
             f"{', ' if tma_components['desc_pool_init_params'] else ''}{tma_components['desc_pool_init_params']}\n"
             "            ).launch(grid=[1, 1, 1], block=[32, 1, 1], stream=stream)\n"
-            "        self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                    op_meta_ptr{local_arg}{selector_arg}{desc_slot_arg}, signal_meta_ptr{peer_signal_arg},\n"
-            f"                    wait_info_ptr{trace_arg},\n"
-            f"                    num_instructions{tensor_sig}{kernel_tma_sig}).launch(\n"
-            "            grid=[self.num_sms, 1, 1],\n"
-            "            block=[self.threads_per_block, 1, 1],\n"
-            "            smem=self.smem_size,\n"
-            "            stream=stream,\n"
-            "            min_blocks_per_mp=1,\n"
-            "        )\n"
+            "        if not desc_pool_init_needed:\n"
+            "            self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
+            f"                        op_meta_ptr{local_arg}{selector_arg}{desc_slot_arg}, signal_meta_ptr{peer_signal_arg}{static_arg},\n"
+            f"                        wait_info_ptr{trace_arg},\n"
+            f"                        num_instructions{tensor_sig}{kernel_tma_sig}).launch(\n"
+            "                grid=[self.num_sms, 1, 1],\n"
+            "                block=[self.threads_per_block, 1, 1],\n"
+            "                smem=self.smem_size,\n"
+            "                stream=stream,\n"
+            "                min_blocks_per_mp=1,\n"
+            "            )\n"
             "\n"
             "    @cute.kernel\n"
             "    def kernel(self, instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"               op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig},\n"
+            f"               op_meta_ptr{local_sig}{selector_sig}{desc_slot_sig}, signal_meta_ptr{peer_signal_sig}{static_sig},\n"
             f"               wait_info_ptr, num_instructions{trace_sig}{tensor_sig}{kernel_tma_sig}):\n"
             f"{local_init}"
             f"{selector_init}"
@@ -1455,7 +1529,7 @@ class Megakernel:
             "        num_blocks = cute.arch.grid_dim()[0]\n"
             "        smem_base = get_smem_base_ptr()\n"
             "        _kernel_loop(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
-            f"                     op_meta_ptr{local_arg}{selector_arg}{desc_slot_arg}, signal_meta_ptr{peer_signal_arg},\n"
+            f"                     op_meta_ptr{local_arg}{selector_arg}{desc_slot_arg}, signal_meta_ptr{peer_signal_arg}{static_arg},\n"
             "                     num_instructions, tidx, block_id, num_blocks,\n"
              f"                     smem_base{trace_arg}, wait_info_ptr{tensor_sig}{kernel_tma_sig})\n"
         )
@@ -1524,8 +1598,6 @@ class Megakernel:
     @staticmethod
     def _op_has_phased_replay(op: ScheduledOp) -> bool:
         """Return whether an op needs the load/store replay shell."""
-        from .ops import Op
-
         op_cls = op.op_cls
         return (
             getattr(op_cls, "load_phase", None) is not None
@@ -1539,8 +1611,7 @@ class Megakernel:
     def _use_compute_only_replay(self) -> bool:
         """Use the lighter replay loop when no TMA or peer phases exist."""
         return (
-            bool(self.config.compute_only_replay)
-            and not self._tma_registry.has_tma
+            not self._tma_registry.has_tma
             and not self._peer_tma_registry.has_peer_tma
             and not any(self._op_has_phased_replay(op) for op in self.ops)
         )
@@ -1715,6 +1786,44 @@ class Megakernel:
                 t4 = rem
             return t0, t1, t2, t3, t4
 
+        @cute.jit
+        def _advance_tile(op_meta_ptr: Int64, op_meta_base: Int32, t0: Int32, t1: Int32, t2: Int32, t3: Int32, t4: Int32):
+            carry = Int32(1)
+            c4 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_4))
+            if carry != Int32(0) and c4 > Int32(1):
+                t4 = t4 + Int32(1)
+                if t4 < c4:
+                    carry = Int32(0)
+                else:
+                    t4 = Int32(0)
+            c3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_3))
+            if carry != Int32(0) and c3 > Int32(1):
+                t3 = t3 + Int32(1)
+                if t3 < c3:
+                    carry = Int32(0)
+                else:
+                    t3 = Int32(0)
+            c2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_2))
+            if carry != Int32(0) and c2 > Int32(1):
+                t2 = t2 + Int32(1)
+                if t2 < c2:
+                    carry = Int32(0)
+                else:
+                    t2 = Int32(0)
+            c1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_1))
+            if carry != Int32(0) and c1 > Int32(1):
+                t1 = t1 + Int32(1)
+                if t1 < c1:
+                    carry = Int32(0)
+                else:
+                    t1 = Int32(0)
+            c0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_0))
+            if carry != Int32(0) and c0 > Int32(1):
+                t0 = t0 + Int32(1)
+                if t0 >= c0:
+                    t0 = Int32(0)
+            return t0, t1, t2, t3, t4
+
 
         @cute.jit
         def _signal_barriers_from_meta(
@@ -1780,6 +1889,7 @@ class Megakernel:
             "phase_tensor_names": phase_tensor_names,
             "phase_tma_names": phase_tma_names,
             "all_tma_canonical": all_tma_canonical,
+            "advance_tile": _advance_tile,
         }
 
     @staticmethod
@@ -1787,7 +1897,6 @@ class Megakernel:
         """Return per-op metadata indices injected into generated kernel code."""
         return {
             "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
-            "_OP_META_USES_CONFIG_MASK": _OP_META_USES_CONFIG_MASK,
             "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
             "_OP_META_LOAD_LOCAL_IDX": _OP_META_LOAD_LOCAL_IDX,
             "_OP_META_COMPUTE_LOCAL_IDX": _OP_META_COMPUTE_LOCAL_IDX,
@@ -1796,13 +1905,16 @@ class Megakernel:
             "_OP_META_WAIT_COUNT": _OP_META_WAIT_COUNT,
             "_OP_META_SIGNAL_COUNT": _OP_META_SIGNAL_COUNT,
             "_OP_META_WAIT_ACQUIRE": _OP_META_WAIT_ACQUIRE,
+            "_OP_META_PHASE_MASK": _OP_META_PHASE_MASK,
+            "_INSTR_RANGE_AXIS_SHIFT": _INSTR_RANGE_AXIS_SHIFT,
+            "_INSTR_RANGE_END_AXIS_SHIFT": _INSTR_RANGE_END_AXIS_SHIFT,
+            "_INSTR_RANGE_STRIDED_BIT": _INSTR_RANGE_STRIDED_BIT,
         }
 
     @staticmethod
     def _tile_info_exec_globals() -> Dict[str, int]:
         """Return shared tile-info layout constants for generated kernel code."""
         return {
-            "_TILE_INFO_LINEAR_IDX": _TILE_INFO_LINEAR_IDX,
             "_TILE_INFO_HANDLER_IDX": _TILE_INFO_HANDLER_IDX,
             "_TILE_INFO_INSTRUCTION_IDX": _TILE_INFO_INSTRUCTION_IDX,
             "_TILE_INFO_TILE_0": _TILE_INFO_TILE_0,
@@ -1810,8 +1922,13 @@ class Megakernel:
             "_TILE_INFO_TILE_2": _TILE_INFO_TILE_2,
             "_TILE_INFO_TILE_3": _TILE_INFO_TILE_3,
             "_TILE_INFO_TILE_4": _TILE_INFO_TILE_4,
-            "_TILE_INFO_NUM_WARPS": _TILE_INFO_NUM_WARPS,
             "_TILE_INFO_OP_CONFIG": _TILE_INFO_OP_CONFIG,
+            "_INSTR_TILE_0": INSTR_TILE_0,
+            "_INSTR_TILE_1": INSTR_TILE_1,
+            "_INSTR_TILE_2": INSTR_TILE_2,
+            "_INSTR_TILE_3": INSTR_TILE_3,
+            "_INSTR_TILE_4": INSTR_TILE_4,
+            "_INSTR_BARRIER_META_IDX": INSTR_BARRIER_META_IDX,
         }
 
     def _kernel_extra_exec_globals(
@@ -1824,6 +1941,7 @@ class Megakernel:
             "_work_notify_mbar": runtime["_work_notify_mbar"],
             "_compute_done_mbar": runtime["_compute_done_mbar"],
             "decompose_tile": runtime["decompose_tile"],
+            "advance_tile": runtime["advance_tile"],
             "ld_shared_v2_b32": ld_shared_v2_b32,
             "st_shared_v2_b32": st_shared_v2_b32,
             "ld_shared_i64": ld_shared_i64,
@@ -1858,6 +1976,9 @@ class Megakernel:
             "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
             "dispatch_communicate_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["communicate"],
             "MIN_IDLE_REGS": MIN_IDLE_REGS,
+            "_OP_PHASE_LOAD": _OP_PHASE_LOAD,
+            "_OP_PHASE_STORE": _OP_PHASE_STORE,
+            "_OP_PHASE_COMMUNICATE": _OP_PHASE_COMMUNICATE,
             **self._op_meta_exec_globals(),
             **self._tile_info_exec_globals(),
             **runtime["trace_exec_globals"],
@@ -1956,22 +2077,28 @@ class Megakernel:
                 _fetch_idx = block_id
                 _fetch_limit = num_instructions
                 _fetch_stride = num_blocks
-                if const_expr(per_sm_instruction_queues):
-                    _fetch_idx = block_id * num_instructions
-                    _fetch_limit = _fetch_idx + num_instructions
-                    _fetch_stride = Int32(1)
-                _fetch_idx_save = Int32(0)
                 _ctrl_done = Int32(0)
-                _ctrl_cached_op_idx = Int32(-1)
-                _ctrl_cached_meta_base = Int32(0)
-                _ctrl_cached_uses_mask = Int32(0)
                 _ctrl_cached_config = Int64(0)
+                _ctrl_cached_config_idx = Int32(-2)
                 _ctrl_cached_handler = Int32(0)
-                _ctrl_cached_num_warps = Int32(1)
                 _ctrl_cached_wait_count = Int32(0)
                 _ctrl_cached_wait_acquire = Int32(0)
+                _ctrl_cached_barrier_meta_idx = Int32(0)
                 _ctrl_cached_wait_barrier = Int32(-2)
                 _ctrl_cached_wait_expected = Int32(-1)
+                _ctrl_cached_op = Int32(TileInstruction.END_MARKER)
+                _ctrl_cached_t0 = Int32(0)
+                _ctrl_cached_t1 = Int32(0)
+                _ctrl_cached_t2 = Int32(0)
+                _ctrl_cached_t3 = Int32(0)
+                _ctrl_cached_t4 = Int32(0)
+                _ctrl_range_axis = Int32(-1)
+                _ctrl_range_pos = Int32(0)
+                _ctrl_range_start = Int32(0)
+                _ctrl_range_end = Int32(0)
+                _ctrl_range_offset = Int32(0)
+                _ctrl_range_stride = Int32(1)
+                _ctrl_range_active = Int32(0)
 
                 produce_idx_ptr = flags_ptr + FLAG_PRODUCE_IDX
                 store_idx_ptr = flags_ptr + FLAG_STORE_IDX
@@ -1981,50 +2108,110 @@ class Megakernel:
                 while _ctrl_done == Int32(0):
                     if lane_id == Int32(0):
                         _instr_op = Int32(TileInstruction.END_MARKER)
-                        _instr_lin = Int32(0)
-                        if _fetch_idx < _fetch_limit:
+                        if _ctrl_range_active != Int32(0):
+                            _instr_op = _ctrl_cached_op
+                        if _ctrl_range_active == Int32(0) and _fetch_idx < _fetch_limit:
                             load_instruction_to_smem(instructions_ptr, _fetch_idx, _temp_instr)
-                            _instr_op, _instr_lin = ld_shared_v2_b32(_temp_instr)
+                            _instr_op = ld_shared_i32(_temp_instr)
                             if _instr_op == Int32(TileInstruction.END_MARKER):
                                 _fetch_idx = _fetch_limit
                             if _instr_op != Int32(TileInstruction.END_MARKER):
-                                _fetch_idx_save = _fetch_idx
+                                _next_fetch_idx = _fetch_idx + _fetch_stride
+                                if _next_fetch_idx < _fetch_limit:
+                                    prefetch_instruction(instructions_ptr, _next_fetch_idx)
                                 _fetch_idx = _fetch_idx + _fetch_stride
 
-                        _p_meta_base = Int32(0)
+                        if _instr_op >= Int32(0) and _ctrl_range_active == Int32(0):
+                            _ctrl_cached_op = _instr_op
+                            _ctrl_meta_base = _op_meta_base(_instr_op)
+                            _ctrl_cached_handler = _op_meta_i32_base(
+                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_HANDLER_IDX)
+                            )
+                            _ctrl_cached_wait_count = _op_meta_i32_base(
+                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_COUNT)
+                            )
+                            _ctrl_cached_wait_acquire = _op_meta_i32_base(
+                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                            )
+                            _ctrl_cached_barrier_meta_idx = ld_shared_i32(
+                                _temp_instr + Int32(4 * _INSTR_BARRIER_META_IDX)
+                            )
+                            if _instr_op != _ctrl_cached_config_idx:
+                                _ctrl_cached_config = ld_global_i64(op_configs_ptr, _instr_op)
+                                _ctrl_cached_config_idx = _instr_op
+
+                            _ctrl_cached_t0 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_0))
+                            _ctrl_cached_t1 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_1))
+                            _ctrl_cached_t2 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_2))
+                            _ctrl_cached_t3 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_3))
+                            _ctrl_cached_t4 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_4))
+                            _phase_mask = _op_meta_i32_base(
+                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_PHASE_MASK)
+                            )
+                            _ctrl_range_axis = (
+                                (_phase_mask // Int32(1 << _INSTR_RANGE_AXIS_SHIFT))
+                                % Int32(16)
+                            ) - Int32(1)
+                            _ctrl_range_end_axis = (
+                                (_phase_mask // Int32(1 << _INSTR_RANGE_END_AXIS_SHIFT))
+                                % Int32(16)
+                            ) - Int32(1)
+                            _ctrl_range_is_strided = (
+                                (_phase_mask // Int32(1 << _INSTR_RANGE_STRIDED_BIT))
+                                % Int32(2)
+                            )
+                            _ctrl_range_stride = Int32(1)
+                            if _ctrl_range_axis == Int32(0):
+                                _ctrl_range_pos = _ctrl_cached_t0
+                            if _ctrl_range_axis == Int32(1):
+                                _ctrl_range_pos = _ctrl_cached_t1
+                            if _ctrl_range_axis == Int32(2):
+                                _ctrl_range_pos = _ctrl_cached_t2
+                            if _ctrl_range_axis == Int32(3):
+                                _ctrl_range_pos = _ctrl_cached_t3
+                            if _ctrl_range_axis == Int32(4):
+                                _ctrl_range_pos = _ctrl_cached_t4
+                            _ctrl_range_start = _ctrl_range_pos
+                            if _ctrl_range_end_axis == Int32(0):
+                                _ctrl_range_end = _ctrl_cached_t0
+                            if _ctrl_range_end_axis == Int32(1):
+                                _ctrl_range_end = _ctrl_cached_t1
+                            if _ctrl_range_end_axis == Int32(2):
+                                _ctrl_range_end = _ctrl_cached_t2
+                            if _ctrl_range_end_axis == Int32(3):
+                                _ctrl_range_end = _ctrl_cached_t3
+                            if _ctrl_range_end_axis == Int32(4):
+                                _ctrl_range_end = _ctrl_cached_t4
+                            _ctrl_range_offset = Int32(0)
+                            if _ctrl_range_is_strided != Int32(0):
+                                _ctrl_range_stride = _ctrl_cached_t4
+                                if _ctrl_range_stride < Int32(1):
+                                    _ctrl_range_stride = Int32(1)
+                                if _ctrl_range_end <= Int32(0):
+                                    _ctrl_range_end = Int32(1)
+                                _ctrl_range_end = (
+                                    _ctrl_range_pos + _ctrl_range_end * _ctrl_range_stride
+                                )
+                            if _ctrl_range_axis < Int32(0) or _ctrl_range_end <= _ctrl_range_pos:
+                                _ctrl_range_end = _ctrl_range_pos + Int32(1)
+                                _ctrl_range_stride = Int32(1)
+                            _ctrl_range_active = Int32(1)
+
                         if _instr_op >= Int32(0):
-                            if _instr_op != _ctrl_cached_op_idx:
-                                _p_meta_base = _op_meta_base(_instr_op)
-                                _ctrl_cached_meta_base = _p_meta_base
-                                _ctrl_cached_uses_mask = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_USES_CONFIG_MASK)
-                                )
-                                if _ctrl_cached_uses_mask != Int32(0):
-                                    _ctrl_cached_config = ld_global_i64(op_configs_ptr, _instr_op)
-                                else:
-                                    _ctrl_cached_config = Int64(0)
-                                _ctrl_cached_handler = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_HANDLER_IDX)
-                                )
-                                _ctrl_cached_num_warps = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_NUM_WARPS)
-                                )
-                                _ctrl_cached_wait_count = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_WAIT_COUNT)
-                                )
-                                _ctrl_cached_wait_acquire = _op_meta_i32_base(
-                                    op_meta_ptr, _p_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
-                                )
-                                _ctrl_cached_op_idx = _instr_op
-                            else:
-                                _p_meta_base = _ctrl_cached_meta_base
+                            _ctrl_current_meta_idx = (
+                                _ctrl_cached_barrier_meta_idx
+                                + _ctrl_range_offset
+                            )
 
                             if _ctrl_cached_wait_count > Int32(0):
                                 _done_waits = Int32(0)
                                 for _w in range_constexpr(max_waits):
                                     if _done_waits == Int32(0):
                                         if _w < _ctrl_cached_wait_count:
-                                            _wi_off = _fetch_idx_save * Int32(max_waits * 2) + Int32(_w * 2)
+                                            _wi_off = (
+                                                _ctrl_current_meta_idx * Int32(max_waits * 2)
+                                                + Int32(_w * 2)
+                                            )
                                             _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
                                             if _bar_idx >= Int32(0):
                                                 _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
@@ -2062,12 +2249,22 @@ class Megakernel:
 
                             _p_slot = produce_idx % Int32(num_pages)
                             _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
-                            _p_t0 = ld_shared_i32(_temp_instr + Int32(8))
-                            _p_t1 = ld_shared_i32(_temp_instr + Int32(12))
-                            _p_t2 = ld_shared_i32(_temp_instr + Int32(16))
-                            _p_t3 = ld_shared_i32(_temp_instr + Int32(20))
-                            _p_t4 = ld_shared_i32(_temp_instr + Int32(24))
-                            st_shared_v2_b32(_p_ti, _instr_op, _instr_lin)
+                            _p_t0 = _ctrl_cached_t0
+                            _p_t1 = _ctrl_cached_t1
+                            _p_t2 = _ctrl_cached_t2
+                            _p_t3 = _ctrl_cached_t3
+                            _p_t4 = _ctrl_cached_t4
+                            if _ctrl_range_axis == Int32(0):
+                                _p_t0 = _ctrl_range_pos
+                            if _ctrl_range_axis == Int32(1):
+                                _p_t1 = _ctrl_range_pos
+                            if _ctrl_range_axis == Int32(2):
+                                _p_t2 = _ctrl_range_pos
+                            if _ctrl_range_axis == Int32(3):
+                                _p_t3 = _ctrl_range_pos
+                            if _ctrl_range_axis == Int32(4):
+                                _p_t4 = _ctrl_range_pos
+                            st_shared_i32(_p_ti, _instr_op)
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_HANDLER_IDX),
                                 _ctrl_cached_handler,
@@ -2078,12 +2275,8 @@ class Megakernel:
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_3), _p_t3)
                             st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_TILE_4), _p_t4)
                             st_shared_i32(
-                                _p_ti + Int32(4 * _TILE_INFO_NUM_WARPS),
-                                _ctrl_cached_num_warps,
-                            )
-                            st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX),
-                                _fetch_idx_save,
+                                _ctrl_current_meta_idx,
                             )
                             st_shared_i64(
                                 _p_ti + Int32(4 * _TILE_INFO_OP_CONFIG),
@@ -2091,8 +2284,15 @@ class Megakernel:
                             )
                             produce_idx = produce_idx + Int32(1)
                             st_shared_release_cta_i32(produce_idx_ptr, produce_idx)
+                            _ctrl_range_pos = _ctrl_range_pos + _ctrl_range_stride
+                            _ctrl_range_offset = _ctrl_range_offset + Int32(1)
+                            if _ctrl_range_pos >= _ctrl_range_end:
+                                _ctrl_range_active = Int32(0)
 
-                        if _instr_op == Int32(TileInstruction.END_MARKER):
+                        if (
+                            _instr_op == Int32(TileInstruction.END_MARKER)
+                            and _ctrl_range_active == Int32(0)
+                        ):
                             if _fetch_idx >= _fetch_limit:
                                 _store_idx_done = ld_shared_i32(store_idx_ptr)
                                 if (produce_idx - _store_idx_done) < Int32(num_pages):
@@ -2127,7 +2327,7 @@ class Megakernel:
                     if _ldr_idx < _p_idx:
                         _dl_slot = _ldr_idx % Int32(num_pages)
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
-                        _dl_op, _dl_lin = ld_shared_v2_b32(_dl_ti)
+                        _dl_op = ld_shared_i32(_dl_ti)
                         if _dl_op != Int32(TileInstruction.END_MARKER):
                             _dl_meta_base = _op_meta_base(_dl_op)
                             _dl_handler = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
@@ -2214,17 +2414,12 @@ class Megakernel:
                         _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
 
                         _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
-                        _ds_op, _ds_lin = ld_shared_v2_b32(_ds_ti)
+                        _ds_op = ld_shared_i32(_ds_ti)
                         _ds_meta_base = _op_meta_base(_ds_op)
                         _ds_handler = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
                         _ds_signal_count = _op_meta_i32_base(
                             op_meta_ptr, _ds_meta_base, Int32(_OP_META_SIGNAL_COUNT)
                         )
-                        _dl_store_handler_local = Int32(0)
-                        if const_expr(dispatch_load_uses_handler_local_idx):
-                            _dl_store_handler_local = _op_meta_i32_base(
-                                op_meta_ptr, _ds_meta_base, Int32(_OP_META_LOAD_LOCAL_IDX)
-                            )
                         _ds_handler_local = Int32(0)
                         if const_expr(dispatch_store_uses_handler_local_idx):
                             _ds_handler_local = _op_meta_i32_base(
@@ -2329,6 +2524,29 @@ class Megakernel:
                                     barriers_ptr,
                                 )
                             if const_expr(has_communicate):
+                                _ds_lin = Int32(0)
+                                _ds_s0 = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_STRIDE_0)
+                                )
+                                _ds_s1 = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_STRIDE_1)
+                                )
+                                _ds_s2 = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_STRIDE_2)
+                                )
+                                _ds_s3 = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_STRIDE_3)
+                                )
+                                _ds_s4 = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_STRIDE_4)
+                                )
+                                _ds_lin = (
+                                    _ds_0 * _ds_s0
+                                    + _ds_1 * _ds_s1
+                                    + _ds_2 * _ds_s2
+                                    + _ds_3 * _ds_s3
+                                    + _ds_4 * _ds_s4
+                                )
                                 signal_peer_barriers(
                                     peer_signal_ptr,
                                     _ds_op,
@@ -2365,6 +2583,7 @@ class Megakernel:
                 consume_ptr = Int32(0)
                 mma_running = Int32(1)
                 _cached_op_idx = Int32(-1)
+                _active_op_warps = Int32(num_mma_warps)
 
                 while mma_running == Int32(1):
                     slot = consume_ptr % Int32(num_pages)
@@ -2375,7 +2594,7 @@ class Megakernel:
                     mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
 
                     tile_info_ptr = smem_base + Int32(ring_state_offset) + slot * Int32(tile_info_bytes)
-                    op_idx, _mma_lin = ld_shared_v2_b32(tile_info_ptr)
+                    op_idx = ld_shared_i32(tile_info_ptr)
 
                     if op_idx == Int32(TileInstruction.END_MARKER):
                         mma_running = Int32(0)
@@ -2411,42 +2630,43 @@ class Megakernel:
                             _cached_op_idx = op_idx
 
                             if const_expr(needs_warp_transition):
-                                _op_warps = ld_shared_i32(
-                                    tile_info_ptr + Int32(4 * _TILE_INFO_NUM_WARPS)
+                                _active_op_warps = _op_meta_i32_base(
+                                    op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_NUM_WARPS)
                                 )
-                                if warp_id >= _op_warps:
+                                if warp_id >= _active_op_warps:
                                     setmaxregister_decrease(MIN_IDLE_REGS)
                                 named_barrier_sync(
                                     Int32(1), Int32(num_compute_threads))
-                                if warp_id < _op_warps:
+                                if warp_id < _active_op_warps:
                                     setmaxregister_increase(mma_reg_count)
 
                         if const_expr(tracing):
                             _tc = trace_start()
 
-                        if const_expr(dispatch_compute_uses_handler_local_idx):
-                            dispatch_compute(
-                                _handler_idx,
-                                _handler_local_idx,
-                                page_ptr,
-                                tile_0,
-                                tile_1,
-                                tile_2,
-                                tile_3,
-                                tile_4,
-                                _op_config,
-                            )
-                        else:
-                            dispatch_compute(
-                                _handler_idx,
-                                page_ptr,
-                                tile_0,
-                                tile_1,
-                                tile_2,
-                                tile_3,
-                                tile_4,
-                                _op_config,
-                            )
+                        if warp_id < _active_op_warps:
+                            if const_expr(dispatch_compute_uses_handler_local_idx):
+                                dispatch_compute(
+                                    _handler_idx,
+                                    _handler_local_idx,
+                                    page_ptr,
+                                    tile_0,
+                                    tile_1,
+                                    tile_2,
+                                    tile_3,
+                                    tile_4,
+                                    _op_config,
+                                )
+                            else:
+                                dispatch_compute(
+                                    _handler_idx,
+                                    page_ptr,
+                                    tile_0,
+                                    tile_1,
+                                    tile_2,
+                                    tile_3,
+                                    tile_4,
+                                    _op_config,
+                                )
 
                         if const_expr(sync_compute_warps_after_tile):
                             named_barrier_sync(Int32(1), Int32(num_compute_threads))
@@ -2508,76 +2728,74 @@ class Megakernel:
             _fetch_idx = block_id
             _fetch_limit = num_instructions
             _fetch_stride = num_blocks
-            if const_expr(per_sm_instruction_queues):
-                _fetch_idx = block_id * num_instructions
-                _fetch_limit = _fetch_idx + num_instructions
-                _fetch_stride = Int32(1)
 
-            _cached_op_idx = Int32(-1)
             _cached_wait_count = Int32(0)
             _cached_wait_acquire = Int32(0)
             _cached_signal_count = Int32(0)
             _cached_wait_barrier = Int32(-2)
             _cached_wait_expected = Int32(-1)
             _running = Int32(1)
-            _instruction_idx = Int32(0)
+            _cached_config_idx = Int32(-2)
+            _cached_config = Int64(0)
 
             while _running == Int32(1):
                 if warp_id == Int32(0) and lane_id == Int32(0):
                     _instr_op = Int32(TileInstruction.END_MARKER)
                     if _fetch_idx < _fetch_limit:
                         load_instruction_to_smem(instructions_ptr, _fetch_idx, iq_base)
-                        _instr_op, _lin = ld_shared_v2_b32(iq_base)
-                        _instruction_idx = _fetch_idx
+                        _instr_op = ld_shared_i32(iq_base)
                         if _instr_op == Int32(TileInstruction.END_MARKER):
                             _fetch_idx = _fetch_limit
                         else:
+                            _next_fetch_idx = _fetch_idx + _fetch_stride
+                            if _next_fetch_idx < _fetch_limit:
+                                prefetch_instruction(instructions_ptr, _next_fetch_idx)
                             _fetch_idx = _fetch_idx + _fetch_stride
                     else:
                         st_shared_i32(iq_base, Int32(TileInstruction.END_MARKER))
                 named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
-                op_idx, _lin_idx = ld_shared_v2_b32(iq_base)
+                op_idx = ld_shared_i32(iq_base)
                 if op_idx == Int32(TileInstruction.END_MARKER):
                     _running = Int32(0)
 
                 if op_idx != Int32(TileInstruction.END_MARKER):
                     _config = Int64(0)
-                    _handler = Int32(0)
                     _compute_local = Int32(0)
                     _meta_base = _op_meta_base(op_idx)
-                    _uses_mask = _op_meta_i32_base(
-                        op_meta_ptr, _meta_base, Int32(_OP_META_USES_CONFIG_MASK)
-                    )
-                    if _uses_mask != Int32(0):
-                        _config = ld_global_i64(op_configs_ptr, op_idx)
                     _handler = _op_meta_i32_base(
                         op_meta_ptr, _meta_base, Int32(_OP_META_HANDLER_IDX)
                     )
+                    _barrier_meta_idx = ld_shared_i32(iq_base + Int32(4 * _INSTR_BARRIER_META_IDX))
+                    if op_idx != _cached_config_idx:
+                        _cached_config = ld_global_i64(op_configs_ptr, op_idx)
+                        _cached_config_idx = op_idx
+                    _config = _cached_config
                     if const_expr(dispatch_compute_uses_handler_local_idx):
                         _compute_local = _op_meta_i32_base(
                             op_meta_ptr, _meta_base, Int32(_OP_META_COMPUTE_LOCAL_IDX)
                         )
 
                     if warp_id == Int32(0) and lane_id == Int32(0):
-                        if op_idx != _cached_op_idx:
-                            _cached_wait_count = _op_meta_i32_base(
-                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
-                            )
-                            _cached_signal_count = _op_meta_i32_base(
-                                op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
-                            )
-                            _cached_wait_acquire = _op_meta_i32_base(
-                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
-                            )
-                            _cached_op_idx = op_idx
+                        _cached_wait_count = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
+                        )
+                        _cached_signal_count = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
+                        )
+                        _cached_wait_acquire = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                        )
 
                         if _cached_wait_count > Int32(0):
                             _done_waits = Int32(0)
                             for _w in range_constexpr(max_waits):
                                 if _done_waits == Int32(0):
                                     if _w < _cached_wait_count:
-                                        _wi_off = _instruction_idx * Int32(max_waits * 2) + Int32(_w * 2)
+                                        _wi_off = (
+                                            _barrier_meta_idx * Int32(max_waits * 2)
+                                            + Int32(_w * 2)
+                                        )
                                         _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
                                         if _bar_idx >= Int32(0):
                                             _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
@@ -2606,44 +2824,168 @@ class Megakernel:
 
                     named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
-                    tile_0 = ld_shared_i32(iq_base + Int32(8))
-                    tile_1 = ld_shared_i32(iq_base + Int32(12))
-                    tile_2 = ld_shared_i32(iq_base + Int32(16))
-                    tile_3 = ld_shared_i32(iq_base + Int32(20))
-                    tile_4 = ld_shared_i32(iq_base + Int32(24))
+                    tile_0 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_0))
+                    tile_1 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_1))
+                    tile_2 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_2))
+                    tile_3 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_3))
+                    tile_4 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_4))
                     page_ptr = _get_page_ptr(smem_base, Int32(0))
-                    if const_expr(dispatch_compute_uses_handler_local_idx):
-                        dispatch_compute(
-                            _handler,
-                            _compute_local,
-                            page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
-                            tile_4,
-                            _config,
-                        )
-                    else:
-                        dispatch_compute(
-                            _handler,
-                            page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
-                            tile_4,
-                            _config,
-                        )
+                    _phase_mask = _op_meta_i32_base(
+                        op_meta_ptr, _meta_base, Int32(_OP_META_PHASE_MASK)
+                    )
+                    _range_axis = (
+                        (_phase_mask // Int32(1 << _INSTR_RANGE_AXIS_SHIFT))
+                        % Int32(16)
+                    ) - Int32(1)
+                    _range_end_axis = (
+                        (_phase_mask // Int32(1 << _INSTR_RANGE_END_AXIS_SHIFT))
+                        % Int32(16)
+                    ) - Int32(1)
+                    _range_is_strided = (
+                        (_phase_mask // Int32(1 << _INSTR_RANGE_STRIDED_BIT))
+                        % Int32(2)
+                    )
+                    _range_pos = Int32(0)
+                    _range_end = Int32(0)
+                    _range_stride = Int32(1)
+                    _range_offset = Int32(0)
+                    if _range_axis == Int32(0):
+                        _range_pos = tile_0
+                    if _range_axis == Int32(1):
+                        _range_pos = tile_1
+                    if _range_axis == Int32(2):
+                        _range_pos = tile_2
+                    if _range_axis == Int32(3):
+                        _range_pos = tile_3
+                    if _range_axis == Int32(4):
+                        _range_pos = tile_4
+                    if _range_end_axis == Int32(0):
+                        _range_end = tile_0
+                    if _range_end_axis == Int32(1):
+                        _range_end = tile_1
+                    if _range_end_axis == Int32(2):
+                        _range_end = tile_2
+                    if _range_end_axis == Int32(3):
+                        _range_end = tile_3
+                    if _range_end_axis == Int32(4):
+                        _range_end = tile_4
+                    if _range_is_strided != Int32(0):
+                        _range_stride = tile_4
+                        if _range_stride < Int32(1):
+                            _range_stride = Int32(1)
+                        if _range_end <= Int32(0):
+                            _range_end = Int32(1)
+                        _range_end = _range_pos + _range_end * _range_stride
+                    if _range_axis < Int32(0) or _range_end <= _range_pos:
+                        _range_end = _range_pos + Int32(1)
+                        _range_stride = Int32(1)
+
+                    while _range_pos < _range_end:
+                        _current_meta_idx = _barrier_meta_idx + _range_offset
+                        if _range_axis >= Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
+                            if _cached_wait_count > Int32(0):
+                                _done_waits = Int32(0)
+                                for _w in range_constexpr(max_waits):
+                                    if _done_waits == Int32(0):
+                                        if _w < _cached_wait_count:
+                                            _wi_off = (
+                                                _current_meta_idx * Int32(max_waits * 2)
+                                                + Int32(_w * 2)
+                                            )
+                                            _bar_idx = ld_global_i32(wait_info_ptr, _wi_off)
+                                            if _bar_idx >= Int32(0):
+                                                _bar_exp = ld_global_i32(wait_info_ptr, _wi_off + Int32(1))
+                                                if (
+                                                    _bar_idx != _cached_wait_barrier
+                                                    or _bar_exp != _cached_wait_expected
+                                                ):
+                                                    if const_expr(relaxed_global_barriers):
+                                                        if _cached_wait_acquire != Int32(0):
+                                                            global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                        else:
+                                                            global_barrier_wait_relaxed(
+                                                                barriers_ptr,
+                                                                _bar_idx,
+                                                                _bar_exp,
+                                                                Int32(global_barrier_sleep_ns),
+                                                            )
+                                                    else:
+                                                        global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                    _cached_wait_barrier = _bar_idx
+                                                    _cached_wait_expected = _bar_exp
+                                            else:
+                                                _done_waits = Int32(1)
+                                        else:
+                                            _done_waits = Int32(1)
+                        if _range_axis >= Int32(0):
+                            named_barrier_sync(Int32(1), Int32(num_compute_threads))
+
+                        if _range_axis == Int32(0):
+                            tile_0 = _range_pos
+                        if _range_axis == Int32(1):
+                            tile_1 = _range_pos
+                        if _range_axis == Int32(2):
+                            tile_2 = _range_pos
+                        if _range_axis == Int32(3):
+                            tile_3 = _range_pos
+                        if _range_axis == Int32(4):
+                            tile_4 = _range_pos
+                        if const_expr(dispatch_compute_uses_handler_local_idx):
+                            dispatch_compute(
+                                _handler,
+                                _compute_local,
+                                page_ptr,
+                                tile_0,
+                                tile_1,
+                                tile_2,
+                                tile_3,
+                                tile_4,
+                                _config,
+                            )
+                        else:
+                            dispatch_compute(
+                                _handler,
+                                page_ptr,
+                                tile_0,
+                                tile_1,
+                                tile_2,
+                                tile_3,
+                                tile_4,
+                                _config,
+                            )
+                        if _range_axis >= Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
+                            if _cached_signal_count > Int32(0):
+                                signal_barriers(
+                                    signal_meta_ptr,
+                                    _current_meta_idx,
+                                    _cached_signal_count,
+                                    barriers_ptr,
+                                )
+                        _range_pos = _range_pos + _range_stride
+                        _range_offset = _range_offset + Int32(1)
+
+                    if _range_axis == Int32(0):
+                        tile_0 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_0))
+                    if _range_axis == Int32(1):
+                        tile_1 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_1))
+                    if _range_axis == Int32(2):
+                        tile_2 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_2))
+                    if _range_axis == Int32(3):
+                        tile_3 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_3))
+                    if _range_axis == Int32(4):
+                        tile_4 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_4))
 
                     if const_expr(sync_compute_warps_after_tile):
-                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
+                        named_barrier_sync(
+                            Int32(1),
+                            Int32(num_compute_threads),
+                        )
 
-                    if warp_id == Int32(0) and lane_id == Int32(0):
+                    if _range_axis < Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
                         if _cached_signal_count > Int32(0):
                             signal_barriers(
                                 signal_meta_ptr,
-                                _instruction_idx,
+                                _barrier_meta_idx,
                                 _cached_signal_count,
                                 barriers_ptr,
                             )
@@ -2673,23 +3015,14 @@ class Megakernel:
         phase_uses_desc_slot_selector,
         extra_exec_globals=None,
     ):
-        """Build the PersistentKernel via source transformation.
-
-        Extracts the kernel loop body, adds tensor and TMA params to dispatch
-        call sites (if any), and exec-generates the PersistentKernel class
-        with all params threaded through __call__ -> kernel -> _kernel_loop.
-        """
+        """Build the PersistentKernel via source transformation."""
         all_canonical = self._backend.all_canonical(self)
-        tensor_params = ", ".join(all_canonical)
         tensor_sig = self._signature_suffix(all_canonical)
 
-        # TMA params threaded into dispatch calls.
         tma_registry = self._tma_registry
         all_tma_canonical = self._collect_phase_unique_names(phase_tma_names)
-        tma_params = ", ".join(all_tma_canonical)
         tma_sig = self._signature_suffix(all_tma_canonical)
 
-        # Peer TMA params for multi-GPU communication
         peer_tma_registry = self._peer_tma_registry
         peer_tma_sig = ""
 
@@ -2832,7 +3165,6 @@ class Megakernel:
         )
 
         config_key = (
-            self.config.backend,
             self.config.num_sms,
             self.config.threads_per_block,
             self.config.page_size,
@@ -2844,8 +3176,6 @@ class Megakernel:
             self.config.noinline,
             self.config.inline_thin_phases,
             self.config.sync_compute_warps_after_tile,
-            self.config.per_sm_instruction_queues,
-            self.config.compute_only_replay,
             self.config.loader_idle_sleep_ns,
             self.config.relaxed_global_barriers,
             self.config.global_barrier_sleep_ns,
@@ -3183,7 +3513,7 @@ class Megakernel:
     ) -> List[Int64]:
         """Return per-phase pointer arguments in ABI order for present tables."""
         args: List[Int64] = []
-        for phase in PHASE_NAMES:
+        for phase in phase_tensors:
             if phase_tensors[phase] is not None:
                 args.append(getattr(launch_state, phase_attr_names[phase]))
         return args
@@ -3194,7 +3524,7 @@ class Megakernel:
         return {
             phase: Int64(phase_tensors[phase].data_ptr())
             if phase_tensors[phase] is not None else Int64(0)
-            for phase in PHASE_NAMES
+            for phase in phase_tensors
         }
 
     @staticmethod
@@ -3205,7 +3535,7 @@ class Megakernel:
         """Return `_LaunchState` kwargs for one per-phase pointer family."""
         return {
             phase_attr_names[phase]: phase_ptrs[phase]
-            for phase in PHASE_NAMES
+            for phase in phase_ptrs
         }
 
     @staticmethod

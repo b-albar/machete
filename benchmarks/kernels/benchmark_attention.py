@@ -36,6 +36,7 @@ except ImportError:
     CUTLASS_AVAILABLE = False
 
 PAGE_SIZES = [16384, 32768, 49152, 65536]
+BACKWARD_PAGE_SIZES = [32768, 49152, 65536]
 BH_SIZES = [1, 4, 16]
 
 # CuTe DSL Flash Attention v2 (Ampere tensor core implementation)
@@ -286,7 +287,7 @@ _BASE_BWD_CONFIGS = [
     (8192, 8192, 128),
 ]
 
-BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in BACKWARD_PAGE_SIZES]
 
 
 @Benchmark.configs(["BH", "M", "N", "D", "page_size"], BWD_CONFIGS)
@@ -360,7 +361,12 @@ def bench_attention_bwd(BH, M, N, D, page_size):
 # Causal Backward Benchmark
 # =============================================================================
 
-CAUSAL_BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+CAUSAL_BWD_CONFIGS = [
+    (bh,) + c + (ps,)
+    for c in _BASE_BWD_CONFIGS
+    for bh in BH_SIZES
+    for ps in BACKWARD_PAGE_SIZES
+]
 
 
 @Benchmark.configs(["BH", "M", "N", "D", "page_size"], CAUSAL_BWD_CONFIGS)
@@ -454,6 +460,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "cute_fa2", "megakernel"],
     )
 
     print()
@@ -466,6 +473,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )
 
     print()
@@ -478,6 +486,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )
 
     print()
@@ -490,4 +499,5 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )

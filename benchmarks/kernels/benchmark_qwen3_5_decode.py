@@ -39,7 +39,7 @@ try:
     import cutlass  # noqa: F401
     import cutlass.cute as cute
     from cutlass import Int32
-    from machete.megakernel.ops import Op
+    from machete.megakernel.ops import Op, TileRange
 
     CUTLASS_AVAILABLE = True
 except ImportError:
@@ -238,6 +238,40 @@ else:
     VCacheStoreOp = None
 
 
+def _decode_gemm_tile_range(*, output_tiles: int):
+    blocks = int(os.environ.get("QWEN_DECODE_GEMM_RANGE_BLOCKS", "0"))
+    if blocks <= 1:
+        return None
+    default_stride = os.environ.get("QWEN_DECODE_NUM_SMS")
+    if default_stride is None and torch.cuda.is_available():
+        default_stride = str(torch.cuda.get_device_properties(0).multi_processor_count)
+    if default_stride is None:
+        default_stride = "70"
+    min_tiles = int(
+        os.environ.get(
+            "QWEN_DECODE_GEMM_RANGE_MIN_TILES",
+            default_stride,
+        )
+    )
+    if min_tiles > 0 and output_tiles < min_tiles:
+        return None
+    stride = int(os.environ.get("QWEN_DECODE_GEMM_RANGE_STRIDE", default_stride))
+    if stride > 1:
+        return TileRange.strided("N", stride=stride, block_size=blocks)
+    return TileRange.coalesced("N", block_size=blocks)
+
+
+def _schedule_decode_gemm(op_cls, *, tile_sizes=None, page_size=32768, **tensors):
+    tile_sizes = dict(tile_sizes or {})
+    output_n = int(tensors["b"].shape[0])
+    tile_n = int(tile_sizes.get("N", 64))
+    output_tiles = (output_n + tile_n - 1) // tile_n
+    tile_range = _decode_gemm_tile_range(output_tiles=output_tiles)
+    if tile_range is not None:
+        tensors["tile_range"] = tile_range
+    return op_cls.schedule(tile_sizes=tile_sizes or None, page_size=page_size, **tensors)
+
+
 def is_sm90_or_newer():
     if not torch.cuda.is_available():
         return False
@@ -432,7 +466,8 @@ def _schedule_layer_ops(
     packed_qkv = qkv_buf is not None
     if packed_qkv:
         qkv_flat = qkv_buf.view(batch, S, (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)
-        qkv_proj_ops = GemmOp.schedule(
+        qkv_proj_ops = _schedule_decode_gemm(
+            GemmOp,
             a=h_buf, b=weights[f"{pfx}.W_qkv"], c=qkv_flat,
             page_size=page_size,
         )
@@ -441,7 +476,8 @@ def _schedule_layer_ops(
             op.static_dims["barrier_group_count_N"] = NUM_Q_HEADS + 2 * NUM_KV_HEADS
         ops += qkv_proj_ops
     else:
-        q_proj_ops = GemmOp.schedule(
+        q_proj_ops = _schedule_decode_gemm(
+            GemmOp,
             a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf,
             page_size=page_size,
         )
@@ -450,7 +486,8 @@ def _schedule_layer_ops(
         ops += q_proj_ops
 
         kv_flat = kv_buf.view(batch, S, 2 * KV_DIM)
-        kv_proj_ops = GemmOp.schedule(
+        kv_proj_ops = _schedule_decode_gemm(
+            GemmOp,
             a=h_buf, b=weights[f"{pfx}.W_kv"], c=kv_flat,
             page_size=page_size,
         )
@@ -567,7 +604,8 @@ def _schedule_layer_ops(
     ops += fa_ops
 
     # 7. O projection
-    ops += GemmOp.schedule(
+    ops += _schedule_decode_gemm(
+        GemmOp,
         a=attn_out_buf, b=weights[f"{pfx}.W_o"], c=proj_buf,
         page_size=page_size,
     )
@@ -580,12 +618,14 @@ def _schedule_layer_ops(
     )
 
     # 9-11. MLP
-    ops += GemmOp.schedule(
+    ops += _schedule_decode_gemm(
+        GemmOp,
         a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf,
         page_size=page_size, tile_sizes=gate_up_tile,
     )
     ops += GLUOp.schedule(x=gate_up_buf, y=mlp_h_buf, activation="silu", tile_sizes={"S": 1}, page_size=page_size)
-    ops += GemmOp.schedule(
+    ops += _schedule_decode_gemm(
+        GemmOp,
         a=mlp_h_buf, b=weights[f"{pfx}.W_down"], c=x_out,
         page_size=page_size,
     )
@@ -764,7 +804,8 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
             page_size=page_size,
         )
         if not torch_lm_head:
-            all_ops += LmHeadGemmOp.schedule(
+            all_ops += _schedule_decode_gemm(
+                LmHeadGemmOp,
                 a=h_final_buf, b=weights["lm_head"], c=logits_buf,
                 page_size=page_size,
             )
@@ -785,7 +826,6 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
         page_size=effective_page_size,
         num_pages=num_pages,
         sync_compute_warps_after_tile=False,
-        per_sm_instruction_queues=os.environ.get("QWEN_DECODE_PER_SM_QUEUES", "1") != "0",
         noinline=os.environ.get("QWEN_DECODE_NOINLINE", default_noinline) != "0",
         inline_thin_phases=os.environ.get("QWEN_DECODE_INLINE_THIN", "1") != "0",
         loader_idle_sleep_ns=int(os.environ.get("QWEN_DECODE_LOADER_SLEEP", "0")),

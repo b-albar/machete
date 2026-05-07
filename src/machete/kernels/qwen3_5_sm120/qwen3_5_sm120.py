@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, const_expr
 
 from machete.kernels.gemm import GemmOp
 from machete.kernels.gemm.gemm import _gemm_epilogue_store_no_mbar_inval_helper
@@ -1082,7 +1082,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
         buf_stride = b_tile_bytes
         c_offset = norm_bytes + 2 * buf_stride
         mbar_offset = c_offset + c_tile_bytes
-        required = mbar_offset + 32
+        required = mbar_offset + 40
         page_size = max(page_size, required)
         if tile_k % 64 == 0 and tile_k >= 64:
             swz_b_ab = 3
@@ -1122,8 +1122,8 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
         assert self.tile_K >= 16 and self.tile_K % 16 == 0, (
             f"{type(self).__name__}: tile_K={self.tile_K} must be >= 16 and a multiple of 16."
         )
-        assert self.mbar_offset + 32 <= self.page_size, (
-            f"{type(self).__name__}: smem {self.mbar_offset + 32}B exceeds page_size "
+        assert self.mbar_offset + 40 <= self.page_size, (
+            f"{type(self).__name__}: smem {self.mbar_offset + 40}B exceeds page_size "
             f"({self.page_size}B)."
         )
 

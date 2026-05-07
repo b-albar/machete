@@ -199,8 +199,8 @@ class TestTMAMegakernel:
         torch.testing.assert_close(y0, x0 + 1.0, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)
 
-    def test_runtime_backend_alias_keeps_distinct_bindings(self):
-        """The runtime alias must preserve distinct desc slots for repeated TMA ops."""
+    def test_repeated_tma_ops_keep_distinct_bindings(self):
+        """Repeated TMA ops must preserve distinct desc slots."""
         torch.manual_seed(42)
         x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
         y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
@@ -211,7 +211,7 @@ class TestTMAMegakernel:
             TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M})
             + TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M})
         )
-        kernel = Megakernel(ops, config=MegakernelConfig(backend="runtime"))
+        kernel = Megakernel(ops, config=MegakernelConfig())
 
         assert len(kernel._backend_ir.handler_specs) == 1
 

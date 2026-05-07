@@ -37,6 +37,7 @@ from benchmarks.kernels.benchmark_qwen3_5_layer import (
     maybe_compiled_forward,
     _pick_single_layer_forward_mma_reg_count,
     _pick_single_layer_forward_tpb,
+    _pick_single_layer_fused_gemm_tiles,
 )
 
 try:
@@ -107,28 +108,34 @@ def _schedule_prefill_layer_ops(
     res_mid,
     res_out,
     h_buf,
-    q_buf,
-    k_buf,
-    v_buf,
+    qkv_buf,
     attn_out_buf,
     proj_buf,
     h2_buf,
     gate_up_buf,
     mlp_h_buf,
     lse_buf,
+    rms_tile_s=16,
+    glu_tile_s=None,
 ):
     """Schedule one full prefill layer into the shared full-model op stream."""
     from machete.kernels.attention import flash_attention_schedule
     from machete.kernels.gemm import GemmOp
     from machete.kernels.glu import GLUOp
-    from machete.kernels.qknorm_rope import QKNormRopeOp
+    from machete.kernels.qknorm_rope import PackedQKNormRopeOp
     from machete.kernels.rms_norm import RMSNormOp
 
     pfx = f"layer.{i}"
     cos, sin = weights["cos"], weights["sin"]
 
-    q_4d = q_buf.view(batch * seq_len, NUM_Q_HEADS, HEAD_DIM)
-    k_4d = k_buf.view(batch * seq_len, NUM_KV_HEADS, HEAD_DIM)
+    q_buf = qkv_buf[:, :, :Q_DIM]
+    k_buf = qkv_buf[:, :, Q_DIM:Q_DIM + KV_DIM]
+    v_buf = qkv_buf[:, :, Q_DIM + KV_DIM:]
+    qk_4d = qkv_buf[:, :, :Q_DIM + KV_DIM].view(
+        batch * seq_len,
+        NUM_Q_HEADS + NUM_KV_HEADS,
+        HEAD_DIM,
+    )
 
     q_fa = q_buf.view(batch, seq_len, NUM_Q_HEADS, HEAD_DIM)
     k_fa = k_buf.view(batch, seq_len, NUM_KV_HEADS, HEAD_DIM)
@@ -144,43 +151,85 @@ def _schedule_prefill_layer_ops(
         causal=True,
         kv_group_size=KV_GROUP_SIZE,
         page_size=page_size,
+        write_lse=False,
     )
     for op in fa_ops:
         op.dim_aliases["M"] = f"seq_{i}"
 
     fa_page_size = fa_config.page_size
+    gemm_tiles = _pick_single_layer_fused_gemm_tiles(batch, seq_len, fa_page_size)
 
     ops = []
-    ops += RMSNormOp.schedule(
+    rms_ops = RMSNormOp.schedule(
         x=x_in,
         weight=weights[f"{pfx}.attn_norm"],
         y=h_buf,
         residual_in=res_in,
         residual_out=res_mid,
-        tile_sizes={"S": 16},
+        tile_sizes={"S": rms_tile_s},
         page_size=fa_page_size,
     )
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_q"], c=q_buf, page_size=fa_page_size)
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_k"], c=k_buf, page_size=fa_page_size)
-    ops += GemmOp.schedule(a=h_buf, b=weights[f"{pfx}.W_v"], c=v_buf, page_size=fa_page_size)
-    ops += QKNormRopeOp.schedule(q=q_4d, norm_weight=weights[f"{pfx}.w_q_norm"], cos=cos, sin=sin, page_size=fa_page_size)
-    ops += QKNormRopeOp.schedule(q=k_4d, norm_weight=weights[f"{pfx}.w_k_norm"], cos=cos, sin=sin, page_size=fa_page_size)
+    ops += rms_ops
+    ops += GemmOp.schedule(
+        a=h_buf,
+        b=weights[f"{pfx}.W_qkv"],
+        c=qkv_buf,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("qkv"),
+    )
+    ops += PackedQKNormRopeOp.schedule(
+        qk=qk_4d,
+        q_norm_weight=weights[f"{pfx}.w_q_norm"],
+        k_norm_weight=weights[f"{pfx}.w_k_norm"],
+        cos=cos,
+        sin=sin,
+        page_size=fa_page_size,
+        num_q_heads=NUM_Q_HEADS,
+        num_k_heads=NUM_KV_HEADS,
+    )
     ops += fa_ops
-    ops += GemmOp.schedule(a=attn_out_buf, b=weights[f"{pfx}.W_o"], c=proj_buf, page_size=fa_page_size)
-    ops += RMSNormOp.schedule(
+    ops += GemmOp.schedule(
+        a=attn_out_buf,
+        b=weights[f"{pfx}.W_o"],
+        c=proj_buf,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("o"),
+    )
+    rms_ops = RMSNormOp.schedule(
         x=proj_buf,
         weight=weights[f"{pfx}.mlp_norm"],
         y=h2_buf,
         residual_in=res_mid,
         residual_out=res_out,
-        tile_sizes={"S": 16},
+        tile_sizes={"S": rms_tile_s},
         page_size=fa_page_size,
     )
-    ops += GemmOp.schedule(a=h2_buf, b=weights[f"{pfx}.W_gate_up"], c=gate_up_buf, page_size=fa_page_size)
-    ops += GLUOp.schedule(x=gate_up_buf, y=mlp_h_buf, activation="silu", page_size=fa_page_size)
-    ops += GemmOp.schedule(a=mlp_h_buf, b=weights[f"{pfx}.W_down"], c=x_out, page_size=fa_page_size)
+    ops += rms_ops
+    ops += GemmOp.schedule(
+        a=h2_buf,
+        b=weights[f"{pfx}.W_gate_up"],
+        c=gate_up_buf,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("gate_up"),
+    )
+    glu_tile_sizes = {"S": glu_tile_s} if glu_tile_s is not None else None
+    glu_ops = GLUOp.schedule(
+        x=gate_up_buf,
+        y=mlp_h_buf,
+        activation="silu",
+        page_size=fa_page_size,
+        tile_sizes=glu_tile_sizes,
+    )
+    ops += glu_ops
+    ops += GemmOp.schedule(
+        a=mlp_h_buf,
+        b=weights[f"{pfx}.W_down"],
+        c=x_out,
+        page_size=fa_page_size,
+        tile_sizes=gemm_tiles.get("down"),
+    )
 
-    extra_keep = [q_4d, k_4d, q_fa, k_fa, v_fa, o_fa]
+    extra_keep = [q_buf, k_buf, v_buf, qk_4d, q_fa, k_fa, v_fa, o_fa]
     return ops, fa_config, extra_keep
 
 
@@ -193,6 +242,10 @@ def megakernel_prefill_build(
     page_size=32768,
     num_pages=1,
     num_layers=NUM_LAYERS,
+    run_once=True,
+    return_kernel=False,
+    rms_tile_s=16,
+    glu_tile_s=None,
 ):
     """Build a single full-model prefill megakernel."""
     from machete.megakernel import Megakernel, MegakernelConfig
@@ -201,6 +254,16 @@ def megakernel_prefill_build(
 
     dtype = x.dtype
     device = x.device
+    weights = dict(weights)
+    qkv_weights = []
+    for i in range(num_layers):
+        pfx = f"layer.{i}"
+        w_qkv = torch.cat(
+            [weights[f"{pfx}.W_q"], weights[f"{pfx}.W_k"], weights[f"{pfx}.W_v"]],
+            dim=0,
+        ).contiguous()
+        weights[f"{pfx}.W_qkv"] = w_qkv
+        qkv_weights.append(w_qkv)
 
     x_buf = [torch.empty(batch, seq_len, HIDDEN, dtype=dtype, device=device) for _ in range(2)]
     res_buf = [torch.empty(batch, seq_len, HIDDEN, dtype=dtype, device=device) for _ in range(2)]
@@ -212,9 +275,7 @@ def megakernel_prefill_build(
         for _ in range(max(1, num_layers))
     ]
     h_buf = torch.empty(batch, seq_len, HIDDEN, dtype=dtype, device=device)
-    q_buf = torch.empty(batch, seq_len, Q_DIM, dtype=dtype, device=device)
-    k_buf = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
-    v_buf = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
+    qkv_buf = torch.empty(batch, seq_len, Q_DIM + 2 * KV_DIM, dtype=dtype, device=device)
     attn_out_buf = torch.empty(batch, seq_len, Q_DIM, dtype=dtype, device=device)
     lse_buf = torch.empty(batch, NUM_Q_HEADS, seq_len, dtype=torch.float32, device=device)
     proj_buf = torch.empty(batch, seq_len, HIDDEN, dtype=dtype, device=device)
@@ -233,9 +294,8 @@ def megakernel_prefill_build(
         *res_buf,
         *res_mid_bufs,
         h_buf,
-        q_buf,
-        k_buf,
-        v_buf,
+        qkv_buf,
+        *qkv_weights,
         attn_out_buf,
         lse_buf,
         proj_buf,
@@ -268,15 +328,15 @@ def megakernel_prefill_build(
             res_mid_bufs[i],
             next_res,
             h_buf,
-            q_buf,
-            k_buf,
-            v_buf,
+            qkv_buf,
             attn_out_buf,
             proj_buf,
             h2_buf,
             gate_up_buf,
             mlp_h_buf,
             lse_buf,
+            rms_tile_s=rms_tile_s,
+            glu_tile_s=glu_tile_s,
         )
         all_ops += layer_ops
         max_fa_tpb = max(max_fa_tpb, fa_config.threads_per_block)
@@ -285,15 +345,16 @@ def megakernel_prefill_build(
 
     final_x = x_buf[num_layers % 2]
     final_res = res_buf[num_layers % 2]
-    all_ops += RMSNormOp.schedule(
+    final_norm_ops = RMSNormOp.schedule(
         x=final_x,
         weight=weights["final_norm"],
         y=h_final,
         residual_in=final_res,
         residual_out=residual_final,
-        tile_sizes={"S": 16},
+        tile_sizes={"S": rms_tile_s},
         page_size=fa_page_size,
     )
+    all_ops += final_norm_ops
     all_ops += LmHeadGemmOp.schedule(a=h_final, b=weights["lm_head"], c=logits, page_size=fa_page_size)
 
     gemm_like_ops = [op for op in all_ops if op.tile_sizes.get("S") is not None]
@@ -311,9 +372,12 @@ def megakernel_prefill_build(
     )
 
     kernel = Megakernel(all_ops, config=config)
-    with contextlib.redirect_stdout(io.StringIO()):
-        kernel.run()
-    torch.cuda.synchronize()
+    if run_once:
+        with contextlib.redirect_stdout(io.StringIO()):
+            kernel.run()
+        torch.cuda.synchronize()
+    if return_kernel:
+        return kernel, logits, residual_final
     spec = kernel.bench_spec(keep_alive=keep_alive)
     return spec, logits, residual_final
 

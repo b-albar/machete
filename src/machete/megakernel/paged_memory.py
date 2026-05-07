@@ -20,6 +20,8 @@ from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from .instruction_layout import INSTRUCTION_ROW_BYTES
+
 
 # =============================================================================
 # Constants
@@ -30,16 +32,14 @@ IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
 
 # Per-slot tile-info layout in shared memory (int32 slots, plus one int64).
 TILE_INFO_OP_IDX: int = 0
-TILE_INFO_LINEAR_IDX: int = 1
-TILE_INFO_HANDLER_IDX: int = 2
-TILE_INFO_TILE_0: int = 3
-TILE_INFO_TILE_1: int = 4
-TILE_INFO_TILE_2: int = 5
-TILE_INFO_TILE_3: int = 6
-TILE_INFO_TILE_4: int = 7
-TILE_INFO_NUM_WARPS: int = 8
-TILE_INFO_INSTRUCTION_IDX: int = 9
-TILE_INFO_OP_CONFIG: int = 10
+TILE_INFO_HANDLER_IDX: int = 1
+TILE_INFO_TILE_0: int = 2
+TILE_INFO_TILE_1: int = 3
+TILE_INFO_TILE_2: int = 4
+TILE_INFO_TILE_3: int = 5
+TILE_INFO_TILE_4: int = 6
+TILE_INFO_INSTRUCTION_IDX: int = 7
+TILE_INFO_OP_CONFIG: int = 8
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -304,15 +304,14 @@ class NPageLayout:
     page_size: int = 16384
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 48 bytes
-    #   [op_idx, linear_tile_idx, handler_idx, tile_0..tile_4,
-    #    num_warps, pad, op_config_ptr]
+    # - Per-page tile info: num_pages * 40 bytes
+    #   [op_idx, handler_idx, tile_0..tile_4, instruction_idx, op_config_ptr]
     # - Flags: 28 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
-    # - Instruction queue: IQ_DEPTH * 28 bytes (full packed TileInstruction rows)
+    # - Instruction queue: IQ_DEPTH * replay instruction row bytes
     # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 48  # Per-page tile metadata (10 int32 slots incl. pad + 1 int64)
-    _IQ_ENTRY_SIZE: int = 28  # Per IQ slot: op_idx + linear_tile_idx + tile_0..tile_4
+    _TILE_INFO_SIZE: int = 40  # Per-page tile metadata (8 int32 slots + 1 int64)
+    _IQ_ENTRY_SIZE: int = INSTRUCTION_ROW_BYTES
     _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 

@@ -130,6 +130,35 @@ class PipelineSpec:
         return PipelineSpec(**values)
 
     @classmethod
+    def range_capable(
+        cls,
+        *,
+        page_count: int = 1,
+        range_axis: int,
+        range_end_axis: int = -1,
+        range_block_size: int = 1,
+        page_bytes: int = 0,
+        semaphore_count: int = 0,
+        scratch_bytes: int = 0,
+    ) -> "PipelineSpec":
+        """Return a pipeline contract whose range support is opt-in per op.
+
+        Use this on an op class to declare that scheduled instances may pass a
+        ``TileRange``. It does not coalesce by default; each scheduled op opts
+        in with ``tile_range=TileRange.coalesced(...)``.
+        """
+        return cls(
+            page_count=page_count,
+            page_bytes=page_bytes,
+            semaphore_count=semaphore_count,
+            scratch_bytes=scratch_bytes,
+            range_axis=range_axis,
+            range_end_axis=range_end_axis,
+            range_block_size=range_block_size,
+            coalesce_ranges=False,
+        )
+
+    @classmethod
     def streaming(
         cls,
         *,
@@ -185,6 +214,108 @@ class PipelineSpec:
             page_bytes=self.page_bytes,
             scratch_bytes=self.scratch_bytes,
         )
+
+
+@dataclass(frozen=True)
+class TileRange:
+    """Per-scheduled-op range coalescing policy.
+
+    ``PipelineSpec`` declares that an op class is range-capable. ``TileRange``
+    is the user-facing schedule-time choice for one op instance::
+
+        ops = MyOp.schedule(
+            ...,
+            tile_range=TileRange.coalesced("O", block_size=2),
+        )
+
+    The axis may be a semantic tile dimension name or a numeric tile axis.
+    """
+
+    axis: Union[int, str]
+    block_size: int = 1
+    end_axis: Optional[Union[int, str]] = None
+    coalesce: bool = True
+    stride: int = 1
+
+    def __post_init__(self):
+        if self.block_size < 0:
+            raise ValueError("TileRange.block_size must be >= 0")
+        if self.stride < 1:
+            raise ValueError("TileRange.stride must be >= 1")
+
+    @classmethod
+    def coalesced(
+        cls,
+        axis: Union[int, str],
+        *,
+        block_size: int = 1,
+        end_axis: Optional[Union[int, str]] = None,
+    ) -> "TileRange":
+        return cls(axis=axis, block_size=block_size, end_axis=end_axis, coalesce=True)
+
+    @classmethod
+    def strided(
+        cls,
+        axis: Union[int, str],
+        *,
+        stride: int,
+        block_size: int = 1,
+        end_axis: Optional[Union[int, str]] = None,
+    ) -> "TileRange":
+        return cls(
+            axis=axis,
+            block_size=block_size,
+            end_axis=end_axis,
+            coalesce=True,
+            stride=stride,
+        )
+
+    @classmethod
+    def disabled(
+        cls,
+        axis: Union[int, str] = 0,
+        *,
+        end_axis: Optional[Union[int, str]] = None,
+    ) -> "TileRange":
+        return cls(axis=axis, block_size=1, end_axis=end_axis, coalesce=False)
+
+    @staticmethod
+    def _resolve_axis(axis: Union[int, str], op: "ScheduledOp") -> int:
+        if isinstance(axis, str):
+            if axis not in op.dim_names:
+                raise ValueError(
+                    f"Range axis {axis!r} is not a tile dimension for "
+                    f"{op.op_cls.__name__}; available: {sorted(op.dim_names)}"
+                )
+            return int(op.dim_names[axis])
+        return int(axis)
+
+    def apply(self, op: "ScheduledOp") -> "ScheduledOp":
+        if getattr(op.op_cls, "pipeline", None) is None:
+            raise ValueError(
+                f"Op {op.op_cls.__name__} does not declare a PipelineSpec; "
+                "tile ranges require a range-capable pipeline."
+            )
+        range_axis = self._resolve_axis(self.axis, op)
+        range_end_axis = (
+            self._resolve_axis(self.end_axis, op)
+            if self.end_axis is not None
+            else range_axis + 1
+        )
+        op.static_dims["pipeline_coalesce_ranges"] = bool(self.coalesce)
+        op.static_dims["pipeline_range_axis"] = range_axis
+        op.static_dims["pipeline_range_end_axis"] = range_end_axis
+        op.static_dims["pipeline_range_block_size"] = int(self.block_size)
+        op.static_dims["pipeline_range_stride"] = int(self.stride)
+        if self.stride > 1:
+            stride_axis = range_end_axis + 1
+            if stride_axis >= MAX_TILE_DIMS or stride_axis == range_axis:
+                raise ValueError(
+                    "TileRange.strided requires one spare tile coordinate after "
+                    "range_end_axis to encode the stride"
+                )
+            op.static_dims["pipeline_range_stride_axis"] = stride_axis
+        return op
 
 
 @dataclass(frozen=True)
@@ -285,6 +416,9 @@ class InstructionPageProtocol:
     def semaphore(self, name: str, local_idx: int = 0) -> int:
         return self.semaphore_role(name).semaphore(local_idx)
 
+    def semaphore_participants(self, name: str) -> int:
+        return self.semaphore_role(name).participants
+
     @classmethod
     def streaming(
         cls,
@@ -348,133 +482,6 @@ class InstructionPageProtocol:
             page_bytes=page_bytes,
             scratch_bytes=scratch_bytes,
         )
-
-
-@dataclass(frozen=True)
-class PersistentRegion:
-    """A scheduled region that lowers as one persistent instruction boundary."""
-
-    name: str
-    ops: Tuple["ScheduledOp", ...]
-    pipeline: PipelineSpec
-    protocol: InstructionPageProtocol
-    lowering: str = "replay"
-    generated_op: Optional["ScheduledOp"] = None
-
-    LOWER_REPLAY: ClassVar[str] = "replay"
-    LOWER_HANDLER: ClassVar[str] = "handler"
-
-    def __post_init__(self):
-        if not self.name:
-            raise ValueError("PersistentRegion.name must be non-empty")
-        if not self.ops:
-            raise ValueError("PersistentRegion.ops must be non-empty")
-        if self.lowering not in (self.LOWER_REPLAY, self.LOWER_HANDLER):
-            raise ValueError(f"unsupported region lowering {self.lowering!r}")
-        if self.lowering == self.LOWER_HANDLER and self.generated_op is None:
-            raise ValueError(
-                "handler-backed PersistentRegion requires a generated scheduled op"
-            )
-        if self.lowering == self.LOWER_REPLAY and self.generated_op is not None:
-            raise ValueError("replay-backed PersistentRegion cannot carry generated_op")
-        if self.protocol.page_count != self.pipeline.page_count:
-            raise ValueError(
-                f"region protocol has {self.protocol.page_count} pages but pipeline declares "
-                f"{self.pipeline.page_count}"
-            )
-        if self.protocol.semaphore_count != self.pipeline.semaphore_count:
-            raise ValueError(
-                f"region protocol has {self.protocol.semaphore_count} semaphores but pipeline declares "
-                f"{self.pipeline.semaphore_count}"
-            )
-
-    @classmethod
-    def from_ops(
-        cls,
-        name: str,
-        ops: Iterable["ScheduledOp"],
-        *,
-        pipeline: Optional[PipelineSpec] = None,
-        protocol: Optional[InstructionPageProtocol] = None,
-        lowering: str = LOWER_REPLAY,
-        generated_op: Optional["ScheduledOp"] = None,
-    ) -> "PersistentRegion":
-        ops_tuple = tuple(ops)
-        pipe = pipeline or PipelineSpec.streaming()
-        proto = protocol or pipe.page_protocol()
-        return cls(
-            name=name,
-            ops=ops_tuple,
-            pipeline=pipe,
-            protocol=proto,
-            lowering=lowering,
-            generated_op=generated_op,
-        )
-
-    @property
-    def total_tiles(self) -> int:
-        if self.generated_op is not None:
-            return self.generated_op.total_tiles
-        return sum(op.total_tiles for op in self.ops)
-
-    def as_replay_ops(self) -> List["ScheduledOp"]:
-        if self.generated_op is not None:
-            return [self.generated_op]
-        return list(self.ops)
-
-
-@dataclass(frozen=True)
-class RegionRecord:
-    """A persistent region mapped onto the flattened replay op list."""
-
-    name: str
-    start_op: int
-    end_op: int
-    pipeline: PipelineSpec
-    protocol: InstructionPageProtocol
-    lowering: str
-
-    @property
-    def op_count(self) -> int:
-        return self.end_op - self.start_op
-
-
-ScheduledItem = Union["ScheduledOp", PersistentRegion]
-
-
-def linearize_scheduled_items(
-    items: Iterable[ScheduledItem],
-) -> Tuple[List["ScheduledOp"], Tuple[RegionRecord, ...]]:
-    """Flatten scheduled items while preserving persistent region boundaries.
-
-    Handler-backed regions lower to the explicit generated op supplied by the
-    scheduler.  Mixed-op codegen is intentionally not inferred here.
-    """
-    flattened: List["ScheduledOp"] = []
-    regions: List[RegionRecord] = []
-    for item in items:
-        if isinstance(item, PersistentRegion):
-            start = len(flattened)
-            flattened.extend(item.as_replay_ops())
-            regions.append(
-                RegionRecord(
-                    name=item.name,
-                    start_op=start,
-                    end_op=len(flattened),
-                    pipeline=item.pipeline,
-                    protocol=item.protocol,
-                    lowering=item.lowering,
-                )
-            )
-        else:
-            flattened.append(item)
-    return flattened, tuple(regions)
-
-
-def flatten_scheduled_items(items: Iterable[ScheduledItem]) -> List["ScheduledOp"]:
-    """Flatten scheduled ops and replay-backed persistent regions."""
-    flattened, _regions = linearize_scheduled_items(items)
-    return flattened
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1088,7 @@ def _process_op_declarations(cls):
         """
         if tile_sizes is None:
             tile_sizes = {}
+        tile_range = tensors.pop("tile_range", None)
 
         unique_dims = cls._UNIQUE_DIMS
         unique_tensors = cls._UNIQUE_TENSORS
@@ -1115,7 +1123,7 @@ def _process_op_declarations(cls):
         )
 
         config_data = pack_fn(**tensors)
-        return ScheduledOp(
+        op = ScheduledOp(
             op_cls=cls,
             tile_counts=tile_counts,
             config_data=config_data,
@@ -1128,6 +1136,9 @@ def _process_op_declarations(cls):
             tensor_metas=tensor_metas,
             tensor_strides=tensor_strides,
         )
+        if tile_range is not None:
+            op.with_tile_range(tile_range)
+        return op
 
     cls._schedule_single = _schedule_single
 
@@ -1268,10 +1279,12 @@ class Op:
     OUTPUTS: ClassVar[List[str]] = []
     pipeline: ClassVar[Optional[PipelineSpec]] = None
     pipeline_abi: ClassVar[Optional[PipelineABI]] = None
+    pipeline_page_protocol: ClassVar[Optional[InstructionPageProtocol]] = None
     load_phase: ClassVar[Optional[str]] = None
     compute_phase: ClassVar[Optional[str]] = None
     store_phase: ClassVar[Optional[str]] = None
     communicate_phase: ClassVar[Optional[str]] = None
+    inline_phases: ClassVar[Tuple[str, ...]] = ()
 
     def __init__(self, **config):
         """Initialize Op instance with compile-time configuration.
@@ -1300,6 +1313,60 @@ class Op:
         self._bind_phase("compute", type(self).compute_phase)
         self._bind_phase("store", type(self).store_phase)
         self._bind_phase("communicate", type(self).communicate_phase)
+
+    def should_noinline_phase(self, phase_name: str, *, allow_inline_phases: bool = True) -> bool:
+        """Return whether a generated wrapper for ``phase_name`` should be noinline.
+
+        The framework default is conservative: every phase stays behind a
+        noinline boundary. Ops with thin hot-path phase wrappers may opt
+        specific phases into inlining via ``inline_phases``.
+        """
+        if allow_inline_phases and phase_name in type(self).inline_phases:
+            return False
+        return True
+
+    @classmethod
+    def pipeline_protocol(cls) -> Optional[InstructionPageProtocol]:
+        """Return the named op-local page/semaphore protocol, if any.
+
+        Op-owned staged kernels should use this protocol instead of hard-coded
+        shared-memory offsets. The megakernel materializes the corresponding
+        offsets as compile-time attributes on each op instance.
+        """
+        explicit = getattr(cls, "pipeline_page_protocol", None)
+        if explicit is not None:
+            return explicit
+        pipeline = getattr(cls, "pipeline", None)
+        if pipeline is None:
+            return None
+        return pipeline.page_protocol()
+
+    def pipeline_page_offset(self, name: str, local_idx: int = 0) -> int:
+        """Return byte offset of a named op-local page within ``page_ptr``."""
+        protocol = type(self).pipeline_protocol()
+        if protocol is None:
+            raise ValueError(f"{type(self).__name__} does not declare a pipeline")
+        page_idx = protocol.page(name, local_idx)
+        return getattr(self, f"machete_pipeline_page_{page_idx}_offset")
+
+    def pipeline_semaphore_offset(self, name: str, local_idx: int = 0) -> int:
+        """Return byte offset of a named op-local semaphore within ``page_ptr``."""
+        protocol = type(self).pipeline_protocol()
+        if protocol is None:
+            raise ValueError(f"{type(self).__name__} does not declare a pipeline")
+        sem_idx = protocol.semaphore(name, local_idx)
+        return getattr(self, f"machete_pipeline_semaphore_{sem_idx}_offset")
+
+    def pipeline_semaphore_participants(self, name: str) -> int:
+        """Return participant count declared for a named op-local semaphore."""
+        protocol = type(self).pipeline_protocol()
+        if protocol is None:
+            raise ValueError(f"{type(self).__name__} does not declare a pipeline")
+        return protocol.semaphore_participants(name)
+
+    def pipeline_scratch_offset(self) -> int:
+        """Return byte offset of op-local scratch storage within ``page_ptr``."""
+        return getattr(self, "machete_pipeline_scratch_offset")
 
     def __init_subclass__(cls, **kwargs):
         """Process op declarations when subclasses define reads and writes."""
@@ -1487,6 +1554,10 @@ class ScheduledOp:
             return self.tile_counts[axis]
         return 1
 
+    def with_tile_range(self, tile_range: TileRange) -> "ScheduledOp":
+        """Apply per-op range coalescing metadata and return ``self``."""
+        return tile_range.apply(self)
+
 __all__ = [
     # Constants
     "MAX_TILE_DIMS",
@@ -1495,18 +1566,15 @@ __all__ = [
     # Metadata
     "InstructionPageProtocol",
     "PageRole",
-    "PersistentRegion",
     "PipelineSpec",
+    "TileRange",
     "PipelineABI",
     "SemaphoreRole",
     "TensorMeta",
-    "RegionRecord",
     # Protocol
     "Op",
     "build_op_config",
     "is_compile_static_dim",
     # Scheduling
     "ScheduledOp",
-    "flatten_scheduled_items",
-    "linearize_scheduled_items",
 ]
