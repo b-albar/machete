@@ -4,7 +4,7 @@
 
 This complements the dedicated full-model decode benchmark:
 - decode: one full-model decode step as a single megakernel
-- prefill: one full prompt pass through all 36 layers as a single megakernel
+- prefill: one full prompt pass through all 24 layers as a single megakernel
 """
 
 import contextlib

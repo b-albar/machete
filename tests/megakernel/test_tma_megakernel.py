@@ -175,7 +175,7 @@ class TestTMAMegakernel:
         x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
         y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
         ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        Megakernel(ops, config=MegakernelConfig(noinline=True)).run()
+        Megakernel(ops, config=MegakernelConfig()).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
     def test_repeated_identical_ops_share_handler_but_keep_distinct_bindings(self):

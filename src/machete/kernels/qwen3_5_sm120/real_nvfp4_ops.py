@@ -1712,6 +1712,7 @@ def schedule_qwen3_5_final_nvfp4_sm120(
     seq_len,
     page_size=DEFAULT_PAGE_SIZE,
     group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
+    final_head_range_block=1,
 ):
     """Schedule final residual plus packed NVFP4 LM head for real Qwen3.5."""
 
@@ -1730,6 +1731,7 @@ def schedule_qwen3_5_final_nvfp4_sm120(
         page_size=page_size,
         eps=QWEN3_5_REAL_EPS,
         group_size=group_size,
+        final_head_range_block=final_head_range_block,
     )
 
 
@@ -1780,6 +1782,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     fa_num_splits=0,
     use_flash_attention=False,
     matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    final_head_range_block=1,
 ):
     """Build the full 24-layer real Qwen3.5 NVFP4 decode schedule.
 
@@ -1870,6 +1873,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
             seq_len=seq_len,
             page_size=page_size,
             group_size=group_size,
+            final_head_range_block=final_head_range_block,
         )
         ops.extend(final_ops)
 

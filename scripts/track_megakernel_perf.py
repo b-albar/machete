@@ -16,7 +16,7 @@ Supported workloads:
 - ``layer-bwd``: single Qwen layer backward megakernel
 
 Examples:
-    python scripts/track_megakernel_perf.py decode --layers 8 12 24 36
+    python scripts/track_megakernel_perf.py decode --layers 8 12 24
     python scripts/track_megakernel_perf.py prefill --seq-lens 128 512 1024
     python scripts/track_megakernel_perf.py layer-fwd --seq-lens 128 512 1024
 """
@@ -390,7 +390,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     decode = sub.add_parser("decode")
-    decode.add_argument("--layers", nargs="+", type=int, default=[8, 12, 24, 36])
+    decode.add_argument("--layers", nargs="+", type=int, default=[8, 12, 24])
     decode.add_argument("--batch", type=int, default=1)
     decode.add_argument("--context-len", type=int, default=128)
     decode.add_argument("--page-size", type=int, default=32768)

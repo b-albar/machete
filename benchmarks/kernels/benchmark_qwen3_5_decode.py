@@ -5,11 +5,11 @@
 Autoregressive decode is deeply memory-bound:
     - Every GEMM is a matrix-vector multiply (M=1 per batch): 1 FLOP/byte
     - Attention reads the entire KV cache: ~1 FLOP/byte
-    - ~31 MB of weights per layer × 36 layers = ~1.1 GB per token
+    - ~31 MB of weights per layer × 24 layers + LM head = ~1.1 GB per token
     - H100 (3.35 TB/s): ~0.33ms pure bandwidth, ~2ms kernel launch overhead
     - Megakernel eliminates ~400 kernel launches → single launch
 
-Architecture (single megakernel, all 36 layers):
+Architecture (single megakernel, all 24 layers):
     Per layer:
         RMSNorm(fused-add) → GEMM(Q) → GEMM(KV packed BSHD)
         → QKNormRope(Q,K) → KV cache update → FlashDecoding(Q, KV_cache[layer])
@@ -50,7 +50,7 @@ except ImportError:
 # Qwen 3.5-0.8B Model Config
 # =============================================================================
 
-NUM_LAYERS = 36
+NUM_LAYERS = 24
 HIDDEN = 1024
 INTERMEDIATE = 3584
 NUM_Q_HEADS = 8
@@ -359,7 +359,7 @@ def allocate_kv_cache(batch, max_seq_len, dtype=torch.bfloat16, device="cuda"):
 
 def sequential_decode_step(x, residual, pos, k_caches, v_caches, weights,
                            num_layers=NUM_LAYERS):
-    """Full-model decode step: 36 layers + final norm + LM head.
+    """Full-model decode step: 24 layers + final norm + LM head.
 
     Args:
         x: (B, S, HIDDEN) — current token embeddings (S=16 for MMA alignment)
@@ -819,14 +819,12 @@ def megakernel_decode_build(batch, pos, k_caches, v_caches, weights,
     qwen_min_tpb = 256 if use_qwen_sm120_ops else 224
     default_tpb = max(qwen_min_tpb, gemm_config.threads_per_block, max_fa_tpb)
     threads_per_block = int(os.environ.get("QWEN_DECODE_THREADS", str(default_tpb)))
-    default_noinline = "1" if use_qwen_sm120_ops else "0"
     config = MegakernelConfig(
         num_sms=int(os.environ["QWEN_DECODE_NUM_SMS"]) if "QWEN_DECODE_NUM_SMS" in os.environ else None,
         threads_per_block=threads_per_block,
         page_size=effective_page_size,
         num_pages=num_pages,
         sync_compute_warps_after_tile=False,
-        noinline=os.environ.get("QWEN_DECODE_NOINLINE", default_noinline) != "0",
         inline_thin_phases=os.environ.get("QWEN_DECODE_INLINE_THIN", "1") != "0",
         loader_idle_sleep_ns=int(os.environ.get("QWEN_DECODE_LOADER_SLEEP", "0")),
         relaxed_global_barriers=os.environ.get("QWEN_DECODE_RELAXED_BARRIER", "1") == "1",

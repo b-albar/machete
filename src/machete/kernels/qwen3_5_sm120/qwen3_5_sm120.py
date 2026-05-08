@@ -37,7 +37,7 @@ from machete.megakernel.ops import (
 )
 
 
-QWEN3_5_NUM_LAYERS = 36
+QWEN3_5_NUM_LAYERS = 24
 QWEN3_5_HIDDEN = 1024
 QWEN3_5_INTERMEDIATE = 3584
 QWEN3_5_NUM_Q_HEADS = 8

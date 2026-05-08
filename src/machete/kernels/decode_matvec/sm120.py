@@ -25,9 +25,11 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx, named_barrier_sync
-from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec, TileRange
 
 
 SM120_DECODE_HIDDEN_DEFAULT = 2048
@@ -71,6 +73,44 @@ def _fp4_e2m1_value(code):
     out = out + cute.arch.fmax((mag - Int32(6)).to(Float32), Float32(0.0))
     sign = Float32(1.0) - (code >> Int32(3)).to(Float32) * Float32(2.0)
     return out * sign
+
+
+@dsl_user_op
+def _nvfp4_byte_ptr_dot2(ptr, offset: Int32, v0: Float32, v1: Float32, scale: Float32, *, loc=None, ip=None) -> Float32:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.F32Type.get(),
+        [
+            ptr.llvm_ptr,
+            Int32(offset).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .u64 addr;\n"
+        ".reg .b8 byte0;\n"
+        ".reg .f16x2 fp4_f16x2;\n"
+        ".reg .f16 weight0_f16, weight1_f16;\n"
+        ".reg .f32 weight0, weight1, acc;\n"
+        "cvt.u64.u32 addr, $2;\n"
+        "add.u64 addr, addr, $1;\n"
+        "ld.global.u8 byte0, [addr];\n"
+        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte0;\n"
+        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
+        "cvt.f32.f16 weight0, weight0_f16;\n"
+        "cvt.f32.f16 weight1, weight1_f16;\n"
+        "mul.rn.f32 acc, weight0, $3;\n"
+        "fma.rn.f32 acc, weight1, $4, acc;\n"
+        "mul.rn.f32 $0, acc, $5;\n"
+        "}\n",
+        "=f,l,r,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(result)
 
 
 class _DecodeMatvecSm120Base(Op):
@@ -122,24 +162,16 @@ class _Nvfp4WeightMixin:
     @cute.jit
     def _dot8_nvfp4_values(self, packed_row, scale_row, k, v0, v1, v2, v3, v4, v5, v6, v7):
         byte_idx = k >> Int32(1)
-        b0 = packed_row[byte_idx].to(Int32) & Int32(255)
-        b1 = packed_row[byte_idx + Int32(1)].to(Int32) & Int32(255)
-        b2 = packed_row[byte_idx + Int32(2)].to(Int32) & Int32(255)
-        b3 = packed_row[byte_idx + Int32(3)].to(Int32) & Int32(255)
         if const_expr(self.group_size == 32):
             scale_idx = k >> Int32(5)
         else:
             scale_idx = k // Int32(self.group_size)
         scale = scale_row[scale_idx].to(Float32)
-        acc = v0 * _fp4_e2m1_value(b0 & Int32(15))
-        acc = acc + v1 * _fp4_e2m1_value(b0 >> Int32(4))
-        acc = acc + v2 * _fp4_e2m1_value(b1 & Int32(15))
-        acc = acc + v3 * _fp4_e2m1_value(b1 >> Int32(4))
-        acc = acc + v4 * _fp4_e2m1_value(b2 & Int32(15))
-        acc = acc + v5 * _fp4_e2m1_value(b2 >> Int32(4))
-        acc = acc + v6 * _fp4_e2m1_value(b3 & Int32(15))
-        acc = acc + v7 * _fp4_e2m1_value(b3 >> Int32(4))
-        return acc * scale
+        acc = _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx, v0, v1, scale)
+        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(1), v2, v3, scale)
+        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(2), v4, v5, scale)
+        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(3), v6, v7, scale)
+        return acc
 
     @cute.jit
     def _dot8_nvfp4(self, a_row, packed_row, scale_row, k):
@@ -1918,6 +1950,10 @@ class FinalRmsTop1LmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
 class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Per-partition final RMS + packed NVFP4 LM-head top-1 partial."""
 
+    pipeline = PipelineSpec.range_capable(
+        range_axis=2,
+        range_end_axis=3,
+    )
     reads = {
         "x": (None, ("B", "S", "K")),
         "norm_weight": (None, ("K",)),
@@ -1938,7 +1974,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
 
     @classmethod
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
+                 group_size=32, tile_range=None, **tensors):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 1)
@@ -1949,7 +1985,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
             raise ValueError("weight_scales G must equal x.K / group_size")
         if tensors["partial_values"].shape != tensors["partial_indices"].shape:
             raise ValueError("partial_values and partial_indices must have the same shape")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
         op.static_dims["page_size"] = page_size
         op.static_dims["eps"] = eps
         op.static_dims["group_size"] = group_size
@@ -2658,6 +2694,7 @@ def schedule_final_nvfp4_sm120(
     page_size=DEFAULT_PAGE_SIZE,
     eps=1e-5,
     group_size=32,
+    final_head_range_block=1,
 ):
     """Schedule final residual plus optional packed NVFP4 LM-head."""
     ops = []
@@ -2677,6 +2714,11 @@ def schedule_final_nvfp4_sm120(
                     partial_values=top_partial_values,
                     partial_indices=top_partial_indices,
                     tile_sizes={"S": seq_len, "P": 1},
+                    tile_range=(
+                        TileRange.coalesced("P", block_size=final_head_range_block)
+                        if final_head_range_block > 1
+                        else None
+                    ),
                     page_size=page_size,
                     eps=eps,
                     group_size=group_size,

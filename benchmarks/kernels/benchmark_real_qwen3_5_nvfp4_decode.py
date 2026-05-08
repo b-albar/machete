@@ -18,7 +18,6 @@ import torch
 
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
-from machete.kernels.decode_matvec.direct_cute_lm_head import get_direct_cute_nvfp4_final
 from machete.kernels.qwen3_5_sm120 import (
     QWEN3_5_REAL_DN_CONV_CHANNELS,
     QWEN3_5_REAL_DN_CONV_KERNEL,
@@ -207,64 +206,6 @@ def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
     )
 
 
-class DirectCuteFinalKernel:
-    def __init__(
-        self,
-        replay_kernel,
-        x,
-        residual,
-        norm_weight,
-        lm_head_nvfp4,
-        block_values,
-        block_indices,
-        top_values,
-        top_indices,
-        *,
-        blocks,
-        threads,
-        group_size,
-    ):
-        self.replay_kernel = replay_kernel
-        self.x = x
-        self.residual = residual
-        self.norm_weight = norm_weight
-        self.lm_head_nvfp4 = lm_head_nvfp4
-        self.block_values = block_values
-        self.block_indices = block_indices
-        self.top_values = top_values
-        self.top_indices = top_indices
-        self.ops = ([] if replay_kernel is None else list(replay_kernel.ops)) + ["direct_cute_nvfp4_lm_head_top1"]
-        self.total_tiles = 0 if replay_kernel is None else replay_kernel.total_tiles
-        self._num_instructions = 0 if replay_kernel is None else replay_kernel._num_instructions
-        self._direct = get_direct_cute_nvfp4_final(
-            hidden_size=QWEN3_5_REAL_HIDDEN,
-            vocab_size=QWEN3_5_REAL_VOCAB,
-            group_size=group_size,
-            blocks=blocks,
-            threads=threads,
-        )
-
-    def compile(self):
-        if self.replay_kernel is not None:
-            self.replay_kernel.compile()
-            self._num_instructions = self.replay_kernel._num_instructions
-
-    def run(self, validate=False):
-        if self.replay_kernel is not None:
-            self.replay_kernel.run(validate=validate, sync=False)
-        self._direct(
-            self.x,
-            self.residual,
-            self.norm_weight,
-            self.lm_head_nvfp4.packed,
-            self.lm_head_nvfp4.scales,
-            self.block_values,
-            self.block_indices,
-            self.top_values,
-            self.top_indices,
-        )
-
-
 def _schedule_body(args, weights, buffers):
     (
         x,
@@ -324,6 +265,7 @@ def _schedule_body(args, weights, buffers):
         fa_num_splits=args.fa_num_splits,
         use_flash_attention=args.use_flash_attention,
         matvec_block=args.matvec_block,
+        final_head_range_block=args.final_head_range_block,
     )
     return schedule
 
@@ -343,11 +285,10 @@ def _make_replay_kernel(args, ops, keep_alive):
 
 def build_kernel(args):
     dtype = torch.bfloat16
-    use_direct_final = args.direct_cute_final_head and not args.no_final
     top_partitions = args.top_partitions
     if top_partitions <= 0:
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        top_partitions = 16 * sm_count if use_direct_final else sm_count
+        top_partitions = sm_count
     weights = (
         _make_dummy_weights(args.context_len, dtype, args.group_size)
         if args.dummy_weights
@@ -378,33 +319,6 @@ def build_kernel(args):
         top_partial_values,
         top_partial_indices,
     ) = buffers
-    if use_direct_final:
-        body_kernel = None
-        keep_alive = []
-        if not args.final_only:
-            body_args = argparse.Namespace(**vars(args))
-            body_args.no_final = True
-            schedule = _schedule_body(body_args, weights, buffers)
-            keep_alive = schedule.keep_alive
-            body_kernel = _make_replay_kernel(args, schedule.ops, [weights, buffers, keep_alive])
-        block_values = top_partial_values.reshape(-1)
-        block_indices = top_partial_indices.reshape(-1)
-        wrapper = DirectCuteFinalKernel(
-            body_kernel,
-            x[-1],
-            residual[-1],
-            weights["final_norm"],
-            weights["lm_head_nvfp4"],
-            block_values,
-            block_indices,
-            top_values,
-            top_indices,
-            blocks=top_partitions,
-            threads=args.direct_cute_threads,
-            group_size=args.group_size,
-        )
-        wrapper._keep_alive = [weights, buffers, keep_alive, body_kernel]
-        return wrapper
     if args.final_only:
         schedule_ops = schedule_qwen3_5_final_nvfp4_sm120(
             x=x[-1],
@@ -419,6 +333,7 @@ def build_kernel(args):
             seq_len=1,
             page_size=args.page_size,
             group_size=args.group_size,
+            final_head_range_block=args.final_head_range_block,
         )
         keep_alive = []
     else:
@@ -455,26 +370,24 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rep", type=int, default=5)
     parser.add_argument("--top-partitions", type=int, default=0)
+    parser.add_argument("--final-head-range-block", type=int, default=1)
     parser.add_argument("--fa-num-splits", type=int, default=0)
     parser.add_argument("--use-flash-attention", action="store_true")
     parser.add_argument("--dummy-weights", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-final", action="store_true")
     parser.add_argument("--final-only", action="store_true")
-    parser.add_argument("--direct-cute-final-head", action="store_true")
-    parser.add_argument("--direct-cute-threads", type=int, default=512)
     args = parser.parse_args()
-    use_direct_final = args.direct_cute_final_head and not args.no_final
 
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {props.name}, SMs={props.multi_processor_count}", flush=True)
     print(
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
-        f"top_partitions={'16*sms' if args.top_partitions <= 0 and use_direct_final else ('sms' if args.top_partitions <= 0 else args.top_partitions)}, "
+        f"top_partitions={'sms' if args.top_partitions <= 0 else args.top_partitions}, "
+        f"final_head_range_block={args.final_head_range_block}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
-        f"direct_cute_final_head={use_direct_final}, "
         f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}",
         flush=True,
     )
