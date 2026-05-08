@@ -76,7 +76,22 @@ def _fp4_e2m1_value(code):
 
 
 @dsl_user_op
-def _nvfp4_byte_ptr_dot2(ptr, offset: Int32, v0: Float32, v1: Float32, scale: Float32, *, loc=None, ip=None) -> Float32:
+def _nvfp4_ptr_dot8(
+    ptr,
+    offset: Int32,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
     from cutlass._mlir import ir
 
     result = llvm.inline_asm(
@@ -86,26 +101,54 @@ def _nvfp4_byte_ptr_dot2(ptr, offset: Int32, v0: Float32, v1: Float32, scale: Fl
             Int32(offset).ir_value(loc=loc, ip=ip),
             Float32(v0).ir_value(loc=loc, ip=ip),
             Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(v4).ir_value(loc=loc, ip=ip),
+            Float32(v5).ir_value(loc=loc, ip=ip),
+            Float32(v6).ir_value(loc=loc, ip=ip),
+            Float32(v7).ir_value(loc=loc, ip=ip),
             Float32(scale).ir_value(loc=loc, ip=ip),
         ],
         "{\n"
         ".reg .u64 addr;\n"
-        ".reg .b8 byte0;\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
         ".reg .f16x2 fp4_f16x2;\n"
         ".reg .f16 weight0_f16, weight1_f16;\n"
         ".reg .f32 weight0, weight1, acc;\n"
         "cvt.u64.u32 addr, $2;\n"
         "add.u64 addr, addr, $1;\n"
         "ld.global.u8 byte0, [addr];\n"
+        "ld.global.u8 byte1, [addr+1];\n"
+        "ld.global.u8 byte2, [addr+2];\n"
+        "ld.global.u8 byte3, [addr+3];\n"
+        "mov.f32 acc, 0f00000000;\n"
         "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte0;\n"
         "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
         "cvt.f32.f16 weight0, weight0_f16;\n"
         "cvt.f32.f16 weight1, weight1_f16;\n"
-        "mul.rn.f32 acc, weight0, $3;\n"
+        "fma.rn.f32 acc, weight0, $3, acc;\n"
         "fma.rn.f32 acc, weight1, $4, acc;\n"
-        "mul.rn.f32 $0, acc, $5;\n"
+        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte1;\n"
+        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
+        "cvt.f32.f16 weight0, weight0_f16;\n"
+        "cvt.f32.f16 weight1, weight1_f16;\n"
+        "fma.rn.f32 acc, weight0, $5, acc;\n"
+        "fma.rn.f32 acc, weight1, $6, acc;\n"
+        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte2;\n"
+        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
+        "cvt.f32.f16 weight0, weight0_f16;\n"
+        "cvt.f32.f16 weight1, weight1_f16;\n"
+        "fma.rn.f32 acc, weight0, $7, acc;\n"
+        "fma.rn.f32 acc, weight1, $8, acc;\n"
+        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte3;\n"
+        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
+        "cvt.f32.f16 weight0, weight0_f16;\n"
+        "cvt.f32.f16 weight1, weight1_f16;\n"
+        "fma.rn.f32 acc, weight0, $9, acc;\n"
+        "fma.rn.f32 acc, weight1, $10, acc;\n"
+        "mul.rn.f32 $0, acc, $11;\n"
         "}\n",
-        "=f,l,r,f,f,f",
+        "=f,l,r,f,f,f,f,f,f,f,f,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -167,11 +210,19 @@ class _Nvfp4WeightMixin:
         else:
             scale_idx = k // Int32(self.group_size)
         scale = scale_row[scale_idx].to(Float32)
-        acc = _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx, v0, v1, scale)
-        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(1), v2, v3, scale)
-        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(2), v4, v5, scale)
-        acc = acc + _nvfp4_byte_ptr_dot2(packed_row.iterator, byte_idx + Int32(3), v6, v7, scale)
-        return acc
+        return _nvfp4_ptr_dot8(
+            packed_row.iterator,
+            byte_idx,
+            v0,
+            v1,
+            v2,
+            v3,
+            v4,
+            v5,
+            v6,
+            v7,
+            scale,
+        )
 
     @cute.jit
     def _dot8_nvfp4(self, a_row, packed_row, scale_row, k):
