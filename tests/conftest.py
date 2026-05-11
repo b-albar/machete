@@ -86,14 +86,12 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
             "test_communicate.py",
             "test_cluster_launch_control.py",
             "test_integration_gpu.py",
-            "test_qwen3_5_prefill.py",
         }:
             markers.append("integration")
         if path.name in {
             "test_communicate.py",
             "test_cluster_launch_control.py",
             "test_integration_gpu.py",
-            "test_qwen3_5_prefill.py",
         }:
             markers.append("slow")
         return tuple(markers)

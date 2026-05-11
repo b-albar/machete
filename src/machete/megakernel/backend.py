@@ -20,12 +20,12 @@ NUM_DMA_WARPS = 3
 PHASE_NAMES = ("load", "compute", "store", "communicate")
 
 
-def _phase_should_noinline(instance, phase_name: str, inline_thin_phases: bool = True) -> bool:
+def _phase_should_noinline(instance, phase_name: str) -> bool:
     """Return whether one phase should stay behind a noinline boundary."""
     policy = getattr(instance, "should_noinline_phase", None)
     if policy is None:
         return True
-    return policy(phase_name, allow_inline_phases=inline_thin_phases)
+    return policy(phase_name)
 
 
 def _get_local_tensor_names(op_cls, tensor_mapping: Dict[str, str]) -> Tuple[str, ...]:
@@ -350,11 +350,7 @@ class HandlerBackend:
     def compile_phase_dispatch_inputs(self, kernel) -> Dict[str, Any]:
         """Compile phase wrappers and synthesize runtime dispatch objects."""
         def phase_should_noinline(instance, phase_name):
-            return _phase_should_noinline(
-                instance,
-                phase_name,
-                inline_thin_phases=kernel.config.inline_thin_phases,
-            )
+            return _phase_should_noinline(instance, phase_name)
 
         return compile_phase_dispatch_inputs(
             self,

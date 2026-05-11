@@ -23,7 +23,9 @@ from machete.megakernel.ops import (
 )
 from machete.megakernel.paged_memory import PipelinePageLayout
 from machete.megakernel.scheduling import (
+    BarrierFormula,
     InstructionStreamBuilder,
+    OverlapTileScheduler,
     TileInstruction,
 )
 
@@ -163,6 +165,33 @@ class _StaticOverwriteScratchOp(Op):
     reads = {}
     writes = {"x": (None, ("N",))}
     tile = ("N",)
+
+
+class _StaticQkvChunkProducerOp(Op):
+    reads = {}
+    writes = {
+        "q": (None, ("O",)),
+        "k_cache": (None, ("O",)),
+    }
+    tile = ("O",)
+
+
+class _StaticQHeadConsumerOp(Op):
+    reads = {"q": (None, ("H",))}
+    writes = {"o": (None, ("H",))}
+    tile = ("H",)
+
+
+class _FullMlpProducerOp(Op):
+    reads = {}
+    writes = {"y": (None, ("B", "S", "O"))}
+    tile = ("B", "S", "O")
+
+
+class _SlicedMlpConsumerOp(Op):
+    reads = {"a": (None, ("B", "S", "K"))}
+    writes = {"z": (None, ("B", "S", "O"))}
+    tile = ("B", "S", "O")
 
 
 class _InvalidStagedLoadLoopOp(Op):
@@ -522,14 +551,14 @@ def test_coalesced_range_instruction_can_use_framework_fast_loop():
 
 
 def test_qwen_final_head_public_api_does_not_expose_scalar_lm_head_variant():
-    import machete.kernels.qwen3_5_sm120 as qwen
+    import machete.kernels.qwen_3_5 as qwen
 
     assert "Qwen3_5FinalRmsLmHeadSm120Op" not in qwen.__all__
     assert "Qwen3_5FinalRmsLmHeadStagedSm120Op" not in qwen.__all__
 
 
 def test_qwen_final_schedule_keeps_lm_head_inside_megakernel_without_scalar_variant():
-    import machete.kernels.qwen3_5_sm120 as qwen
+    import machete.kernels.qwen_3_5 as qwen
     from machete.kernels.rms_norm import RMSNormOp
 
     dtype = torch.bfloat16
@@ -567,7 +596,7 @@ def test_qwen_final_schedule_keeps_lm_head_inside_megakernel_without_scalar_vari
 
 
 def test_qwen_lm_head_rejects_non_divisible_vocab_tile():
-    import machete.kernels.qwen3_5_sm120 as qwen
+    import machete.kernels.qwen_3_5 as qwen
 
     dtype = torch.bfloat16
     h = torch.empty(1, 16, qwen.QWEN3_5_HIDDEN, dtype=dtype)
@@ -588,7 +617,7 @@ def test_qwen_top1_lm_head_matches_torch_small():
     script = r"""
 import torch
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import Qwen3_5Top1LmHeadSm120Op
+from machete.kernels.qwen_3_5.sm120 import Qwen3_5Top1LmHeadSm120Op
 
 torch.manual_seed(17)
 dtype = torch.bfloat16
@@ -629,7 +658,7 @@ torch.testing.assert_close(top_indices, ref_indices.to(torch.int32), rtol=0, ato
 
 
 def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
-    import machete.kernels.qwen3_5_sm120 as qwen
+    import machete.kernels.qwen_3_5 as qwen
 
     dtype = torch.bfloat16
     batch = 1
@@ -719,9 +748,148 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     assert builder._build_wait_info_entry(first_finalize, formulas) == [0, 4]
 
 
+def test_barrier_formula_supports_half_open_tile_range_guard():
+    formula = BarrierFormula(
+        base=17,
+        coeffs=(1, 0, 0, 0, 0),
+        divs=(2, 1, 1, 1, 1),
+        guard_min=4,
+        guard_max=10,
+    )
+
+    assert formula.has_guard
+    assert not formula.is_guarded((3,))
+    assert formula.is_guarded((4,))
+    assert formula.is_guarded((9,))
+    assert not formula.is_guarded((10,))
+    assert formula.compute_index((8,)) == 21
+
+    axis_guard = BarrierFormula(
+        base=0,
+        coeffs=(8, 0, 1, 0, 0),
+        guard_min=4,
+        guard_max=8,
+        guard_coeffs=(0, 0, 1, 0, 0),
+    )
+    assert axis_guard.is_guarded((0, 0, 4))
+    assert axis_guard.is_guarded((1, 0, 4))
+    assert not axis_guard.is_guarded((0, 0, 8))
+
+
+def test_buffer_specific_barrier_aliases_drive_dependency_formulas():
+    producer = ScheduledOp(
+        _StaticQkvChunkProducerOp,
+        tile_counts=(8,),
+        dim_names={"O": 0},
+        tile_sizes={"O": 64},
+        static_dims={
+            "barrier_signal_q_alias_O": "q_group",
+            "barrier_signal_q_tile_size_O": 64,
+        },
+    )
+    consumer = ScheduledOp(
+        _StaticQHeadConsumerOp,
+        tile_counts=(2,),
+        dim_names={"H": 0},
+        tile_sizes={"H": 1},
+        static_dims={
+            "barrier_wait_q_alias_H": "q_group",
+            "barrier_wait_q_tile_size_H": 256,
+        },
+    )
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(producer)
+    builder.add_op(consumer)
+    formulas = builder.get_op_barrier_formulas()
+    signal_formula = formulas[0][1][0]
+    wait_formula = formulas[1][0][0]
+
+    assert signal_formula.compute_index((0,)) == signal_formula.compute_index((3,))
+    assert signal_formula.compute_index((4,)) == signal_formula.compute_index((7,))
+    assert signal_formula.compute_index((0,)) != signal_formula.compute_index((4,))
+    assert wait_formula.compute_index((0,)) == signal_formula.compute_index((0,))
+    assert wait_formula.compute_index((1,)) == signal_formula.compute_index((4,))
+    assert wait_formula.expected == 4
+
+
+def test_last_dim_slice_consumer_waits_on_matching_producer_region():
+    y = torch.empty((1, 1, 8192), dtype=torch.float32)
+    a = y[:, :, 2048:4096]
+    z = torch.empty((1, 1, 2048), dtype=torch.float32)
+
+    producer = _FullMlpProducerOp.schedule(
+        y=y,
+        tile_sizes={"B": 1, "S": 1, "O": 8},
+    )[0]
+    consumer = _SlicedMlpConsumerOp.schedule(
+        a=a,
+        z=z,
+        tile_sizes={"B": 1, "S": 1, "O": 8},
+    )[0]
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(producer)
+    builder.add_op(consumer)
+    formulas = builder.get_op_barrier_formulas()
+    signal_formula = formulas[0][1][0]
+    wait_formula = formulas[1][0][0]
+
+    assert builder.num_barriers == 4
+    assert signal_formula.divs[2] == 256
+    assert wait_formula.expected == 256
+    assert wait_formula.compute_index((0, 0, 0)) == signal_formula.compute_index((0, 0, 256))
+    assert signal_formula.compute_index((0, 0, 255)) != wait_formula.compute_index((0, 0, 0))
+    assert signal_formula.compute_index((0, 0, 511)) == wait_formula.compute_index((0, 0, 0))
+    assert signal_formula.compute_index((0, 0, 512)) != wait_formula.compute_index((0, 0, 0))
+
+
+def test_overlap_scheduler_can_prioritize_newly_ready_consumers():
+    producer = ScheduledOp(
+        _StaticQkvChunkProducerOp,
+        tile_counts=(8,),
+        dim_names={"O": 0},
+        tile_sizes={"O": 64},
+        static_dims={
+            "barrier_signal_q_alias_O": "q_group",
+            "barrier_signal_q_tile_size_O": 64,
+        },
+    )
+    consumer = ScheduledOp(
+        _StaticQHeadConsumerOp,
+        tile_counts=(2,),
+        dim_names={"H": 0},
+        tile_sizes={"H": 1},
+        static_dims={
+            "barrier_wait_q_alias_H": "q_group",
+            "barrier_wait_q_tile_size_H": 256,
+        },
+    )
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(producer)
+    builder.add_op(consumer)
+    instructions = builder.build(
+        scheduler=OverlapTileScheduler(
+            fetch_stride=1,
+            prefer_data_movement=False,
+            prefer_ready_consumers=True,
+        )
+    )
+
+    assert [(instr.op_idx, instr.tiles) for instr in instructions[:6]] == [
+        (0, (0,)),
+        (0, (1,)),
+        (0, (2,)),
+        (0, (3,)),
+        (1, (0,)),
+        (0, (4,)),
+    ]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_fused_rms_add_staged_decode_gemm_matches_torch_small():
-    from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import (
+    from machete.kernels.qwen_3_5.sm120 import (
         Qwen3_5RMSAddStagedDecodeGemmSm120Op,
     )
 
@@ -771,7 +939,7 @@ def test_qwen_ranged_rms_add_decode_matvec_reuses_norm_for_long_ranges():
     script = r"""
 import torch
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import (
+from machete.kernels.qwen_3_5.sm120 import (
     Qwen3_5RMSAddRangedDecodeMatvecSm120Op,
 )
 
@@ -827,7 +995,7 @@ def test_qwen_ranged_rms_add_decode_gemm_matches_torch_long_ranges():
     script = r"""
 import torch
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import (
+from machete.kernels.qwen_3_5.sm120 import (
     Qwen3_5RMSAddRangedDecodeGemmSm120Op,
 )
 
@@ -882,7 +1050,7 @@ torch.testing.assert_close(c.float(), ref, rtol=2e-2, atol=3e-1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 def test_qwen_ranged_rms_add_decode_gemm_rejects_unstable_tile_k():
-    from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import (
+    from machete.kernels.qwen_3_5.sm120 import (
         Qwen3_5RMSAddRangedDecodeGemmSm120Op,
     )
 
@@ -907,14 +1075,14 @@ def test_qwen_ranged_rms_add_decode_gemm_rejects_unstable_tile_k():
 
 
 def test_qwen_decode_gemm_uses_staged_abi():
-    import machete.kernels.qwen3_5_sm120 as qwen
+    import machete.kernels.qwen_3_5 as qwen
 
     assert qwen.Qwen3_5DecodeMatvecGemmSm120Op.pipeline_abi == PipelineABI.op_owned()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_staged_decode_gemm_matches_torch_small():
-    from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import Qwen3_5DecodeMatvecGemmSm120Op
+    from machete.kernels.qwen_3_5.sm120 import Qwen3_5DecodeMatvecGemmSm120Op
 
     torch.manual_seed(3)
     dtype = torch.bfloat16
@@ -945,7 +1113,7 @@ def test_qwen_staged_decode_gemm_matches_torch_small():
 
 
 def test_qwen_ranged_lm_head_matches_torch_small():
-    from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import Qwen3_5RangedLmHeadSm120Op
+    from machete.kernels.qwen_3_5.sm120 import Qwen3_5RangedLmHeadSm120Op
 
     dtype = torch.bfloat16
     h = torch.empty(1, 16, 64, dtype=dtype)
@@ -975,7 +1143,7 @@ def test_qwen_ranged_lm_head_handles_long_coalesced_ranges():
     script = r"""
 import torch
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qwen3_5_sm120.qwen3_5_sm120 import Qwen3_5RangedLmHeadSm120Op
+from machete.kernels.qwen_3_5.sm120 import Qwen3_5RangedLmHeadSm120Op
 
 torch.manual_seed(1)
 dtype = torch.bfloat16

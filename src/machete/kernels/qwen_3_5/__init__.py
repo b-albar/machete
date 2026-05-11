@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Machete Authors
 """SM120-oriented Qwen 3.5 decode ops."""
 
-from .qwen3_5_sm120 import (
+from .sm120 import (
     QWEN3_5_EPS,
     QWEN3_5_DECODE_S,
     QWEN3_5_GATE_UP_TILE,
@@ -29,6 +29,8 @@ from .qwen3_5_sm120 import (
     Qwen3_5RangedLmHeadSm120Op,
     Qwen3_5Top1LmHeadSm120Op,
     Qwen3_5VCacheStoreSm120Op,
+    schedule_decode_layer_sm120,
+    schedule_final_sm120,
     schedule_decode_layer_qwen3_5_sm120,
     schedule_final_qwen3_5_sm120,
 )
@@ -97,6 +99,8 @@ __all__ = [
     "Qwen3_5RangedLmHeadSm120Op",
     "Qwen3_5Top1LmHeadSm120Op",
     "Qwen3_5VCacheStoreSm120Op",
+    "schedule_decode_layer_sm120",
+    "schedule_final_sm120",
     "schedule_decode_layer_qwen3_5_sm120",
     "schedule_final_qwen3_5_sm120",
     "Qwen3_5DeltaNetCoreSm120Op",

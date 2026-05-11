@@ -618,6 +618,32 @@ def is_last_dim_slice_alias(a: TensorMeta, b: TensorMeta) -> bool:
     return a_starts[:-1] == b_starts[:-1]
 
 
+def last_dim_slice_region(full: TensorMeta, view: TensorMeta) -> Optional[Tuple[int, int, int]]:
+    """Return the half-open last-dim region for ``view`` inside ``full``.
+
+    The returned tuple is ``(start, length, full_length)`` in elements.  This is
+    stricter than ``tensor_meta_overlaps`` and is used by the dependency
+    scheduler to map a full-tensor producer to a consumer reading one contiguous
+    innermost-dimension slice.
+    """
+    if not is_last_dim_slice_alias(full, view):
+        return None
+    if full.shape[:-1] != view.shape[:-1]:
+        return None
+
+    full_starts = _decompose_storage_offset(full)
+    view_starts = _decompose_storage_offset(view)
+    if full_starts is None or view_starts is None:
+        return None
+
+    start = view_starts[-1] - full_starts[-1]
+    length = view.shape[-1]
+    full_length = full.shape[-1]
+    if start < 0 or length < 0 or start + length > full_length:
+        return None
+    return start, length, full_length
+
+
 def _flattened_leading_overlap(a: TensorMeta, b: TensorMeta) -> Optional[bool]:
     """Exact overlap for views that differ only by flattening the first 2 axes."""
     if a.storage_ptr != b.storage_ptr:
@@ -1285,6 +1311,8 @@ class Op:
     store_phase: ClassVar[Optional[str]] = None
     communicate_phase: ClassVar[Optional[str]] = None
     inline_phases: ClassVar[Tuple[str, ...]] = ()
+    sync_compute_warps_after_tile: ClassVar[bool] = False
+    uses_smem_page: ClassVar[bool] = True
 
     def __init__(self, **config):
         """Initialize Op instance with compile-time configuration.
@@ -1314,14 +1342,14 @@ class Op:
         self._bind_phase("store", type(self).store_phase)
         self._bind_phase("communicate", type(self).communicate_phase)
 
-    def should_noinline_phase(self, phase_name: str, *, allow_inline_phases: bool = True) -> bool:
+    def should_noinline_phase(self, phase_name: str) -> bool:
         """Return whether a generated wrapper for ``phase_name`` should be noinline.
 
         The framework default is conservative: every phase stays behind a
         noinline boundary. Ops with thin hot-path phase wrappers may opt
         specific phases into inlining via ``inline_phases``.
         """
-        if allow_inline_phases and phase_name in type(self).inline_phases:
+        if phase_name in type(self).inline_phases:
             return False
         return True
 
@@ -1575,6 +1603,7 @@ __all__ = [
     "Op",
     "build_op_config",
     "is_compile_static_dim",
+    "last_dim_slice_region",
     # Scheduling
     "ScheduledOp",
 ]

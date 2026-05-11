@@ -160,11 +160,6 @@ class TestMegakernel:
         assert _phase_should_noinline(DefaultPolicyOp(), "compute")
         assert not _phase_should_noinline(InlineComputeOp(), "compute")
         assert _phase_should_noinline(InlineComputeOp(), "load")
-        assert _phase_should_noinline(
-            InlineComputeOp(),
-            "compute",
-            inline_thin_phases=False,
-        )
 
     def test_migrated_thin_phase_policies(self):
         """Ops that used backend allowlists now declare their own inline phases."""
@@ -176,6 +171,27 @@ class TestMegakernel:
         assert QKNormRopeOp.inline_phases == all_thin
         assert RMSNormOp.inline_phases == all_thin
         assert GLUBwdOp.inline_phases == ("compute",)
+
+    def test_compute_sync_policy_is_op_owned(self):
+        """CTA compute sync is derived from op requirements."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+
+        class DefaultSyncOp(Op):
+            pass
+
+        class SyncOp(Op):
+            sync_compute_warps_after_tile = True
+
+        assert not Megakernel(
+            [ScheduledOp(DefaultSyncOp, tile_counts=(1,))],
+            config=MegakernelConfig(num_sms=1),
+            device="cpu",
+        )._sync_compute_warps_after_tile()
+        assert Megakernel(
+            [ScheduledOp(DefaultSyncOp, tile_counts=(1,)), ScheduledOp(SyncOp, tile_counts=(1,))],
+            config=MegakernelConfig(num_sms=1),
+            device="cpu",
+        )._sync_compute_warps_after_tile()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):

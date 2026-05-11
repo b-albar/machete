@@ -18,7 +18,7 @@ import torch
 
 from machete.megakernel import Megakernel, MegakernelConfig
 from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
-from machete.kernels.qwen3_5_sm120 import (
+from machete.kernels.qwen_3_5 import (
     QWEN3_5_REAL_DN_CONV_CHANNELS,
     QWEN3_5_REAL_DN_CONV_KERNEL,
     QWEN3_5_REAL_DN_NUM_HEADS,
@@ -38,7 +38,7 @@ from machete.kernels.qwen3_5_sm120 import (
     schedule_qwen3_5_final_nvfp4_sm120,
     schedule_qwen3_5_real_nvfp4_decode_sm120,
 )
-from machete.kernels.qwen3_5_sm120.real_nvfp4_ops import QWEN3_5_REAL_DN_KEY_DIM
+from machete.kernels.qwen_3_5.real_nvfp4_ops import QWEN3_5_REAL_DN_KEY_DIM
 
 
 def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> NVFP4Tensor:

@@ -22,6 +22,7 @@ from machete.megakernel.scheduling import (
     TileInstruction,
     TileScheduler,
     BackwardScheduler,
+    OverlapTileScheduler,
 )
 from typing import ClassVar, List
 
@@ -1055,6 +1056,78 @@ class TestSchedulerAPI:
         """TileScheduler base class cannot be instantiated directly."""
         with pytest.raises(TypeError):
             TileScheduler()
+
+    def test_overlap_scheduler_preserves_stride_for_ready_chain_tiles(self):
+        """OverlapTileScheduler should preserve broad producer/consumer waves."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+        ]
+
+    def test_overlap_scheduler_respects_fetch_stride_waves(self):
+        """Stride-aware overlap should not create same-round dependencies."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_NOPOp, tile_counts=(8,))
+
+        instructions = builder.build(scheduler=OverlapTileScheduler(fetch_stride=4))[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (0, 4), (0, 5), (0, 6), (0, 7),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+            (1, 4), (1, 5), (1, 6), (1, 7),
+        ]
+
+    def test_overlap_scheduler_waits_for_many_to_one_dependencies(self):
+        """Many-to-one consumers must wait until all producer tiles have signaled."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            _ProducerOp,
+            tile_counts=(2, 3),
+            dim_names={"batch": 0, "seq": 1},
+        )
+        builder.add_op(
+            _ConsumerOp,
+            tile_counts=(2,),
+            dim_names={"batch": 0},
+        )
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+        positions = {(i.op_idx, i.tiles): pos for pos, i in enumerate(instructions)}
+
+        for batch in range(2):
+            consumer_pos = positions[(1, (batch,))]
+            producer_positions = [
+                positions[(0, (batch, seq))]
+                for seq in range(3)
+            ]
+            assert consumer_pos > max(producer_positions)
+
+    def test_overlap_scheduler_all_tiles_present(self):
+        """OverlapTileScheduler must emit every tile exactly once."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+
+        assert len(instructions) == 12
+        assert {
+            (i.op_idx, i.tiles[0], i.tiles[1])
+            for i in instructions
+        } == {
+            (op_idx, m, n)
+            for op_idx in (0, 1)
+            for m in range(3)
+            for n in range(2)
+        }
 
 
 # =============================================================================

@@ -27,7 +27,7 @@ def test_real_qwen_full_attention_nvfp4_schedule_uses_native_ops():
         RmsAddNormSm120Op,
         RmsGateUpSiluNvfp4Sm120Op,
     )
-    from machete.kernels.qwen3_5_sm120 import (
+    from machete.kernels.qwen_3_5 import (
         Qwen3_5GatedSingleTokenAttentionSm120Op,
         Qwen3_5QGateRopeCacheSm120Op,
         QWEN3_5_REAL_HEAD_DIM,
@@ -110,7 +110,7 @@ def test_real_qwen_full_attention_nvfp4_schedule_uses_native_ops():
 
 
 def test_real_qwen_qkv_rope_cache_postprocess_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import Qwen3_5QkvRopeCacheSm120Op
+    from machete.kernels.qwen_3_5 import Qwen3_5QkvRopeCacheSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     torch.manual_seed(31)
@@ -167,7 +167,7 @@ def test_real_qwen_qkv_rope_cache_postprocess_matches_reference():
 
 
 def test_real_qwen_q_gate_rope_cache_postprocess_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import Qwen3_5QGateRopeCacheSm120Op
+    from machete.kernels.qwen_3_5 import Qwen3_5QGateRopeCacheSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     torch.manual_seed(37)
@@ -244,7 +244,7 @@ def test_real_qwen_q_gate_rope_cache_postprocess_matches_reference():
 
 
 def test_real_qwen_single_token_attention_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import Qwen3_5SingleTokenAttentionSm120Op
+    from machete.kernels.qwen_3_5 import Qwen3_5SingleTokenAttentionSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     torch.manual_seed(19)
@@ -285,7 +285,7 @@ def test_real_qwen_single_token_attention_matches_reference():
 
 
 def test_real_qwen_gated_single_token_attention_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import Qwen3_5GatedSingleTokenAttentionSm120Op
+    from machete.kernels.qwen_3_5 import Qwen3_5GatedSingleTokenAttentionSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     torch.manual_seed(41)
@@ -329,7 +329,7 @@ def test_real_qwen_gated_single_token_attention_matches_reference():
 
 
 def test_real_qwen_flash_decode_attention_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import schedule_qwen3_5_flash_decode_attention_sm120
+    from machete.kernels.qwen_3_5 import schedule_qwen3_5_flash_decode_attention_sm120
     from machete.megakernel import Megakernel, MegakernelConfig
 
     torch.manual_seed(23)
@@ -382,7 +382,7 @@ def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
         RmsMatvecNvfp4Sm120Op,
         RmsReadMatvecNvfp4Sm120Op,
     )
-    from machete.kernels.qwen3_5_sm120 import (
+    from machete.kernels.qwen_3_5 import (
         Qwen3_5DeltaNetCoreSm120Op,
         QWEN3_5_REAL_HIDDEN,
         QWEN3_5_REAL_INTERMEDIATE,
@@ -464,7 +464,7 @@ def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
 
 
 def test_real_qwen_deltanet_core_matches_reference():
-    from machete.kernels.qwen3_5_sm120 import Qwen3_5DeltaNetCoreSm120Op
+    from machete.kernels.qwen_3_5 import Qwen3_5DeltaNetCoreSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     major, _minor = torch.cuda.get_device_capability()
@@ -669,7 +669,7 @@ def test_final_nvfp4_partial_top1_fuses_residual_add():
 
 
 def test_real_qwen_full_decode_entry_is_explicit_about_required_buffers():
-    from machete.kernels.qwen3_5_sm120 import schedule_qwen3_5_real_nvfp4_decode_sm120
+    from machete.kernels.qwen_3_5 import schedule_qwen3_5_real_nvfp4_decode_sm120
 
     with pytest.raises(TypeError):
         schedule_qwen3_5_real_nvfp4_decode_sm120()

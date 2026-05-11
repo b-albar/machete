@@ -30,7 +30,7 @@ from .instruction_layout import (
     INSTR_TILE_4,
     INSTRUCTION_WORDS,
 )
-from .ops import MAX_TILE_DIMS, Op, ScheduledOp, tensor_meta_overlaps
+from .ops import MAX_TILE_DIMS, Op, ScheduledOp, last_dim_slice_region, tensor_meta_overlaps
 
 
 # =============================================================================
@@ -54,8 +54,9 @@ class BarrierFormula:
         coeffs: Per-axis multipliers for tile indices (up to MAX_TILE_DIMS)
         divs: Per-axis divisors for tile indices (for tile size ratios, default 1)
         expected: For wait deps: how many signals to wait for (default 1)
-        guard_max: Only execute when the computed linear index is less than
-            this value. Defaults to NO_GUARD (always passes).
+        guard_min/guard_max: Only execute when the computed linear index is
+            within this half-open interval. Defaults to [0, NO_GUARD), which
+            always passes for normal tile coordinates.
     """
 
     # Sentinel: guard_max value that always passes (larger than any tile count)
@@ -66,7 +67,9 @@ class BarrierFormula:
     divs: Tuple[int, ...] = (1,) * MAX_TILE_DIMS
     offset: int = 0
     expected: int = 1
+    guard_min: int = 0
     guard_max: int = NO_GUARD
+    guard_coeffs: Optional[Tuple[int, ...]] = None
 
     def compute_index(self, tiles: Tuple[int, ...]) -> int:
         """Compute barrier index for a given tile (host-side, for testing)."""
@@ -79,13 +82,14 @@ class BarrierFormula:
     def is_guarded(self, tiles: Tuple[int, ...]) -> bool:
         """Check if the guard passes for a given tile (host-side, for testing)."""
         padded = tuple(tiles) + (0,) * (MAX_TILE_DIMS - len(tiles))
-        linear = sum(self.coeffs[i] * padded[i] for i in range(MAX_TILE_DIMS))
-        return linear < self.guard_max
+        guard_coeffs = self.guard_coeffs if self.guard_coeffs is not None else self.coeffs
+        linear = sum(guard_coeffs[i] * padded[i] for i in range(MAX_TILE_DIMS))
+        return self.guard_min <= linear < self.guard_max
 
     @property
     def has_guard(self) -> bool:
         """Whether this formula has an active guard (not NO_GUARD)."""
-        return self.guard_max != self.NO_GUARD
+        return self.guard_min != 0 or self.guard_max != self.NO_GUARD
 
 
 # =============================================================================
@@ -183,6 +187,28 @@ class _DepEdge:
     producer_idx: int
     consumer_idx: int
     kind: str  # "one_to_one", "many_to_one", "one_to_many"
+    producer_buffer: str = ""
+    consumer_buffer: str = ""
+
+
+@dataclass(frozen=True)
+class _DepPair:
+    """Resolved logical dependency between two scheduled ops."""
+
+    producer_idx: int
+    consumer_idx: int
+    producer_buffer: str = ""
+    consumer_buffer: str = ""
+
+
+@dataclass(frozen=True)
+class _LastDimRegionDep:
+    """Producer-only tiled dimension grouped by a consumer's last-dim slice."""
+
+    producer_dim: str
+    group_index: int
+    group_count: int
+    group_tiles: int
 
 # =============================================================================
 # Tile Schedulers
@@ -426,6 +452,201 @@ class BackwardScheduler(TileScheduler):
         return _depth_sorted_instructions(op_records, depth)
 
 
+class OverlapTileScheduler(TileScheduler):
+    """Readiness-aware scheduler for load/compute/store overlap.
+
+    ``BackwardScheduler`` emits broad op waves: all producer tiles, then their
+    consumers.  That minimizes runtime waits but can leave the persistent
+    loader/store/compute pipeline with long stretches of similar work.
+
+    This scheduler simulates the compiled barrier formulas on the host and
+    emits only tiles whose waits are already satisfied. It schedules ready work
+    in fetch-stride-sized waves so persistent CTAs do not receive same-round
+    producer/consumer dependencies, while still allowing data-movement-heavy
+    ops to be prioritized within each safe wave.
+    """
+
+    def __init__(
+        self,
+        *,
+        fetch_stride: Optional[int] = None,
+        prefer_data_movement: bool = True,
+        prefer_ready_consumers: bool = False,
+    ):
+        self.fetch_stride = fetch_stride
+        self.prefer_data_movement = prefer_data_movement
+        self.prefer_ready_consumers = prefer_ready_consumers
+
+    def bind_num_blocks(self, num_blocks: int) -> None:
+        """Bind the runtime instruction fetch stride used by persistent CTAs."""
+        if self.fetch_stride is None:
+            self.fetch_stride = max(1, int(num_blocks))
+
+    @staticmethod
+    def _phase_overridden(op_cls: Type[Op], phase_name: str) -> bool:
+        if getattr(op_cls, f"{phase_name}_phase", None) is not None:
+            return True
+        return getattr(op_cls, phase_name, None) is not getattr(Op, phase_name, None)
+
+    @classmethod
+    def _resource_score(cls, op: ScheduledOp) -> int:
+        op_cls = op.op_cls
+        score = 0
+        if getattr(op_cls, "pipeline", None) is not None:
+            score += 3
+        if cls._phase_overridden(op_cls, "load"):
+            score += 2
+        if cls._phase_overridden(op_cls, "store"):
+            score += 1
+        if cls._phase_overridden(op_cls, "communicate"):
+            score += 1
+        if getattr(op_cls, "_TMA_LOADS", set()) or getattr(op_cls, "_TMA_COMPUTE_LOADS", set()):
+            score += 1
+        if (
+            getattr(op_cls, "_TMA_STORES", set())
+            or getattr(op_cls, "_TMA_REDUCE_STORES", set())
+            or getattr(op_cls, "_PEER_STORES", set())
+            or getattr(op_cls, "_PEER_REDUCE_STORES", set())
+        ):
+            score += 1
+        return score
+
+    @staticmethod
+    def _waits_ready(
+        instr: TileInstruction,
+        wait_formulas: List[BarrierFormula],
+        barrier_counts: Dict[int, int],
+    ) -> bool:
+        for formula in wait_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                continue
+            barrier_idx = formula.compute_index(instr.tiles)
+            if barrier_counts.get(barrier_idx, 0) < formula.expected:
+                return False
+        return True
+
+    @staticmethod
+    def _signal(
+        instr: TileInstruction,
+        signal_formulas: List[BarrierFormula],
+        barrier_counts: Dict[int, int],
+    ) -> None:
+        for formula in signal_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                continue
+            barrier_idx = formula.compute_index(instr.tiles)
+            barrier_counts[barrier_idx] = barrier_counts.get(barrier_idx, 0) + 1
+
+    def _priority(
+        self,
+        *,
+        op_idx: int,
+        tile_idx: int,
+        pos: int,
+        depths: List[int],
+        resource_scores: List[int],
+    ) -> Tuple[int, int, int, int, int]:
+        resource_score = resource_scores[op_idx] if self.prefer_data_movement else 0
+        depth_score = -depths[op_idx] if self.prefer_ready_consumers else depths[op_idx]
+        return (
+            depth_score,
+            -op_idx,
+            resource_score,
+            -tile_idx,
+            -pos,
+        )
+
+    def _schedule_stride_waves(
+        self,
+        candidates: List[Tuple[int, int, TileInstruction]],
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+        depths: List[int],
+        resource_scores: List[int],
+        fetch_stride: int,
+    ) -> List[TileInstruction]:
+        scheduled: List[TileInstruction] = []
+        barrier_counts: Dict[int, int] = {}
+
+        while candidates:
+            ready = []
+            for pos, (op_idx, tile_idx, instr) in enumerate(candidates):
+                wait_formulas = formulas.get(op_idx, ([], []))[0]
+                if self._waits_ready(instr, wait_formulas, barrier_counts):
+                    ready.append((
+                        *self._priority(
+                            op_idx=op_idx,
+                            tile_idx=tile_idx,
+                            pos=pos,
+                            depths=depths,
+                            resource_scores=resource_scores,
+                        ),
+                        pos,
+                    ))
+
+            if not ready:
+                raise RuntimeError(
+                    "OverlapTileScheduler could not find a ready tile. "
+                    "This usually indicates a cyclic or unsatisfied dependency graph."
+                )
+
+            ready.sort(reverse=True)
+            selected = ready[:fetch_stride]
+            selected_positions = [entry[-1] for entry in selected]
+            selected_records = [(pos, candidates[pos]) for pos in selected_positions]
+
+            # Remove after recording so priority order is independent of index
+            # shifts. Signals are applied after selecting the whole wave; this
+            # prevents same-fetch-round dependencies from being introduced.
+            for pos in sorted(selected_positions, reverse=True):
+                candidates.pop(pos)
+
+            for _pos, (op_idx, _tile_idx, instr) in selected_records:
+                scheduled.append(instr)
+            for _pos, (op_idx, _tile_idx, instr) in selected_records:
+                signal_formulas = formulas.get(op_idx, ([], []))[1]
+                self._signal(instr, signal_formulas, barrier_counts)
+
+        return scheduled
+
+    def schedule_with_formulas(
+        self,
+        op_records: List["_OpRecord"],
+        edges: List["_DepEdge"],
+        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
+    ) -> List[TileInstruction]:
+        if not op_records:
+            return []
+
+        depths = _compute_op_depths(len(op_records), edges)
+        resource_scores = [self._resource_score(rec.op) for rec in op_records]
+        candidates: List[Tuple[int, int, TileInstruction]] = []
+        for rec in op_records:
+            for tile_idx, tile in enumerate(rec.tiles):
+                candidates.append((rec.op_idx, tile_idx, TileInstruction(rec.op_idx, tile)))
+
+        fetch_stride = max(1, int(self.fetch_stride or 1))
+        return self._schedule_stride_waves(
+            candidates,
+            formulas,
+            depths,
+            resource_scores,
+            fetch_stride,
+        )
+
+    def schedule(
+        self,
+        op_records: List["_OpRecord"],
+        consumer_deps: Dict[int, List["_DepEdge"]],
+        edges: List["_DepEdge"],
+    ) -> List[TileInstruction]:
+        """Fallback when barrier formulas are unavailable.
+
+        ``InstructionStreamBuilder`` calls ``schedule_with_formulas`` for this
+        scheduler.  This method keeps the abstract interface complete.
+        """
+        return BackwardScheduler().schedule(op_records, consumer_deps, edges)
+
+
 # =============================================================================
 # Instruction Stream Builder
 # =============================================================================
@@ -661,6 +882,29 @@ class InstructionStreamBuilder:
                             tensor_ptr_deps[(cons_rec.op_idx, cons_buf)] = prod_rec.op_idx
         return tensor_ptr_deps
 
+    def _find_producer_buffer(
+        self,
+        prod_idx: int,
+        consumer: ScheduledOp,
+        consumer_buf: str,
+    ) -> str:
+        """Return the producer output buffer that backs a consumer input."""
+        prod = self._op_records[prod_idx].op
+        if consumer_buf in prod.op_cls.OUTPUTS:
+            prod_ptr = prod.tensor_ptrs.get(consumer_buf)
+            cons_ptr = consumer.tensor_ptrs.get(consumer_buf)
+            if prod_ptr is None or cons_ptr is None or prod_ptr == cons_ptr:
+                return consumer_buf
+
+        cons_meta = consumer.tensor_metas.get(consumer_buf)
+        if cons_meta is not None:
+            for prod_buf in prod.op_cls.OUTPUTS:
+                prod_meta = prod.tensor_metas.get(prod_buf)
+                if prod_meta is not None and tensor_meta_overlaps(prod_meta, cons_meta):
+                    return prod_buf
+
+        return consumer_buf
+
     def _find_producer(
         self,
         rec: "_OpRecord",
@@ -712,10 +956,10 @@ class InstructionStreamBuilder:
         self,
         buffer_producers: Dict[str, int],
         tensor_ptr_deps: Dict[Tuple[int, str], int],
-    ) -> List[Tuple[int, int]]:
+    ) -> List[_DepPair]:
         """Resolve ordered op pairs for RAW plus shared-storage anti-dependencies."""
-        pairs: List[Tuple[int, int]] = []
-        seen: Set[Tuple[int, int]] = set()
+        pairs: List[_DepPair] = []
+        seen: Set[Tuple[int, int, str, str]] = set()
         raw_pairs: Set[Tuple[int, int]] = set()
 
         # RAW edges from declared inputs.
@@ -724,11 +968,19 @@ class InstructionStreamBuilder:
                 prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
                 if prod_idx is None:
                     continue
-                pair = (prod_idx, rec.op_idx)
-                if pair not in seen:
-                    seen.add(pair)
-                    raw_pairs.add(pair)
-                    pairs.append(pair)
+                prod_buf = self._find_producer_buffer(prod_idx, rec.op, buf)
+                seen_key = (prod_idx, rec.op_idx, prod_buf, buf)
+                if seen_key not in seen:
+                    seen.add(seen_key)
+                    raw_pairs.add((prod_idx, rec.op_idx))
+                    pairs.append(
+                        _DepPair(
+                            producer_idx=prod_idx,
+                            consumer_idx=rec.op_idx,
+                            producer_buffer=prod_buf,
+                            consumer_buffer=buf,
+                        )
+                    )
 
                 # Split-K / row-parallel style reductions have multiple
                 # associative writers for one logical tensor. The latest writer
@@ -744,11 +996,18 @@ class InstructionStreamBuilder:
                                 continue
                             cand_meta = cand.op.tensor_metas.get(cand_name)
                             if cand_meta is not None and tensor_meta_overlaps(cand_meta, cons_meta):
-                                pair = (cand_idx, rec.op_idx)
-                                if pair not in seen:
-                                    seen.add(pair)
-                                    raw_pairs.add(pair)
-                                    pairs.append(pair)
+                                seen_key = (cand_idx, rec.op_idx, cand_name, buf)
+                                if seen_key not in seen:
+                                    seen.add(seen_key)
+                                    raw_pairs.add((cand_idx, rec.op_idx))
+                                    pairs.append(
+                                        _DepPair(
+                                            producer_idx=cand_idx,
+                                            consumer_idx=rec.op_idx,
+                                            producer_buffer=cand_name,
+                                            consumer_buffer=buf,
+                                        )
+                                    )
                                 added_reduce = True
                         if added_reduce:
                             continue
@@ -765,16 +1024,19 @@ class InstructionStreamBuilder:
                 for cand_idx in range(rec.op_idx - 1, -1, -1):
                     cand = self._op_records[cand_idx]
                     matched = False
+                    cand_buf = ""
                     for cand_name in cand.op.op_cls.INPUTS:
                         cand_meta = cand.op.tensor_metas.get(cand_name)
                         if cand_meta is not None and tensor_meta_overlaps(cand_meta, out_meta):
                             matched = True
+                            cand_buf = cand_name
                             break
                     if not matched:
                         for cand_name in cand.op.op_cls.OUTPUTS:
                             cand_meta = cand.op.tensor_metas.get(cand_name)
                             if cand_meta is not None and tensor_meta_overlaps(cand_meta, out_meta):
                                 matched = True
+                                cand_buf = cand_name
                                 break
                     if matched:
                         # Atomic-reduce stores to the same output are
@@ -793,18 +1055,25 @@ class InstructionStreamBuilder:
                             for cand_name in cand.op.op_cls.OUTPUTS
                         ):
                             continue
-                        pair = (cand_idx, rec.op_idx)
-                        if pair not in seen:
-                            seen.add(pair)
-                            pairs.append(pair)
+                        seen_key = (cand_idx, rec.op_idx, cand_buf, out_name)
+                        if seen_key not in seen:
+                            seen.add(seen_key)
+                            pairs.append(
+                                _DepPair(
+                                    producer_idx=cand_idx,
+                                    consumer_idx=rec.op_idx,
+                                    producer_buffer=cand_buf,
+                                    consumer_buffer=out_name,
+                                )
+                            )
 
         return self._transitively_reduce_dep_pairs(pairs, preserve=raw_pairs)
 
     @staticmethod
     def _transitively_reduce_dep_pairs(
-        pairs: List[Tuple[int, int]],
+        pairs: List[_DepPair],
         preserve: Optional[Set[Tuple[int, int]]] = None,
-    ) -> List[Tuple[int, int]]:
+    ) -> List[_DepPair]:
         """Remove dependency pairs already implied by another op-level path.
 
         Shared-storage anti-dependencies can connect a later writer to every
@@ -819,7 +1088,8 @@ class InstructionStreamBuilder:
         preserve = preserve or set()
 
         adjacency: Dict[int, Set[int]] = {}
-        for src, dst in pairs:
+        for pair in pairs:
+            src, dst = pair.producer_idx, pair.consumer_idx
             adjacency.setdefault(src, set()).add(dst)
 
         def has_alternate_path(src: int, dst: int) -> bool:
@@ -836,9 +1106,10 @@ class InstructionStreamBuilder:
             return False
 
         return [
-            (src, dst)
-            for src, dst in pairs
-            if (src, dst) in preserve or not has_alternate_path(src, dst)
+            pair
+            for pair in pairs
+            if (pair.producer_idx, pair.consumer_idx) in preserve
+            or not has_alternate_path(pair.producer_idx, pair.consumer_idx)
         ]
 
     def _resolve_dep_edges(self) -> List[_DepEdge]:
@@ -857,7 +1128,9 @@ class InstructionStreamBuilder:
         tensor_ptr_deps = self._build_tensor_ptr_deps()
 
         edges: List[_DepEdge] = []
-        for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+        for dep in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+            prod_idx = dep.producer_idx
+            cons_idx = dep.consumer_idx
             producer = self._op_records[prod_idx]
             consumer = self._op_records[cons_idx]
             p_dims = set(producer.op.dim_names.keys())
@@ -876,6 +1149,8 @@ class InstructionStreamBuilder:
                 producer_idx=prod_idx,
                 consumer_idx=cons_idx,
                 kind=kind,
+                producer_buffer=dep.producer_buffer,
+                consumer_buffer=dep.consumer_buffer,
             ))
 
         return edges
@@ -954,13 +1229,54 @@ class InstructionStreamBuilder:
 
         return formulas, barrier_counter
 
-    def _canonical_dim_map(self, op: ScheduledOp, role: str) -> Dict[str, str]:
+    @staticmethod
+    def _buffer_static_keys(prefix: str, role: str, buffer_name: str, suffix: str) -> Tuple[str, ...]:
+        if buffer_name:
+            return (
+                f"{prefix}_{role}_{buffer_name}_{suffix}",
+                f"{prefix}_{buffer_name}_{role}_{suffix}",
+            )
+        return ()
+
+    def _static_dim_lookup(
+        self,
+        op: ScheduledOp,
+        *,
+        prefix: str,
+        role: str,
+        buffer_name: str,
+        suffix: str,
+        fallback,
+    ):
+        for key in self._buffer_static_keys(prefix, role, buffer_name, suffix):
+            if key in op.static_dims:
+                return op.static_dims[key]
+        return op.static_dims.get(f"{prefix}_{role}_{suffix}", fallback)
+
+    def _canonical_dim_map(self, op: ScheduledOp, role: str, buffer_name: str = "") -> Dict[str, str]:
         """Map role-specific canonical dimension names to original dim names."""
         canon_to_orig = {}
+        declared_dims = None
+        if buffer_name:
+            meta = op.tensor_metas.get(buffer_name)
+            if meta is not None:
+                declared_dims = set(meta.declared_dims)
         for dim_name in op.dim_names:
-            canonical_name = op.static_dims.get(
-                f"barrier_{role}_alias_{dim_name}",
-                op.dim_aliases.get(dim_name, dim_name),
+            has_explicit_alias = dim_name in op.dim_aliases
+            suffix = f"alias_{dim_name}"
+            if any(key in op.static_dims for key in self._buffer_static_keys("barrier", role, buffer_name, suffix)):
+                has_explicit_alias = True
+            if f"barrier_{role}_{suffix}" in op.static_dims:
+                has_explicit_alias = True
+            if declared_dims is not None and dim_name not in declared_dims and not has_explicit_alias:
+                continue
+            canonical_name = self._static_dim_lookup(
+                op,
+                prefix="barrier",
+                role=role,
+                buffer_name=buffer_name,
+                suffix=f"alias_{dim_name}",
+                fallback=op.dim_aliases.get(dim_name, dim_name),
             )
             canon_to_orig[canonical_name] = dim_name
         return canon_to_orig
@@ -969,10 +1285,12 @@ class InstructionStreamBuilder:
         self,
         producer: ScheduledOp,
         consumer: ScheduledOp,
+        producer_buffer: str = "",
+        consumer_buffer: str = "",
     ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
         """Resolve shared and producer-only dimensions between two ops."""
-        producer_dims = self._canonical_dim_map(producer, "signal")
-        consumer_dims = self._canonical_dim_map(consumer, "wait")
+        producer_dims = self._canonical_dim_map(producer, "signal", producer_buffer)
+        consumer_dims = self._canonical_dim_map(consumer, "wait", consumer_buffer)
         shared_canonical = set(producer_dims) & set(consumer_dims)
         producer_only = set(producer_dims) - shared_canonical
         shared_pairs = [
@@ -987,22 +1305,39 @@ class InstructionStreamBuilder:
         producer: ScheduledOp,
         consumer: ScheduledOp,
         shared_pairs: List[Tuple[str, str, str]],
+        producer_buffer: str = "",
+        consumer_buffer: str = "",
     ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
         """Filter shared dims down to those representable by BarrierFormula."""
         incompatible_dims = []
         compatible_pairs = []
 
         for canonical_name, producer_dim, consumer_dim in shared_pairs:
-            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal")
-            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait")
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer)
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer)
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            producer_tiles = producer.tiles_for_axis(producer_axis)
-            consumer_tiles = consumer.tiles_for_axis(consumer_axis)
-            producer_group_count = producer.static_dims.get(
-                f"barrier_group_count_{producer_dim}"
+            producer_tiles = self._barrier_axis_tile_span(
+                producer,
+                producer_dim,
+                "signal",
+                producer_buffer,
+                producer.tiles_for_axis(producer_axis),
             )
-            consumer_offset = self._barrier_index_offset(consumer, consumer_dim, "wait")
+            consumer_tiles = self._barrier_axis_tile_span(
+                consumer,
+                consumer_dim,
+                "wait",
+                consumer_buffer,
+                consumer.tiles_for_axis(consumer_axis),
+            )
+            producer_group_count = self._barrier_group_count(
+                producer,
+                producer_dim,
+                "signal",
+                producer_buffer,
+            )
+            consumer_offset = self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer)
 
             if (
                 producer_tile_size != consumer_tile_size
@@ -1045,6 +1380,8 @@ class InstructionStreamBuilder:
         consumer: ScheduledOp,
         shared_pairs: List[Tuple[str, str, str]],
         producer_only_dims: List[str],
+        producer_buffer: str = "",
+        consumer_buffer: str = "",
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
         """Compute divisor vectors plus expected/barrier counts for a dependency edge."""
         producer_divs = [1] * MAX_TILE_DIMS
@@ -1054,8 +1391,8 @@ class InstructionStreamBuilder:
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal")
-            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait")
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer)
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer)
             if producer_tile_size > consumer_tile_size:
                 consumer_divs[consumer_axis] = producer_tile_size // consumer_tile_size
             elif consumer_tile_size > producer_tile_size:
@@ -1066,11 +1403,17 @@ class InstructionStreamBuilder:
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            producer_group_count = producer.static_dims.get(
-                f"barrier_group_count_{producer_dim}"
+            producer_group_count = self._barrier_group_count(
+                producer,
+                producer_dim,
+                "signal",
+                producer_buffer,
             )
-            consumer_group_count = consumer.static_dims.get(
-                f"barrier_group_count_{consumer_dim}"
+            consumer_group_count = self._barrier_group_count(
+                consumer,
+                consumer_dim,
+                "wait",
+                consumer_buffer,
             )
             if producer_group_count is not None:
                 num_barriers *= int(producer_group_count)
@@ -1078,8 +1421,20 @@ class InstructionStreamBuilder:
                 num_barriers *= int(consumer_group_count)
             else:
                 num_barriers *= min(
-                    producer.tiles_for_axis(producer_axis),
-                    consumer.tiles_for_axis(consumer_axis),
+                    self._barrier_axis_tile_span(
+                        producer,
+                        producer_dim,
+                        "signal",
+                        producer_buffer,
+                        producer.tiles_for_axis(producer_axis),
+                    ),
+                    self._barrier_axis_tile_span(
+                        consumer,
+                        consumer_dim,
+                        "wait",
+                        consumer_buffer,
+                        consumer.tiles_for_axis(consumer_axis),
+                    ),
                 )
 
         if producer_only_dims:
@@ -1116,40 +1471,284 @@ class InstructionStreamBuilder:
             consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
         return tuple(producer_coeffs), tuple(consumer_coeffs)
 
-    def _barrier_tile_size(self, op: ScheduledOp, dim: str, role: str) -> int:
+    def _barrier_tile_size(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "") -> int:
         """Return role-specific tile size used only for barrier index mapping."""
         return int(
-            op.static_dims.get(
-                f"barrier_{role}_tile_size_{dim}",
-                op.static_dims.get(
+            self._static_dim_lookup(
+                op,
+                prefix="barrier",
+                role=role,
+                buffer_name=buffer_name,
+                suffix=f"tile_size_{dim}",
+                fallback=op.static_dims.get(
                     f"barrier_tile_size_{dim}",
                     op.tile_sizes.get(dim, 1),
                 ),
             )
         )
 
-    def _barrier_index_offset(self, op: ScheduledOp, dim: str, role: str) -> int:
+    def _barrier_index_offset(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "") -> int:
         """Return role-specific barrier index offset for packed/subset views."""
         return int(
-            op.static_dims.get(
-                f"barrier_{role}_index_offset_{dim}",
-                op.static_dims.get(f"barrier_index_offset_{dim}", 0),
+            self._static_dim_lookup(
+                op,
+                prefix="barrier",
+                role=role,
+                buffer_name=buffer_name,
+                suffix=f"index_offset_{dim}",
+                fallback=op.static_dims.get(f"barrier_index_offset_{dim}", 0),
             )
         )
+
+    def _barrier_group_count(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = ""):
+        value = self._static_dim_lookup(
+            op,
+            prefix="barrier",
+            role=role,
+            buffer_name=buffer_name,
+            suffix=f"group_count_{dim}",
+            fallback=op.static_dims.get(f"barrier_group_count_{dim}"),
+        )
+        return None if value is None else int(value)
+
+    def _barrier_guard_bound(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        bound: str,
+        fallback: int,
+    ) -> int:
+        return int(
+            self._static_dim_lookup(
+                op,
+                prefix="barrier",
+                role=role,
+                buffer_name=buffer_name,
+                suffix=f"guard_{bound}_{dim}",
+                fallback=fallback,
+            )
+        )
+
+    def _has_barrier_guard_bound(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        bound: str,
+    ) -> bool:
+        suffix = f"guard_{bound}_{dim}"
+        if any(key in op.static_dims for key in self._buffer_static_keys("barrier", role, buffer_name, suffix)):
+            return True
+        return f"barrier_{role}_{suffix}" in op.static_dims
+
+    def _barrier_axis_tile_span(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        fallback: int,
+    ) -> int:
+        guard_min = self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0)
+        guard_max = self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD)
+        if guard_min == 0 and guard_max == BarrierFormula.NO_GUARD:
+            return fallback
+        return max(0, min(guard_max, fallback) - max(0, guard_min))
+
+    def _barrier_formula_guard(
+        self,
+        op: ScheduledOp,
+        role: str,
+        buffer_name: str,
+        shared_pairs: List[Tuple[str, str, str]],
+        pair_index: int,
+    ) -> Tuple[int, int, Optional[Tuple[int, ...]]]:
+        if not shared_pairs:
+            return 0, BarrierFormula.NO_GUARD, None
+        mins = []
+        maxs = []
+        guard_coeffs = [0] * MAX_TILE_DIMS
+        has_axis_guard = False
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            dim = producer_dim if pair_index == 1 else consumer_dim
+            mins.append(self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0))
+            maxs.append(self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD))
+            if (
+                self._has_barrier_guard_bound(op, dim, role, buffer_name, "min")
+                or self._has_barrier_guard_bound(op, dim, role, buffer_name, "max")
+            ):
+                guard_coeffs[op.dim_names[dim]] = 1
+                has_axis_guard = True
+        guard_min = max(mins) if mins else 0
+        guard_max = min(maxs) if maxs else BarrierFormula.NO_GUARD
+        return guard_min, guard_max, tuple(guard_coeffs) if has_axis_guard else None
 
     def _barrier_formula_offsets(
         self,
         producer: ScheduledOp,
         consumer: ScheduledOp,
         shared_pairs: List[Tuple[str, str, str]],
+        producer_buffer: str = "",
+        consumer_buffer: str = "",
     ) -> Tuple[int, int]:
         """Compute optional constant offsets for shared-dim barrier mappings."""
         producer_offset = 0
         consumer_offset = 0
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
-            producer_offset += self._barrier_index_offset(producer, producer_dim, "signal")
-            consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait")
+            producer_offset += self._barrier_index_offset(producer, producer_dim, "signal", producer_buffer)
+            consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer)
         return producer_offset, consumer_offset
+
+    def _last_dim_region_dep(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        producer_buffer: str,
+        consumer_buffer: str,
+        producer_only_dims: List[str],
+    ) -> Optional[_LastDimRegionDep]:
+        """Detect full-producer to sliced-consumer dependencies.
+
+        This covers the decode MLP pattern where an up/gate op writes
+        ``y[B,S,O]`` and each down op reads a contiguous ``a[B,S,K]`` view of
+        that storage.  The consumer has no tile axis for that input ``K`` dim,
+        so ordinary shared-dim formulas collapse all producer ``O`` tiles.  If
+        the slice boundaries align with producer barrier tiles, we can group
+        producer signals by region and let the consumer wait on only its group.
+        """
+        prod_meta = producer.tensor_metas.get(producer_buffer)
+        cons_meta = consumer.tensor_metas.get(consumer_buffer)
+        if prod_meta is None or cons_meta is None:
+            return None
+        if not prod_meta.declared_dims or not cons_meta.declared_dims:
+            return None
+
+        producer_dim = prod_meta.declared_dims[-1]
+        consumer_dim = cons_meta.declared_dims[-1]
+        if producer_dim not in producer_only_dims:
+            return None
+        if producer_dim not in producer.dim_names:
+            return None
+        if consumer_dim in consumer.dim_names:
+            return None
+
+        region = last_dim_slice_region(prod_meta, cons_meta)
+        if region is None:
+            return None
+        slice_start, slice_len, full_len = region
+        if slice_len <= 0 or full_len <= 0 or full_len % slice_len != 0:
+            return None
+
+        producer_tile_size = self._barrier_tile_size(
+            producer,
+            producer_dim,
+            "signal",
+            producer_buffer,
+        )
+        if producer_tile_size <= 0:
+            return None
+        if slice_start % slice_len != 0:
+            return None
+        if slice_start % producer_tile_size != 0 or slice_len % producer_tile_size != 0:
+            return None
+
+        group_tiles = slice_len // producer_tile_size
+        group_count = full_len // slice_len
+        group_index = slice_start // slice_len
+        producer_tiles = producer.tiles_for_axis(producer.dim_names[producer_dim])
+        if producer_tiles != group_tiles * group_count:
+            return None
+
+        return _LastDimRegionDep(
+            producer_dim=producer_dim,
+            group_index=group_index,
+            group_count=group_count,
+            group_tiles=group_tiles,
+        )
+
+    def _barrier_region_formula_components(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+        producer_only_dims: List[str],
+        region: _LastDimRegionDep,
+        producer_buffer: str,
+        consumer_buffer: str,
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], int, int, int, int]:
+        """Build barrier formulas for one producer-only last-dim region edge."""
+        producer_divs, consumer_divs, expected, _ = self._barrier_formula_params(
+            producer,
+            consumer,
+            shared_pairs,
+            [],
+            producer_buffer,
+            consumer_buffer,
+        )
+        producer_divs = list(producer_divs)
+        producer_divs[producer.dim_names[region.producer_dim]] = region.group_tiles
+        expected *= region.group_tiles
+
+        remaining_producer_only = [
+            dim for dim in producer_only_dims if dim != region.producer_dim
+        ]
+        for producer_dim in remaining_producer_only:
+            expected *= producer.tiles_for_axis(producer.dim_names[producer_dim])
+
+        shared_pairs_sorted = sorted(shared_pairs, key=lambda item: item[0])
+        shared_strides: Dict[str, int] = {}
+        stride = region.group_count
+        for canonical_name, producer_dim, consumer_dim in reversed(shared_pairs_sorted):
+            shared_strides[canonical_name] = stride
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            stride *= min(
+                self._barrier_axis_tile_span(
+                    producer,
+                    producer_dim,
+                    "signal",
+                    producer_buffer,
+                    producer.tiles_for_axis(producer_axis),
+                ),
+                self._barrier_axis_tile_span(
+                    consumer,
+                    consumer_dim,
+                    "wait",
+                    consumer_buffer,
+                    consumer.tiles_for_axis(consumer_axis),
+                ),
+            )
+
+        producer_coeffs = [0] * MAX_TILE_DIMS
+        consumer_coeffs = [0] * MAX_TILE_DIMS
+        for canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_coeffs[producer.dim_names[producer_dim]] = shared_strides[canonical_name]
+            consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
+        producer_coeffs[producer.dim_names[region.producer_dim]] = 1
+
+        producer_offset, consumer_offset = self._barrier_formula_offsets(
+            producer,
+            consumer,
+            shared_pairs,
+            producer_buffer,
+            consumer_buffer,
+        )
+        consumer_offset += region.group_index
+
+        num_barriers = stride
+        return (
+            tuple(producer_coeffs),
+            tuple(consumer_coeffs),
+            tuple(producer_divs),
+            consumer_divs,
+            expected,
+            num_barriers,
+            producer_offset,
+            consumer_offset,
+        )
 
     def _resolve_named_formulas(
         self,
@@ -1176,39 +1775,104 @@ class InstructionStreamBuilder:
         barrier_counter = 0
         signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int, int], int] = {}
 
-        for prod_idx, cons_idx in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+        for dep in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+                prod_idx = dep.producer_idx
+                cons_idx = dep.consumer_idx
                 producer = self._op_records[prod_idx]
                 consumer = self._op_records[cons_idx]
 
                 p_op = producer.op
                 c_op = consumer.op
 
-                shared_pairs, producer_only_dims = self._shared_dim_pairs(p_op, c_op)
+                shared_pairs, producer_only_dims = self._shared_dim_pairs(
+                    p_op,
+                    c_op,
+                    dep.producer_buffer,
+                    dep.consumer_buffer,
+                )
                 shared_pairs, incompatible_dims = self._compatible_shared_dim_pairs(
-                    p_op, c_op, shared_pairs
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                    dep.producer_buffer,
+                    dep.consumer_buffer,
                 )
                 producer_only_dims.extend(incompatible_dims)
 
-                producer_divs, consumer_divs, expected, num_barriers = self._barrier_formula_params(
+                region_dep = self._last_dim_region_dep(
                     p_op,
                     c_op,
-                    shared_pairs,
+                    dep.producer_buffer,
+                    dep.consumer_buffer,
                     producer_only_dims,
                 )
-                producer_coeffs, consumer_coeffs = self._barrier_formula_coeffs(
+                if region_dep is not None:
+                    (
+                        producer_coeffs,
+                        consumer_coeffs,
+                        producer_divs,
+                        consumer_divs,
+                        expected,
+                        num_barriers,
+                        producer_offset,
+                        consumer_offset,
+                    ) = self._barrier_region_formula_components(
+                        p_op,
+                        c_op,
+                        shared_pairs,
+                        producer_only_dims,
+                        region_dep,
+                        dep.producer_buffer,
+                        dep.consumer_buffer,
+                    )
+                else:
+                    producer_divs, consumer_divs, expected, num_barriers = self._barrier_formula_params(
+                        p_op,
+                        c_op,
+                        shared_pairs,
+                        producer_only_dims,
+                        dep.producer_buffer,
+                        dep.consumer_buffer,
+                    )
+                    producer_coeffs, consumer_coeffs = self._barrier_formula_coeffs(
+                        p_op,
+                        c_op,
+                        shared_pairs,
+                    )
+                    producer_offset, consumer_offset = self._barrier_formula_offsets(
+                        p_op,
+                        c_op,
+                        shared_pairs,
+                        dep.producer_buffer,
+                        dep.consumer_buffer,
+                    )
+                producer_guard_min, producer_guard_max, producer_guard_coeffs = self._barrier_formula_guard(
                     p_op,
-                    c_op,
+                    "signal",
+                    dep.producer_buffer,
                     shared_pairs,
+                    1,
                 )
-                producer_offset, consumer_offset = self._barrier_formula_offsets(
-                    p_op,
+                consumer_guard_min, consumer_guard_max, consumer_guard_coeffs = self._barrier_formula_guard(
                     c_op,
+                    "wait",
+                    dep.consumer_buffer,
                     shared_pairs,
+                    0,
                 )
 
                 # Fan-out consumers can share the same producer-side readiness
                 # counter. Each consumer still keeps its own expected count.
-                signal_key = (prod_idx, producer_coeffs, producer_divs, num_barriers, producer_offset)
+                signal_key = (
+                    prod_idx,
+                    producer_coeffs,
+                    producer_divs,
+                    num_barriers,
+                    producer_offset,
+                    producer_guard_min,
+                    producer_guard_max,
+                    producer_guard_coeffs,
+                )
                 signal_base = signal_family_cache.get(signal_key)
                 if signal_base is None:
                     signal_base = barrier_counter
@@ -1219,6 +1883,9 @@ class InstructionStreamBuilder:
                             coeffs=producer_coeffs,
                             divs=producer_divs,
                             offset=producer_offset,
+                            guard_min=producer_guard_min,
+                            guard_max=producer_guard_max,
+                            guard_coeffs=producer_guard_coeffs,
                         )
                     )
                     barrier_counter += num_barriers
@@ -1231,6 +1898,9 @@ class InstructionStreamBuilder:
                         divs=consumer_divs,
                         offset=consumer_offset,
                         expected=expected,
+                        guard_min=consumer_guard_min,
+                        guard_max=consumer_guard_max,
+                        guard_coeffs=consumer_guard_coeffs,
                     )
                 )
 
@@ -1548,5 +2218,6 @@ __all__ = [
     "TileInstruction",
     "TileScheduler",
     "BackwardScheduler",
+    "OverlapTileScheduler",
     "InstructionStreamBuilder",
 ]

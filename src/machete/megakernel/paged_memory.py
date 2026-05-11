@@ -40,6 +40,7 @@ TILE_INFO_TILE_3: int = 5
 TILE_INFO_TILE_4: int = 6
 TILE_INFO_INSTRUCTION_IDX: int = 7
 TILE_INFO_OP_CONFIG: int = 8
+TILE_INFO_PAGE_ID: int = 10
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -54,6 +55,8 @@ FLAG_DISPATCH_LOAD: int = 4    # Controller → Loader: page slot to load next
 FLAG_PRODUCE_IDX: int = 16     # Controller: produce counter (read by store warp)
 FLAG_STORE_IDX: int = 20       # Store warp: store counter (read by controller)
 FLAG_LOAD_DONE: int = 24       # Controller: signals all instructions consumed
+FLAG_DATA_RELEASE_IDX: int = 28  # Store warp: physical page release counter
+FLAG_DATA_PRODUCE_IDX: int = 32  # Controller: physical page produce counter
 
 
 # =============================================================================
@@ -302,17 +305,18 @@ class NPageLayout:
 
     num_pages: int = 2
     page_size: int = 16384
+    num_slots: int | None = None
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 40 bytes
-    #   [op_idx, handler_idx, tile_0..tile_4, instruction_idx, op_config_ptr]
-    # - Flags: 28 bytes (see FLAG_* constants for active offsets;
+    # - Per-slot tile info: num_slots * 48 bytes
+    #   [op_idx, handler_idx, tile_0..tile_4, instruction_idx, op_config_ptr, page_id]
+    # - Flags: 32 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * replay instruction row bytes
-    # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 40  # Per-page tile metadata (8 int32 slots + 1 int64)
+    # - Mbarriers: 2 * num_slots * 8 bytes [work_notify + compute_done]
+    _TILE_INFO_SIZE: int = 48  # Per-slot tile metadata (8 int32 + 1 int64 + page_id + pad)
     _IQ_ENTRY_SIZE: int = INSTRUCTION_ROW_BYTES
-    _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
+    _FLAGS_SIZE: int = 36  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
@@ -321,10 +325,16 @@ class NPageLayout:
             raise ValueError(f"num_pages must be >= 1, got {self.num_pages}")
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
+        if self.num_slots is None:
+            self.num_slots = self.num_pages
+        if self.num_slots < 1:
+            raise ValueError(f"num_slots must be >= 1, got {self.num_slots}")
+        if self.num_slots > MAX_PAGES:
+            raise ValueError(f"num_slots must be <= {MAX_PAGES}, got {self.num_slots}")
 
         # Scratch region layout: [tile_info][flags][iq][mbarriers]
         self.ring_state_offset = 0
-        self.flags_offset = self.num_pages * self._TILE_INFO_SIZE
+        self.flags_offset = self.num_slots * self._TILE_INFO_SIZE
         self.iq_offset = _align_up(self.flags_offset + self._FLAGS_SIZE, 8)
 
         # mbarrier array layout (each 8 bytes, MUST be 8-byte aligned per PTX):
@@ -335,7 +345,7 @@ class NPageLayout:
             self.iq_offset + IQ_DEPTH * self._IQ_ENTRY_SIZE, 8
         )
 
-        num_mbarriers = 2 * self.num_pages  # work_notify + compute_done
+        num_mbarriers = 2 * self.num_slots  # work_notify + compute_done
         raw_scratch_size = (
             self.mbarrier_offset
             + num_mbarriers * self._MBARRIER_SIZE
@@ -356,9 +366,9 @@ class NPageLayout:
         """Get offset to the work_notify mbarrier for a given work slot."""
         return self.mbarrier_offset + slot_idx * self._MBARRIER_SIZE
 
-    def compute_done_mbar_offset(self, page_idx: int) -> int:
-        """Get offset to the compute_done mbarrier for a given page."""
-        return self.mbarrier_offset + self.num_pages * self._MBARRIER_SIZE + page_idx * self._MBARRIER_SIZE
+    def compute_done_mbar_offset(self, slot_idx: int) -> int:
+        """Get offset to the compute_done mbarrier for a given work slot."""
+        return self.mbarrier_offset + self.num_slots * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
 
     @classmethod
     def for_device(
@@ -415,6 +425,7 @@ class NPageLayout:
         return (
             f"NPageLayout(\n"
             f"  num_pages={self.num_pages},\n"
+            f"  num_slots={self.num_slots},\n"
             f"  page_size={self.page_size // 1024}KB,\n"
             f"  total_size={self.total_size // 1024}KB,\n"
             f"  scratch_size={self.scratch_size}B,\n"

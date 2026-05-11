@@ -49,6 +49,9 @@ from .scheduling import (
     INSTR_TILE_3,
     INSTR_TILE_4,
     TileInstruction,
+    TileScheduler,
+    BackwardScheduler,
+    OverlapTileScheduler,
     InstructionStreamBuilder,
 )
 
@@ -108,6 +111,9 @@ __all__ = [
     "INSTR_TILE_3",
     "INSTR_TILE_4",
     "TileInstruction",
+    "TileScheduler",
+    "BackwardScheduler",
+    "OverlapTileScheduler",
     "InstructionStreamBuilder",
     # Configuration & Megakernel
     "DEFAULT_PAGE_SIZE",

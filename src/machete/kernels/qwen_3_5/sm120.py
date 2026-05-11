@@ -1617,13 +1617,9 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
             op.static_dims["head_chunks"] = QWEN3_5_HEAD_DIM // op.tile_sizes["N"]
         return ops
 
-    @cute.jit
-    def load(self, page_ptr):
-        pass
-
-    @cute.jit
-    def store(self, page_ptr):
-        pass
+    load = Op.load
+    store = Op.store
+    communicate = Op.communicate
 
     @cute.jit
     def _issue_b_tma(self, page_ptr, stream_idx, k_block, tile_N, b_tma, b_tma_gmem, kr_0, kr_1):
@@ -2740,6 +2736,8 @@ class Qwen3_5QKNormRopeKCacheStoreSm120Op(_BaseQKNormRopeOp):
 class Qwen3_5VCacheStoreSm120Op(Op):
     """Copy BSHD V scratch blocks into their BSHD KV-cache windows."""
 
+    uses_smem_page = False
+
     reads = {"src_v": (None, ("B", "S", "H", "D"))}
     writes = {"dst_v": (None, ("B", "N", "H", "D"))}
     tile = ("B", "S", "H")
@@ -2820,7 +2818,7 @@ def schedule_decode_layer_qwen3_5_sm120(
     page_size=DEFAULT_PAGE_SIZE,
     eps=QWEN3_5_EPS,
     fa_num_splits=0,
-    rms_tile_s=1,
+    rms_tile_s=2,
     gate_up_tile=None,
     packed_qkv=False,
     chunked_attention_barriers=False,
@@ -3099,7 +3097,7 @@ def schedule_final_qwen3_5_sm120(
     seq_len,
     page_size=DEFAULT_PAGE_SIZE,
     eps=QWEN3_5_EPS,
-    rms_tile_s=1,
+    rms_tile_s=2,
 ):
     """Schedule Qwen final fused-add RMSNorm and optional in-kernel LM head."""
     from machete.kernels.rms_norm import RMSNormOp
@@ -3145,6 +3143,10 @@ def schedule_final_qwen3_5_sm120(
     )
 
 
+schedule_decode_layer_sm120 = schedule_decode_layer_qwen3_5_sm120
+schedule_final_sm120 = schedule_final_qwen3_5_sm120
+
+
 __all__ = [
     "QWEN3_5_NUM_LAYERS",
     "QWEN3_5_HIDDEN",
@@ -3172,6 +3174,8 @@ __all__ = [
     "Qwen3_5RMSAddRangedDecodeGemmSm120Op",
     "Qwen3_5Top1LmHeadSm120Op",
     "Qwen3_5VCacheStoreSm120Op",
+    "schedule_decode_layer_sm120",
+    "schedule_final_sm120",
     "schedule_decode_layer_qwen3_5_sm120",
     "schedule_final_qwen3_5_sm120",
 ]

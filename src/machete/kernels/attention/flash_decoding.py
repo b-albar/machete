@@ -295,7 +295,6 @@ class _FlashDecodingSplitTmaOp(Op):
         return MegakernelConfig(
             threads_per_block=threads_per_block,
             page_size=page_size,
-            noinline=True,
             num_sms=num_sms,
         )
 

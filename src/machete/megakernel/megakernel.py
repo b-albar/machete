@@ -15,6 +15,7 @@ persistent kernel shell. It does not define individual op math.
 import ctypes
 from dataclasses import dataclass
 import inspect
+import os
 import re
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -68,6 +69,7 @@ from .interpreter import (
     nanosleep,
 )
 from .paged_memory import (
+    MAX_PAGES,
     NPageLayout,
     PipelinePageLayout,
     st_shared_i32,
@@ -82,9 +84,12 @@ from .paged_memory import (
     FLAG_PRODUCE_IDX,
     FLAG_STORE_IDX,
     FLAG_LOAD_DONE,
+    FLAG_DATA_RELEASE_IDX,
+    FLAG_DATA_PRODUCE_IDX,
     TILE_INFO_HANDLER_IDX as _TILE_INFO_HANDLER_IDX,
     TILE_INFO_INSTRUCTION_IDX as _TILE_INFO_INSTRUCTION_IDX,
     TILE_INFO_OP_CONFIG as _TILE_INFO_OP_CONFIG,
+    TILE_INFO_PAGE_ID as _TILE_INFO_PAGE_ID,
     TILE_INFO_TILE_0 as _TILE_INFO_TILE_0,
     TILE_INFO_TILE_1 as _TILE_INFO_TILE_1,
     TILE_INFO_TILE_2 as _TILE_INFO_TILE_2,
@@ -153,6 +158,7 @@ _OP_PHASE_COMMUNICATE = 8
 _INSTR_RANGE_AXIS_SHIFT = 4
 _INSTR_RANGE_END_AXIS_SHIFT = 8
 _INSTR_RANGE_STRIDED_BIT = 12
+_INSTR_NO_SMEM_PAGE_BIT = 13
 
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
@@ -180,16 +186,9 @@ class MegakernelConfig:
             <= 65536 registers per SM.
 
     Compilation:
-        noinline: Emit op phases as noinline device functions when legal
-            (compute always, load/store/communicate when TMA can be recreated
-            locally). Reduces register pressure and compile-time blowup from
-            repeatedly inlined phase bodies.
-        opt_level: LLVM optimization level 0-3 (default: 2). noinline requires <= 2.
+        opt_level: LLVM optimization level 0-3 (default: 2).
         tracing: Enable cutedsl-trace instrumentation (default: False).
             When False, trace blocks are stripped at source level (zero overhead).
-        sync_compute_warps_after_tile: Keep a CTA named-barrier sync after each
-            compute tile. This is conservative for generic ops; specialized
-            streams can disable it when per-slot mbarrier arrivals are enough.
 
     Multi-GPU (peer TMA):
         peer_buffers: {tensor_name: [peer0_tensor, peer1_tensor, ...]}
@@ -205,9 +204,6 @@ class MegakernelConfig:
     tracing: bool = False
     dma_reg_count: int = 40
     mma_reg_count: int = 232
-    noinline: bool = True
-    inline_thin_phases: bool = True
-    sync_compute_warps_after_tile: bool = False
     loader_idle_sleep_ns: int = 100
     relaxed_global_barriers: bool = True
     global_barrier_sleep_ns: int = 8
@@ -475,6 +471,10 @@ class Megakernel:
         if self._ops_use_coalesced_pipeline(ops):
             Megakernel._unload_active_tma_modules()
             Megakernel._drop_cached_tma_kernels()
+        self._has_page_free_ops = (
+            os.environ.get("MACHETE_ENABLE_PAGE_FREE_OPS", "0") == "1"
+            and any(not bool(getattr(op.op_cls, "uses_smem_page", True)) for op in ops)
+        )
 
         # Detect resident block count if not specified.
         #
@@ -489,12 +489,19 @@ class Megakernel:
             props = torch.cuda.get_device_properties(device)
             total_tiles = max(1, sum(op.total_tiles for op in ops))
             self.config.num_sms = min(props.multi_processor_count, total_tiles)
+        if self._scheduler is not None and hasattr(self._scheduler, "bind_num_blocks"):
+            self._scheduler.bind_num_blocks(self.config.num_sms)
 
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
+                num_slots=(
+                    min(MAX_PAGES, self.config.num_pages + 2)
+                    if self._has_page_free_ops
+                    else self.config.num_pages
+                ),
                 page_size=self.config.page_size,
             )
         else:
@@ -604,6 +611,9 @@ class Megakernel:
 
         self._tracing_state = None
         if self.config.tracing:
+            from cutedsl_trace.config import set_tracing_enabled
+
+            set_tracing_enabled(True)
             self._tracing_state = setup_tracing(
                 self.ops, self.num_sms, self.total_tiles, device=self.device
             )
@@ -746,6 +756,15 @@ class Megakernel:
                 phase_mask |= _OP_PHASE_COMMUNICATE
             pipeline = self._pipeline_spec_for_op(op)
             instruction_phase_mask = phase_mask
+            uses_smem_page = bool(getattr(op.op_cls, "uses_smem_page", True))
+            if not uses_smem_page:
+                if phase_mask != _OP_PHASE_COMPUTE:
+                    raise ValueError(
+                        f"{op.op_cls.__name__} declares uses_smem_page=False but "
+                        "has active load/store/communicate phases. Page-free ops "
+                        "must be compute-only."
+                    )
+                instruction_phase_mask |= 1 << _INSTR_NO_SMEM_PAGE_BIT
             if pipeline is not None and pipeline.coalesce_ranges and pipeline.range_axis >= 0:
                 range_axis = int(pipeline.range_axis)
                 range_end_axis = int(pipeline.range_end_axis)
@@ -1184,6 +1203,7 @@ class Megakernel:
         signal_barriers,
         get_page_ptr_fn,
         num_pages: int,
+        num_slots: int,
         iq_offset: int,
         flags_offset: int,
         ring_state_offset: int,
@@ -1218,6 +1238,7 @@ class Megakernel:
             "named_barrier_sync": named_barrier_sync,
             "global_barrier_signal": global_barrier_signal,
             "num_pages": num_pages,
+            "num_slots": num_slots,
             "iq_offset": iq_offset,
             "flags_offset": flags_offset,
             "ring_state_offset": ring_state_offset,
@@ -1616,6 +1637,13 @@ class Megakernel:
             and not any(self._op_has_phased_replay(op) for op in self.ops)
         )
 
+    def _sync_compute_warps_after_tile(self) -> bool:
+        """Return whether any op requires a CTA sync after compute."""
+        return any(
+            bool(getattr(op.op_cls, "sync_compute_warps_after_tile", False))
+            for op in self.ops
+        )
+
     @staticmethod
     def _resolve_warp_register_api():
         """Resolve the CuTe warp register allocation API, with a no-op fallback."""
@@ -1654,6 +1682,8 @@ class Megakernel:
             "smem_size": layout.total_size,
             "tracing": self.config.tracing,
             "num_pages": layout.num_pages,
+            "num_slots": layout.num_slots,
+            "has_page_free_ops": self._has_page_free_ops,
             "iq_offset": layout.iq_offset,
             "flags_offset": layout.flags_offset,
             "ring_state_offset": layout.ring_state_offset,
@@ -1909,6 +1939,7 @@ class Megakernel:
             "_INSTR_RANGE_AXIS_SHIFT": _INSTR_RANGE_AXIS_SHIFT,
             "_INSTR_RANGE_END_AXIS_SHIFT": _INSTR_RANGE_END_AXIS_SHIFT,
             "_INSTR_RANGE_STRIDED_BIT": _INSTR_RANGE_STRIDED_BIT,
+            "_INSTR_NO_SMEM_PAGE_BIT": _INSTR_NO_SMEM_PAGE_BIT,
         }
 
     @staticmethod
@@ -1923,6 +1954,7 @@ class Megakernel:
             "_TILE_INFO_TILE_3": _TILE_INFO_TILE_3,
             "_TILE_INFO_TILE_4": _TILE_INFO_TILE_4,
             "_TILE_INFO_OP_CONFIG": _TILE_INFO_OP_CONFIG,
+            "_TILE_INFO_PAGE_ID": _TILE_INFO_PAGE_ID,
             "_INSTR_TILE_0": INSTR_TILE_0,
             "_INSTR_TILE_1": INSTR_TILE_1,
             "_INSTR_TILE_2": INSTR_TILE_2,
@@ -1958,6 +1990,8 @@ class Megakernel:
             "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
             "FLAG_STORE_IDX": FLAG_STORE_IDX,
             "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
+            "FLAG_DATA_RELEASE_IDX": FLAG_DATA_RELEASE_IDX,
+            "FLAG_DATA_PRODUCE_IDX": FLAG_DATA_PRODUCE_IDX,
             "_op_meta_i32": runtime["_op_meta_i32"],
             "_op_meta_base": runtime["_op_meta_base"],
             "_op_meta_i32_base": runtime["_op_meta_i32_base"],
@@ -1969,8 +2003,9 @@ class Megakernel:
             "ld_global_i32": ld_global_i32,
             "has_communicate": runtime["has_communicate"],
             "needs_warp_transition": runtime["needs_warp_transition"],
-            "sync_compute_warps_after_tile": self.config.sync_compute_warps_after_tile,
+            "sync_compute_warps_after_tile": self._sync_compute_warps_after_tile(),
             "loader_idle_sleep_ns": int(self.config.loader_idle_sleep_ns),
+            "has_page_free_ops": bool(kernel_cfg["has_page_free_ops"]),
             "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
             "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
             "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
@@ -2056,7 +2091,9 @@ class Megakernel:
                     st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
                     st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
                     st_shared_i32(flags_ptr + FLAG_LOAD_DONE, Int32(0))
-                    for _ip in range(num_pages):
+                    st_shared_i32(flags_ptr + FLAG_DATA_RELEASE_IDX, Int32(0))
+                    st_shared_i32(flags_ptr + FLAG_DATA_PRODUCE_IDX, Int32(0))
+                    for _ip in range(num_slots):
                         _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
                         st_shared_i32(_slot_ti, Int32(-1))
                         mbarrier_init(
@@ -2073,6 +2110,14 @@ class Megakernel:
 
             # ========== CONTROLLER WARP (fetch + pre-computed barrier wait) ==========
             if warp_id == Int32(num_mma_warps):
+                if const_expr(tracing):
+                    _ctrl_lane = begin_lane_dynamic_raw(
+                        Int32(4),
+                        Int32(trace_row_stride),
+                        block_id,
+                        Int32(3),
+                        lane_id == Int32(0),
+                    )
                 produce_idx = Int32(0)
                 _fetch_idx = block_id
                 _fetch_limit = num_instructions
@@ -2087,6 +2132,7 @@ class Megakernel:
                 _ctrl_cached_wait_barrier = Int32(-2)
                 _ctrl_cached_wait_expected = Int32(-1)
                 _ctrl_cached_op = Int32(TileInstruction.END_MARKER)
+                _ctrl_cached_phase_mask = Int32(0)
                 _ctrl_cached_t0 = Int32(0)
                 _ctrl_cached_t1 = Int32(0)
                 _ctrl_cached_t2 = Int32(0)
@@ -2148,6 +2194,7 @@ class Megakernel:
                             _phase_mask = _op_meta_i32_base(
                                 op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_PHASE_MASK)
                             )
+                            _ctrl_cached_phase_mask = _phase_mask
                             _ctrl_range_axis = (
                                 (_phase_mask // Int32(1 << _INSTR_RANGE_AXIS_SHIFT))
                                 % Int32(16)
@@ -2220,6 +2267,8 @@ class Megakernel:
                                                     or _bar_exp != _ctrl_cached_wait_expected
                                                 ):
                                                     if const_expr(relaxed_global_barriers):
+                                                        if const_expr(tracing):
+                                                            _tdw = trace_start()
                                                         if _ctrl_cached_wait_acquire != Int32(0):
                                                             global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
                                                         else:
@@ -2229,8 +2278,28 @@ class Megakernel:
                                                                 _bar_exp,
                                                                 Int32(global_barrier_sleep_ns),
                                                             )
+                                                        if const_expr(tracing):
+                                                            _ctrl_lane = end_event_dynamic_raw_1(
+                                                                _tdw,
+                                                                _trace_buf,
+                                                                Int32(trace_row_stride),
+                                                                _ctrl_lane,
+                                                                Int32(trace_dep_wait_fmt),
+                                                                _instr_op,
+                                                            )
                                                     else:
+                                                        if const_expr(tracing):
+                                                            _tdw = trace_start()
                                                         global_barrier_wait(barriers_ptr, _bar_idx, _bar_exp)
+                                                        if const_expr(tracing):
+                                                            _ctrl_lane = end_event_dynamic_raw_1(
+                                                                _tdw,
+                                                                _trace_buf,
+                                                                Int32(trace_row_stride),
+                                                                _ctrl_lane,
+                                                                Int32(trace_dep_wait_fmt),
+                                                                _instr_op,
+                                                            )
                                                     _ctrl_cached_wait_barrier = _bar_idx
                                                     _ctrl_cached_wait_expected = _bar_exp
                                             else:
@@ -2239,16 +2308,31 @@ class Megakernel:
                                             _done_waits = Int32(1)
 
                             _si = ld_shared_i32(store_idx_ptr)
-                            while (produce_idx - _si) >= Int32(num_pages):
-                                _wait_slot = produce_idx % Int32(num_pages)
-                                _wait_phase = ((produce_idx // Int32(num_pages)) + Int32(1)) % Int32(2)
+                            while (produce_idx - _si) >= Int32(num_slots):
+                                _wait_slot = produce_idx % Int32(num_slots)
+                                _wait_phase = ((produce_idx // Int32(num_slots)) + Int32(1)) % Int32(2)
+                                if const_expr(tracing):
+                                    _trfw = trace_start()
                                 mbarrier_wait(
                                     _compute_done_mbar(smem_base, _wait_slot), _wait_phase
                                 )
+                                if const_expr(tracing):
+                                    _ctrl_lane = end_event_dynamic_raw_1(
+                                        _trfw,
+                                        _trace_buf,
+                                        Int32(trace_row_stride),
+                                        _ctrl_lane,
+                                        Int32(trace_ring_full_wait_fmt),
+                                        _instr_op,
+                                    )
                                 _si = ld_shared_i32(store_idx_ptr)
 
-                            _p_slot = produce_idx % Int32(num_pages)
+                            _p_slot = produce_idx % Int32(num_slots)
                             _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
+                            st_shared_i32(
+                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),
+                                _p_slot,
+                            )
                             _p_t0 = _ctrl_cached_t0
                             _p_t1 = _ctrl_cached_t1
                             _p_t2 = _ctrl_cached_t2
@@ -2295,8 +2379,8 @@ class Megakernel:
                         ):
                             if _fetch_idx >= _fetch_limit:
                                 _store_idx_done = ld_shared_i32(store_idx_ptr)
-                                if (produce_idx - _store_idx_done) < Int32(num_pages):
-                                    _sent = produce_idx % Int32(num_pages)
+                                if (produce_idx - _store_idx_done) < Int32(num_slots):
+                                    _sent = produce_idx % Int32(num_slots)
                                     st_shared_i32(
                                         smem_base + Int32(ring_state_offset) + _sent * Int32(tile_info_bytes),
                                         Int32(TileInstruction.END_MARKER),
@@ -2305,12 +2389,14 @@ class Megakernel:
                                     st_shared_i32(load_done_ptr, Int32(1))
 
                     _ctrl_done = ld_shared_i32(load_done_ptr)
+                if const_expr(tracing):
+                    finish_lane_dynamic_raw(_trace_buf, _ctrl_lane)
 
             # ========== LOADER WARP (TMA dispatch) ==========
             if warp_id == Int32(num_mma_warps + 1):
                 if const_expr(tracing):
                     _dma_lane = begin_lane_dynamic_raw(
-                        Int32(3),
+                        Int32(4),
                         Int32(trace_row_stride),
                         block_id,
                         Int32(0),
@@ -2325,7 +2411,7 @@ class Megakernel:
                 while _ldr_done == Int32(0):
                     _p_idx = ld_shared_acquire_cta_i32(_ldr_produce_ptr)
                     if _ldr_idx < _p_idx:
-                        _dl_slot = _ldr_idx % Int32(num_pages)
+                        _dl_slot = _ldr_idx % Int32(num_slots)
                         _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
                         _dl_op = ld_shared_i32(_dl_ti)
                         if _dl_op != Int32(TileInstruction.END_MARKER):
@@ -2342,10 +2428,17 @@ class Megakernel:
                             _dl_3 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_3))
                             _dl_4 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_4))
                             _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
-                            _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                             _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
                             if const_expr(tracing):
                                 _tl = trace_start()
+                            if const_expr(has_page_free_ops):
+                                _dl_page = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_PAGE_ID))
+                                _dl_pp = _get_page_ptr(
+                                    smem_base,
+                                    (_dl_page + Int32(num_pages)) % Int32(num_pages),
+                                )
+                            else:
+                                _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                             if const_expr(dispatch_load_uses_handler_local_idx):
                                 dispatch_load(
                                     _dl_handler,
@@ -2395,7 +2488,7 @@ class Megakernel:
             if is_store_warp:
                 if const_expr(tracing):
                     _store_lane = begin_lane_dynamic_raw(
-                        Int32(3),
+                        Int32(4),
                         Int32(trace_row_stride),
                         block_id,
                         Int32(2),
@@ -2410,8 +2503,8 @@ class Megakernel:
                     _p_idx = ld_shared_i32(produce_idx_ptr)
 
                     if _s_idx < _p_idx:
-                        _s_slot = _s_idx % Int32(num_pages)
-                        _s_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+                        _s_slot = _s_idx % Int32(num_slots)
+                        _s_phase = (_s_idx // Int32(num_slots)) % Int32(2)
 
                         _ds_ti = smem_base + Int32(ring_state_offset) + _s_slot * Int32(tile_info_bytes)
                         _ds_op = ld_shared_i32(_ds_ti)
@@ -2439,7 +2532,10 @@ class Megakernel:
                             _ds_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX)
                         )
                         _ds_config = ld_shared_i64(_ds_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
-                        _ds_pp = _get_page_ptr(smem_base, _s_slot)
+                        if const_expr(has_page_free_ops):
+                            _ds_page = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_PAGE_ID))
+                        else:
+                            _ds_page = _s_slot
 
                         if const_expr(tracing):
                             _tsw = trace_start()
@@ -2456,6 +2552,13 @@ class Megakernel:
 
                         if const_expr(tracing):
                             _tss = trace_start()
+                        if const_expr(has_page_free_ops):
+                            _ds_pp = _get_page_ptr(
+                                smem_base,
+                                (_ds_page + Int32(num_pages)) % Int32(num_pages),
+                            )
+                        else:
+                            _ds_pp = _get_page_ptr(smem_base, _s_slot)
                         if const_expr(dispatch_store_uses_handler_local_idx):
                             dispatch_store(
                                 _ds_handler,
@@ -2559,8 +2662,8 @@ class Megakernel:
                         if ld_shared_i32(load_done_ptr) == Int32(1):
                             _sw_done = Int32(1)
                         if ld_shared_i32(load_done_ptr) != Int32(1):
-                            _sw_next_slot = _s_idx % Int32(num_pages)
-                            _sw_next_phase = (_s_idx // Int32(num_pages)) % Int32(2)
+                            _sw_next_slot = _s_idx % Int32(num_slots)
+                            _sw_next_phase = (_s_idx // Int32(num_slots)) % Int32(2)
                             mbarrier_wait(
                                 _work_notify_mbar(smem_base, _sw_next_slot),
                                 _sw_next_phase,
@@ -2573,7 +2676,7 @@ class Megakernel:
             if warp_id < Int32(num_mma_warps):
                 if const_expr(tracing):
                     _mma_lane = begin_lane_dynamic_raw(
-                        Int32(3),
+                        Int32(4),
                         Int32(trace_row_stride),
                         block_id,
                         Int32(1),
@@ -2586,9 +2689,9 @@ class Megakernel:
                 _active_op_warps = Int32(num_mma_warps)
 
                 while mma_running == Int32(1):
-                    slot = consume_ptr % Int32(num_pages)
+                    slot = consume_ptr % Int32(num_slots)
 
-                    _wn_phase = (consume_ptr // Int32(num_pages)) % Int32(2)
+                    _wn_phase = (consume_ptr // Int32(num_slots)) % Int32(2)
                     if const_expr(tracing):
                         _tw = trace_start()
                     mbarrier_wait(_work_notify_mbar(smem_base, slot), _wn_phase)
@@ -2625,7 +2728,10 @@ class Megakernel:
                                 op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_COMPUTE_LOCAL_IDX)
                             )
                         _op_config = ld_shared_i64(tile_info_ptr + Int32(4 * _TILE_INFO_OP_CONFIG))
-                        page_ptr = _get_page_ptr(smem_base, slot)
+                        if const_expr(has_page_free_ops):
+                            _page_id = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_PAGE_ID))
+                        else:
+                            _page_id = slot
                         if op_idx != _cached_op_idx:
                             _cached_op_idx = op_idx
 
@@ -2644,6 +2750,13 @@ class Megakernel:
                             _tc = trace_start()
 
                         if warp_id < _active_op_warps:
+                            if const_expr(has_page_free_ops):
+                                page_ptr = _get_page_ptr(
+                                    smem_base,
+                                    (_page_id + Int32(num_pages)) % Int32(num_pages),
+                                )
+                            else:
+                                page_ptr = _get_page_ptr(smem_base, slot)
                             if const_expr(dispatch_compute_uses_handler_local_idx):
                                 dispatch_compute(
                                     _handler_idx,
@@ -2700,7 +2813,7 @@ class Megakernel:
         num_mma_warps = kernel_cfg["num_mma_warps"]
         num_compute_threads = kernel_cfg["num_compute_threads"]
         mma_reg_count = kernel_cfg["mma_reg_count"]
-        sync_compute_warps_after_tile = bool(self.config.sync_compute_warps_after_tile)
+        sync_compute_warps_after_tile = self._sync_compute_warps_after_tile()
         relaxed_global_barriers = bool(self.config.relaxed_global_barriers)
         global_barrier_sleep_ns = int(self.config.global_barrier_sleep_ns)
 
@@ -3005,6 +3118,7 @@ class Megakernel:
         threads_per_block,
         smem_size,
         num_pages,
+        num_slots,
         iq_offset,
         flags_offset,
         ring_state_offset,
@@ -3042,6 +3156,8 @@ class Megakernel:
             phase_uses_handler_local_idx=phase_uses_handler_local_idx,
             dispatch_extra_params=dispatch_extra_params,
         )
+        if extra_exec_globals and extra_exec_globals.get("has_page_free_ops", False):
+            fn_source = self._enable_page_free_ring_source(fn_source)
 
         exec_globals = self._build_kernel_exec_globals(
             dispatch_load=dispatch_load,
@@ -3050,6 +3166,7 @@ class Megakernel:
             signal_barriers=signal_barriers,
             get_page_ptr_fn=get_page_ptr_fn,
             num_pages=num_pages,
+            num_slots=num_slots,
             iq_offset=iq_offset,
             flags_offset=flags_offset,
             ring_state_offset=ring_state_offset,
@@ -3077,6 +3194,84 @@ class Megakernel:
         )
         exec_generated_source(pk_source, "persistent_kernel", pk_globals)
         return pk_globals["PersistentKernel"]()
+
+    @staticmethod
+    def _replace_required(source: str, old: str, new: str) -> str:
+        if old not in source:
+            def _shift_left(text: str) -> str:
+                lines = text.splitlines(True)
+                return "".join(
+                    line[8:] if line.startswith("        ") else line
+                    for line in lines
+                )
+
+            old_shifted = _shift_left(old)
+            new_shifted = _shift_left(new)
+            if old_shifted in source:
+                return source.replace(old_shifted, new_shifted, 1)
+            raise RuntimeError("Failed to patch generated page-free ring source")
+        return source.replace(old, new, 1)
+
+    def _enable_page_free_ring_source(self, source: str) -> str:
+        """Specialize the generated ring loop for ops that do not own smem pages.
+
+        CUTLASS DSL still lowers statically-false Python branches into SCF in
+        some cases, so the page-free path is spliced into the generated source
+        only for kernels that actually need it.
+        """
+        source = self._replace_required(
+            source,
+            "                _temp_instr = iq_base\n",
+            "                data_release_idx_ptr = flags_ptr + FLAG_DATA_RELEASE_IDX\n"
+            "                data_produce_idx_ptr = flags_ptr + FLAG_DATA_PRODUCE_IDX\n"
+            "                _temp_instr = iq_base\n"
+        )
+        source = self._replace_required(
+            source,
+            "                            st_shared_i32(\n"
+            "                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
+            "                                _p_slot,\n"
+            "                            )\n",
+            "                            _ctrl_no_page = (\n"
+            "                                (_ctrl_cached_phase_mask // Int32(1 << _INSTR_NO_SMEM_PAGE_BIT))\n"
+            "                                % Int32(2)\n"
+            "                            )\n"
+            "                            st_shared_i32(\n"
+            "                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
+            "                                Int32(-1),\n"
+            "                            )\n"
+            "                            if _ctrl_no_page == Int32(0):\n"
+            "                                _dp = ld_shared_i32(data_produce_idx_ptr)\n"
+            "                                _dr = ld_shared_acquire_cta_i32(data_release_idx_ptr)\n"
+            "                                while (_dp - _dr) >= Int32(num_pages):\n"
+            "                                    nanosleep(Int32(loader_idle_sleep_ns))\n"
+            "                                    _dr = ld_shared_acquire_cta_i32(data_release_idx_ptr)\n"
+            "                                st_shared_i32(\n"
+            "                                    _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
+            "                                    _dp % Int32(num_pages),\n"
+            "                                )\n"
+            "                                st_shared_i32(data_produce_idx_ptr, _dp + Int32(1))\n",
+        )
+        source = self._replace_required(
+            source,
+            "                load_done_ptr = flags_ptr + FLAG_LOAD_DONE\n"
+            "                while _sw_done == Int32(0):\n",
+            "                load_done_ptr = flags_ptr + FLAG_LOAD_DONE\n"
+            "                data_release_idx_ptr = flags_ptr + FLAG_DATA_RELEASE_IDX\n"
+            "                while _sw_done == Int32(0):\n",
+        )
+        source = self._replace_required(
+            source,
+            "                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))\n",
+            "                            if _ds_page >= Int32(0):\n"
+            "                                _store_data_release_idx = ld_shared_i32(data_release_idx_ptr) + Int32(1)\n"
+            "                                st_shared_release_cta_i32(\n"
+            "                                    data_release_idx_ptr,\n"
+            "                                    _store_data_release_idx,\n"
+            "                                )\n"
+            "                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))\n",
+        )
+        return source
 
     @property
     def num_peer_barriers(self) -> int:
@@ -3121,6 +3316,7 @@ class Megakernel:
             kernel_cfg["actual_threads_per_block"],
             kernel_cfg["smem_size"],
             kernel_cfg["num_pages"],
+            kernel_cfg["num_slots"],
             kernel_cfg["iq_offset"],
             kernel_cfg["flags_offset"],
             kernel_cfg["ring_state_offset"],
@@ -3173,9 +3369,7 @@ class Megakernel:
             self.config.dma_reg_count,
             self.config.mma_reg_count,
             self.config.num_devices,
-            self.config.noinline,
-            self.config.inline_thin_phases,
-            self.config.sync_compute_warps_after_tile,
+            self._sync_compute_warps_after_tile(),
             self.config.loader_idle_sleep_ns,
             self.config.relaxed_global_barriers,
             self.config.global_barrier_sleep_ns,
@@ -3260,19 +3454,17 @@ class Megakernel:
             tracing_str = " [traced]" if self.config.tracing else ""
             tma_str = " [TMA]" if self._tma_registry.has_tma else ""
             peer_str = " [peer]" if self._peer_tma_registry.has_peer_tma else ""
-            noinline_str = " [noinline]" if self.config.noinline else ""
             print(
-                f"Compiling persistent kernel ({tracing_str}{tma_str}{peer_str}{noinline_str}) for "
+                f"Compiling persistent kernel ({tracing_str}{tma_str}{peer_str} [op-phase-policy]) for "
                 f"{len(self.ops)} ops, "
                 f"{self.total_tiles} tiles, {self.num_sms} SMs, "
                 f"{self.smem_size // 1024}KB smem..."
             )
 
-            # Install noinline + opt_level patches during compilation
+            # Install noinline support; op phase policy decides which wrappers use it.
             _pipeline_patch = None
-            if self.config.noinline:
-                from . import noinline as noinline_mod
-                noinline_mod.install()
+            from . import noinline as noinline_mod
+            noinline_mod.install()
             if self.config.opt_level != 3:
                 from cutlass.cutlass_dsl.cutlass import CutlassBaseDSL
                 _orig_preprocess = CutlassBaseDSL.preprocess_pipeline
@@ -3328,8 +3520,7 @@ class Megakernel:
                 if self._eager_load_compiled_kernel_for_current_device():
                     torch.cuda.synchronize()
             finally:
-                if self.config.noinline:
-                    noinline_mod.uninstall()
+                noinline_mod.uninstall()
                 if _pipeline_patch is not None:
                     CutlassBaseDSL.preprocess_pipeline = _pipeline_patch
 
@@ -3751,6 +3942,9 @@ class Megakernel:
             self._barriers_tensor.zero_()
 
         if self.config.tracing:
+            from .tracing import ensure_device_trace_buffer
+
+            ensure_device_trace_buffer(self._tracing_state)
             self._tracing_state.builder.reset()
             trace_buffer_ptr = Int64(self._tracing_state.builder._buffer.data_ptr())
         else:
