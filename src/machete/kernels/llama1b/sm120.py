@@ -1,11 +1,9 @@
 # Copyright (c) 2025, Machete Authors
 """Llama-1B SM120 decode kernels.
 
-The generic SM120 decode ops still provide the scalar fused Q/K/V, gate/up, and
-final head paths.  Llama-specific O/down projections use staged weight matvecs
-so their loader warp streams weight blocks into shared memory while compute
-warps consume the previous block, matching Hazy's low-latency matvec shape more
-closely than the direct global-memory fallback.
+The Llama-specific SM120 ops use staged weight matvecs: loader warps stream
+weight blocks into shared memory while compute warps consume the previous
+block, matching Hazy's low-latency matvec shape.
 """
 
 import operator
@@ -15,7 +13,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32
+from cutlass import Float32, Int32, const_expr
 
 from machete.kernels.decode_matvec.sm120 import (
     ResidualAddSm120Op as Llama1BResidualAddSm120Op,
@@ -31,7 +29,6 @@ from machete.megakernel.interpreter import (
 from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineABI, PipelineSpec
 
 from .sm100 import (
-    LLAMA1B_REDUCTION_DIM_PER_WARP,
     LLAMA1B_CONSUMER_WARPS,
     LLAMA1B_HEAD_DIM,
     LLAMA1B_HIDDEN,
@@ -43,10 +40,33 @@ from .sm100 import (
     LLAMA1B_VOCAB,
 )
 
-LLAMA1B_SM120_MATVEC_BLOCK = 10
-LLAMA1B_SM120_QKV_HEAD_BLOCK = 8
-LLAMA1B_SM120_FINAL_MATVEC_BLOCK = 22
-LLAMA1B_SM120_THREADS_PER_BLOCK = (LLAMA1B_CONSUMER_WARPS + 3) * 32
+LLAMA1B_SM120_MATVEC_BLOCK = 12
+LLAMA1B_SM120_QKV_HEAD_BLOCK = 12
+LLAMA1B_SM120_FINAL_MATVEC_BLOCK = 24
+LLAMA1B_SM120_CONSUMER_WARPS = 8
+LLAMA1B_SM120_REDUCTION_DIM_PER_WARP = LLAMA1B_HIDDEN // LLAMA1B_SM120_CONSUMER_WARPS
+LLAMA1B_SM120_THREADS_PER_BLOCK = (LLAMA1B_SM120_CONSUMER_WARPS + 3) * 32
+LLAMA1B_SM120_MIN_STAGED_PAGE_SIZE = 32 * 1024
+LLAMA1B_SM120_LARGE_STAGED_PAGE_SIZE = 96 * 1024
+
+
+def _validate_staged_page_size(page_size: int) -> None:
+    if page_size < LLAMA1B_SM120_MIN_STAGED_PAGE_SIZE:
+        raise ValueError(
+            "Llama-1B SM120 staged decode requires page_size >= 32768 bytes. "
+            f"Got page_size={page_size}; use 32768 or larger."
+        )
+
+
+def _set_exact_staged_page_size(op, page_size: int, required: int) -> None:
+    _validate_staged_page_size(page_size)
+    if required > page_size:
+        raise ValueError(
+            f"{op.op_cls.__name__} requires page_size >= {required} bytes, "
+            f"but requested page_size={page_size}. The staged SM120 kernel uses "
+            "the requested page size exactly; choose a compatible page_size."
+        )
+    op.static_dims["page_size"] = page_size
 
 
 @dataclass
@@ -66,6 +86,7 @@ def _silu(x):
 class _Llama1BStagedWeightMatvecSm120Base(Op):
     """Hazy-style decode matvec with loader-owned staged weight pages."""
 
+    allow_single_staged_buffer = False
     pipeline = PipelineSpec.streaming(
         range_axis=2,
         range_end_axis=3,
@@ -73,6 +94,8 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
         coalesce_ranges=True,
     )
     pipeline_abi = PipelineABI.op_owned()
+    pipeline_force_framework_range = True
+    pipeline_auto_range_block_size = True
     reads = {
         "a": (None, ("B", "S", "K")),
         "weight": (None, ("O", "K")),
@@ -88,7 +111,7 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
 
         page_size = max(op.static_dims.get("page_size", DEFAULT_PAGE_SIZE) for op in ops)
         return MegakernelConfig(
-            threads_per_block=(LLAMA1B_CONSUMER_WARPS + NUM_DMA_WARPS) * 32,
+            threads_per_block=(LLAMA1B_SM120_CONSUMER_WARPS + NUM_DMA_WARPS) * 32,
             page_size=page_size,
             mma_reg_count=96,
         )
@@ -98,7 +121,7 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
         if tensor_name == "weight":
             return (
                 tile_sizes["O"],
-                static_dims.get("reduction_tile_K", LLAMA1B_REDUCTION_DIM_PER_WARP),
+                static_dims.get("reduction_tile_K", LLAMA1B_SM120_REDUCTION_DIM_PER_WARP),
             )
         return None
 
@@ -110,33 +133,58 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
         return None
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, reduction_tile_K=None, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        reduction_tile_K=None,
+        **tensors,
+    ):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 1)
         tile_sizes.setdefault("O", LLAMA1B_MATVEC_BLOCK)
         if tile_sizes["S"] != 1:
             raise ValueError(f"{cls.__name__} is a single-token decode matvec; got S={tile_sizes['S']}")
+        if tile_sizes["O"] % 4 != 0:
+            raise ValueError(f"{cls.__name__} requires O tile size divisible by 4; got O={tile_sizes['O']}")
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         weight = tensors["weight"]
         if reduction_tile_K is None:
-            reduction_tile_K = LLAMA1B_REDUCTION_DIM_PER_WARP
+            reduction_tile_K = LLAMA1B_SM120_REDUCTION_DIM_PER_WARP
         reduction_tile_K = min(reduction_tile_K, weight.shape[1])
         reduction_chunks = (weight.shape[1] + reduction_tile_K - 1) // reduction_tile_K
         staged_weight_chunk_bytes = tile_sizes["O"] * reduction_tile_K * weight.element_size()
         staged_weight_bytes = reduction_chunks * staged_weight_chunk_bytes
-        mbar_offset = 2 * staged_weight_bytes
-        rms_offset = mbar_offset + 32
+        staged_num_buffers = 2
+        mbarrier_bytes = 32
+        mbar_offset = staged_num_buffers * staged_weight_bytes
+        rms_offset = mbar_offset + mbarrier_bytes
         partial_offset = rms_offset + reduction_chunks * 4
         scratch_bytes = reduction_chunks * 4 + reduction_chunks * tile_sizes["O"] * 4
+        required = rms_offset + scratch_bytes
+        if (
+            required > page_size
+            and cls.allow_single_staged_buffer
+        ):
+            compact_mbarrier_bytes = 16
+            compact_required = staged_weight_bytes + compact_mbarrier_bytes + scratch_bytes
+            if compact_required <= page_size:
+                staged_num_buffers = 1
+                mbarrier_bytes = compact_mbarrier_bytes
+                mbar_offset = staged_weight_bytes
+                rms_offset = mbar_offset + mbarrier_bytes
+                partial_offset = rms_offset + reduction_chunks * 4
+                required = rms_offset + scratch_bytes
         op.static_dims["reduction_tile_K"] = reduction_tile_K
         op.static_dims["reduction_chunks"] = reduction_chunks
+        op.static_dims["staged_num_buffers"] = staged_num_buffers
         op.static_dims["staged_weight_chunk_bytes"] = staged_weight_chunk_bytes
         op.static_dims["staged_weight_bytes"] = staged_weight_bytes
         op.static_dims["mbar_offset"] = mbar_offset
         op.static_dims["rms_offset"] = rms_offset
         op.static_dims["partial_offset"] = partial_offset
-        op.static_dims["page_size"] = max(page_size, rms_offset + scratch_bytes)
+        _set_exact_staged_page_size(op, page_size, required)
         return [op]
 
     @cute.jit
@@ -150,19 +198,25 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(1))
             mbarrier_init(bf_1, Int32(1))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
+            if const_expr(self.staged_num_buffers != 1):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
         mbarrier_init_fence()
         with cute.arch.elect_one():
-            mbarrier_arrive(bf_1)
+            if const_expr(self.staged_num_buffers != 1):
+                mbarrier_arrive(bf_1)
 
         block_idx = tile_O
         iter_idx = Int32(0)
         while block_idx < tile_3:
-            buf_idx = iter_idx % Int32(2)
+            buf_idx = Int32(0)
+            if const_expr(self.staged_num_buffers != 1):
+                buf_idx = iter_idx % Int32(2)
             buf_base = page_ptr + buf_idx * Int32(self.staged_weight_bytes)
             if iter_idx > Int32(0):
-                bf_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
+                bf_phase = (iter_idx - Int32(1)) % Int32(2)
+                if const_expr(self.staged_num_buffers != 1):
+                    bf_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
                 if buf_idx == Int32(0):
                     mbarrier_wait(bf_0, bf_phase)
                 if buf_idx == Int32(1):
@@ -175,18 +229,24 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
             )
             nbytes = Int32(self.staged_weight_bytes)
             mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-            kr_ptr = cute.make_ptr(cutlass.Int64, kr_0, cute.AddressSpace.smem)
+            kr_ptr = cute.make_ptr(cutlass.Int64, bf_1, cute.AddressSpace.smem)
+            if const_expr(self.staged_num_buffers != 1):
+                kr_ptr = cute.make_ptr(cutlass.Int64, kr_0, cute.AddressSpace.smem)
             if iter_idx == Int32(0):
                 with cute.arch.elect_one():
                     mbarrier_arrive_expect_tx(work_mbar, nbytes)
             if iter_idx > Int32(0):
-                if buf_idx == Int32(0):
+                if const_expr(self.staged_num_buffers == 1):
                     with cute.arch.elect_one():
-                        mbarrier_arrive_expect_tx(kr_0, nbytes)
-                if buf_idx == Int32(1):
-                    kr_ptr = cute.make_ptr(cutlass.Int64, kr_1, cute.AddressSpace.smem)
-                    with cute.arch.elect_one():
-                        mbarrier_arrive_expect_tx(kr_1, nbytes)
+                        mbarrier_arrive_expect_tx(bf_1, nbytes)
+                else:
+                    if buf_idx == Int32(0):
+                        with cute.arch.elect_one():
+                            mbarrier_arrive_expect_tx(kr_0, nbytes)
+                    if buf_idx == Int32(1):
+                        kr_ptr = cute.make_ptr(cutlass.Int64, kr_1, cute.AddressSpace.smem)
+                        with cute.arch.elect_one():
+                            mbarrier_arrive_expect_tx(kr_1, nbytes)
 
             for k_chunk in range(self.reduction_chunks):
                 chunk_base = buf_base + Int32(k_chunk) * Int32(self.staged_weight_chunk_bytes)
@@ -240,34 +300,96 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
         return cute.arch.warp_reduction(acc, operator.add)
 
     @cute.jit
-    def _dot_staged_partial_vec4(self, tile_B, row_idx, local_o, k_chunk, a, staged_weight):
+    def _dot_staged_norm_residual_partial4(
+        self,
+        tile_B,
+        row_idx,
+        local_o,
+        k_chunk,
+        rstd,
+        x,
+        residual_in,
+        norm_weight,
+        staged_weight,
+    ):
         lane_idx = cute.arch.lane_idx()
         k_start = k_chunk * Int32(self.reduction_tile_K)
-        a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S) + k_start
-        a_row = cute.make_tensor(a.iterator + a_base, cute.make_layout(self.reduction_tile_K))
-        acc = Float32(0.0)
-        k = lane_idx * Int32(4)
+        x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S) + k_start
+        r_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S) + k_start
+        x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.reduction_tile_K))
+        r_row = cute.make_tensor(residual_in.iterator + r_base, cute.make_layout(self.reduction_tile_K))
+        norm_row = cute.make_tensor(norm_weight.iterator + k_start, cute.make_layout(self.reduction_tile_K))
+        acc0 = Float32(0.0)
+        acc1 = Float32(0.0)
+        acc2 = Float32(0.0)
+        acc3 = Float32(0.0)
+        local_o1 = local_o + Int32(1)
+        local_o2 = local_o + Int32(2)
+        local_o3 = local_o + Int32(3)
+        k = lane_idx * Int32(2)
         while k < Int32(self.reduction_tile_K):
             global_k = k_start + k
             if global_k < Int32(self.K):
-                acc = acc + a_row[k].to(Float32) * staged_weight[(k, local_o)].to(Float32)
+                nv = (x_row[k].to(Float32) + r_row[k].to(Float32)) * rstd * norm_row[k].to(Float32)
+                acc0 = acc0 + nv * staged_weight[(k, local_o)].to(Float32)
+                acc1 = acc1 + nv * staged_weight[(k, local_o1)].to(Float32)
+                acc2 = acc2 + nv * staged_weight[(k, local_o2)].to(Float32)
+                acc3 = acc3 + nv * staged_weight[(k, local_o3)].to(Float32)
             k1 = k + Int32(1)
             global_k1 = k_start + k1
             if k1 < Int32(self.reduction_tile_K):
                 if global_k1 < Int32(self.K):
-                    acc = acc + a_row[k1].to(Float32) * staged_weight[(k1, local_o)].to(Float32)
-            k2 = k + Int32(2)
-            global_k2 = k_start + k2
-            if k2 < Int32(self.reduction_tile_K):
-                if global_k2 < Int32(self.K):
-                    acc = acc + a_row[k2].to(Float32) * staged_weight[(k2, local_o)].to(Float32)
-            k3 = k + Int32(3)
-            global_k3 = k_start + k3
-            if k3 < Int32(self.reduction_tile_K):
-                if global_k3 < Int32(self.K):
-                    acc = acc + a_row[k3].to(Float32) * staged_weight[(k3, local_o)].to(Float32)
-            k = k + Int32(128)
-        return cute.arch.warp_reduction(acc, operator.add)
+                    nv1 = (x_row[k1].to(Float32) + r_row[k1].to(Float32)) * rstd * norm_row[k1].to(Float32)
+                    acc0 = acc0 + nv1 * staged_weight[(k1, local_o)].to(Float32)
+                    acc1 = acc1 + nv1 * staged_weight[(k1, local_o1)].to(Float32)
+                    acc2 = acc2 + nv1 * staged_weight[(k1, local_o2)].to(Float32)
+                    acc3 = acc3 + nv1 * staged_weight[(k1, local_o3)].to(Float32)
+            k = k + Int32(64)
+        return (
+            cute.arch.warp_reduction(acc0, operator.add),
+            cute.arch.warp_reduction(acc1, operator.add),
+            cute.arch.warp_reduction(acc2, operator.add),
+            cute.arch.warp_reduction(acc3, operator.add),
+        )
+
+    @cute.jit
+    def _dot_staged_partial4(self, tile_B, row_idx, local_o, k_chunk, a, staged_weight):
+        lane_idx = cute.arch.lane_idx()
+        k_start = k_chunk * Int32(self.reduction_tile_K)
+        a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S) + k_start
+        a_row = cute.make_tensor(a.iterator + a_base, cute.make_layout(self.reduction_tile_K))
+        acc0 = Float32(0.0)
+        acc1 = Float32(0.0)
+        acc2 = Float32(0.0)
+        acc3 = Float32(0.0)
+        local_o1 = local_o + Int32(1)
+        local_o2 = local_o + Int32(2)
+        local_o3 = local_o + Int32(3)
+        k = lane_idx * Int32(2)
+        while k < Int32(self.reduction_tile_K):
+            global_k = k_start + k
+            if global_k < Int32(self.K):
+                av = a_row[k].to(Float32)
+                acc0 = acc0 + av * staged_weight[(k, local_o)].to(Float32)
+                acc1 = acc1 + av * staged_weight[(k, local_o1)].to(Float32)
+                acc2 = acc2 + av * staged_weight[(k, local_o2)].to(Float32)
+                acc3 = acc3 + av * staged_weight[(k, local_o3)].to(Float32)
+            k1 = k + Int32(1)
+            global_k1 = k_start + k1
+            if k1 < Int32(self.reduction_tile_K):
+                if global_k1 < Int32(self.K):
+                    av1 = a_row[k1].to(Float32)
+                    acc0 = acc0 + av1 * staged_weight[(k1, local_o)].to(Float32)
+                    acc1 = acc1 + av1 * staged_weight[(k1, local_o1)].to(Float32)
+                    acc2 = acc2 + av1 * staged_weight[(k1, local_o2)].to(Float32)
+                    acc3 = acc3 + av1 * staged_weight[(k1, local_o3)].to(Float32)
+            k = k + Int32(64)
+        return (
+            cute.arch.warp_reduction(acc0, operator.add),
+            cute.arch.warp_reduction(acc1, operator.add),
+            cute.arch.warp_reduction(acc2, operator.add),
+            cute.arch.warp_reduction(acc3, operator.add),
+        )
 
     @cute.jit
     def _sum_staged_partials(self, page_ptr, local_o):
@@ -328,10 +450,10 @@ class Llama1BDownMatvecSm120Op(_Llama1BStagedWeightMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_partial4(
                                 tile_B,
                                 row_idx,
                                 Int32(local_o),
@@ -340,17 +462,24 @@ class Llama1BDownMatvecSm120Op(_Llama1BStagedWeightMatvecSm120Base):
                                 staged_weight,
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
-                                y_row[out_idx] = total.to(self.y_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                            y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
+                            y_row[out_idx] = total.to(self.y_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -412,10 +541,10 @@ class Llama1BMatvecResidualSm120Op(_Llama1BStagedWeightMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_partial4(
                                 tile_B,
                                 row_idx,
                                 Int32(local_o),
@@ -424,19 +553,26 @@ class Llama1BMatvecResidualSm120Op(_Llama1BStagedWeightMatvecSm120Base):
                                 staged_weight,
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
-                                out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
-                                res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.O))
-                                out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.O))
-                                out_row[out_idx] = (total + res_row[out_idx].to(Float32)).to(self.residual_out_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
+                            out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                            res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.O))
+                            out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.O))
+                            out_row[out_idx] = (total + res_row[out_idx].to(Float32)).to(self.residual_out_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -447,87 +583,57 @@ class Llama1BMatvecResidualSm120Op(_Llama1BStagedWeightMatvecSm120Base):
             iter_idx = iter_idx + Int32(1)
 
 
-class Llama1BMatvecResidualVec4Sm120Op(Llama1BMatvecResidualSm120Op):
-    """Experimental staged projection using a 4-wide K loop per lane."""
+class Llama1BDownAdd4Sm120Op(Op):
+    """Fuse the four row-parallel down-projection partials."""
+
+    reads = {
+        "p0": (None, ("B", "S", "D")),
+        "p1": (None, ("B", "S", "D")),
+        "p2": (None, ("B", "S", "D")),
+        "p3": (None, ("B", "S", "D")),
+    }
+    writes = {"y": (None, ("B", "S", "D"))}
+    tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, **tensors):
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        tile_sizes.setdefault("S", 1)
+        tile_sizes.setdefault("D", 256)
+        if tile_sizes["S"] != 1:
+            raise ValueError(f"{cls.__name__} is a single-token decode add; got S={tile_sizes['S']}")
+        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, tile_3,
-                a, residual_in, residual_out):
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, p0, p1, p2, p3, y):
         tidx = cute.arch.thread_idx()[0]
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        row_start = tile_S * Int32(self.tile_size_S)
-        bf_0 = page_ptr + Int32(self.mbar_offset)
-        bf_1 = page_ptr + Int32(self.mbar_offset + 8)
-        kr_0 = page_ptr + Int32(self.mbar_offset + 16)
-        kr_1 = page_ptr + Int32(self.mbar_offset + 24)
-
-        block_idx = tile_O
-        iter_idx = Int32(0)
-        while block_idx < tile_3:
-            buf_idx = iter_idx % Int32(2)
-            if iter_idx > Int32(0):
-                kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-                if buf_idx == Int32(0):
-                    mbarrier_wait(kr_0, kr_phase)
-                if buf_idx == Int32(1):
-                    mbarrier_wait(kr_1, kr_phase)
-            partials = cute.make_tensor(
-                cute.make_ptr(cutlass.Float32, page_ptr + Int32(self.partial_offset), cute.AddressSpace.smem),
-                cute.make_layout((self.reduction_chunks, self.tile_size_O), stride=(self.tile_size_O, 1)),
-            )
-            row_idx = row_start
-            if row_idx < Int32(self.S):
-                o_start = block_idx * Int32(self.tile_size_O)
-                if warp_idx < Int32(self.reduction_chunks):
-                    staged_weight = cute.make_tensor(
-                        cute.make_ptr(
-                            self.weight_dtype,
-                            page_ptr
-                            + buf_idx * Int32(self.staged_weight_bytes)
-                            + warp_idx * Int32(self.staged_weight_chunk_bytes),
-                            cute.AddressSpace.smem,
-                            assumed_align=128,
-                        ),
-                        cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
+        row_idx = tile_S * Int32(self.tile_size_S)
+        d_start = tile_D * Int32(self.tile_size_D)
+        d_stop = d_start + Int32(self.tile_size_D)
+        if row_idx < Int32(self.S):
+            base = tile_B * Int32(self.S * self.D) + row_idx * Int32(self.D)
+            p0_row = cute.make_tensor(p0.iterator + base, cute.make_layout(self.D))
+            p1_row = cute.make_tensor(p1.iterator + base, cute.make_layout(self.D))
+            p2_row = cute.make_tensor(p2.iterator + base, cute.make_layout(self.D))
+            p3_row = cute.make_tensor(p3.iterator + base, cute.make_layout(self.D))
+            y_row = cute.make_tensor(y.iterator + base, cute.make_layout(self.D))
+            d = d_start + tidx
+            while d < d_stop:
+                if d < Int32(self.D):
+                    total = (
+                        p0_row[d].to(Float32)
+                        + p1_row[d].to(Float32)
+                        + p2_row[d].to(Float32)
+                        + p3_row[d].to(Float32)
                     )
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
-                        if out_idx < Int32(self.O):
-                            partial = self._dot_staged_partial_vec4(
-                                tile_B,
-                                row_idx,
-                                Int32(local_o),
-                                warp_idx,
-                                a,
-                                staged_weight,
-                            )
-                            if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
-                named_barrier_sync(Int32(2), Int32(self.threads_per_row))
-                if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
-                        if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
-                                out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
-                                res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.O))
-                                out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.O))
-                                out_row[out_idx] = (total + res_row[out_idx].to(Float32)).to(self.residual_out_dtype)
-            named_barrier_sync(Int32(2), Int32(self.threads_per_row))
-            if tidx == Int32(0):
-                if buf_idx == Int32(0):
-                    mbarrier_arrive(bf_0)
-                if buf_idx == Int32(1):
-                    mbarrier_arrive(bf_1)
-            block_idx = block_idx + Int32(1)
-            iter_idx = iter_idx + Int32(1)
+                    y_row[d] = total.to(self.y_dtype)
+                d = d + Int32(self.threads_per_row)
 
 
 class _Llama1BStagedRmsMatvecSm120Base(_Llama1BStagedWeightMatvecSm120Base):
-    """Staged RMS-normalized matvec using Hazy's 512-wide warp split."""
+    """Staged RMS-normalized matvec using Hazy's warp-split shape."""
 
     reads = {
         "x": (None, ("B", "S", "K")),
@@ -536,7 +642,14 @@ class _Llama1BStagedRmsMatvecSm120Base(_Llama1BStagedWeightMatvecSm120Base):
     }
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, reduction_tile_K=None, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        reduction_tile_K=None,
+        **tensors,
+    ):
         ops = super().schedule(
             tile_sizes=tile_sizes,
             page_size=page_size,
@@ -618,6 +731,56 @@ class _Llama1BStagedRmsMatvecSm120Base(_Llama1BStagedWeightMatvecSm120Base):
             k = k + Int32(64)
         return cute.arch.warp_reduction(acc, operator.add)
 
+    @cute.jit
+    def _dot_staged_norm_partial4(
+        self,
+        tile_B,
+        row_idx,
+        local_o,
+        k_chunk,
+        rstd,
+        x,
+        norm_weight,
+        staged_weight,
+    ):
+        lane_idx = cute.arch.lane_idx()
+        k_start = k_chunk * Int32(self.reduction_tile_K)
+        x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S) + k_start
+        x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.reduction_tile_K))
+        norm_row = cute.make_tensor(norm_weight.iterator + k_start, cute.make_layout(self.reduction_tile_K))
+        acc0 = Float32(0.0)
+        acc1 = Float32(0.0)
+        acc2 = Float32(0.0)
+        acc3 = Float32(0.0)
+        local_o1 = local_o + Int32(1)
+        local_o2 = local_o + Int32(2)
+        local_o3 = local_o + Int32(3)
+        k = lane_idx * Int32(2)
+        while k < Int32(self.reduction_tile_K):
+            global_k = k_start + k
+            if global_k < Int32(self.K):
+                nv = x_row[k].to(Float32) * rstd * norm_row[k].to(Float32)
+                acc0 = acc0 + nv * staged_weight[(k, local_o)].to(Float32)
+                acc1 = acc1 + nv * staged_weight[(k, local_o1)].to(Float32)
+                acc2 = acc2 + nv * staged_weight[(k, local_o2)].to(Float32)
+                acc3 = acc3 + nv * staged_weight[(k, local_o3)].to(Float32)
+            k1 = k + Int32(1)
+            global_k1 = k_start + k1
+            if k1 < Int32(self.reduction_tile_K):
+                if global_k1 < Int32(self.K):
+                    nv1 = x_row[k1].to(Float32) * rstd * norm_row[k1].to(Float32)
+                    acc0 = acc0 + nv1 * staged_weight[(k1, local_o)].to(Float32)
+                    acc1 = acc1 + nv1 * staged_weight[(k1, local_o1)].to(Float32)
+                    acc2 = acc2 + nv1 * staged_weight[(k1, local_o2)].to(Float32)
+                    acc3 = acc3 + nv1 * staged_weight[(k1, local_o3)].to(Float32)
+            k = k + Int32(64)
+        return (
+            cute.arch.warp_reduction(acc0, operator.add),
+            cute.arch.warp_reduction(acc1, operator.add),
+            cute.arch.warp_reduction(acc2, operator.add),
+            cute.arch.warp_reduction(acc3, operator.add),
+        )
+
 
 class _Llama1BStagedRmsResidualMatvecSm120Base(_Llama1BStagedRmsMatvecSm120Base):
     """Staged RMS(input + residual) matvec for attention projections."""
@@ -632,8 +795,20 @@ class _Llama1BStagedRmsResidualMatvecSm120Base(_Llama1BStagedRmsMatvecSm120Base)
     }
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, cache_pos=0, **tensors):
-        ops = super().schedule(tile_sizes=tile_sizes, page_size=page_size, eps=eps, **tensors)
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        cache_pos=0,
+        **tensors,
+    ):
+        ops = super().schedule(
+            tile_sizes=tile_sizes,
+            page_size=page_size,
+            eps=eps,
+            **tensors,
+        )
         op = ops[0]
         op.static_dims["cache_pos"] = cache_pos
         op.static_dims["head_dim"] = tensors["cos"].shape[1]
@@ -764,6 +939,8 @@ class _Llama1BStagedRmsResidualMatvecSm120Base(_Llama1BStagedRmsMatvecSm120Base)
 class Llama1BRmsQSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
     """Staged RMS(input+residual) + Q matvec + Hazy-style RoPE."""
 
+    allow_single_staged_buffer = True
+
     writes = {
         "residual_out": (None, ("B", "S", "K")),
         "q": (None, ("B", "S", "O")),
@@ -783,17 +960,22 @@ class Llama1BRmsQSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
 
         rstd = self._row_rstd_residual(page_ptr, tile_B, row_idx, x, residual_in)
         self._store_residual(tile_B, row_idx, x, residual_in, residual_out)
-        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
         block_idx = tile_O
         iter_idx = Int32(0)
         while block_idx < tile_3:
-            buf_idx = iter_idx % Int32(2)
+            buf_idx = Int32(0)
+            if const_expr(self.staged_num_buffers != 1):
+                buf_idx = iter_idx % Int32(2)
             if iter_idx > Int32(0):
-                kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-                if buf_idx == Int32(0):
-                    mbarrier_wait(kr_0, kr_phase)
-                if buf_idx == Int32(1):
-                    mbarrier_wait(kr_1, kr_phase)
+                kr_phase = (iter_idx - Int32(1)) % Int32(2)
+                if const_expr(self.staged_num_buffers == 1):
+                    mbarrier_wait(bf_1, kr_phase)
+                else:
+                    kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
+                    if buf_idx == Int32(0):
+                        mbarrier_wait(kr_0, kr_phase)
+                    if buf_idx == Int32(1):
+                        mbarrier_wait(kr_1, kr_phase)
             partials = cute.make_tensor(
                 cute.make_ptr(cutlass.Float32, page_ptr + Int32(self.partial_offset), cute.AddressSpace.smem),
                 cute.make_layout((self.reduction_chunks, self.tile_size_O), stride=(self.tile_size_O, 1)),
@@ -810,31 +992,41 @@ class Llama1BRmsQSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_residual_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_residual_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, residual_in, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, Int32(local_o), total, cos, sin)
-                            if lane_idx == Int32(0):
-                                q_base = tile_B * Int32(self.q_stride_B) + row_idx * Int32(self.q_stride_S)
-                                q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.O))
-                                q_row[out_idx] = total.to(self.q_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, local_o, total, cos, sin)
+                            q_base = tile_B * Int32(self.q_stride_B) + row_idx * Int32(self.q_stride_S)
+                            q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.O))
+                            q_row[out_idx] = total.to(self.q_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
-                if buf_idx == Int32(0):
+                if const_expr(self.staged_num_buffers == 1):
                     mbarrier_arrive(bf_0)
-                if buf_idx == Int32(1):
-                    mbarrier_arrive(bf_1)
+                else:
+                    if buf_idx == Int32(0):
+                        mbarrier_arrive(bf_0)
+                    if buf_idx == Int32(1):
+                        mbarrier_arrive(bf_1)
             block_idx = block_idx + Int32(1)
             iter_idx = iter_idx + Int32(1)
 
@@ -891,32 +1083,39 @@ class Llama1BRmsKCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_residual_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_residual_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, residual_in, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
+                            total = self._sum_staged_partials(page_ptr, local_o)
                             if apply_rope != Int32(0):
-                                total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, Int32(local_o), total, cos, sin)
-                            if lane_idx == Int32(0):
-                                head = out_idx // Int32(self.head_dim)
-                                dim = out_idx % Int32(self.head_dim)
-                                dst_base = (
-                                    tile_B * Int32(self.dst_cache_stride_B)
-                                    + (row_idx + Int32(self.cache_pos)) * Int32(self.dst_cache_stride_T)
-                                    + head * Int32(self.dst_cache_stride_H)
-                                )
-                                dst_row = cute.make_tensor(dst_cache.iterator + dst_base, cute.make_layout(self.HD))
-                                dst_row[dim] = total.to(self.dst_cache_dtype)
+                                total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, local_o, total, cos, sin)
+                            head = out_idx // Int32(self.head_dim)
+                            dim = out_idx % Int32(self.head_dim)
+                            dst_base = (
+                                tile_B * Int32(self.dst_cache_stride_B)
+                                + (row_idx + Int32(self.cache_pos)) * Int32(self.dst_cache_stride_T)
+                                + head * Int32(self.dst_cache_stride_H)
+                            )
+                            dst_row = cute.make_tensor(dst_cache.iterator + dst_base, cute.make_layout(self.HD))
+                            dst_row[dim] = total.to(self.dst_cache_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -967,7 +1166,7 @@ class Llama1BRmsKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
         if tensor_name in ("k_weight", "v_weight"):
             return (
                 tile_sizes["O"],
-                static_dims.get("reduction_tile_K", LLAMA1B_REDUCTION_DIM_PER_WARP),
+                static_dims.get("reduction_tile_K", LLAMA1B_SM120_REDUCTION_DIM_PER_WARP),
             )
         return None
 
@@ -979,14 +1178,21 @@ class Llama1BRmsKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
         return None
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, cache_pos=0, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        cache_pos=0,
+        **tensors,
+    ):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 1)
         tile_sizes.setdefault("O", LLAMA1B_MATVEC_BLOCK)
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         weight = tensors["k_weight"]
-        reduction_tile_K = min(LLAMA1B_REDUCTION_DIM_PER_WARP, weight.shape[1])
+        reduction_tile_K = min(LLAMA1B_SM120_REDUCTION_DIM_PER_WARP, weight.shape[1])
         reduction_chunks = (weight.shape[1] + reduction_tile_K - 1) // reduction_tile_K
         staged_weight_chunk_bytes = tile_sizes["O"] * reduction_tile_K * weight.element_size()
         staged_weight_bytes = reduction_chunks * staged_weight_chunk_bytes
@@ -1001,7 +1207,7 @@ class Llama1BRmsKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
         op.static_dims["mbar_offset"] = mbar_offset
         op.static_dims["rms_offset"] = rms_offset
         op.static_dims["partial_offset"] = partial_offset
-        op.static_dims["page_size"] = max(page_size, rms_offset + scratch_bytes)
+        _set_exact_staged_page_size(op, page_size, rms_offset + scratch_bytes)
         op.static_dims["eps"] = eps
         op.static_dims["cache_pos"] = cache_pos
         op.static_dims["head_dim"] = tensors["cos"].shape[1]
@@ -1124,41 +1330,48 @@ class Llama1BRmsKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_residual_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_residual_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, residual_in, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
+                            total = self._sum_staged_partials(page_ptr, local_o)
                             if not is_v:
-                                total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, Int32(local_o), total, cos, sin)
-                            if lane_idx == Int32(0):
-                                head = out_idx // Int32(self.head_dim)
-                                dim = out_idx % Int32(self.head_dim)
-                                if is_v:
-                                    dst_base = (
-                                        tile_B * Int32(self.v_cache_stride_B)
-                                        + (row_idx + Int32(self.cache_pos)) * Int32(self.v_cache_stride_T)
-                                        + head * Int32(self.v_cache_stride_H)
-                                    )
-                                    dst_row = cute.make_tensor(v_cache.iterator + dst_base, cute.make_layout(self.HD))
-                                    dst_row[dim] = total.to(self.v_cache_dtype)
-                                else:
-                                    dst_base = (
-                                        tile_B * Int32(self.k_cache_stride_B)
-                                        + (row_idx + Int32(self.cache_pos)) * Int32(self.k_cache_stride_T)
-                                        + head * Int32(self.k_cache_stride_H)
-                                    )
-                                    dst_row = cute.make_tensor(k_cache.iterator + dst_base, cute.make_layout(self.HD))
-                                    dst_row[dim] = total.to(self.k_cache_dtype)
+                                total = self._apply_hazy_rope(page_ptr, row_idx, out_idx, local_o, total, cos, sin)
+                            head = out_idx // Int32(self.head_dim)
+                            dim = out_idx % Int32(self.head_dim)
+                            if is_v:
+                                dst_base = (
+                                    tile_B * Int32(self.v_cache_stride_B)
+                                    + (row_idx + Int32(self.cache_pos)) * Int32(self.v_cache_stride_T)
+                                    + head * Int32(self.v_cache_stride_H)
+                                )
+                                dst_row = cute.make_tensor(v_cache.iterator + dst_base, cute.make_layout(self.HD))
+                                dst_row[dim] = total.to(self.v_cache_dtype)
+                            else:
+                                dst_base = (
+                                    tile_B * Int32(self.k_cache_stride_B)
+                                    + (row_idx + Int32(self.cache_pos)) * Int32(self.k_cache_stride_T)
+                                    + head * Int32(self.k_cache_stride_H)
+                                )
+                                dst_row = cute.make_tensor(k_cache.iterator + dst_base, cute.make_layout(self.HD))
+                                dst_row[dim] = total.to(self.k_cache_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1188,7 +1401,13 @@ class Llama1BRmsQKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
         kv_group_size=4,
         **tensors,
     ):
-        ops = super().schedule(tile_sizes=tile_sizes, page_size=page_size, eps=eps, cache_pos=cache_pos, **tensors)
+        ops = super().schedule(
+            tile_sizes=tile_sizes,
+            page_size=page_size,
+            eps=eps,
+            cache_pos=cache_pos,
+            **tensors,
+        )
         op = ops[0]
         op.static_dims["cache_pos"] = cache_pos
         op.static_dims["head_dim"] = tensors["cos"].shape[1]
@@ -1212,7 +1431,6 @@ class Llama1BRmsQKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
 
         rstd = self._row_rstd_residual(page_ptr, tile_B, row_idx, x, residual_in)
         self._store_residual(tile_B, row_idx, x, residual_in, residual_out)
-        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
         block_idx = tile_O
         iter_idx = Int32(0)
         while block_idx < tile_3:
@@ -1239,50 +1457,55 @@ class Llama1BRmsQKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_residual_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_residual_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, residual_in, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
+                            total = self._sum_staged_partials(page_ptr, local_o)
                             group = out_idx // Int32(self.qkv_group_cols)
                             group_o = out_idx - group * Int32(self.qkv_group_cols)
                             if group_o < Int32(self.q_group_cols):
                                 q_idx = group * Int32(self.q_group_cols) + group_o
-                                total = self._apply_hazy_rope(page_ptr, row_idx, q_idx, Int32(local_o), total, cos, sin)
-                                if lane_idx == Int32(0):
-                                    q_base = tile_B * Int32(self.q_stride_B) + row_idx * Int32(self.q_stride_S)
-                                    q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.q_dim))
-                                    q_row[q_idx] = total.to(self.q_dtype)
+                                total = self._apply_hazy_rope(page_ptr, row_idx, q_idx, local_o, total, cos, sin)
+                                q_base = tile_B * Int32(self.q_stride_B) + row_idx * Int32(self.q_stride_S)
+                                q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.q_dim))
+                                q_row[q_idx] = total.to(self.q_dtype)
                             elif group_o < Int32(self.q_group_cols + self.head_dim):
                                 dim = group_o - Int32(self.q_group_cols)
-                                total = self._apply_hazy_rope(page_ptr, row_idx, dim, Int32(local_o), total, cos, sin)
-                                if lane_idx == Int32(0):
-                                    dst_base = (
-                                        tile_B * Int32(self.k_cache_stride_B)
-                                        + (row_idx + Int32(self.cache_pos)) * Int32(self.k_cache_stride_T)
-                                        + group * Int32(self.k_cache_stride_H)
-                                    )
-                                    dst_row = cute.make_tensor(k_cache.iterator + dst_base, cute.make_layout(self.HD))
-                                    dst_row[dim] = total.to(self.k_cache_dtype)
+                                total = self._apply_hazy_rope(page_ptr, row_idx, dim, local_o, total, cos, sin)
+                                dst_base = (
+                                    tile_B * Int32(self.k_cache_stride_B)
+                                    + (row_idx + Int32(self.cache_pos)) * Int32(self.k_cache_stride_T)
+                                    + group * Int32(self.k_cache_stride_H)
+                                )
+                                dst_row = cute.make_tensor(k_cache.iterator + dst_base, cute.make_layout(self.HD))
+                                dst_row[dim] = total.to(self.k_cache_dtype)
                             else:
-                                if lane_idx == Int32(0):
-                                    dim = group_o - Int32(self.q_group_cols + self.head_dim)
-                                    dst_base = (
-                                        tile_B * Int32(self.v_cache_stride_B)
-                                        + (row_idx + Int32(self.cache_pos)) * Int32(self.v_cache_stride_T)
-                                        + group * Int32(self.v_cache_stride_H)
-                                    )
-                                    dst_row = cute.make_tensor(v_cache.iterator + dst_base, cute.make_layout(self.HD))
-                                    dst_row[dim] = total.to(self.v_cache_dtype)
+                                dim = group_o - Int32(self.q_group_cols + self.head_dim)
+                                dst_base = (
+                                    tile_B * Int32(self.v_cache_stride_B)
+                                    + (row_idx + Int32(self.cache_pos)) * Int32(self.v_cache_stride_T)
+                                    + group * Int32(self.v_cache_stride_H)
+                                )
+                                dst_row = cute.make_tensor(v_cache.iterator + dst_base, cute.make_layout(self.HD))
+                                dst_row[dim] = total.to(self.v_cache_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1342,24 +1565,31 @@ class Llama1BRmsUpMatvecSm120Op(_Llama1BStagedRmsMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                up_base = tile_B * Int32(self.up_stride_B) + row_idx * Int32(self.up_stride_S)
-                                up_row = cute.make_tensor(up.iterator + up_base, cute.make_layout(self.O))
-                                up_row[out_idx] = total.to(self.up_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            up_base = tile_B * Int32(self.up_stride_B) + row_idx * Int32(self.up_stride_S)
+                            up_row = cute.make_tensor(up.iterator + up_base, cute.make_layout(self.O))
+                            up_row[out_idx] = total.to(self.up_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1421,26 +1651,33 @@ class Llama1BRmsGateSiluMatvecSm120Op(_Llama1BStagedRmsMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            gate = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                up_base = tile_B * Int32(self.up_stride_B) + row_idx * Int32(self.up_stride_S)
-                                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                                up_row = cute.make_tensor(up.iterator + up_base, cute.make_layout(self.O))
-                                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
-                                y_row[out_idx] = (_silu(gate) * up_row[out_idx].to(Float32)).to(self.y_dtype)
+                            gate = self._sum_staged_partials(page_ptr, local_o)
+                            up_base = tile_B * Int32(self.up_stride_B) + row_idx * Int32(self.up_stride_S)
+                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                            up_row = cute.make_tensor(up.iterator + up_base, cute.make_layout(self.O))
+                            y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
+                            y_row[out_idx] = (_silu(gate) * up_row[out_idx].to(Float32)).to(self.y_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1468,7 +1705,7 @@ class Llama1BRmsUpGateSiluSm120Op(_Llama1BStagedRmsMatvecSm120Base):
         if tensor_name in ("up_weight", "gate_weight"):
             return (
                 tile_sizes["O"],
-                static_dims.get("reduction_tile_K", LLAMA1B_REDUCTION_DIM_PER_WARP),
+                static_dims.get("reduction_tile_K", LLAMA1B_SM120_REDUCTION_DIM_PER_WARP),
             )
         return None
 
@@ -1487,9 +1724,11 @@ class Llama1BRmsUpGateSiluSm120Op(_Llama1BStagedRmsMatvecSm120Base):
         tile_sizes.setdefault("O", LLAMA1B_MATVEC_BLOCK)
         if tile_sizes["S"] != 1:
             raise ValueError(f"{cls.__name__} is a single-token decode matvec; got S={tile_sizes['S']}")
+        if tile_sizes["O"] % 4 != 0:
+            raise ValueError(f"{cls.__name__} requires O tile size divisible by 4; got O={tile_sizes['O']}")
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         weight = tensors["up_weight"]
-        reduction_tile_K = min(LLAMA1B_REDUCTION_DIM_PER_WARP, weight.shape[1])
+        reduction_tile_K = min(LLAMA1B_SM120_REDUCTION_DIM_PER_WARP, weight.shape[1])
         reduction_chunks = (weight.shape[1] + reduction_tile_K - 1) // reduction_tile_K
         staged_weight_chunk_bytes = tile_sizes["O"] * reduction_tile_K * weight.element_size()
         staged_weight_bytes = reduction_chunks * staged_weight_chunk_bytes
@@ -1506,7 +1745,7 @@ class Llama1BRmsUpGateSiluSm120Op(_Llama1BStagedRmsMatvecSm120Base):
         op.static_dims["rms_offset"] = rms_offset
         op.static_dims["partial_offset"] = partial_offset
         op.static_dims["up_cache_offset"] = up_cache_offset
-        op.static_dims["page_size"] = max(page_size, rms_offset + scratch_bytes)
+        _set_exact_staged_page_size(op, page_size, rms_offset + scratch_bytes)
         op.static_dims["eps"] = eps
         return [op]
 
@@ -1660,27 +1899,34 @@ class Llama1BRmsUpGateSiluSm120Op(_Llama1BStagedRmsMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_partials_at(page_ptr, Int32(self.partial_offset), Int32(local_o))
-                            if lane_idx == Int32(0):
-                                if is_gate:
-                                    y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                                    y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
-                                    y_row[out_idx] = (_silu(total) * up_cache[Int32(local_o)]).to(self.y_dtype)
-                                else:
-                                    up_cache[Int32(local_o)] = total
+                            total = self._sum_partials_at(page_ptr, Int32(self.partial_offset), local_o)
+                            if is_gate:
+                                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.O))
+                                y_row[out_idx] = (_silu(total) * up_cache[local_o]).to(self.y_dtype)
+                            else:
+                                up_cache[local_o] = total
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1735,24 +1981,31 @@ class Llama1BFinalRmsLmHeadSm120Op(_Llama1BStagedRmsMatvecSm120Base):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                logits_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
-                                logits_row = cute.make_tensor(logits.iterator + logits_base, cute.make_layout(self.O))
-                                logits_row[out_idx] = total.to(self.logits_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            logits_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
+                            logits_row = cute.make_tensor(logits.iterator + logits_base, cute.make_layout(self.O))
+                            logits_row[out_idx] = total.to(self.logits_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -1767,7 +2020,14 @@ class Llama1BFinalRmsLmHeadSingleStageSm120Op(Llama1BFinalRmsLmHeadSm120Op):
     """Single-buffer final RMS + LM-head projection for larger vocab tiles."""
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, **tensors):
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=LLAMA1B_SM120_LARGE_STAGED_PAGE_SIZE,
+        eps=1e-5,
+        reduction_tile_K=None,
+        **tensors,
+    ):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 1)
@@ -1776,7 +2036,9 @@ class Llama1BFinalRmsLmHeadSingleStageSm120Op(Llama1BFinalRmsLmHeadSm120Op):
             raise ValueError(f"{cls.__name__} is a single-token decode matvec; got S={tile_sizes['S']}")
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         weight = tensors["weight"]
-        reduction_tile_K = min(LLAMA1B_REDUCTION_DIM_PER_WARP, weight.shape[1])
+        if reduction_tile_K is None:
+            reduction_tile_K = LLAMA1B_SM120_REDUCTION_DIM_PER_WARP
+        reduction_tile_K = min(reduction_tile_K, weight.shape[1])
         reduction_chunks = (weight.shape[1] + reduction_tile_K - 1) // reduction_tile_K
         staged_weight_chunk_bytes = tile_sizes["O"] * reduction_tile_K * weight.element_size()
         staged_weight_bytes = reduction_chunks * staged_weight_chunk_bytes
@@ -1791,7 +2053,7 @@ class Llama1BFinalRmsLmHeadSingleStageSm120Op(Llama1BFinalRmsLmHeadSm120Op):
         op.static_dims["mbar_offset"] = mbar_offset
         op.static_dims["rms_offset"] = rms_offset
         op.static_dims["partial_offset"] = partial_offset
-        op.static_dims["page_size"] = max(page_size, partial_offset + scratch_bytes)
+        _set_exact_staged_page_size(op, page_size, partial_offset + scratch_bytes)
         op.static_dims["eps"] = eps
         return [op]
 
@@ -1870,24 +2132,31 @@ class Llama1BFinalRmsLmHeadSingleStageSm120Op(Llama1BFinalRmsLmHeadSm120Op):
                         ),
                         cute.make_layout((self.reduction_tile_K, self.tile_size_O), stride=(1, self.reduction_tile_K)),
                     )
-                    for local_o in range(self.tile_size_O):
+                    for local_o in range(0, self.tile_size_O, 4):
                         out_idx = o_start + Int32(local_o)
                         if out_idx < Int32(self.O):
-                            partial = self._dot_staged_norm_partial(
+                            partial0, partial1, partial2, partial3 = self._dot_staged_norm_partial4(
                                 tile_B, row_idx, Int32(local_o), warp_idx, rstd, x, norm_weight, staged_weight
                             )
                             if lane_idx == Int32(0):
-                                partials[(warp_idx, Int32(local_o))] = partial
+                                partials[(warp_idx, Int32(local_o))] = partial0
+                                if out_idx + Int32(1) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 1))] = partial1
+                                if out_idx + Int32(2) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 2))] = partial2
+                                if out_idx + Int32(3) < Int32(self.O):
+                                    partials[(warp_idx, Int32(local_o + 3))] = partial3
                 named_barrier_sync(Int32(2), Int32(self.threads_per_row))
                 if warp_idx == Int32(0):
-                    for local_o in range(self.tile_size_O):
-                        out_idx = o_start + Int32(local_o)
+                    local_o = lane_idx
+                    while local_o < Int32(self.tile_size_O):
+                        out_idx = o_start + local_o
                         if out_idx < Int32(self.O):
-                            total = self._sum_staged_partials(page_ptr, Int32(local_o))
-                            if lane_idx == Int32(0):
-                                logits_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
-                                logits_row = cute.make_tensor(logits.iterator + logits_base, cute.make_layout(self.O))
-                                logits_row[out_idx] = total.to(self.logits_dtype)
+                            total = self._sum_staged_partials(page_ptr, local_o)
+                            logits_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
+                            logits_row = cute.make_tensor(logits.iterator + logits_base, cute.make_layout(self.O))
+                            logits_row[out_idx] = total.to(self.logits_dtype)
+                        local_o = local_o + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 mbarrier_arrive(bf)
@@ -1899,9 +2168,9 @@ class Llama1BDecodeAttentionSm120Op(Op):
     """Single-token GQA decode attention for Llama-1B.
 
     Hazy's Llama attention instruction is scheduled per KV head and computes
-    the four GQA query heads together. This scalar-CUTE version keeps the same
-    online softmax math as the old direct op, but changes scheduling from one
-    tile per query head to one tile per KV head with four active warps.
+    the four GQA query heads together. This scalar-CUTE version keeps the
+    standard online softmax math, but schedules one tile per KV head with four
+    active query-head warps.
     """
 
     reads = {
@@ -2349,9 +2618,11 @@ def schedule_decode_layer_sm120(
     head_dim=LLAMA1B_HEAD_DIM,
     kv_group_size=(LLAMA1B_Q_DIM // LLAMA1B_HEAD_DIM) // (LLAMA1B_KV_DIM // LLAMA1B_HEAD_DIM),
     matvec_block=LLAMA1B_SM120_MATVEC_BLOCK,
-    split_upgate=False,
+    split_upgate=True,
 ):
     """Schedule one Llama-1B decode layer with staged SM120 O/down matvecs."""
+    _validate_staged_page_size(page_size)
+
     pfx = f"layer.{layer_idx}"
     cos = weights["cos"][cache_pos : cache_pos + seq_len]
     sin = weights["sin"][cache_pos : cache_pos + seq_len]
@@ -2463,7 +2734,13 @@ def schedule_decode_layer_sm120(
     )
     down_keep = []
     upgate_keep = []
-    for reduction_block in range(intermediate_size // hidden_size):
+    num_down_blocks = intermediate_size // hidden_size
+    down_partial_buf = None
+    if num_down_blocks == 4:
+        down_partial_buf = x_out.new_empty((num_down_blocks - 1, batch, seq_len, hidden_size))
+        down_keep.append(down_partial_buf)
+
+    for reduction_block in range(num_down_blocks):
         start = reduction_block * hidden_size
         stop = start + hidden_size
         a_block = mlp_h_buf[:, :, start:stop]
@@ -2483,23 +2760,34 @@ def schedule_decode_layer_sm120(
                 eps=eps,
             )
         down_keep += [a_block, w_block]
-        if reduction_block == 0:
+        if down_partial_buf is not None:
+            y_block = x_out if reduction_block == 0 else down_partial_buf[reduction_block - 1]
+            down_keep.append(y_block)
             ops += Llama1BDownMatvecSm120Op.schedule(
                 a=a_block,
                 weight=w_block,
-                y=x_out,
+                y=y_block,
                 tile_sizes={"S": seq_len, "O": matvec_block},
                 page_size=page_size,
             )
         else:
-            ops += Llama1BMatvecResidualSm120Op.schedule(
-                a=a_block,
-                weight=w_block,
-                residual_in=x_out,
-                residual_out=x_out,
-                tile_sizes={"S": seq_len, "O": matvec_block},
-                page_size=page_size,
-            )
+            if reduction_block == 0:
+                ops += Llama1BDownMatvecSm120Op.schedule(
+                    a=a_block,
+                    weight=w_block,
+                    y=x_out,
+                    tile_sizes={"S": seq_len, "O": matvec_block},
+                    page_size=page_size,
+                )
+            else:
+                ops += Llama1BMatvecResidualSm120Op.schedule(
+                    a=a_block,
+                    weight=w_block,
+                    residual_in=x_out,
+                    residual_out=x_out,
+                    tile_sizes={"S": seq_len, "O": matvec_block},
+                    page_size=page_size,
+                )
 
     if not split_upgate:
         upgate_ops = Llama1BRmsUpGateSiluSm120Op.schedule(
@@ -2514,6 +2802,16 @@ def schedule_decode_layer_sm120(
         )
         insert_at = len(ops) - (intermediate_size // hidden_size)
         ops[insert_at:insert_at] = upgate_ops
+
+    if down_partial_buf is not None:
+        ops += Llama1BDownAdd4Sm120Op.schedule(
+            p0=x_out,
+            p1=down_partial_buf[0],
+            p2=down_partial_buf[1],
+            p3=down_partial_buf[2],
+            y=x_out,
+            tile_sizes={"S": seq_len, "D": 256},
+        )
 
     return Llama1BLayerSchedule(
         ops=ops,
@@ -2536,6 +2834,8 @@ def schedule_final_sm120(
     matvec_block=LLAMA1B_MATVEC_BLOCK,
     reduction_tile_K=None,
 ):
+    _validate_staged_page_size(page_size)
+
     ops = Llama1BResidualAddSm120Op.schedule(
         x=x,
         residual_in=residual,
@@ -2577,10 +2877,12 @@ def schedule_decode_model_sm120(
     eps=1e-5,
     matvec_block=LLAMA1B_SM120_MATVEC_BLOCK,
     final_matvec_block=LLAMA1B_SM120_FINAL_MATVEC_BLOCK,
-    fa_num_splits=0,
-    split_upgate=False,
+    fa_num_splits=-1,
+    split_upgate=True,
 ):
     """Schedule a full single-token Llama-1B SM120 decode forward pass."""
+    _validate_staged_page_size(page_size)
+
     if len(x_buffers) < 2 or len(residual_buffers) < 2:
         raise ValueError("x_buffers and residual_buffers must each contain two ping-pong buffers")
     ops = []
@@ -2589,7 +2891,7 @@ def schedule_decode_model_sm120(
     if fa_num_splits < 0:
         cache_len = cache_pos + seq_len
         if cache_len < 384:
-            fa_num_splits = 12
+            fa_num_splits = 8
         else:
             fa_num_splits = min(64, max(16, cache_len // 8))
     cur = 0
@@ -2648,8 +2950,11 @@ __all__ = [
     "LLAMA1B_MATVEC_BLOCK",
     "LLAMA1B_SM120_MATVEC_BLOCK",
     "LLAMA1B_SM120_FINAL_MATVEC_BLOCK",
+    "LLAMA1B_SM120_CONSUMER_WARPS",
+    "LLAMA1B_SM120_REDUCTION_DIM_PER_WARP",
     "LLAMA1B_SM120_THREADS_PER_BLOCK",
     "LLAMA1B_CONSUMER_WARPS",
+    "Llama1BDownAdd4Sm120Op",
     "Llama1BDownMatvecSm120Op",
     "Llama1BDecodeAttentionSm120Op",
     "Llama1BDecodeAttentionPartialSm120Op",
@@ -2657,7 +2962,6 @@ __all__ = [
     "Llama1BFinalRmsLmHeadSm120Op",
     "Llama1BFinalRmsLmHeadSingleStageSm120Op",
     "Llama1BMatvecResidualSm120Op",
-    "Llama1BMatvecResidualVec4Sm120Op",
     "Llama1BResidualAddSm120Op",
     "Llama1BRmsGateSiluMatvecSm120Op",
     "Llama1BRmsKCacheSm120Op",

@@ -265,7 +265,6 @@ def _schedule_body(args, weights, buffers):
         fa_num_splits=args.fa_num_splits,
         use_flash_attention=args.use_flash_attention,
         matvec_block=args.matvec_block,
-        final_head_range_block=args.final_head_range_block,
     )
     return schedule
 
@@ -333,7 +332,6 @@ def build_kernel(args):
             seq_len=1,
             page_size=args.page_size,
             group_size=args.group_size,
-            final_head_range_block=args.final_head_range_block,
         )
         keep_alive = []
     else:
@@ -370,7 +368,6 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rep", type=int, default=5)
     parser.add_argument("--top-partitions", type=int, default=0)
-    parser.add_argument("--final-head-range-block", type=int, default=1)
     parser.add_argument("--fa-num-splits", type=int, default=0)
     parser.add_argument("--use-flash-attention", action="store_true")
     parser.add_argument("--dummy-weights", action="store_true")
@@ -385,7 +382,6 @@ def main():
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
         f"top_partitions={'sms' if args.top_partitions <= 0 else args.top_partitions}, "
-        f"final_head_range_block={args.final_head_range_block}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
         f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}",

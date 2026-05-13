@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+from machete.kernels.llama1b import LLAMA1B_SM120_QKV_HEAD_BLOCK, LLAMA1B_SM120_THREADS_PER_BLOCK
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -39,12 +41,14 @@ def test_llama1b_sm120_fused_upgate_matches_reference():
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
-            threads_per_block=256,
+            threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
             page_size=49152,
+            num_pages=2,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
         ),
     )
+    assert kernel._layout.num_slots > kernel._layout.num_pages
     kernel.run(validate=False)
     torch.cuda.synchronize()
 
@@ -92,7 +96,7 @@ def test_llama1b_sm120_grouped_attention_matches_reference():
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
-            threads_per_block=256,
+            threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
             page_size=49152,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
@@ -141,7 +145,7 @@ def test_llama1b_sm120_split_attention_matches_reference():
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
-            threads_per_block=256,
+            threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
             page_size=49152,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
@@ -200,11 +204,11 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         k_cache=k_fused,
         v_cache=v_fused,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     fused = Megakernel(
         fused_ops,
-        config=MegakernelConfig(threads_per_block=256, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     fused.run(validate=False)
 
@@ -218,7 +222,7 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         sin=sin,
         dst_cache=k_split,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     split_ops += Llama1BRmsVCacheSm120Op.schedule(
         x=x,
@@ -229,11 +233,11 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         sin=sin,
         dst_cache=v_split,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     split = Megakernel(
         split_ops,
-        config=MegakernelConfig(threads_per_block=256, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     split.run(validate=False)
     torch.cuda.synchronize()
@@ -269,7 +273,7 @@ def test_llama1b_sm120_single_stage_final_head_matches_reference():
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
-            threads_per_block=256,
+            threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
             page_size=page_size,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
@@ -347,12 +351,12 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         k_cache=k_fused,
         v_cache=v_fused,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
         kv_group_size=kv_group_size,
     )
     fused = Megakernel(
         fused_ops,
-        config=MegakernelConfig(threads_per_block=256, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     fused.run(validate=False)
 
@@ -366,7 +370,7 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         sin=sin,
         residual_out=residual_split,
         q=q_split,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     split_ops += Llama1BRmsKCacheSm120Op.schedule(
         x=x,
@@ -377,7 +381,7 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         sin=sin,
         dst_cache=k_split,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     split_ops += Llama1BRmsVCacheSm120Op.schedule(
         x=x,
@@ -388,11 +392,11 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         sin=sin,
         dst_cache=v_split,
         cache_pos=cache_pos,
-        tile_sizes={"S": 1, "O": 8},
+        tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
     )
     split = Megakernel(
         split_ops,
-        config=MegakernelConfig(threads_per_block=256, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     split.run(validate=False)
     torch.cuda.synchronize()

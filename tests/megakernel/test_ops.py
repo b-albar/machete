@@ -10,7 +10,7 @@ import pytest
 import torch
 import cutlass.cute as cute
 from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
-from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, TileRange, build_op_config
+from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, build_op_config
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
@@ -72,37 +72,7 @@ class _RangeCapableSerialNonTmaLoadOp(_SerialNonTmaLoadOp):
     pipeline = PipelineSpec(page_count=1)
 
 
-def test_tile_range_applies_semantic_axis_to_scheduled_op():
-    op = ScheduledOp(
-        _RangeCapableNOPOp,
-        tile_counts=(2, 3, 4),
-        dim_names={"B": 0, "S": 1, "O": 2},
-    )
-
-    assert op.with_tile_range(TileRange.coalesced("O", block_size=2)) is op
-    assert op.static_dims["pipeline_coalesce_ranges"] is True
-    assert op.static_dims["pipeline_range_axis"] == 2
-    assert op.static_dims["pipeline_range_end_axis"] == 3
-    assert op.static_dims["pipeline_range_block_size"] == 2
-
-
-def test_strided_tile_range_records_stride_metadata():
-    op = ScheduledOp(
-        _RangeCapableNOPOp,
-        tile_counts=(2, 3, 8),
-        dim_names={"B": 0, "S": 1, "O": 2},
-    )
-
-    op.with_tile_range(TileRange.strided("O", stride=4, block_size=3))
-
-    assert op.static_dims["pipeline_coalesce_ranges"] is True
-    assert op.static_dims["pipeline_range_axis"] == 2
-    assert op.static_dims["pipeline_range_end_axis"] == 3
-    assert op.static_dims["pipeline_range_stride"] == 4
-    assert op.static_dims["pipeline_range_stride_axis"] == 4
-
-
-def test_range_capable_pipeline_is_opt_in():
+def test_range_capable_pipeline_declares_range_metadata_without_coalescing():
     spec = PipelineSpec.range_capable(range_axis=2, range_end_axis=3)
 
     assert spec.page_count == 1
@@ -112,52 +82,20 @@ def test_range_capable_pipeline_is_opt_in():
     assert spec.coalesce_ranges is False
 
 
-def test_tile_range_rejects_unknown_semantic_axis():
-    op = ScheduledOp(_RangeCapableNOPOp, tile_counts=(2,), dim_names={"B": 0})
-
-    with pytest.raises(ValueError, match="Range axis 'O'"):
-        op.with_tile_range(TileRange.coalesced("O"))
-
-
-def test_tile_range_rejects_ops_without_pipeline_spec():
-    op = ScheduledOp(_NOPOp, tile_counts=(2,), dim_names={"M": 0})
-
-    with pytest.raises(ValueError, match="does not declare a PipelineSpec"):
-        op.with_tile_range(TileRange.coalesced("M"))
-
-
-def test_tile_range_rejects_negative_block_size():
-    with pytest.raises(ValueError, match="TileRange.block_size"):
-        TileRange.coalesced("M", block_size=-1)
-
-
-def test_tile_range_rejects_negative_stride():
-    with pytest.raises(ValueError, match="TileRange.stride"):
-        TileRange.strided("M", stride=0)
-
-
-def test_base_schedule_accepts_tile_range_option():
-    x = torch.empty(8, dtype=torch.float16)
-    y = torch.empty_like(x)
-
-    ops = _RangeCapableSerialNonTmaLoadOp.schedule(
-        x=x,
-        y=y,
-        tile_sizes={"M": 1},
-        tile_range=TileRange.coalesced("M", block_size=4),
-    )
-
-    assert ops[0].static_dims["pipeline_coalesce_ranges"] is True
-    assert ops[0].static_dims["pipeline_range_axis"] == 0
-    assert ops[0].static_dims["pipeline_range_block_size"] == 4
-
-
-def test_strided_tile_range_coalesces_by_residue_and_expands_logical_tiles():
+def test_strided_pipeline_range_coalesces_by_residue_and_expands_logical_tiles():
     op = ScheduledOp(
         _RangeCapableNOPOp,
         tile_counts=(1, 1, 10),
         dim_names={"B": 0, "S": 1, "O": 2},
-    ).with_tile_range(TileRange.strided("O", stride=4, block_size=3))
+        static_dims={
+            "pipeline_coalesce_ranges": True,
+            "pipeline_range_axis": 2,
+            "pipeline_range_end_axis": 3,
+            "pipeline_range_block_size": 3,
+            "pipeline_range_stride": 4,
+            "pipeline_range_stride_axis": 4,
+        },
+    )
     builder = InstructionStreamBuilder()
     builder.add_op(op)
 

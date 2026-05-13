@@ -1986,13 +1986,16 @@ class InstructionStreamBuilder:
     def pipeline_barrier_meta_indices(
         self,
         instructions: List[TileInstruction],
+        *,
+        expand_predicate=None,
     ) -> Tuple[List[int], List[TileInstruction]]:
         """Return coalesced-instruction metadata row bases and expanded rows.
 
         The replay stream may keep one coalesced instruction while the runtime
         expands its subtiles into ring slots. Wait/signal metadata remains
         per logical subtile, so the controller can use ``base + subtile_offset``
-        for each emitted ring slot.
+        for each emitted ring slot. Ops that own the coalesced range internally
+        keep one metadata row containing all logical waits/signals.
         """
         meta_indices: List[int] = []
         expanded: List[TileInstruction] = []
@@ -2001,8 +2004,14 @@ class InstructionStreamBuilder:
             if instr.op_idx == TileInstruction.END_MARKER:
                 expanded.append(instr)
                 continue
-            for logical_tile in self._logical_tiles_for_instruction(instr):
-                expanded.append(TileInstruction(instr.op_idx, logical_tile))
+            should_expand = True
+            if expand_predicate is not None:
+                should_expand = bool(expand_predicate(instr))
+            if should_expand:
+                for logical_tile in self._logical_tiles_for_instruction(instr):
+                    expanded.append(TileInstruction(instr.op_idx, logical_tile))
+            else:
+                expanded.append(instr)
         return meta_indices, expanded
 
     def coalesce_pipeline_instructions(
@@ -2077,8 +2086,8 @@ class InstructionStreamBuilder:
                 padded.extend([-1, 0])
             wait_data.append(padded)
         self._op_wait_counts = self._max_counts_by_op(instructions, raw_wait_data, pair_width=2)
+        empty = [-1, 0] * max_waits
         if num_blocks is not None and num_blocks > 0:
-            empty = [-1, 0] * max_waits
             seen_waits = [dict() for _ in range(num_blocks)]
             for idx, entry in enumerate(wait_data):
                 block_idx = idx % num_blocks
@@ -2171,13 +2180,17 @@ class InstructionStreamBuilder:
         signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
         logical_tiles = self._logical_tiles_for_instruction(instr)
         range_axis, _end_axis = self._range_axis_for_op_idx(instr.op_idx)
+        preserve_range_multiplicity = len(logical_tiles) > 1
         for formula in signal_formulas:
             seen = set()
-            preserve_range_multiplicity = range_axis >= 0 and formula.coeffs[range_axis] != 0
+            preserve_formula_multiplicity = (
+                preserve_range_multiplicity
+                or (range_axis >= 0 and formula.coeffs[range_axis] != 0)
+            )
             for tile in logical_tiles:
                 if not (formula.has_guard and not formula.is_guarded(tile)):
                     barrier_idx = formula.compute_index(tile)
-                    if preserve_range_multiplicity or barrier_idx not in seen:
+                    if preserve_formula_multiplicity or barrier_idx not in seen:
                         seen.add(barrier_idx)
                         entry.append(barrier_idx)
         return entry

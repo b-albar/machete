@@ -65,7 +65,7 @@ def test_sm120_nvfp4_matvec_matches_dequantized_reference():
 
 def test_sm120_nvfp4_pair_matvec_matches_dequantized_reference():
     from machete.kernels.decode_matvec import MatvecPairNvfp4Sm120Op
-    from machete.megakernel import Megakernel, MegakernelConfig, TileRange
+    from machete.megakernel import Megakernel, MegakernelConfig
     from machete.quantization import dequantize_nvfp4_weight, quantize_nvfp4_weight
 
     major, _minor = torch.cuda.get_device_capability()
@@ -93,11 +93,7 @@ def test_sm120_nvfp4_pair_matvec_matches_dequantized_reference():
         tile_sizes={"S": seq, "O": 16},
         page_size=49152,
         group_size=32,
-        tile_range=TileRange.coalesced("O", block_size=2),
     )
-    assert ops[0].static_dims["pipeline_coalesce_ranges"] is True
-    assert ops[0].static_dims["pipeline_range_axis"] == ops[0].dim_names["O"]
-    assert ops[0].static_dims["pipeline_range_block_size"] == 2
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(

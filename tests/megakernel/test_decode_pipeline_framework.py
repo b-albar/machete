@@ -748,7 +748,7 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     assert builder._build_wait_info_entry(first_finalize, formulas) == [0, 4]
 
 
-def test_barrier_formula_supports_half_open_tile_range_guard():
+def test_barrier_formula_supports_half_open_tile_interval_guard():
     formula = BarrierFormula(
         base=17,
         coeffs=(1, 0, 0, 0, 0),

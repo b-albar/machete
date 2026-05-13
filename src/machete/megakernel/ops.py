@@ -141,11 +141,11 @@ class PipelineSpec:
         semaphore_count: int = 0,
         scratch_bytes: int = 0,
     ) -> "PipelineSpec":
-        """Return a pipeline contract whose range support is opt-in per op.
+        """Return a pipeline contract whose range support is scheduler-owned.
 
-        Use this on an op class to declare that scheduled instances may pass a
-        ``TileRange``. It does not coalesce by default; each scheduled op opts
-        in with ``tile_range=TileRange.coalesced(...)``.
+        Use this on an op class to declare the axis that automatic pipeline
+        range coalescing may use. It does not coalesce by default; ops opt in
+        with class-level automatic range settings or static pipeline metadata.
         """
         return cls(
             page_count=page_count,
@@ -214,108 +214,6 @@ class PipelineSpec:
             page_bytes=self.page_bytes,
             scratch_bytes=self.scratch_bytes,
         )
-
-
-@dataclass(frozen=True)
-class TileRange:
-    """Per-scheduled-op range coalescing policy.
-
-    ``PipelineSpec`` declares that an op class is range-capable. ``TileRange``
-    is the user-facing schedule-time choice for one op instance::
-
-        ops = MyOp.schedule(
-            ...,
-            tile_range=TileRange.coalesced("O", block_size=2),
-        )
-
-    The axis may be a semantic tile dimension name or a numeric tile axis.
-    """
-
-    axis: Union[int, str]
-    block_size: int = 1
-    end_axis: Optional[Union[int, str]] = None
-    coalesce: bool = True
-    stride: int = 1
-
-    def __post_init__(self):
-        if self.block_size < 0:
-            raise ValueError("TileRange.block_size must be >= 0")
-        if self.stride < 1:
-            raise ValueError("TileRange.stride must be >= 1")
-
-    @classmethod
-    def coalesced(
-        cls,
-        axis: Union[int, str],
-        *,
-        block_size: int = 1,
-        end_axis: Optional[Union[int, str]] = None,
-    ) -> "TileRange":
-        return cls(axis=axis, block_size=block_size, end_axis=end_axis, coalesce=True)
-
-    @classmethod
-    def strided(
-        cls,
-        axis: Union[int, str],
-        *,
-        stride: int,
-        block_size: int = 1,
-        end_axis: Optional[Union[int, str]] = None,
-    ) -> "TileRange":
-        return cls(
-            axis=axis,
-            block_size=block_size,
-            end_axis=end_axis,
-            coalesce=True,
-            stride=stride,
-        )
-
-    @classmethod
-    def disabled(
-        cls,
-        axis: Union[int, str] = 0,
-        *,
-        end_axis: Optional[Union[int, str]] = None,
-    ) -> "TileRange":
-        return cls(axis=axis, block_size=1, end_axis=end_axis, coalesce=False)
-
-    @staticmethod
-    def _resolve_axis(axis: Union[int, str], op: "ScheduledOp") -> int:
-        if isinstance(axis, str):
-            if axis not in op.dim_names:
-                raise ValueError(
-                    f"Range axis {axis!r} is not a tile dimension for "
-                    f"{op.op_cls.__name__}; available: {sorted(op.dim_names)}"
-                )
-            return int(op.dim_names[axis])
-        return int(axis)
-
-    def apply(self, op: "ScheduledOp") -> "ScheduledOp":
-        if getattr(op.op_cls, "pipeline", None) is None:
-            raise ValueError(
-                f"Op {op.op_cls.__name__} does not declare a PipelineSpec; "
-                "tile ranges require a range-capable pipeline."
-            )
-        range_axis = self._resolve_axis(self.axis, op)
-        range_end_axis = (
-            self._resolve_axis(self.end_axis, op)
-            if self.end_axis is not None
-            else range_axis + 1
-        )
-        op.static_dims["pipeline_coalesce_ranges"] = bool(self.coalesce)
-        op.static_dims["pipeline_range_axis"] = range_axis
-        op.static_dims["pipeline_range_end_axis"] = range_end_axis
-        op.static_dims["pipeline_range_block_size"] = int(self.block_size)
-        op.static_dims["pipeline_range_stride"] = int(self.stride)
-        if self.stride > 1:
-            stride_axis = range_end_axis + 1
-            if stride_axis >= MAX_TILE_DIMS or stride_axis == range_axis:
-                raise ValueError(
-                    "TileRange.strided requires one spare tile coordinate after "
-                    "range_end_axis to encode the stride"
-                )
-            op.static_dims["pipeline_range_stride_axis"] = stride_axis
-        return op
 
 
 @dataclass(frozen=True)
@@ -1114,7 +1012,6 @@ def _process_op_declarations(cls):
         """
         if tile_sizes is None:
             tile_sizes = {}
-        tile_range = tensors.pop("tile_range", None)
 
         unique_dims = cls._UNIQUE_DIMS
         unique_tensors = cls._UNIQUE_TENSORS
@@ -1162,8 +1059,6 @@ def _process_op_declarations(cls):
             tensor_metas=tensor_metas,
             tensor_strides=tensor_strides,
         )
-        if tile_range is not None:
-            op.with_tile_range(tile_range)
         return op
 
     cls._schedule_single = _schedule_single
@@ -1582,10 +1477,6 @@ class ScheduledOp:
             return self.tile_counts[axis]
         return 1
 
-    def with_tile_range(self, tile_range: TileRange) -> "ScheduledOp":
-        """Apply per-op range coalescing metadata and return ``self``."""
-        return tile_range.apply(self)
-
 __all__ = [
     # Constants
     "MAX_TILE_DIMS",
@@ -1595,7 +1486,6 @@ __all__ = [
     "InstructionPageProtocol",
     "PageRole",
     "PipelineSpec",
-    "TileRange",
     "PipelineABI",
     "SemaphoreRole",
     "TensorMeta",

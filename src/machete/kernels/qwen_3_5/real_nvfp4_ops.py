@@ -31,7 +31,7 @@ from machete.kernels.decode_matvec import (
 )
 from machete.kernels.attention.flash_decoding import FlashDecodingCombineBSHDOp, flash_decoding_schedule
 from machete.megakernel.interpreter import named_barrier_sync
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec, TileRange
+from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec
 
 
 QWEN3_5_REAL_NUM_LAYERS = 24
@@ -93,7 +93,6 @@ def _schedule_nvfp4_pair_projection(
     matvec_block,
     page_size,
     group_size,
-    tile_range=None,
 ):
     packed0, scales0 = weights0
     packed1, scales1 = weights1
@@ -108,7 +107,6 @@ def _schedule_nvfp4_pair_projection(
         tile_sizes={"S": seq_len, "O": matvec_block},
         page_size=page_size,
         group_size=group_size,
-        tile_range=tile_range,
     )
 
 
@@ -127,7 +125,6 @@ def _schedule_nvfp4_quad_projection(
     matvec_block,
     page_size,
     group_size,
-    tile_range=None,
 ):
     packed0, scales0 = weights0
     packed1, scales1 = weights1
@@ -150,7 +147,6 @@ def _schedule_nvfp4_quad_projection(
         tile_sizes={"S": seq_len, "O": matvec_block},
         page_size=page_size,
         group_size=group_size,
-        tile_range=tile_range,
     )
 
 
@@ -1408,7 +1404,6 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
         matvec_block=matvec_block,
         page_size=page_size,
         group_size=group_size,
-        tile_range=TileRange.coalesced("O", block_size=2),
     )
     ops += _schedule_nvfp4_pair_projection(
         x=norm_buf,
@@ -1712,7 +1707,6 @@ def schedule_qwen3_5_final_nvfp4_sm120(
     seq_len,
     page_size=DEFAULT_PAGE_SIZE,
     group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
-    final_head_range_block=1,
 ):
     """Schedule final residual plus packed NVFP4 LM head for real Qwen3.5."""
 
@@ -1731,7 +1725,6 @@ def schedule_qwen3_5_final_nvfp4_sm120(
         page_size=page_size,
         eps=QWEN3_5_REAL_EPS,
         group_size=group_size,
-        final_head_range_block=final_head_range_block,
     )
 
 
@@ -1782,7 +1775,6 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     fa_num_splits=0,
     use_flash_attention=False,
     matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
-    final_head_range_block=1,
 ):
     """Build the full 24-layer real Qwen3.5 NVFP4 decode schedule.
 
@@ -1873,8 +1865,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
             seq_len=seq_len,
             page_size=page_size,
             group_size=group_size,
-            final_head_range_block=final_head_range_block,
-        )
+    )
         ops.extend(final_ops)
 
     return DecodeLayerScheduleSm120(

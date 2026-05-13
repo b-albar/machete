@@ -28,7 +28,7 @@ from machete.kernels.decode_matvec.sm120 import (
     MatvecNvfp4Sm120Op,
     _MatvecNvfp4Sm120Base,
 )
-from machete.megakernel import Megakernel, MegakernelConfig, TileRange
+from machete.megakernel import Megakernel, MegakernelConfig
 from machete.megakernel.interpreter import (
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
@@ -71,16 +71,17 @@ class StagedWeightMatvecNvfp4Sm120Op(_MatvecNvfp4Sm120Base):
             raise ValueError("weight_packed K2 must equal a.K / 2")
         if tensors["weight_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
             raise ValueError("weight_scales G must equal a.K / group_size")
-        tile_range = (
-            TileRange.strided("O", stride=range_stride, block_size=range_blocks)
-            if range_stride > 1
-            else TileRange.coalesced("O", block_size=range_blocks)
-        )
         op = cls._schedule_single(
             tile_sizes=tile_sizes,
-            tile_range=tile_range,
             **tensors,
         )
+        op.static_dims["pipeline_coalesce_ranges"] = True
+        op.static_dims["pipeline_range_axis"] = op.dim_names["O"]
+        op.static_dims["pipeline_range_end_axis"] = op.dim_names["O"] + 1
+        op.static_dims["pipeline_range_block_size"] = range_blocks
+        op.static_dims["pipeline_range_stride"] = range_stride
+        if range_stride > 1:
+            op.static_dims["pipeline_range_stride_axis"] = op.dim_names["O"] + 2
         packed_bytes = tile_sizes["O"] * int(tensors["weight_packed"].shape[1])
         scale_offset = ((packed_bytes + 127) // 128) * 128
         scale_bytes = (

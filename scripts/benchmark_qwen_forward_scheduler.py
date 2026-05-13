@@ -14,7 +14,6 @@ import io
 import torch
 
 from machete.megakernel import OverlapTileScheduler
-from machete.megakernel.ops import TileRange
 from machete.utils.benchmark import Benchmark
 from benchmarks.kernels.benchmark_qwen3_5_layer import (
     D2,
@@ -56,7 +55,6 @@ def _time_variant(
     args,
     page_size: int,
     scheduler,
-    gemm_tile_range,
     warmup: int,
     rep: int,
 ):
@@ -65,7 +63,6 @@ def _time_variant(
             *args,
             page_size=page_size,
             scheduler=scheduler,
-            gemm_tile_range=gemm_tile_range,
         )
     torch.cuda.synchronize()
     ms = bench._bench_kernel_func(spec, warmup=warmup, rep=rep)
@@ -77,7 +74,6 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq-len", type=int, nargs="+", default=[128, 256, 512, 1024])
     parser.add_argument("--page-size", type=int, nargs="+", default=[32768, 49152])
-    parser.add_argument("--range-blocks", type=int, nargs="+", default=[0, 2, 4])
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--rep", type=int, default=20)
     args = parser.parse_args()
@@ -87,43 +83,35 @@ def main():
 
     bench = Benchmark()
     variants = [("default", None), ("overlap", OverlapTileScheduler())]
-    range_variants = [("single", None)]
-    for blocks in args.range_blocks:
-        if blocks > 0:
-            range_variants.append((f"N{blocks}", TileRange.coalesced("N", block_size=blocks)))
 
-    print("seq_len,page_size,range,scheduler,time_ms,speedup_vs_default")
+    print("seq_len,page_size,scheduler,time_ms,speedup_vs_default")
     for seq_len in args.seq_len:
         for page_size in args.page_size:
-            baseline_ms = None
-            for range_name, gemm_tile_range in range_variants:
-                qwen_args = _alloc_qwen_layer(args.batch, seq_len)
-                timings = {}
-                for name, scheduler in variants:
-                    try:
-                        timings[name], _, _ = _time_variant(
-                            bench,
-                            qwen_args,
-                            page_size,
-                            scheduler,
-                            gemm_tile_range,
-                            args.warmup,
-                            args.rep,
-                        )
-                    except Exception as exc:
-                        timings[name] = float("nan")
-                        print(
-                            f"# {name}/{range_name} failed for "
-                            f"seq_len={seq_len} page_size={page_size}: {exc}"
-                        )
+            qwen_args = _alloc_qwen_layer(args.batch, seq_len)
+            timings = {}
+            for name, scheduler in variants:
+                try:
+                    timings[name], _, _ = _time_variant(
+                        bench,
+                        qwen_args,
+                        page_size,
+                        scheduler,
+                        args.warmup,
+                        args.rep,
+                    )
+                except Exception as exc:
+                    timings[name] = float("nan")
+                    print(
+                        f"# {name} failed for "
+                        f"seq_len={seq_len} page_size={page_size}: {exc}"
+                    )
 
-                if baseline_ms is None:
-                    baseline_ms = timings["default"]
-                for name, ms in timings.items():
-                    speedup = baseline_ms / ms if ms == ms and baseline_ms == baseline_ms else float("nan")
-                    print(f"{seq_len},{page_size},{range_name},{name},{ms:.6f},{speedup:.6f}")
+            baseline_ms = timings["default"]
+            for name, ms in timings.items():
+                speedup = baseline_ms / ms if ms == ms and baseline_ms == baseline_ms else float("nan")
+                print(f"{seq_len},{page_size},{name},{ms:.6f},{speedup:.6f}")
 
-                del qwen_args
+            del qwen_args
             gc.collect()
             torch.cuda.empty_cache()
 

@@ -454,6 +454,94 @@ class Megakernel:
                 ).parameters
         return active
 
+    def _apply_automatic_pipeline_ranges(self) -> None:
+        """Choose scheduler-owned range caps for ops that opt in.
+
+        The scheduler still defines the actual ranges: post-schedule coalescing
+        only merges same-op tiles that are adjacent in the replay stream. This
+        cap prevents a long same-op run from becoming too coarse.
+        """
+        for op in self.ops:
+            if not bool(getattr(op.op_cls, "pipeline_auto_range_block_size", False)):
+                continue
+            if "pipeline_range_block_size" in op.static_dims:
+                continue
+            pipeline = self._pipeline_spec_for_op(op)
+            if pipeline is None or pipeline.range_axis < 0:
+                continue
+            range_axis = int(pipeline.range_axis)
+            if range_axis < 0 or range_axis >= len(op.tile_counts):
+                continue
+            range_end_axis = int(pipeline.range_end_axis)
+            if range_end_axis < 0:
+                range_end_axis = range_axis + 1
+            if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
+                continue
+            range_tiles = max(1, int(op.tile_counts[range_axis]))
+            max_block_size = int(getattr(op.op_cls, "pipeline_auto_range_max_block_size", 4))
+            # Keep the fast path small: it should reduce replay fetch overhead
+            # without turning the scheduler's per-tile overlap into large chunks.
+            block_size = min(max(1, max_block_size), range_tiles)
+            if block_size > 1:
+                op.static_dims["pipeline_coalesce_ranges"] = True
+                op.static_dims["pipeline_range_axis"] = range_axis
+                op.static_dims["pipeline_range_end_axis"] = range_end_axis
+                op.static_dims["pipeline_range_block_size"] = block_size
+                op.static_dims.setdefault("pipeline_range_stride", 1)
+
+    def _range_expands_in_framework(self, op_idx: int) -> bool:
+        """Return whether the persistent shell expands a coalesced op range.
+
+        If every active phase accepts the range-end tile parameter, the op owns
+        the full range and the shell emits a single ring item. If no active
+        phase accepts it, the shell expands the range into per-subtile work.
+        Metadata rows must match that runtime choice.
+        """
+        if op_idx < 0 or op_idx >= len(self.ops):
+            return True
+        op = self.ops[op_idx]
+        pipeline = self._pipeline_spec_for_op(op)
+        if pipeline is None or not pipeline.coalesce_ranges or pipeline.range_axis < 0:
+            return False
+        if bool(
+            op.static_dims.get(
+                "pipeline_force_framework_range",
+                getattr(op.op_cls, "pipeline_force_framework_range", False),
+            )
+        ):
+            return True
+        range_axis = int(pipeline.range_axis)
+        range_end_axis = int(pipeline.range_end_axis)
+        if range_end_axis < 0:
+            range_end_axis = range_axis + 1
+        if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
+            return False
+
+        threads_per_block = self.config.threads_per_block
+        num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
+        num_compute_threads = threads_per_block - num_dma_warps * 32
+        kernel_config = {"threads_per_row": num_compute_threads}
+        config = build_op_config(op, kernel_config=kernel_config)
+        instance = op.op_cls(**config)
+        range_phase_owners = self._active_range_phase_ownership(instance, f"tile_{range_end_axis}")
+        range_owner_count = sum(1 for owns in range_phase_owners.values() if owns)
+        if (
+            len(range_phase_owners) > 1
+            and range_owner_count > 0
+            and range_owner_count != len(range_phase_owners)
+        ):
+            owners = ", ".join(
+                f"{phase}={'range' if owns else 'single'}"
+                for phase, owns in range_phase_owners.items()
+            )
+            raise ValueError(
+                f"{op.op_cls.__name__} has partial coalesced-range ownership "
+                f"({owners}). Staged range ops must either let the framework "
+                "expand every subtile through all phases, or every active "
+                f"phase must accept tile_{range_end_axis}."
+            )
+        return range_owner_count == 0
+
     def __init__(
         self,
         ops: List[ScheduledOp],
@@ -475,6 +563,10 @@ class Megakernel:
             os.environ.get("MACHETE_ENABLE_PAGE_FREE_OPS", "0") == "1"
             and any(not bool(getattr(op.op_cls, "uses_smem_page", True)) for op in ops)
         )
+        # Keep instruction slots separate from physical shared-memory pages for
+        # multi-page kernels. This prevents slot metadata/mbarrier phase reuse
+        # from being coupled to page reuse.
+        self._use_physical_page_ring = self._has_page_free_ops
 
         # Detect resident block count if not specified.
         #
@@ -491,17 +583,18 @@ class Megakernel:
             self.config.num_sms = min(props.multi_processor_count, total_tiles)
         if self._scheduler is not None and hasattr(self._scheduler, "bind_num_blocks"):
             self._scheduler.bind_num_blocks(self.config.num_sms)
+        self._apply_automatic_pipeline_ranges()
 
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
+            num_slots = self.config.num_pages
+            if self.config.num_pages > 1 or self._has_page_free_ops:
+                num_slots = min(MAX_PAGES, self.config.num_pages + 2)
+                self._use_physical_page_ring = True
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
-                num_slots=(
-                    min(MAX_PAGES, self.config.num_pages + 2)
-                    if self._has_page_free_ops
-                    else self.config.num_pages
-                ),
+                num_slots=num_slots,
                 page_size=self.config.page_size,
             )
         else:
@@ -510,6 +603,24 @@ class Megakernel:
                 page_size=self.config.page_size,
                 min_pages=1,
             )
+            if self._layout.num_pages > 1 or self._has_page_free_ops:
+                self._use_physical_page_ring = True
+                if torch.cuda.is_available():
+                    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                    max_smem = props.shared_memory_per_block_optin
+                else:
+                    max_smem = 228 * 1024
+                for n in range(self._layout.num_pages, 0, -1):
+                    num_slots = min(MAX_PAGES, n + 2) if n > 1 or self._has_page_free_ops else n
+                    candidate = NPageLayout(
+                        num_pages=n,
+                        num_slots=num_slots,
+                        page_size=self.config.page_size,
+                    )
+                    if candidate.total_size <= max_smem:
+                        self._layout = candidate
+                        self._use_physical_page_ring = n > 1 or self._has_page_free_ops
+                        break
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
 
@@ -655,11 +766,21 @@ class Megakernel:
             barrier_meta_indices = None
             materialized_instructions = instructions
             if self._ops_use_coalesced_pipeline(self.ops):
+                range_expansion_cache: Dict[int, bool] = {}
+
+                def _range_expands(instr: TileInstruction) -> bool:
+                    if instr.op_idx not in range_expansion_cache:
+                        range_expansion_cache[instr.op_idx] = self._range_expands_in_framework(instr.op_idx)
+                    return range_expansion_cache[instr.op_idx]
+
                 instructions = self._builder.coalesce_pipeline_instructions(instructions)
                 (
                     barrier_meta_indices,
                     materialized_instructions,
-                ) = self._builder.pipeline_barrier_meta_indices(instructions)
+                ) = self._builder.pipeline_barrier_meta_indices(
+                    instructions,
+                    expand_predicate=_range_expands,
+                )
             self._wait_info = self._builder.build_wait_info_tensor(
                 materialized_instructions,
                 self.device,
@@ -770,28 +891,36 @@ class Megakernel:
                 range_end_axis = int(pipeline.range_end_axis)
                 if range_end_axis < 0:
                     range_end_axis = range_axis + 1
-                range_end_param = f"tile_{range_end_axis}"
-                range_phase_owners = self._active_range_phase_ownership(instance, range_end_param)
-                range_owner_count = sum(1 for owns in range_phase_owners.values() if owns)
-                if (
-                    len(range_phase_owners) > 1
-                    and range_owner_count > 0
-                    and range_owner_count != len(range_phase_owners)
-                ):
-                    owners = ", ".join(
-                        f"{phase}={'range' if owns else 'single'}"
-                        for phase, owns in range_phase_owners.items()
+                force_framework_range = bool(
+                    op.static_dims.get(
+                        "pipeline_force_framework_range",
+                        getattr(op.op_cls, "pipeline_force_framework_range", False),
                     )
-                    raise ValueError(
-                        f"{op.op_cls.__name__} has partial coalesced-range ownership "
-                        f"({owners}). Staged range ops must either let the framework "
-                        "expand every subtile through all phases, or every active "
-                        f"phase must accept {range_end_param}."
-                    )
+                )
+                range_owner_count = 0
+                if not force_framework_range:
+                    range_end_param = f"tile_{range_end_axis}"
+                    range_phase_owners = self._active_range_phase_ownership(instance, range_end_param)
+                    range_owner_count = sum(1 for owns in range_phase_owners.values() if owns)
+                    if (
+                        len(range_phase_owners) > 1
+                        and range_owner_count > 0
+                        and range_owner_count != len(range_phase_owners)
+                    ):
+                        owners = ", ".join(
+                            f"{phase}={'range' if owns else 'single'}"
+                            for phase, owns in range_phase_owners.items()
+                        )
+                        raise ValueError(
+                            f"{op.op_cls.__name__} has partial coalesced-range ownership "
+                            f"({owners}). Staged range ops must either let the framework "
+                            "expand every subtile through all phases, or every active "
+                            f"phase must accept {range_end_param}."
+                        )
                 if (
                     range_end_axis < MAX_TILE_DIMS
                     and range_end_axis != range_axis
-                    and range_owner_count == 0
+                    and (force_framework_range or range_owner_count == 0)
                 ):
                     instruction_phase_mask |= (range_axis + 1) << _INSTR_RANGE_AXIS_SHIFT
                     instruction_phase_mask |= (range_end_axis + 1) << _INSTR_RANGE_END_AXIS_SHIFT
@@ -1237,6 +1366,7 @@ class Megakernel:
             "nanosleep": nanosleep,
             "named_barrier_sync": named_barrier_sync,
             "global_barrier_signal": global_barrier_signal,
+            "global_barrier_signal_gpu": global_barrier_signal_gpu,
             "num_pages": num_pages,
             "num_slots": num_slots,
             "iq_offset": iq_offset,
@@ -1529,8 +1659,8 @@ class Megakernel:
             "        if not desc_pool_init_needed:\n"
             "            self.kernel(instructions_ptr, barriers_ptr, op_configs_ptr,\n"
             f"                        op_meta_ptr{local_arg}{selector_arg}{desc_slot_arg}, signal_meta_ptr{peer_signal_arg}{static_arg},\n"
-            f"                        wait_info_ptr{trace_arg},\n"
-            f"                        num_instructions{tensor_sig}{kernel_tma_sig}).launch(\n"
+            f"                        wait_info_ptr,\n"
+            f"                        num_instructions{trace_arg}{tensor_sig}{kernel_tma_sig}).launch(\n"
             "                grid=[self.num_sms, 1, 1],\n"
             "                block=[self.threads_per_block, 1, 1],\n"
             "                smem=self.smem_size,\n"
@@ -1683,7 +1813,7 @@ class Megakernel:
             "tracing": self.config.tracing,
             "num_pages": layout.num_pages,
             "num_slots": layout.num_slots,
-            "has_page_free_ops": self._has_page_free_ops,
+            "has_page_free_ops": self._use_physical_page_ring and not self._use_compute_only_replay(),
             "iq_offset": layout.iq_offset,
             "flags_offset": layout.flags_offset,
             "ring_state_offset": layout.ring_state_offset,
@@ -1927,6 +2057,16 @@ class Megakernel:
         """Return per-op metadata indices injected into generated kernel code."""
         return {
             "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
+            "_OP_META_STRIDE_0": _OP_META_STRIDE_0,
+            "_OP_META_STRIDE_1": _OP_META_STRIDE_1,
+            "_OP_META_STRIDE_2": _OP_META_STRIDE_2,
+            "_OP_META_STRIDE_3": _OP_META_STRIDE_3,
+            "_OP_META_STRIDE_4": _OP_META_STRIDE_4,
+            "_OP_META_COUNT_0": _OP_META_COUNT_0,
+            "_OP_META_COUNT_1": _OP_META_COUNT_1,
+            "_OP_META_COUNT_2": _OP_META_COUNT_2,
+            "_OP_META_COUNT_3": _OP_META_COUNT_3,
+            "_OP_META_COUNT_4": _OP_META_COUNT_4,
             "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
             "_OP_META_LOAD_LOCAL_IDX": _OP_META_LOAD_LOCAL_IDX,
             "_OP_META_COMPUTE_LOCAL_IDX": _OP_META_COMPUTE_LOCAL_IDX,
@@ -1996,6 +2136,7 @@ class Megakernel:
             "_op_meta_base": runtime["_op_meta_base"],
             "_op_meta_i32_base": runtime["_op_meta_i32_base"],
             "max_waits": runtime["max_waits"],
+            "max_signal_formulas": self._max_signal_formulas,
             "global_barrier_wait": global_barrier_wait,
             "global_barrier_wait_relaxed": global_barrier_wait_relaxed,
             "relaxed_global_barriers": self.config.relaxed_global_barriers,
@@ -2139,6 +2280,7 @@ class Megakernel:
                 _ctrl_cached_t3 = Int32(0)
                 _ctrl_cached_t4 = Int32(0)
                 _ctrl_range_axis = Int32(-1)
+                _ctrl_range_end_axis = Int32(-1)
                 _ctrl_range_pos = Int32(0)
                 _ctrl_range_start = Int32(0)
                 _ctrl_range_end = Int32(0)
@@ -2348,6 +2490,17 @@ class Megakernel:
                                 _p_t3 = _ctrl_range_pos
                             if _ctrl_range_axis == Int32(4):
                                 _p_t4 = _ctrl_range_pos
+                            _p_range_next = _ctrl_range_pos + _ctrl_range_stride
+                            if _ctrl_range_end_axis == Int32(0):
+                                _p_t0 = _p_range_next
+                            if _ctrl_range_end_axis == Int32(1):
+                                _p_t1 = _p_range_next
+                            if _ctrl_range_end_axis == Int32(2):
+                                _p_t2 = _p_range_next
+                            if _ctrl_range_end_axis == Int32(3):
+                                _p_t3 = _p_range_next
+                            if _ctrl_range_end_axis == Int32(4):
+                                _p_t4 = _p_range_next
                             st_shared_i32(_p_ti, _instr_op)
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_HANDLER_IDX),
@@ -2620,12 +2773,20 @@ class Megakernel:
 
                         with cute.arch.elect_one():
                             if _ds_signal_count > Int32(0):
-                                signal_barriers(
-                                    signal_meta_ptr,
-                                    _ds_instruction_idx,
-                                    _ds_signal_count,
-                                    barriers_ptr,
-                                )
+                                if _ds_signal_count == Int32(1):
+                                    _sig_barrier = ld_global_i32(
+                                        signal_meta_ptr,
+                                        _ds_instruction_idx * Int32(max_signal_formulas),
+                                    )
+                                    if _sig_barrier >= Int32(0):
+                                        global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
+                                else:
+                                    signal_barriers(
+                                        signal_meta_ptr,
+                                        _ds_instruction_idx,
+                                        _ds_signal_count,
+                                        barriers_ptr,
+                                    )
                             if const_expr(has_communicate):
                                 _ds_lin = Int32(0)
                                 _ds_s0 = _op_meta_i32_base(
@@ -2810,6 +2971,7 @@ class Megakernel:
         dispatch_compute = runtime["dispatch_compute"]
         signal_barriers = runtime["signal_barriers"]
         max_waits = runtime["max_waits"]
+        max_signal_formulas = self._max_signal_formulas
         num_mma_warps = kernel_cfg["num_mma_warps"]
         num_compute_threads = kernel_cfg["num_compute_threads"]
         mma_reg_count = kernel_cfg["mma_reg_count"]
@@ -3068,12 +3230,20 @@ class Megakernel:
                             )
                         if _range_axis >= Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
                             if _cached_signal_count > Int32(0):
-                                signal_barriers(
-                                    signal_meta_ptr,
-                                    _current_meta_idx,
-                                    _cached_signal_count,
-                                    barriers_ptr,
-                                )
+                                if _cached_signal_count == Int32(1):
+                                    _sig_barrier = ld_global_i32(
+                                        signal_meta_ptr,
+                                        _current_meta_idx * Int32(max_signal_formulas),
+                                    )
+                                    if _sig_barrier >= Int32(0):
+                                        global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
+                                else:
+                                    signal_barriers(
+                                        signal_meta_ptr,
+                                        _current_meta_idx,
+                                        _cached_signal_count,
+                                        barriers_ptr,
+                                    )
                         _range_pos = _range_pos + _range_stride
                         _range_offset = _range_offset + Int32(1)
 
@@ -3096,12 +3266,20 @@ class Megakernel:
 
                     if _range_axis < Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
                         if _cached_signal_count > Int32(0):
-                            signal_barriers(
-                                signal_meta_ptr,
-                                _barrier_meta_idx,
-                                _cached_signal_count,
-                                barriers_ptr,
-                            )
+                            if _cached_signal_count == Int32(1):
+                                _sig_barrier = ld_global_i32(
+                                    signal_meta_ptr,
+                                    _barrier_meta_idx * Int32(max_signal_formulas),
+                                )
+                                if _sig_barrier >= Int32(0):
+                                    global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
+                            else:
+                                signal_barriers(
+                                    signal_meta_ptr,
+                                    _barrier_meta_idx,
+                                    _cached_signal_count,
+                                    barriers_ptr,
+                                )
                 named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
         return _kernel_loop_compute_only
@@ -3501,12 +3679,16 @@ class Megakernel:
                 ]
                 if self._peer_tma_registry.has_peer_tma:
                     compile_args.append(launch_state.peer_signal_ptr)
-                if self.config.tracing:
-                    compile_args.append(launch_state.trace_buffer_ptr)
                 compile_args.extend(
                     [
                         launch_state.wait_info_ptr,
                         self._num_instructions_i32,
+                    ]
+                )
+                if self.config.tracing:
+                    compile_args.append(launch_state.trace_buffer_ptr)
+                compile_args.extend(
+                    [
                         *launch_state.cute_tensors,
                         launch_state.local_tma_desc_pool_ptr,
                         launch_state.peer_tma_desc_pool_ptr,
@@ -3625,6 +3807,13 @@ class Megakernel:
 
     def _build_launch_state(self) -> _LaunchState:
         """Build stable launch arguments shared by run() and bench_spec()."""
+        trace_buffer_ptr = Int64(0)
+        if self.config.tracing:
+            from .tracing import ensure_device_trace_buffer
+
+            ensure_device_trace_buffer(self._tracing_state)
+            trace_buffer_ptr = Int64(self._tracing_state.builder._buffer.data_ptr())
+
         selected_tensor_names = self._backend.all_canonical(self)
         selected_cute_tensors = []
         if self._cute_tensors:
@@ -3667,7 +3856,7 @@ class Megakernel:
             peer_tma_desc_pool_ptr=Int64(self._peer_tma_desc_pool.data_ptr()) if self._peer_tma_desc_pool is not None else Int64(0),
             signal_meta_ptr=Int64(self._signal_metadata_tensor.data_ptr()),
             peer_signal_ptr=Int64(self._peer_signal_tensor.data_ptr()) if self._peer_signal_tensor is not None else Int64(0),
-            trace_buffer_ptr=Int64(0),
+            trace_buffer_ptr=trace_buffer_ptr,
             cute_tensors=selected_cute_tensors,
             tma_tensor_args=[ct for _, ct in self._tma_cute_tensors] if self._tma_cute_tensors else [],
             peer_tma_tensor_args=(
@@ -3863,14 +4052,18 @@ class Megakernel:
             ]
             if self._peer_tma_registry.has_peer_tma:
                 launch_args.append(launch_state.peer_signal_ptr)
+            launch_args.extend(
+                [
+                    launch_state.wait_info_ptr,
+                    num_instructions,
+                ]
+            )
             if self.config.tracing:
                 launch_args.append(
                     trace_buffer_ptr if trace_buffer_ptr is not None else launch_state.trace_buffer_ptr
                 )
             launch_args.extend(
                 [
-                    launch_state.wait_info_ptr,
-                    num_instructions,
                     *launch_state.cute_tensors,
                     launch_state.local_tma_desc_pool_ptr,
                     launch_state.peer_tma_desc_pool_ptr,

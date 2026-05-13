@@ -29,7 +29,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx, named_barrier_sync
-from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec, TileRange
+from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec
 
 
 SM120_DECODE_HIDDEN_DEFAULT = 2048
@@ -972,47 +972,6 @@ class MatvecResidualSm120Op(_DecodeMatvecSm120Base):
                             out_tile[local_o] = val.to(self.residual_out_dtype)
 
 
-class MatvecResidualParallelSm120Op(MatvecResidualSm120Op):
-    """Direct matvec residual that assigns output columns across compute warps."""
-
-    @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight, residual_in, residual_out):
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
-        row_start = tile_S * Int32(self.tile_size_S)
-        out_start = tile_O * Int32(self.tile_size_O)
-        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
-            local_row = local_work // self.tile_size_O
-            local_o = local_work - local_row * self.tile_size_O
-            row_idx = row_start + Int32(local_row)
-            if row_idx < Int32(self.S):
-                out_idx = out_start + Int32(local_o)
-                if out_idx < Int32(self.O):
-                    a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
-                    acc = Float32(0.0)
-                    w_base = out_idx * Int32(self.weight_stride_O)
-                    k_base = Int32(0)
-                    while k_base < Int32(self.K):
-                        a_row = cute.make_tensor(a.iterator + a_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        weight_row = cute.make_tensor(weight.iterator + w_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        elem = lane_idx
-                        while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
-                            k = k_base + elem
-                            if k < Int32(self.K):
-                                acc = acc + a_row[elem].to(Float32) * weight_row[elem].to(Float32)
-                            elem = elem + Int32(32)
-                        k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
-                    total = cute.arch.warp_reduction(acc, operator.add)
-                    if lane_idx == Int32(0):
-                        out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
-                        res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
-                        res_tile = cute.make_tensor(residual_in.iterator + res_base + out_start, cute.make_layout(self.tile_size_O))
-                        out_tile = cute.make_tensor(residual_out.iterator + out_base + out_start, cute.make_layout(self.tile_size_O))
-                        val = total + res_tile[local_o].to(Float32)
-                        out_tile[local_o] = val.to(self.residual_out_dtype)
-
-
 class MatvecSm120Op(_DecodeMatvecSm120Base):
     """Down projection matvec that writes the layer MLP delta."""
 
@@ -1068,44 +1027,6 @@ class MatvecSm120Op(_DecodeMatvecSm120Base):
                             y_tile[local_o] = total.to(self.y_dtype)
 
 
-class MatvecParallelSm120Op(MatvecSm120Op):
-    """Direct matvec that assigns output columns across compute warps."""
-
-    @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight, y):
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
-        row_start = tile_S * Int32(self.tile_size_S)
-        out_start = tile_O * Int32(self.tile_size_O)
-        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_O, num_warps):
-            local_row = local_work // self.tile_size_O
-            local_o = local_work - local_row * self.tile_size_O
-            row_idx = row_start + Int32(local_row)
-            if row_idx < Int32(self.S):
-                out_idx = out_start + Int32(local_o)
-                if out_idx < Int32(self.O):
-                    a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
-                    acc = Float32(0.0)
-                    w_base = out_idx * Int32(self.weight_stride_O)
-                    k_base = Int32(0)
-                    while k_base < Int32(self.K):
-                        a_row = cute.make_tensor(a.iterator + a_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        weight_row = cute.make_tensor(weight.iterator + w_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        elem = lane_idx
-                        while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
-                            k = k_base + elem
-                            if k < Int32(self.K):
-                                acc = acc + a_row[elem].to(Float32) * weight_row[elem].to(Float32)
-                            elem = elem + Int32(32)
-                        k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
-                    total = cute.arch.warp_reduction(acc, operator.add)
-                    if lane_idx == Int32(0):
-                        y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                        y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
-                        y_tile[local_o] = total.to(self.y_dtype)
-
-
 class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Packed NVFP4 projection matvec base."""
 
@@ -1124,7 +1045,6 @@ class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
-        tile_range=None,
         **tensors,
     ):
         tile_sizes = dict(tile_sizes or {})
@@ -1135,7 +1055,7 @@ class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             raise ValueError("weight_packed K2 must equal a.K / 2")
         if tensors["weight_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
             raise ValueError("weight_scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
@@ -1204,7 +1124,6 @@ class MatvecPairNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
-        tile_range=None,
         **tensors,
     ):
         tile_sizes = dict(tile_sizes or {})
@@ -1219,7 +1138,7 @@ class MatvecPairNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             raise ValueError("weight K2 must equal a.K / 2")
         if tensors["weight0_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
             raise ValueError("weight scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
@@ -1304,6 +1223,8 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Packed NVFP4 matvec for four same-sized projections sharing one input."""
 
     pipeline = SM120_OUTPUT_RANGE_PIPELINE
+    pipeline_auto_range_block_size = True
+    pipeline_auto_range_max_block_size = 2
     reads = {
         "a": (None, ("B", "S", "K")),
         "weight0_packed": (cutlass.Uint8, ("O", "K2")),
@@ -1330,7 +1251,6 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
-        tile_range=None,
         **tensors,
     ):
         tile_sizes = dict(tile_sizes or {})
@@ -1348,7 +1268,7 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             raise ValueError("weight K2 must equal a.K / 2")
         if scale_shape[1] != tensors["a"].shape[-1] // group_size:
             raise ValueError("weight scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
@@ -1690,7 +1610,6 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         page_size=DEFAULT_PAGE_SIZE,
         eps=1e-5,
         group_size=32,
-        tile_range=None,
         **tensors,
     ):
         tile_sizes = dict(tile_sizes or {})
@@ -1704,7 +1623,7 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         expected_g = tensors["x"].shape[-1] // group_size
         if tensors["gate_scales"].shape[1] != expected_g or tensors["up_scales"].shape[1] != expected_g:
             raise ValueError("gate/up scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["eps"] = eps
         return _finalize_nvfp4_matvec_schedule(
             op,
@@ -1887,74 +1806,6 @@ class FinalRmsLmHeadSm120Op(RmsGateUpSiluSm120Op):
                             out_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
                             out_tile = cute.make_tensor(logits.iterator + out_base + v_start, cute.make_layout(self.tile_size_V))
                             out_tile[local_v] = total.to(self.logits_dtype)
-
-
-class FinalRmsLmHeadParallelSm120Op(FinalRmsLmHeadSm120Op):
-    """Direct final RMS+LM-head with output columns distributed across warps."""
-
-    @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, tile_V, x, norm_weight, weight, logits):
-        warp_idx = cute.arch.warp_idx()
-        lane_idx = cute.arch.lane_idx()
-        num_warps = self.threads_per_row // 32
-        row_start = tile_S * Int32(self.tile_size_S)
-        v_start = tile_V * Int32(self.tile_size_V)
-        rstd_smem = cute.make_tensor(
-            cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout(self.tile_size_S),
-        )
-        for local_row in range(warp_idx, self.tile_size_S, num_warps):
-            row_idx = row_start + Int32(local_row)
-            if row_idx < Int32(self.S):
-                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
-                sum_sq = Float32(0.0)
-                k_base = Int32(0)
-                while k_base < Int32(self.K):
-                    x_row = cute.make_tensor(x.iterator + x_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                    elem = lane_idx
-                    while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
-                        k = k_base + elem
-                        if k < Int32(self.K):
-                            xv = x_row[elem].to(Float32)
-                            sum_sq = sum_sq + xv * xv
-                        elem = elem + Int32(32)
-                    k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
-                total_sq = cute.arch.warp_reduction(sum_sq, operator.add)
-                rstd = cute.math.rsqrt(total_sq * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
-                if lane_idx == Int32(0):
-                    rstd_smem[local_row] = rstd
-
-        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
-
-        for local_work in range(warp_idx, self.tile_size_S * self.tile_size_V, num_warps):
-            local_row = local_work // self.tile_size_V
-            local_v = local_work - local_row * self.tile_size_V
-            row_idx = row_start + Int32(local_row)
-            if row_idx < Int32(self.S):
-                v = v_start + Int32(local_v)
-                if v < Int32(self.V):
-                    x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
-                    rstd = rstd_smem[local_row]
-                    acc = Float32(0.0)
-                    w_base = v * Int32(self.weight_stride_V)
-                    k2_base = Int32(0)
-                    while k2_base < Int32(self.K):
-                        x_row = cute.make_tensor(x.iterator + x_base + k2_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        norm_row = cute.make_tensor(norm_weight.iterator + k2_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        weight_row = cute.make_tensor(weight.iterator + w_base + k2_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                        elem2 = lane_idx
-                        while elem2 < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
-                            k2 = k2_base + elem2
-                            if k2 < Int32(self.K):
-                                nv = x_row[elem2].to(Float32) * rstd * norm_row[elem2].to(Float32)
-                                acc = acc + nv * weight_row[elem2].to(Float32)
-                            elem2 = elem2 + Int32(32)
-                        k2_base = k2_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
-                    total = cute.arch.warp_reduction(acc, operator.add)
-                    if lane_idx == Int32(0):
-                        out_base = tile_B * Int32(self.logits_stride_B) + row_idx * Int32(self.logits_stride_S)
-                        out_tile = cute.make_tensor(logits.iterator + out_base + v_start, cute.make_layout(self.tile_size_V))
-                        out_tile[local_v] = total.to(self.logits_dtype)
 
 
 class FinalRmsLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
@@ -2229,7 +2080,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
 
     @classmethod
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, tile_range=None, **tensors):
+                 group_size=32, **tensors):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
         tile_sizes.setdefault("S", 1)
@@ -2240,7 +2091,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
             raise ValueError("weight_scales G must equal x.K / group_size")
         if tensors["partial_values"].shape != tensors["partial_indices"].shape:
             raise ValueError("partial_values and partial_indices must have the same shape")
-        op = cls._schedule_single(tile_sizes=tile_sizes, tile_range=tile_range, **tensors)
+        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["page_size"] = page_size
         op.static_dims["eps"] = eps
         op.static_dims["group_size"] = group_size
@@ -2967,7 +2818,6 @@ def schedule_final_nvfp4_sm120(
     page_size=DEFAULT_PAGE_SIZE,
     eps=1e-5,
     group_size=32,
-    final_head_range_block=1,
 ):
     """Schedule final residual plus optional packed NVFP4 LM-head."""
     ops = []
@@ -2987,11 +2837,6 @@ def schedule_final_nvfp4_sm120(
                     partial_values=top_partial_values,
                     partial_indices=top_partial_indices,
                     tile_sizes={"S": seq_len, "P": 1},
-                    tile_range=(
-                        TileRange.coalesced("P", block_size=final_head_range_block)
-                        if final_head_range_block > 1
-                        else None
-                    ),
                     page_size=page_size,
                     eps=eps,
                     group_size=group_size,
@@ -3060,17 +2905,14 @@ def schedule_final_nvfp4_sm120(
 
 __all__ = [
     "FinalRmsLmHeadSm120Op",
-    "FinalRmsLmHeadParallelSm120Op",
     "FinalRmsLmHeadNvfp4Sm120Op",
     "FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1LmHeadNvfp4Sm120Op",
     "MatvecPairNvfp4Sm120Op",
     "MatvecQuadNvfp4Sm120Op",
-    "MatvecResidualParallelSm120Op",
     "MatvecResidualSm120Op",
     "MatvecResidualNvfp4Sm120Op",
-    "MatvecParallelSm120Op",
     "MatvecSm120Op",
     "MatvecNvfp4Sm120Op",
     "ResidualAddSm120Op",

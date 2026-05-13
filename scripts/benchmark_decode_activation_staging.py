@@ -25,7 +25,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.cute.nvgpu.cpasync import CopyBulkG2SOp, group_bulk_copy_modes
 
-from machete.megakernel import Megakernel, MegakernelConfig, TileRange
+from machete.megakernel import Megakernel, MegakernelConfig
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec
 
@@ -77,14 +77,19 @@ class _StagedActivationDotOp(_DirectActivationDotOp):
     pipeline = PipelineSpec.range_capable(range_axis=1, range_end_axis=2)
 
     @classmethod
-    def schedule(cls, *, a, w, y, tile_o: int, page_size: int, tile_range=None):
+    def schedule(cls, *, a, w, y, tile_o: int, page_size: int, range_blocks: int = 1):
         ops = cls._schedule_single(
             tile_sizes={"B": 1, "O": tile_o},
-            tile_range=tile_range,
             a=a,
             w=w,
             y=y,
         )
+        if range_blocks > 1:
+            ops.static_dims["pipeline_coalesce_ranges"] = True
+            ops.static_dims["pipeline_range_axis"] = ops.dim_names["O"]
+            ops.static_dims["pipeline_range_end_axis"] = ops.dim_names["O"] + 1
+            ops.static_dims["pipeline_range_block_size"] = range_blocks
+            ops.static_dims["pipeline_range_stride"] = 1
         activation_bytes = int(a.shape[1]) * a.element_size()
         if activation_bytes > page_size:
             raise ValueError(f"activation tile needs {activation_bytes}B, page_size={page_size}")
@@ -212,7 +217,7 @@ def _make_kernel(kind: str, a, w, y, args):
             y=y,
             tile_o=args.tile_o,
             page_size=args.page_size,
-            tile_range=TileRange.coalesced("O", block_size=args.range_blocks),
+            range_blocks=args.range_blocks,
         )
     else:
         raise ValueError(kind)
