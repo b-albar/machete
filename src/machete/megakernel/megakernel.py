@@ -40,6 +40,7 @@ from .registries import (
 from .scheduling import (
     BarrierFormula,
     INSTR_BARRIER_META_IDX,
+    INSTR_RANGE_META,
     INSTR_TILE_0,
     INSTR_TILE_1,
     INSTR_TILE_2,
@@ -155,9 +156,6 @@ _OP_PHASE_COMPUTE = 2
 _OP_PHASE_STORE = 4
 _OP_PHASE_COMMUNICATE = 8
 
-_INSTR_RANGE_AXIS_SHIFT = 4
-_INSTR_RANGE_END_AXIS_SHIFT = 8
-_INSTR_RANGE_STRIDED_BIT = 12
 _INSTR_NO_SMEM_PAGE_BIT = 13
 
 # Per-signal-formula metadata layout (int32 entries).
@@ -361,19 +359,6 @@ class Megakernel:
         return op.static_dims.get(f"pipeline_{name}")
 
     @classmethod
-    def _ops_use_coalesced_pipeline(cls, ops: List[ScheduledOp]) -> bool:
-        return any(
-            (pipeline := cls._pipeline_for_cls(op.op_cls)) is not None
-            and pipeline.with_overrides(
-                range_axis=cls._pipeline_static_dim(op, "range_axis"),
-                range_end_axis=cls._pipeline_static_dim(op, "range_end_axis"),
-                range_block_size=cls._pipeline_static_dim(op, "range_block_size"),
-                coalesce_ranges=cls._pipeline_static_dim(op, "coalesce_ranges"),
-            ).coalesce_ranges
-            for op in ops
-        )
-
-    @classmethod
     def _pipeline_spec_for_op(cls, op: ScheduledOp):
         pipeline = cls._pipeline_for_cls(op.op_cls)
         if pipeline is None:
@@ -386,10 +371,6 @@ class Megakernel:
             input_stages=cls._pipeline_static_dim(op, "input_stages"),
             output_stages=cls._pipeline_static_dim(op, "output_stages"),
             stage_pages=cls._pipeline_static_dim(op, "stage_pages"),
-            range_axis=cls._pipeline_static_dim(op, "range_axis"),
-            range_end_axis=cls._pipeline_static_dim(op, "range_end_axis"),
-            range_block_size=cls._pipeline_static_dim(op, "range_block_size"),
-            coalesce_ranges=cls._pipeline_static_dim(op, "coalesce_ranges"),
         )
 
     @classmethod
@@ -454,42 +435,7 @@ class Megakernel:
                 ).parameters
         return active
 
-    def _apply_automatic_pipeline_ranges(self) -> None:
-        """Choose scheduler-owned range caps for ops that opt in.
-
-        The scheduler still defines the actual ranges: post-schedule coalescing
-        only merges same-op tiles that are adjacent in the replay stream. This
-        cap prevents a long same-op run from becoming too coarse.
-        """
-        for op in self.ops:
-            if not bool(getattr(op.op_cls, "pipeline_auto_range_block_size", False)):
-                continue
-            if "pipeline_range_block_size" in op.static_dims:
-                continue
-            pipeline = self._pipeline_spec_for_op(op)
-            if pipeline is None or pipeline.range_axis < 0:
-                continue
-            range_axis = int(pipeline.range_axis)
-            if range_axis < 0 or range_axis >= len(op.tile_counts):
-                continue
-            range_end_axis = int(pipeline.range_end_axis)
-            if range_end_axis < 0:
-                range_end_axis = range_axis + 1
-            if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
-                continue
-            range_tiles = max(1, int(op.tile_counts[range_axis]))
-            max_block_size = int(getattr(op.op_cls, "pipeline_auto_range_max_block_size", 4))
-            # Keep the fast path small: it should reduce replay fetch overhead
-            # without turning the scheduler's per-tile overlap into large chunks.
-            block_size = min(max(1, max_block_size), range_tiles)
-            if block_size > 1:
-                op.static_dims["pipeline_coalesce_ranges"] = True
-                op.static_dims["pipeline_range_axis"] = range_axis
-                op.static_dims["pipeline_range_end_axis"] = range_end_axis
-                op.static_dims["pipeline_range_block_size"] = block_size
-                op.static_dims.setdefault("pipeline_range_stride", 1)
-
-    def _range_expands_in_framework(self, op_idx: int) -> bool:
+    def _range_expands_in_framework(self, op_idx: int, range_end_axis: int) -> bool:
         """Return whether the persistent shell expands a coalesced op range.
 
         If every active phase accepts the range-end tile parameter, the op owns
@@ -499,23 +445,9 @@ class Megakernel:
         """
         if op_idx < 0 or op_idx >= len(self.ops):
             return True
+        if range_end_axis < 0 or range_end_axis >= MAX_TILE_DIMS:
+            return False
         op = self.ops[op_idx]
-        pipeline = self._pipeline_spec_for_op(op)
-        if pipeline is None or not pipeline.coalesce_ranges or pipeline.range_axis < 0:
-            return False
-        if bool(
-            op.static_dims.get(
-                "pipeline_force_framework_range",
-                getattr(op.op_cls, "pipeline_force_framework_range", False),
-            )
-        ):
-            return True
-        range_axis = int(pipeline.range_axis)
-        range_end_axis = int(pipeline.range_end_axis)
-        if range_end_axis < 0:
-            range_end_axis = range_axis + 1
-        if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
-            return False
 
         threads_per_block = self.config.threads_per_block
         num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
@@ -556,7 +488,7 @@ class Megakernel:
         self.device = device
         self._scheduler = scheduler
         ops = self.ops
-        if self._ops_use_coalesced_pipeline(ops):
+        if any(getattr(op.op_cls, "pipeline", None) is not None for op in ops):
             Megakernel._unload_active_tma_modules()
             Megakernel._drop_cached_tma_kernels()
         self._has_page_free_ops = (
@@ -583,7 +515,6 @@ class Megakernel:
             self.config.num_sms = min(props.multi_processor_count, total_tiles)
         if self._scheduler is not None and hasattr(self._scheduler, "bind_num_blocks"):
             self._scheduler.bind_num_blocks(self.config.num_sms)
-        self._apply_automatic_pipeline_ranges()
 
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
@@ -764,31 +695,49 @@ class Megakernel:
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
             barrier_meta_indices = None
-            materialized_instructions = instructions
-            if self._ops_use_coalesced_pipeline(self.ops):
-                range_expansion_cache: Dict[int, bool] = {}
+            expanded_instructions = instructions
+            range_expansion_cache: Dict[Tuple[int, int], bool] = {}
 
-                def _range_expands(instr: TileInstruction) -> bool:
-                    if instr.op_idx not in range_expansion_cache:
-                        range_expansion_cache[instr.op_idx] = self._range_expands_in_framework(instr.op_idx)
-                    return range_expansion_cache[instr.op_idx]
+            def _range_expands(instr: TileInstruction) -> bool:
+                if instr.range_axis < 0:
+                    return False
+                key = (instr.op_idx, instr.range_end_axis)
+                if key not in range_expansion_cache:
+                    range_expansion_cache[key] = self._range_expands_in_framework(
+                        instr.op_idx,
+                        instr.range_end_axis,
+                    )
+                return range_expansion_cache[key]
 
-                instructions = self._builder.coalesce_pipeline_instructions(instructions)
-                (
-                    barrier_meta_indices,
-                    materialized_instructions,
-                ) = self._builder.pipeline_barrier_meta_indices(
-                    instructions,
-                    expand_predicate=_range_expands,
+            instructions = self._builder.coalesce_pipeline_instructions(
+                instructions,
+                num_blocks=self.num_sms,
+            )
+            (
+                barrier_meta_indices,
+                expanded_instructions,
+            ) = self._builder.pipeline_barrier_meta_indices(
+                instructions,
+                expand_predicate=_range_expands,
+            )
+            instructions = [
+                TileInstruction(instr.op_idx, instr.tiles)
+                if (
+                    instr.op_idx != TileInstruction.END_MARKER
+                    and instr.range_axis >= 0
+                    and not _range_expands(instr)
                 )
+                else instr
+                for instr in instructions
+            ]
             self._wait_info = self._builder.build_wait_info_tensor(
-                materialized_instructions,
+                expanded_instructions,
                 self.device,
                 num_blocks=self.num_sms,
             )
             self._max_wait_formulas = max(1, self._wait_info.shape[1] // 2)
             self._signal_metadata_tensor = self._builder.build_signal_info_tensor(
-                materialized_instructions, self.device
+                expanded_instructions, self.device
             )
             self._max_signal_formulas = max(1, self._signal_metadata_tensor.shape[1])
             if self._op_metadata_tensor is None:
@@ -799,7 +748,7 @@ class Megakernel:
                 instructions=instructions,
                 barrier_meta_indices=barrier_meta_indices,
             )
-            self._num_instructions = self._instructions_tensor.shape[0]
+            self._num_instructions = len(instructions)
             self._num_instructions_i32 = Int32(self._num_instructions)
         elif self._op_metadata_tensor is None:
             self._prepare_op_metadata_tensors()
@@ -875,7 +824,6 @@ class Megakernel:
                 phase_mask |= _OP_PHASE_STORE
             if getattr(op.op_cls, "communicate") is not Op.communicate:
                 phase_mask |= _OP_PHASE_COMMUNICATE
-            pipeline = self._pipeline_spec_for_op(op)
             instruction_phase_mask = phase_mask
             uses_smem_page = bool(getattr(op.op_cls, "uses_smem_page", True))
             if not uses_smem_page:
@@ -886,46 +834,6 @@ class Megakernel:
                         "must be compute-only."
                     )
                 instruction_phase_mask |= 1 << _INSTR_NO_SMEM_PAGE_BIT
-            if pipeline is not None and pipeline.coalesce_ranges and pipeline.range_axis >= 0:
-                range_axis = int(pipeline.range_axis)
-                range_end_axis = int(pipeline.range_end_axis)
-                if range_end_axis < 0:
-                    range_end_axis = range_axis + 1
-                force_framework_range = bool(
-                    op.static_dims.get(
-                        "pipeline_force_framework_range",
-                        getattr(op.op_cls, "pipeline_force_framework_range", False),
-                    )
-                )
-                range_owner_count = 0
-                if not force_framework_range:
-                    range_end_param = f"tile_{range_end_axis}"
-                    range_phase_owners = self._active_range_phase_ownership(instance, range_end_param)
-                    range_owner_count = sum(1 for owns in range_phase_owners.values() if owns)
-                    if (
-                        len(range_phase_owners) > 1
-                        and range_owner_count > 0
-                        and range_owner_count != len(range_phase_owners)
-                    ):
-                        owners = ", ".join(
-                            f"{phase}={'range' if owns else 'single'}"
-                            for phase, owns in range_phase_owners.items()
-                        )
-                        raise ValueError(
-                            f"{op.op_cls.__name__} has partial coalesced-range ownership "
-                            f"({owners}). Staged range ops must either let the framework "
-                            "expand every subtile through all phases, or every active "
-                            f"phase must accept {range_end_param}."
-                        )
-                if (
-                    range_end_axis < MAX_TILE_DIMS
-                    and range_end_axis != range_axis
-                    and (force_framework_range or range_owner_count == 0)
-                ):
-                    instruction_phase_mask |= (range_axis + 1) << _INSTR_RANGE_AXIS_SHIFT
-                    instruction_phase_mask |= (range_end_axis + 1) << _INSTR_RANGE_END_AXIS_SHIFT
-                    if int(op.static_dims.get("pipeline_range_stride", 1)) > 1:
-                        instruction_phase_mask |= 1 << _INSTR_RANGE_STRIDED_BIT
             num_warps = int(getattr(instance, "num_mma_warps", default_num_mma_warps))
             handler_idx = int(op_handler_indices[op_idx])
             op_meta.extend(
@@ -2076,9 +1984,6 @@ class Megakernel:
             "_OP_META_SIGNAL_COUNT": _OP_META_SIGNAL_COUNT,
             "_OP_META_WAIT_ACQUIRE": _OP_META_WAIT_ACQUIRE,
             "_OP_META_PHASE_MASK": _OP_META_PHASE_MASK,
-            "_INSTR_RANGE_AXIS_SHIFT": _INSTR_RANGE_AXIS_SHIFT,
-            "_INSTR_RANGE_END_AXIS_SHIFT": _INSTR_RANGE_END_AXIS_SHIFT,
-            "_INSTR_RANGE_STRIDED_BIT": _INSTR_RANGE_STRIDED_BIT,
             "_INSTR_NO_SMEM_PAGE_BIT": _INSTR_NO_SMEM_PAGE_BIT,
         }
 
@@ -2101,6 +2006,7 @@ class Megakernel:
             "_INSTR_TILE_3": INSTR_TILE_3,
             "_INSTR_TILE_4": INSTR_TILE_4,
             "_INSTR_BARRIER_META_IDX": INSTR_BARRIER_META_IDX,
+            "_INSTR_RANGE_META": INSTR_RANGE_META,
         }
 
     def _kernel_extra_exec_globals(
@@ -2282,7 +2188,6 @@ class Megakernel:
                 _ctrl_range_axis = Int32(-1)
                 _ctrl_range_end_axis = Int32(-1)
                 _ctrl_range_pos = Int32(0)
-                _ctrl_range_start = Int32(0)
                 _ctrl_range_end = Int32(0)
                 _ctrl_range_offset = Int32(0)
                 _ctrl_range_stride = Int32(1)
@@ -2310,17 +2215,23 @@ class Megakernel:
                                 _fetch_idx = _fetch_idx + _fetch_stride
 
                         if _instr_op >= Int32(0) and _ctrl_range_active == Int32(0):
-                            _ctrl_cached_op = _instr_op
                             _ctrl_meta_base = _op_meta_base(_instr_op)
-                            _ctrl_cached_handler = _op_meta_i32_base(
-                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_HANDLER_IDX)
-                            )
-                            _ctrl_cached_wait_count = _op_meta_i32_base(
-                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_COUNT)
-                            )
-                            _ctrl_cached_wait_acquire = _op_meta_i32_base(
-                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
-                            )
+                            _phase_mask = _ctrl_cached_phase_mask
+                            if _instr_op != _ctrl_cached_op:
+                                _ctrl_cached_op = _instr_op
+                                _ctrl_cached_handler = _op_meta_i32_base(
+                                    op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_HANDLER_IDX)
+                                )
+                                _ctrl_cached_wait_count = _op_meta_i32_base(
+                                    op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_COUNT)
+                                )
+                                _ctrl_cached_wait_acquire = _op_meta_i32_base(
+                                    op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                                )
+                                _phase_mask = _op_meta_i32_base(
+                                    op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_PHASE_MASK)
+                                )
+                                _ctrl_cached_phase_mask = _phase_mask
                             _ctrl_cached_barrier_meta_idx = ld_shared_i32(
                                 _temp_instr + Int32(4 * _INSTR_BARRIER_META_IDX)
                             )
@@ -2333,23 +2244,17 @@ class Megakernel:
                             _ctrl_cached_t2 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_2))
                             _ctrl_cached_t3 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_3))
                             _ctrl_cached_t4 = ld_shared_i32(_temp_instr + Int32(4 * _INSTR_TILE_4))
-                            _phase_mask = _op_meta_i32_base(
-                                op_meta_ptr, _ctrl_meta_base, Int32(_OP_META_PHASE_MASK)
+                            _ctrl_range_stride = Int32(1)
+                            _ctrl_range_offset = Int32(0)
+                            _ctrl_range_meta = ld_shared_i32(
+                                _temp_instr + Int32(4 * _INSTR_RANGE_META)
                             )
-                            _ctrl_cached_phase_mask = _phase_mask
                             _ctrl_range_axis = (
-                                (_phase_mask // Int32(1 << _INSTR_RANGE_AXIS_SHIFT))
-                                % Int32(16)
+                                _ctrl_range_meta % Int32(16)
                             ) - Int32(1)
                             _ctrl_range_end_axis = (
-                                (_phase_mask // Int32(1 << _INSTR_RANGE_END_AXIS_SHIFT))
-                                % Int32(16)
+                                (_ctrl_range_meta // Int32(16)) % Int32(16)
                             ) - Int32(1)
-                            _ctrl_range_is_strided = (
-                                (_phase_mask // Int32(1 << _INSTR_RANGE_STRIDED_BIT))
-                                % Int32(2)
-                            )
-                            _ctrl_range_stride = Int32(1)
                             if _ctrl_range_axis == Int32(0):
                                 _ctrl_range_pos = _ctrl_cached_t0
                             if _ctrl_range_axis == Int32(1):
@@ -2360,7 +2265,6 @@ class Megakernel:
                                 _ctrl_range_pos = _ctrl_cached_t3
                             if _ctrl_range_axis == Int32(4):
                                 _ctrl_range_pos = _ctrl_cached_t4
-                            _ctrl_range_start = _ctrl_range_pos
                             if _ctrl_range_end_axis == Int32(0):
                                 _ctrl_range_end = _ctrl_cached_t0
                             if _ctrl_range_end_axis == Int32(1):
@@ -2371,16 +2275,6 @@ class Megakernel:
                                 _ctrl_range_end = _ctrl_cached_t3
                             if _ctrl_range_end_axis == Int32(4):
                                 _ctrl_range_end = _ctrl_cached_t4
-                            _ctrl_range_offset = Int32(0)
-                            if _ctrl_range_is_strided != Int32(0):
-                                _ctrl_range_stride = _ctrl_cached_t4
-                                if _ctrl_range_stride < Int32(1):
-                                    _ctrl_range_stride = Int32(1)
-                                if _ctrl_range_end <= Int32(0):
-                                    _ctrl_range_end = Int32(1)
-                                _ctrl_range_end = (
-                                    _ctrl_range_pos + _ctrl_range_end * _ctrl_range_stride
-                                )
                             if _ctrl_range_axis < Int32(0) or _ctrl_range_end <= _ctrl_range_pos:
                                 _ctrl_range_end = _ctrl_range_pos + Int32(1)
                                 _ctrl_range_stride = Int32(1)
@@ -2391,7 +2285,6 @@ class Megakernel:
                                 _ctrl_cached_barrier_meta_idx
                                 + _ctrl_range_offset
                             )
-
                             if _ctrl_cached_wait_count > Int32(0):
                                 _done_waits = Int32(0)
                                 for _w in range_constexpr(max_waits):
@@ -2473,7 +2366,7 @@ class Megakernel:
                             _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
                             st_shared_i32(
                                 _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),
-                                _p_slot,
+                                _p_slot % Int32(num_pages),
                             )
                             _p_t0 = _ctrl_cached_t0
                             _p_t1 = _ctrl_cached_t1
@@ -2521,8 +2414,8 @@ class Megakernel:
                             )
                             produce_idx = produce_idx + Int32(1)
                             st_shared_release_cta_i32(produce_idx_ptr, produce_idx)
-                            _ctrl_range_pos = _ctrl_range_pos + _ctrl_range_stride
                             _ctrl_range_offset = _ctrl_range_offset + Int32(1)
+                            _ctrl_range_pos = _ctrl_range_pos + _ctrl_range_stride
                             if _ctrl_range_pos >= _ctrl_range_end:
                                 _ctrl_range_active = Int32(0)
 
@@ -2586,10 +2479,7 @@ class Megakernel:
                                 _tl = trace_start()
                             if const_expr(has_page_free_ops):
                                 _dl_page = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_PAGE_ID))
-                                _dl_pp = _get_page_ptr(
-                                    smem_base,
-                                    (_dl_page + Int32(num_pages)) % Int32(num_pages),
-                                )
+                                _dl_pp = _get_page_ptr(smem_base, _dl_page)
                             else:
                                 _dl_pp = _get_page_ptr(smem_base, _dl_slot)
                             if const_expr(dispatch_load_uses_handler_local_idx):
@@ -2706,10 +2596,7 @@ class Megakernel:
                         if const_expr(tracing):
                             _tss = trace_start()
                         if const_expr(has_page_free_ops):
-                            _ds_pp = _get_page_ptr(
-                                smem_base,
-                                (_ds_page + Int32(num_pages)) % Int32(num_pages),
-                            )
+                            _ds_pp = _get_page_ptr(smem_base, _ds_page)
                         else:
                             _ds_pp = _get_page_ptr(smem_base, _s_slot)
                         if const_expr(dispatch_store_uses_handler_local_idx):
@@ -2912,10 +2799,7 @@ class Megakernel:
 
                         if warp_id < _active_op_warps:
                             if const_expr(has_page_free_ops):
-                                page_ptr = _get_page_ptr(
-                                    smem_base,
-                                    (_page_id + Int32(num_pages)) % Int32(num_pages),
-                                )
+                                page_ptr = _get_page_ptr(smem_base, _page_id)
                             else:
                                 page_ptr = _get_page_ptr(smem_base, slot)
                             if const_expr(dispatch_compute_uses_handler_local_idx):
@@ -3010,6 +2894,9 @@ class Megakernel:
             _cached_wait_barrier = Int32(-2)
             _cached_wait_expected = Int32(-1)
             _running = Int32(1)
+            _cached_op_idx = Int32(TileInstruction.END_MARKER)
+            _cached_handler = Int32(0)
+            _cached_phase_mask = Int32(0)
             _cached_config_idx = Int32(-2)
             _cached_config = Int64(0)
 
@@ -3038,9 +2925,16 @@ class Megakernel:
                     _config = Int64(0)
                     _compute_local = Int32(0)
                     _meta_base = _op_meta_base(op_idx)
-                    _handler = _op_meta_i32_base(
-                        op_meta_ptr, _meta_base, Int32(_OP_META_HANDLER_IDX)
-                    )
+                    _op_meta_changed = op_idx != _cached_op_idx
+                    if _op_meta_changed:
+                        _cached_handler = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_HANDLER_IDX)
+                        )
+                        _cached_phase_mask = _op_meta_i32_base(
+                            op_meta_ptr, _meta_base, Int32(_OP_META_PHASE_MASK)
+                        )
+                        _cached_op_idx = op_idx
+                    _handler = _cached_handler
                     _barrier_meta_idx = ld_shared_i32(iq_base + Int32(4 * _INSTR_BARRIER_META_IDX))
                     if op_idx != _cached_config_idx:
                         _cached_config = ld_global_i64(op_configs_ptr, op_idx)
@@ -3052,15 +2946,16 @@ class Megakernel:
                         )
 
                     if warp_id == Int32(0) and lane_id == Int32(0):
-                        _cached_wait_count = _op_meta_i32_base(
-                            op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
-                        )
-                        _cached_signal_count = _op_meta_i32_base(
-                            op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
-                        )
-                        _cached_wait_acquire = _op_meta_i32_base(
-                            op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
-                        )
+                        if _op_meta_changed:
+                            _cached_wait_count = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
+                            )
+                            _cached_signal_count = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
+                            )
+                            _cached_wait_acquire = _op_meta_i32_base(
+                                op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
+                            )
 
                         if _cached_wait_count > Int32(0):
                             _done_waits = Int32(0)
@@ -3105,25 +3000,20 @@ class Megakernel:
                     tile_3 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_3))
                     tile_4 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_4))
                     page_ptr = _get_page_ptr(smem_base, Int32(0))
-                    _phase_mask = _op_meta_i32_base(
-                        op_meta_ptr, _meta_base, Int32(_OP_META_PHASE_MASK)
-                    )
-                    _range_axis = (
-                        (_phase_mask // Int32(1 << _INSTR_RANGE_AXIS_SHIFT))
-                        % Int32(16)
-                    ) - Int32(1)
-                    _range_end_axis = (
-                        (_phase_mask // Int32(1 << _INSTR_RANGE_END_AXIS_SHIFT))
-                        % Int32(16)
-                    ) - Int32(1)
-                    _range_is_strided = (
-                        (_phase_mask // Int32(1 << _INSTR_RANGE_STRIDED_BIT))
-                        % Int32(2)
-                    )
+                    _phase_mask = _cached_phase_mask
                     _range_pos = Int32(0)
                     _range_end = Int32(0)
                     _range_stride = Int32(1)
                     _range_offset = Int32(0)
+                    _range_axis = Int32(-1)
+                    _range_end_axis = Int32(-1)
+                    _range_meta = ld_shared_i32(iq_base + Int32(4 * _INSTR_RANGE_META))
+                    _range_axis = (
+                        _range_meta % Int32(16)
+                    ) - Int32(1)
+                    _range_end_axis = (
+                        (_range_meta // Int32(16)) % Int32(16)
+                    ) - Int32(1)
                     if _range_axis == Int32(0):
                         _range_pos = tile_0
                     if _range_axis == Int32(1):
@@ -3144,20 +3034,17 @@ class Megakernel:
                         _range_end = tile_3
                     if _range_end_axis == Int32(4):
                         _range_end = tile_4
-                    if _range_is_strided != Int32(0):
-                        _range_stride = tile_4
-                        if _range_stride < Int32(1):
-                            _range_stride = Int32(1)
-                        if _range_end <= Int32(0):
-                            _range_end = Int32(1)
-                        _range_end = _range_pos + _range_end * _range_stride
                     if _range_axis < Int32(0) or _range_end <= _range_pos:
                         _range_end = _range_pos + Int32(1)
                         _range_stride = Int32(1)
 
                     while _range_pos < _range_end:
                         _current_meta_idx = _barrier_meta_idx + _range_offset
-                        if _range_axis >= Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
+                        if (
+                            _range_axis >= Int32(0)
+                            and warp_id == Int32(0)
+                            and lane_id == Int32(0)
+                        ):
                             if _cached_wait_count > Int32(0):
                                 _done_waits = Int32(0)
                                 for _w in range_constexpr(max_waits):
@@ -3228,7 +3115,11 @@ class Megakernel:
                                 tile_4,
                                 _config,
                             )
-                        if _range_axis >= Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
+                        if (
+                            _range_axis >= Int32(0)
+                            and warp_id == Int32(0)
+                            and lane_id == Int32(0)
+                        ):
                             if _cached_signal_count > Int32(0):
                                 if _cached_signal_count == Int32(1):
                                     _sig_barrier = ld_global_i32(
@@ -3244,8 +3135,8 @@ class Megakernel:
                                         _cached_signal_count,
                                         barriers_ptr,
                                     )
-                        _range_pos = _range_pos + _range_stride
                         _range_offset = _range_offset + Int32(1)
+                        _range_pos = _range_pos + _range_stride
 
                     if _range_axis == Int32(0):
                         tile_0 = ld_shared_i32(iq_base + Int32(4 * _INSTR_TILE_0))
@@ -3264,7 +3155,11 @@ class Megakernel:
                             Int32(num_compute_threads),
                         )
 
-                    if _range_axis < Int32(0) and warp_id == Int32(0) and lane_id == Int32(0):
+                    if (
+                        _range_axis < Int32(0)
+                        and warp_id == Int32(0)
+                        and lane_id == Int32(0)
+                    ):
                         if _cached_signal_count > Int32(0):
                             if _cached_signal_count == Int32(1):
                                 _sig_barrier = ld_global_i32(
@@ -3408,7 +3303,7 @@ class Megakernel:
             source,
             "                            st_shared_i32(\n"
             "                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
-            "                                _p_slot,\n"
+            "                                _p_slot % Int32(num_pages),\n"
             "                            )\n",
             "                            _ctrl_no_page = (\n"
             "                                (_ctrl_cached_phase_mask // Int32(1 << _INSTR_NO_SMEM_PAGE_BIT))\n"
@@ -3514,11 +3409,11 @@ class Megakernel:
         - Config parameters (threads, pages, etc.)
         - Backward flag
 
-        Tile counts, barrier formulas, and instruction streams are now
-        materialized into runtime tensors (`op_meta`, instructions,
-        wait_info, signal metadata). They no longer affect the emitted
-        kernel body directly, so batch-dynamic scheduling can reuse the
-        same compiled kernel while rebuilding only runtime metadata.
+        Tile counts, barrier formulas, and instruction streams now live in
+        runtime tensors (`op_meta`, instructions, wait_info, signal metadata).
+        They no longer affect the emitted kernel body directly, so
+        batch-dynamic scheduling can reuse the same compiled kernel while
+        rebuilding only runtime metadata.
         """
         handler_keys = tuple(
             spec.compile_key for spec in self._backend_ir.handler_specs

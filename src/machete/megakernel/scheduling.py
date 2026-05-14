@@ -18,11 +18,12 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import ClassVar, Dict, List, Optional, Tuple, Type, Union
 
 from .instruction_layout import (
     INSTR_BARRIER_META_IDX,
     INSTR_OP_IDX,
+    INSTR_RANGE_META,
     INSTR_TILE_0,
     INSTR_TILE_1,
     INSTR_TILE_2,
@@ -111,6 +112,8 @@ class TileInstruction:
 
     op_idx: int
     tiles: Tuple[int, ...]  # Up to MAX_TILE_DIMS tile indices
+    range_axis: int = -1
+    range_end_axis: int = -1
 
     # Sentinel for end of stream
     END_MARKER: int = -1
@@ -127,11 +130,14 @@ class TileInstruction:
         if self.op_idx == self.END_MARKER:
             return [self.op_idx] + [0] * (INSTRUCTION_WORDS - 1)
         padded_tiles = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
+        range_meta = 0
+        if self.range_axis >= 0 and self.range_end_axis >= 0:
+            range_meta = (self.range_axis + 1) | ((self.range_end_axis + 1) << 4)
         return [
             self.op_idx,
             *padded_tiles,
             barrier_meta_idx,
-            0,
+            range_meta,
         ]
 
     @classmethod
@@ -323,83 +329,48 @@ def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]
     return consumer_deps
 
 
-def _coalesce_pipeline_ranges(
+def _coalesce_coordinate_ranges(
     instructions: List[TileInstruction],
     *,
-    range_axis: int,
-    range_end_axis: int,
+    tile_rank: int,
     max_range_tiles: int = 0,
-    range_stride: int = 1,
-    range_stride_axis: int = -1,
 ) -> List[TileInstruction]:
-    """Coalesce single-block instructions into contiguous or strided ranges."""
+    """Coalesce adjacent same-op tiles that form a contiguous coordinate range."""
     if not instructions:
         return []
-    if range_axis < 0:
-        return instructions
-    if range_end_axis < 0:
-        range_end_axis = range_axis + 1
-    if range_end_axis >= MAX_TILE_DIMS or range_end_axis == range_axis:
-        return instructions
-    if range_stride < 1:
-        range_stride = 1
-    if range_stride == 1:
-        range_stride_axis = -1
-    elif range_stride_axis < 0:
-        range_stride_axis = range_end_axis + 1
-    if range_stride > 1 and (
-        range_stride_axis >= MAX_TILE_DIMS
-        or range_stride_axis in (range_axis, range_end_axis)
-    ):
+    if tile_rank <= 0 or tile_rank >= MAX_TILE_DIMS:
         return instructions
 
-    if range_stride > 1:
-        groups: Dict[Tuple[int, ...], List[Tuple[int, TileInstruction]]] = {}
-        for original_idx, instr in enumerate(instructions):
-            tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
-            key = []
-            for axis in range(MAX_TILE_DIMS):
-                if axis in (range_axis, range_end_axis, range_stride_axis):
-                    continue
-                key.append(tiles[axis])
-            key.append(tiles[range_axis] % range_stride)
-            groups.setdefault(tuple(key), []).append((original_idx, instr))
-
-        out_with_order: List[Tuple[int, TileInstruction]] = []
-        for group in groups.values():
-            group.sort(key=lambda item: (item[1].tiles[range_axis], item[0]))
-            idx = 0
-            while idx < len(group):
-                first_order, first = group[idx]
-                tiles = list(first.tiles) + [0] * (MAX_TILE_DIMS - len(first.tiles))
-                start = tiles[range_axis]
-                count = 1
-                idx += 1
-                while idx < len(group):
-                    _, candidate = group[idx]
-                    cand_tiles = list(candidate.tiles) + [0] * (
-                        MAX_TILE_DIMS - len(candidate.tiles)
-                    )
-                    if max_range_tiles > 0 and count >= max_range_tiles:
-                        break
-                    if cand_tiles[range_axis] != start + count * range_stride:
-                        break
-                    count += 1
-                    idx += 1
-                tiles[range_end_axis] = count
-                tiles[range_stride_axis] = range_stride
-                out_with_order.append((first_order, TileInstruction(first.op_idx, tuple(tiles))))
-        out_with_order.sort(key=lambda item: item[0])
-        return [instr for _, instr in out_with_order]
-
+    range_end_axis = tile_rank
     out: List[TileInstruction] = []
     idx = 0
     while idx < len(instructions):
         first = instructions[idx]
         tiles = list(first.tiles) + [0] * (MAX_TILE_DIMS - len(first.tiles))
+
+        range_axis = -1
+        if idx + 1 < len(instructions):
+            next_tiles = list(instructions[idx + 1].tiles) + [0] * (
+                MAX_TILE_DIMS - len(instructions[idx + 1].tiles)
+            )
+            for axis in range(tile_rank):
+                if next_tiles[axis] != tiles[axis] + 1:
+                    continue
+                if all(
+                    next_tiles[other] == tiles[other]
+                    for other in range(tile_rank)
+                    if other != axis
+                ):
+                    range_axis = axis
+                    break
+
+        if range_axis < 0:
+            out.append(first)
+            idx += 1
+            continue
+
         start = tiles[range_axis]
-        existing_end = tiles[range_end_axis]
-        end = existing_end if existing_end > start else start + 1
+        end = start + 1
         idx += 1
 
         while idx < len(instructions):
@@ -407,23 +378,27 @@ def _coalesce_pipeline_ranges(
             cand_tiles = list(candidate.tiles) + [0] * (MAX_TILE_DIMS - len(candidate.tiles))
             if max_range_tiles > 0 and end - start >= max_range_tiles:
                 break
-            same_prefix = True
-            for axis in range(MAX_TILE_DIMS):
-                if axis in (range_axis, range_end_axis):
-                    continue
-                if cand_tiles[axis] != tiles[axis]:
-                    same_prefix = False
-                    break
+            same_prefix = all(
+                cand_tiles[axis] == tiles[axis]
+                for axis in range(tile_rank)
+                if axis != range_axis
+            )
             if not same_prefix or cand_tiles[range_axis] != end:
                 break
             end += 1
             idx += 1
 
         tiles[range_end_axis] = end
-        out.append(TileInstruction(op_idx=first.op_idx, tiles=tuple(tiles)))
+        out.append(
+            TileInstruction(
+                op_idx=first.op_idx,
+                tiles=tuple(tiles),
+                range_axis=range_axis,
+                range_end_axis=range_end_axis,
+            )
+        )
 
     return out
-
 
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
@@ -470,17 +445,29 @@ class OverlapTileScheduler(TileScheduler):
         self,
         *,
         fetch_stride: Optional[int] = None,
+        adaptive_fetch_stride: bool = False,
         prefer_data_movement: bool = True,
         prefer_ready_consumers: bool = False,
     ):
         self.fetch_stride = fetch_stride
+        self.adaptive_fetch_stride = bool(adaptive_fetch_stride)
         self.prefer_data_movement = prefer_data_movement
         self.prefer_ready_consumers = prefer_ready_consumers
+        self._bound_num_blocks: Optional[int] = None
 
     def bind_num_blocks(self, num_blocks: int) -> None:
         """Bind the runtime instruction fetch stride used by persistent CTAs."""
-        if self.fetch_stride is None:
+        self._bound_num_blocks = max(1, int(num_blocks))
+        if self.fetch_stride is None and not self.adaptive_fetch_stride:
             self.fetch_stride = max(1, int(num_blocks))
+
+    def _resolve_fetch_stride(self, total_tiles: int) -> int:
+        if self.fetch_stride is not None:
+            return max(1, int(self.fetch_stride))
+        num_blocks = max(1, int(self._bound_num_blocks or 1))
+        if self.adaptive_fetch_stride and total_tiles <= 14 * num_blocks:
+            return 2 * num_blocks
+        return num_blocks
 
     @staticmethod
     def _phase_overridden(op_cls: Type[Op], phase_name: str) -> bool:
@@ -545,15 +532,16 @@ class OverlapTileScheduler(TileScheduler):
         pos: int,
         depths: List[int],
         resource_scores: List[int],
+        has_waits: List[bool],
     ) -> Tuple[int, int, int, int, int]:
         resource_score = resource_scores[op_idx] if self.prefer_data_movement else 0
-        depth_score = -depths[op_idx] if self.prefer_ready_consumers else depths[op_idx]
+        consumer_score = 1 if self.prefer_ready_consumers and has_waits[op_idx] else 0
         return (
-            depth_score,
+            consumer_score,
+            depths[op_idx],
             -op_idx,
             resource_score,
             -tile_idx,
-            -pos,
         )
 
     def _schedule_stride_waves(
@@ -562,6 +550,7 @@ class OverlapTileScheduler(TileScheduler):
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
         depths: List[int],
         resource_scores: List[int],
+        has_waits: List[bool],
         fetch_stride: int,
     ) -> List[TileInstruction]:
         scheduled: List[TileInstruction] = []
@@ -579,6 +568,7 @@ class OverlapTileScheduler(TileScheduler):
                             pos=pos,
                             depths=depths,
                             resource_scores=resource_scores,
+                            has_waits=has_waits,
                         ),
                         pos,
                     ))
@@ -619,17 +609,19 @@ class OverlapTileScheduler(TileScheduler):
 
         depths = _compute_op_depths(len(op_records), edges)
         resource_scores = [self._resource_score(rec.op) for rec in op_records]
+        has_waits = [bool(formulas.get(rec.op_idx, ([], []))[0]) for rec in op_records]
         candidates: List[Tuple[int, int, TileInstruction]] = []
         for rec in op_records:
             for tile_idx, tile in enumerate(rec.tiles):
                 candidates.append((rec.op_idx, tile_idx, TileInstruction(rec.op_idx, tile)))
 
-        fetch_stride = max(1, int(self.fetch_stride or 1))
+        fetch_stride = self._resolve_fetch_stride(sum(rec.op.total_tiles for rec in op_records))
         return self._schedule_stride_waves(
             candidates,
             formulas,
             depths,
             resource_scores,
+            has_waits,
             fetch_stride,
         )
 
@@ -689,55 +681,26 @@ class InstructionStreamBuilder:
         self._cached_formulas = None
         self._barrier_count = None
 
-    def _range_axis_for_op_idx(self, op_idx: int) -> Tuple[int, int]:
-        pipeline = self._pipeline_for_op_idx(op_idx)
-        if pipeline is None or not pipeline.coalesce_ranges or pipeline.range_axis < 0:
-            return -1, -1
-        end_axis = pipeline.range_end_axis
-        if end_axis < 0:
-            end_axis = pipeline.range_axis + 1
-        if end_axis >= MAX_TILE_DIMS or end_axis == pipeline.range_axis:
-            return -1, -1
-        return pipeline.range_axis, end_axis
-
-    def _range_stride_for_op_idx(self, op_idx: int) -> Tuple[int, int]:
-        if op_idx < 0 or op_idx >= len(self._op_records):
-            return 1, -1
-        static_dims = self._op_records[op_idx].op.static_dims
-        stride = int(static_dims.get("pipeline_range_stride", 1))
-        stride_axis = int(static_dims.get("pipeline_range_stride_axis", -1))
-        if stride < 1:
-            stride = 1
-        if stride == 1:
-            return 1, -1
-        return stride, stride_axis
-
     def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
         """Return logical tiles covered by one possibly range-owned instruction."""
         if instr.op_idx == TileInstruction.END_MARKER:
             return []
-        range_axis, end_axis = self._range_axis_for_op_idx(instr.op_idx)
+        range_axis = instr.range_axis
+        end_axis = instr.range_end_axis
         if range_axis < 0:
             return [instr.tiles]
-        range_stride, stride_axis = self._range_stride_for_op_idx(instr.op_idx)
+        if end_axis < 0 or end_axis >= MAX_TILE_DIMS or end_axis == range_axis:
+            return [instr.tiles]
         tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
         start = tiles[range_axis]
-        if range_stride > 1:
-            count = tiles[end_axis]
-            if count <= 1:
-                return [instr.tiles]
-            end = start + count * range_stride
-        else:
-            end = tiles[end_axis]
-            if end <= start:
-                return [instr.tiles]
+        end = tiles[end_axis]
+        if end <= start:
+            return [instr.tiles]
         out: List[Tuple[int, ...]] = []
-        for axis_value in range(start, end, range_stride):
+        for axis_value in range(start, end):
             logical = list(tiles)
             logical[range_axis] = axis_value
             logical[end_axis] = 0
-            if stride_axis >= 0 and stride_axis < MAX_TILE_DIMS:
-                logical[stride_axis] = 0
             out.append(tuple(logical))
         return out
 
@@ -758,10 +721,6 @@ class InstructionStreamBuilder:
                 input_stages=op.static_dims.get("pipeline_input_stages"),
                 output_stages=op.static_dims.get("pipeline_output_stages"),
                 stage_pages=op.static_dims.get("pipeline_stage_pages"),
-                range_axis=op.static_dims.get("pipeline_range_axis"),
-                range_end_axis=op.static_dims.get("pipeline_range_end_axis"),
-                range_block_size=op.static_dims.get("pipeline_range_block_size"),
-                coalesce_ranges=op.static_dims.get("pipeline_coalesce_ranges"),
             )
         return None
 
@@ -2017,32 +1976,72 @@ class InstructionStreamBuilder:
     def coalesce_pipeline_instructions(
         self,
         instructions: List[TileInstruction],
+        *,
+        num_blocks: Optional[int] = None,
     ) -> List[TileInstruction]:
-        """Coalesce adjacent range-owned instructions in a flat stream."""
-        out: List[TileInstruction] = []
+        """Coalesce adjacent range-owned instructions.
+
+        Persistent CTAs fetch the instruction stream with a stride of
+        ``num_blocks``.  Two instructions that are adjacent in one CTA's fetch
+        stream are therefore usually not adjacent in the flat list.  When the
+        block count is known, coalesce each strided CTA stream independently
+        and interleave the streams back together.  This lets the scheduler form
+        local same-op fast-path ranges without changing cross-CTA work
+        distribution.
+        """
         non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
-        idx = 0
-        while idx < len(non_end):
-            op_idx = non_end[idx].op_idx
-            run_end = idx + 1
-            while run_end < len(non_end) and non_end[run_end].op_idx == op_idx:
-                run_end += 1
-            run = non_end[idx:run_end]
-            pipeline = self._pipeline_for_op_idx(op_idx)
-            if pipeline is not None and pipeline.coalesce_ranges:
-                static_dims = self._op_records[op_idx].op.static_dims
-                run = _coalesce_pipeline_ranges(
+
+        def _coalesce_flat(stream: List[TileInstruction]) -> List[TileInstruction]:
+            out: List[TileInstruction] = []
+            idx = 0
+            while idx < len(stream):
+                op_idx = stream[idx].op_idx
+                run_end = idx + 1
+                while run_end < len(stream) and stream[run_end].op_idx == op_idx:
+                    run_end += 1
+                run = stream[idx:run_end]
+                tile_rank = len(self._op_records[op_idx].op.tile_counts)
+                max_range_tiles = 0
+                if num_blocks is not None and num_blocks > 0:
+                    max_range_tiles = max(
+                        1,
+                        math.ceil(
+                            max(1, int(self._op_records[op_idx].op.total_tiles))
+                            / max(1, int(num_blocks))
+                        ),
+                    )
+                run = _coalesce_coordinate_ranges(
                     run,
-                    range_axis=pipeline.range_axis,
-                    range_end_axis=pipeline.range_end_axis,
-                    max_range_tiles=pipeline.range_block_size,
-                    range_stride=int(static_dims.get("pipeline_range_stride", 1)),
-                    range_stride_axis=int(static_dims.get("pipeline_range_stride_axis", -1)),
+                    tile_rank=tile_rank,
+                    max_range_tiles=max_range_tiles,
                 )
-            out.extend(run)
-            idx = run_end
-        out.append(TileInstruction.end_instruction())
-        return out
+                out.extend(run)
+                idx = run_end
+            return out
+
+        global_coalesced = _coalesce_flat(non_end)
+        global_out = global_coalesced + [TileInstruction.end_instruction()]
+
+        if num_blocks is None or num_blocks <= 1 or len(non_end) <= 1:
+            return global_out
+
+        stream_count = max(1, int(num_blocks))
+        streams: List[List[TileInstruction]] = []
+        for block_idx in range(stream_count):
+            stream = [non_end[idx] for idx in range(block_idx, len(non_end), stream_count)]
+            streams.append(_coalesce_flat(stream))
+
+        max_stream_len = max((len(stream) for stream in streams), default=0)
+        strided_out: List[TileInstruction] = []
+        end = TileInstruction.end_instruction()
+        for stream_pos in range(max_stream_len + 1):
+            for stream in streams:
+                if stream_pos < len(stream):
+                    strided_out.append(stream[stream_pos])
+                else:
+                    strided_out.append(end)
+
+        return strided_out if len(strided_out) < len(global_out) else global_out
 
     @property
     def max_wait_deps(self) -> int:
@@ -2179,7 +2178,7 @@ class InstructionStreamBuilder:
         entry: List[int] = []
         signal_formulas = formulas.get(instr.op_idx, ([], []))[1]
         logical_tiles = self._logical_tiles_for_instruction(instr)
-        range_axis, _end_axis = self._range_axis_for_op_idx(instr.op_idx)
+        range_axis = instr.range_axis
         preserve_range_multiplicity = len(logical_tiles) > 1
         for formula in signal_formulas:
             seen = set()
@@ -2223,6 +2222,7 @@ __all__ = [
     "INSTRUCTION_WORDS",
     "INSTR_BARRIER_META_IDX",
     "INSTR_OP_IDX",
+    "INSTR_RANGE_META",
     "INSTR_TILE_0",
     "INSTR_TILE_1",
     "INSTR_TILE_2",

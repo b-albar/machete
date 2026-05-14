@@ -72,29 +72,17 @@ class _RangeCapableSerialNonTmaLoadOp(_SerialNonTmaLoadOp):
     pipeline = PipelineSpec(page_count=1)
 
 
-def test_range_capable_pipeline_declares_range_metadata_without_coalescing():
-    spec = PipelineSpec.range_capable(range_axis=2, range_end_axis=3)
+def test_pipeline_spec_no_longer_declares_range_metadata():
+    spec = PipelineSpec(page_count=1)
 
     assert spec.page_count == 1
-    assert spec.range_axis == 2
-    assert spec.range_end_axis == 3
-    assert spec.range_block_size == 1
-    assert spec.coalesce_ranges is False
 
 
-def test_strided_pipeline_range_coalesces_by_residue_and_expands_logical_tiles():
+def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
     op = ScheduledOp(
         _RangeCapableNOPOp,
         tile_counts=(1, 1, 10),
         dim_names={"B": 0, "S": 1, "O": 2},
-        static_dims={
-            "pipeline_coalesce_ranges": True,
-            "pipeline_range_axis": 2,
-            "pipeline_range_end_axis": 3,
-            "pipeline_range_block_size": 3,
-            "pipeline_range_stride": 4,
-            "pipeline_range_stride_axis": 4,
-        },
     )
     builder = InstructionStreamBuilder()
     builder.add_op(op)
@@ -103,25 +91,48 @@ def test_strided_pipeline_range_coalesces_by_residue_and_expands_logical_tiles()
     non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
 
     assert [instr.tiles for instr in non_end] == [
-        (0, 0, 0, 3, 4),
-        (0, 0, 1, 3, 4),
-        (0, 0, 2, 2, 4),
-        (0, 0, 3, 2, 4),
+        (0, 0, 0, 10, 0),
     ]
+    assert [(instr.range_axis, instr.range_end_axis) for instr in non_end] == [(2, 3)]
     assert [
         instr.tiles for instr in builder.expand_pipeline_instructions(instructions)
         if instr.op_idx != TileInstruction.END_MARKER
     ] == [
         (0, 0, 0, 0, 0),
-        (0, 0, 4, 0, 0),
-        (0, 0, 8, 0, 0),
         (0, 0, 1, 0, 0),
-        (0, 0, 5, 0, 0),
-        (0, 0, 9, 0, 0),
         (0, 0, 2, 0, 0),
-        (0, 0, 6, 0, 0),
         (0, 0, 3, 0, 0),
+        (0, 0, 4, 0, 0),
+        (0, 0, 5, 0, 0),
+        (0, 0, 6, 0, 0),
         (0, 0, 7, 0, 0),
+        (0, 0, 8, 0, 0),
+        (0, 0, 9, 0, 0),
+    ]
+
+
+def test_pipeline_range_coalesces_per_cta_fetch_stream():
+    """Same-op tiles consecutive per CTA should form ranges even if interleaved globally."""
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 110),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+    instructions = []
+    for i in range(10):
+        instructions.append(TileInstruction(0, (0, 0, i)))
+        instructions.append(TileInstruction(0, (0, 0, 100 + i)))
+    instructions.append(TileInstruction.end_instruction())
+
+    coalesced = builder.coalesce_pipeline_instructions(instructions, num_blocks=2)
+
+    assert [instr.tiles for instr in coalesced] == [
+        (0, 0, 0, 10, 0),
+        (0, 0, 100, 110, 0),
+        (0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0),
     ]
 
 
@@ -1023,6 +1034,21 @@ class TestSchedulerAPI:
             (1, 4), (1, 5), (1, 6), (1, 7),
         ]
 
+    def test_overlap_scheduler_adaptive_fetch_stride_uses_wider_small_waves(self):
+        """Adaptive overlap can use two CTA waves for short instruction streams."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        scheduler = OverlapTileScheduler(adaptive_fetch_stride=True)
+        scheduler.bind_num_blocks(4)
+
+        instructions = builder.build(scheduler=scheduler)[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:8]] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (0, 4), (0, 5), (0, 6), (0, 7),
+        ]
+
     def test_overlap_scheduler_waits_for_many_to_one_dependencies(self):
         """Many-to-one consumers must wait until all producer tiles have signaled."""
         builder = InstructionStreamBuilder()
@@ -1066,6 +1092,25 @@ class TestSchedulerAPI:
             for m in range(3)
             for n in range(2)
         }
+
+    def test_overlap_ready_does_not_prioritize_independent_sinks(self):
+        """Ready-consumer mode should not move unrelated sinks ahead of the chain."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        instructions = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=2,
+                prefer_data_movement=False,
+                prefer_ready_consumers=True,
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:2]] == [
+            (0, 0), (0, 1),
+        ]
 
 
 # =============================================================================

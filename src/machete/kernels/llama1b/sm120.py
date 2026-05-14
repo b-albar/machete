@@ -87,15 +87,8 @@ class _Llama1BStagedWeightMatvecSm120Base(Op):
     """Hazy-style decode matvec with loader-owned staged weight pages."""
 
     allow_single_staged_buffer = False
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
-    pipeline_force_framework_range = True
-    pipeline_auto_range_block_size = True
     reads = {
         "a": (None, ("B", "S", "K")),
         "weight": (None, ("O", "K")),

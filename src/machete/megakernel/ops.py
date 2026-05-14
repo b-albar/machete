@@ -70,10 +70,6 @@ class PipelineSpec:
     stage_pages: int = 1
     semaphore_count: int = 0
     scratch_bytes: int = 0
-    range_axis: int = -1
-    range_end_axis: int = -1
-    range_block_size: int = 1
-    coalesce_ranges: bool = False
 
     def __post_init__(self):
         if self.page_count < 1:
@@ -88,24 +84,6 @@ class PipelineSpec:
             raise ValueError("PipelineSpec.semaphore_count must be non-negative")
         if self.scratch_bytes < 0:
             raise ValueError("PipelineSpec.scratch_bytes must be non-negative")
-        if self.range_axis < -1 or self.range_axis >= MAX_TILE_DIMS:
-            raise ValueError(
-                f"PipelineSpec.range_axis must be -1 or in [0, {MAX_TILE_DIMS})"
-            )
-        if self.range_end_axis < -1 or self.range_end_axis >= MAX_TILE_DIMS:
-            raise ValueError(
-                f"PipelineSpec.range_end_axis must be -1 or in [0, {MAX_TILE_DIMS})"
-            )
-        if self.coalesce_ranges and self.range_axis < 0:
-            raise ValueError("PipelineSpec.coalesce_ranges requires range_axis >= 0")
-        if (
-            self.coalesce_ranges
-            and self.range_end_axis >= 0
-            and self.range_end_axis == self.range_axis
-        ):
-            raise ValueError("PipelineSpec.range_end_axis must differ from range_axis")
-        if self.range_block_size < 0:
-            raise ValueError("PipelineSpec.range_block_size must be >= 0")
 
     @property
     def resource_bytes(self) -> int:
@@ -121,42 +99,9 @@ class PipelineSpec:
             "stage_pages": self.stage_pages,
             "semaphore_count": self.semaphore_count,
             "scratch_bytes": self.scratch_bytes,
-            "range_axis": self.range_axis,
-            "range_end_axis": self.range_end_axis,
-            "range_block_size": self.range_block_size,
-            "coalesce_ranges": self.coalesce_ranges,
         }
         values.update({k: v for k, v in overrides.items() if v is not None})
         return PipelineSpec(**values)
-
-    @classmethod
-    def range_capable(
-        cls,
-        *,
-        page_count: int = 1,
-        range_axis: int,
-        range_end_axis: int = -1,
-        range_block_size: int = 1,
-        page_bytes: int = 0,
-        semaphore_count: int = 0,
-        scratch_bytes: int = 0,
-    ) -> "PipelineSpec":
-        """Return a pipeline contract whose range support is scheduler-owned.
-
-        Use this on an op class to declare the axis that automatic pipeline
-        range coalescing may use. It does not coalesce by default; ops opt in
-        with class-level automatic range settings or static pipeline metadata.
-        """
-        return cls(
-            page_count=page_count,
-            page_bytes=page_bytes,
-            semaphore_count=semaphore_count,
-            scratch_bytes=scratch_bytes,
-            range_axis=range_axis,
-            range_end_axis=range_end_axis,
-            range_block_size=range_block_size,
-            coalesce_ranges=False,
-        )
 
     @classmethod
     def streaming(
@@ -167,10 +112,6 @@ class PipelineSpec:
         stage_pages: int = 4,
         page_bytes: int = 0,
         scratch_bytes: int = 0,
-        range_axis: int = -1,
-        range_end_axis: int = -1,
-        range_block_size: int = 1,
-        coalesce_ranges: bool = False,
     ) -> "PipelineSpec":
         """Return a staged load/compute/store page-ring contract."""
         return cls(
@@ -181,10 +122,6 @@ class PipelineSpec:
             stage_pages=stage_pages,
             semaphore_count=1 + 2 * (input_stages + output_stages),
             scratch_bytes=scratch_bytes,
-            range_axis=range_axis,
-            range_end_axis=range_end_axis,
-            range_block_size=range_block_size,
-            coalesce_ranges=coalesce_ranges,
         )
 
     def page_protocol(self) -> "InstructionPageProtocol":

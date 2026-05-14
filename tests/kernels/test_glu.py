@@ -133,6 +133,22 @@ class TestGLUForward:
             y.float(), y_ref.float(), atol=1e-2, rtol=1e-2,
         )
 
+    @requires_gpu
+    def test_direct_forward_rejects_non_divisible_d_tile(self):
+        """Direct wide GLU must reject D tiles that do not cover rows exactly."""
+        from machete.kernels.glu import DirectGLUOp
+
+        x = torch.empty(1, 16, 2 * 3584, dtype=torch.bfloat16, device="cuda")
+        y = torch.empty(1, 16, 3584, dtype=torch.bfloat16, device="cuda")
+
+        with pytest.raises(ValueError, match="D % tile_size_D"):
+            DirectGLUOp.schedule(
+                x=x,
+                y=y,
+                activation="silu",
+                tile_sizes={"S": 16, "D": 1024},
+            )
+
 
 # =============================================================================
 # Backward Tests
@@ -202,6 +218,24 @@ class TestGLUBackward:
 
         dx = _run_glu_backward(dy, x, activation='silu')
         assert torch.all(dx == 0), "dx should be zero when dy is zero"
+
+    @requires_gpu
+    def test_backward_rejects_non_power_of_two_d_tile(self):
+        """Reject TMA chunk shapes that can fault at runtime."""
+        from machete.kernels.glu import GLUBwdOp
+
+        x = torch.empty(1, 16, 2 * 3584, dtype=torch.bfloat16, device="cuda")
+        dy = torch.empty(1, 16, 3584, dtype=torch.bfloat16, device="cuda")
+        dx = torch.empty_like(x)
+
+        with pytest.raises(ValueError, match="power-of-two tile_size_D"):
+            GLUBwdOp.schedule(
+                dy=dy,
+                x=x,
+                dx=dx,
+                activation="silu",
+                tile_sizes={"S": 8, "D": 896},
+            )
 
 
 # =============================================================================

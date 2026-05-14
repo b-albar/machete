@@ -160,6 +160,51 @@ def test_shape_aware_auto_tiles_long_rows_use_wide_spatial_tile():
     ) == (128, 128, 16)
 
 
+def test_shape_aware_auto_tiles_qwen_reducer_prefers_narrower_n():
+    """Qwen down-proj shapes prefer more K reuse over the widest N tile."""
+    from machete.kernels.gemm import GemmOp
+
+    assert GemmOp._shape_aware_auto_tiles(
+        32768,
+        input_k=3584,
+        output_n=1024,
+        batch=1,
+        rows=512,
+        elem_bytes=2,
+        has_a_scale=False,
+    ) == (128, 64, 32)
+
+
+def test_shape_aware_auto_tiles_tiny_single_batch_stays_small():
+    """Avoid the multi-batch small-sequence tile on tiny B=1 shapes."""
+    from machete.kernels.gemm import GemmOp
+
+    assert GemmOp._shape_aware_auto_tiles(
+        32768,
+        input_k=3584,
+        output_n=1024,
+        batch=1,
+        rows=128,
+        elem_bytes=2,
+        has_a_scale=False,
+    ) == (64, 32, 64)
+
+
+def test_shape_aware_auto_tiles_small_multibatch_uses_128_rows():
+    """Batched short sequences amortize better with 128-row GEMM tiles."""
+    from machete.kernels.gemm import GemmOp
+
+    assert GemmOp._shape_aware_auto_tiles(
+        32768,
+        input_k=1024,
+        output_n=7168,
+        batch=4,
+        rows=128,
+        elem_bytes=2,
+        has_a_scale=False,
+    ) == (128, 64, 32)
+
+
 @requires_sm90_cutlass
 class TestGemmForward:
     """GEMM forward pass correctness tests."""

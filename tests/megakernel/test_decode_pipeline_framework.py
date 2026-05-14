@@ -80,21 +80,11 @@ class _CustomProtocolNoop(Op):
 
 
 class _CoalescedPipelineNoop(Op):
-    pipeline = PipelineSpec.streaming(
-        range_axis=0,
-        range_end_axis=1,
-        range_block_size=16,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
 
 
 class _CoalescedRangeFillOp(Op):
-    pipeline = PipelineSpec.streaming(
-        range_axis=0,
-        range_end_axis=1,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     reads = {}
     writes = {"y": (None, ("N",))}
     tile = ("N",)
@@ -135,12 +125,7 @@ class _AddOneOp(Op):
 
 
 class _RangeLoopAddOneOp(_AddOneOp):
-    pipeline = PipelineSpec.streaming(
-        range_axis=0,
-        range_end_axis=1,
-        range_block_size=16,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
 
 
 class _StaticSingleWriterProducerOp(Op):
@@ -195,7 +180,7 @@ class _SlicedMlpConsumerOp(Op):
 
 
 class _InvalidStagedLoadLoopOp(Op):
-    pipeline = PipelineSpec.streaming(range_axis=0)
+    pipeline = PipelineSpec.streaming()
     reads = {}
     writes = {"y": (None, ("N",))}
     tile = ("N",)
@@ -216,12 +201,7 @@ class _InvalidPlainLoadLoopOp(Op):
 
 
 class _PartialRangeOwnershipStagedOp(Op):
-    pipeline = PipelineSpec.streaming(
-        range_axis=0,
-        range_end_axis=1,
-        range_block_size=4,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     reads = {}
     writes = {"y": (None, ("N",))}
     tile = ("N",)
@@ -239,10 +219,6 @@ def test_streaming_spec_matches_reference_shape():
     spec = PipelineSpec.streaming(
         page_bytes=2048,
         scratch_bytes=384,
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=16,
-        coalesce_ranges=True,
     )
 
     assert spec.page_count == 13  # activation page + 3 input stages * 4 pages
@@ -251,10 +227,6 @@ def test_streaming_spec_matches_reference_shape():
     assert spec.stage_pages == 4
     assert spec.semaphore_count == 13  # activation + arrived/finished pairs
     assert spec.resource_bytes == 13 * 2048 + 13 * 8 + 384
-    assert spec.range_axis == 2
-    assert spec.range_end_axis == 3
-    assert spec.range_block_size == 16
-    assert spec.coalesce_ranges is True
 
 
 def test_streaming_protocol_names_pages_and_semaphores():
@@ -408,10 +380,6 @@ def test_scheduled_op_can_override_pipeline_resources_without_specializing_confi
             "pipeline_page_bytes": 1024,
             "pipeline_semaphore_count": 4,
             "pipeline_scratch_bytes": 32,
-            "pipeline_range_axis": 2,
-            "pipeline_range_end_axis": 3,
-            "pipeline_range_block_size": 16,
-            "pipeline_coalesce_ranges": True,
         },
     )
     kernel = Megakernel(
@@ -424,7 +392,6 @@ def test_scheduled_op_can_override_pipeline_resources_without_specializing_confi
     meta = kernel._op_metadata_tensor.cpu().tolist()
     assert len(meta) == mk._OP_META_STRIDE
     assert "pipeline_page_bytes" not in build_op_config(op)
-    assert "pipeline_range_axis" not in build_op_config(op)
 
 
 def test_non_pipeline_ops_get_zero_pipeline_metadata():
@@ -587,8 +554,6 @@ def test_qwen_final_schedule_keeps_lm_head_inside_megakernel_without_scalar_vari
     assert qwen.Qwen3_5LmHeadGemmSm120Op.pipeline_abi == PipelineABI.op_owned()
     assert qwen.Qwen3_5DecodeMatvecGemmSm120Op.pipeline_abi == PipelineABI.op_owned()
     assert qwen.Qwen3_5RangedLmHeadSm120Op.pipeline_abi == PipelineABI.op_owned()
-    assert qwen.Qwen3_5LmHeadGemmSm120Op.pipeline.range_axis == 2
-    assert qwen.Qwen3_5LmHeadGemmSm120Op.pipeline.range_block_size == 16
     assert qwen.Qwen3_5RangedLmHeadSm120Op.tma_loads == {"weight"}
     assert ops[1].tile_sizes["S"] == qwen.QWEN3_5_DECODE_S
     assert ops[1].tile_sizes["N"] == 128
@@ -734,7 +699,6 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     assert layer.ops[1].static_dims["barrier_wait_alias_H"] == "qkv_chunk_0"
     assert layer.ops[1].static_dims["barrier_signal_alias_H"] == "q_head_0"
 
-    layer.ops[0].static_dims["pipeline_range_block_size"] = 4
     builder = InstructionStreamBuilder()
     for op in layer.ops[:2]:
         builder.add_op(op)
@@ -1128,7 +1092,6 @@ def test_qwen_ranged_lm_head_matches_torch_small():
     )
 
     assert ops[0].op_cls.pipeline_abi == PipelineABI.op_owned()
-    assert ops[0].op_cls.pipeline.coalesce_ranges is True
     assert ops[0].tile_sizes["N"] == 16
 
 

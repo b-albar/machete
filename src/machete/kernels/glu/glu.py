@@ -15,8 +15,8 @@ Supported activations (via static_dims['activation']):
 TMA pipelined load/compute/store:
     Forward:  TMA load x (N=2D per row) → compute y in registers → write y to
               smem (D per row) → TMA store y.
-    Backward: TMA load x (N=2D per row) → read dy from global → compute dx →
-              write dx to smem (N per row, overwrites x) → TMA store dx.
+    Backward: TMA load gate/up D chunks → read dy from global → compute dx →
+              write dx chunks to smem → TMA store dx chunks.
 
 Multi-row tiling: tile_size_S = page_size / (N * elem_bytes).
 Forward uses two-phase compute with named_barrier_sync (y has different stride
@@ -53,6 +53,14 @@ ACT_MAP = {
     'silu': ACT_SILU,
     'swish': ACT_SILU,
 }
+
+
+def _align_up(x, align):
+    return ((x + align - 1) // align) * align
+
+
+def _is_power_of_two(x):
+    return x > 0 and (x & (x - 1)) == 0
 
 
 def _pick_forward_tile_size_s(x, y, activation, page_size):
@@ -591,15 +599,26 @@ class DirectGLUOp(Op):
         )
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
+        D = y.shape[-1]
+        prefer_wide_tile = (
+            activation in ("silu", "swish")
+            and x.shape[0] > 1
+            and D % 896 == 0
+        )
+        tile_sizes.setdefault("S", 32 if prefer_wide_tile else 16)
         if "D" not in tile_sizes:
-            D = y.shape[-1]
-            for tile_d in (512, 256, 128, 64, 32):
+            candidates = (896, 512, 256, 128, 64, 32) if prefer_wide_tile else (512, 256, 128, 64, 32)
+            for tile_d in candidates:
                 if D % tile_d == 0:
                     tile_sizes["D"] = tile_d
                     break
             else:
                 tile_sizes["D"] = min(D, 256)
+        if y.shape[-1] % tile_sizes["D"] != 0:
+            raise ValueError(
+                f"DirectGLU requires D % tile_size_D == 0, got "
+                f"D={y.shape[-1]}, tile_size_D={tile_sizes['D']}"
+            )
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["activation"] = ACT_MAP.get(activation, ACT_SILU)
         ops[0].static_dims["page_size"] = page_size
@@ -726,6 +745,19 @@ class GLUBwdOp(Op):
     tma_loads = {"x"}
     tma_stores = {"dx"}
 
+    @classmethod
+    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
+        if tensor_name in {"x", "dx"}:
+            return (1, tile_sizes["S"], tile_sizes["D"])
+        return None
+
+    @classmethod
+    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
+        if tensor_name in {"x", "dx"}:
+            tile_d, tile_s, tile_b = tma_tile_shape
+            return f"cute.make_layout(({tile_d}, {tile_s}, {tile_b}))"
+        return None
+
     def __init__(self, **config):
         super().__init__(**config)
         # x_dtype comes from the first read tensor (dy). Override to get x's.
@@ -741,8 +773,16 @@ class GLUBwdOp(Op):
         assert self.D >= 32 and self.D % 32 == 0, (
             f"GLU requires D >= 32 and D % 32 == 0, got D={self.D}")
 
-        # x and dx have same shape (N per row) → smem reuse, no barrier.
-        self.x_tile_bytes = self.tile_size_S * self.N * self.elem_bytes
+        assert self.D % self.tile_size_D == 0, (
+            f"GLU bwd requires D % tile_size_D == 0, got D={self.D}, "
+            f"tile_size_D={self.tile_size_D}")
+
+        self.num_d_tiles = self.D // self.tile_size_D
+        self.chunk_tile_bytes = self.tile_size_S * self.tile_size_D * self.elem_bytes
+        self.chunk_stride_bytes = _align_up(self.chunk_tile_bytes, 128)
+        self.up_smem_offset = self.chunk_stride_bytes
+        self.up_smem_offset_elems = self.up_smem_offset // self.elem_bytes
+        self.x_tile_bytes = 2 * self.chunk_stride_bytes
         assert self.x_tile_bytes <= self.page_size, (
             f"GLU bwd: x tile ({self.x_tile_bytes}B) > page ({self.page_size}B)")
 
@@ -767,13 +807,43 @@ class GLUBwdOp(Op):
             f"GLU bwd: x last dim ({x.shape[-1]}) must be 2 * dy last dim ({dy.shape[-1]})")
 
         tile_sizes = dict(tile_sizes or {})
+        if "D" not in tile_sizes:
+            D = dy.shape[-1]
+            tile_d = D
+            if D > 2048:
+                for candidate in (256, 512, 128, 64, 32):
+                    if D % candidate == 0:
+                        tile_d = candidate
+                        break
+            tile_sizes["D"] = tile_d
         if "S" not in tile_sizes:
-            N = x.shape[-1]
             elem_bytes = x.element_size()
-            tile_sizes["S"] = max(1, page_size // (N * elem_bytes))
+            tile_sizes["S"] = max(1, page_size // (2 * tile_sizes["D"] * elem_bytes))
+        if dy.shape[-1] % tile_sizes["D"] != 0:
+            raise ValueError(
+                f"GLU bwd requires D % tile_size_D == 0, got "
+                f"D={dy.shape[-1]}, tile_size_D={tile_sizes['D']}"
+            )
+        if not _is_power_of_two(tile_sizes["D"]):
+            raise ValueError(
+                f"GLU bwd requires power-of-two tile_size_D for TMA staging, "
+                f"got tile_size_D={tile_sizes['D']}"
+            )
+        elem_bytes = x.element_size()
+        chunk_tile_bytes = tile_sizes["S"] * tile_sizes["D"] * elem_bytes
+        x_tile_bytes = 2 * _align_up(chunk_tile_bytes, 128)
+        if x_tile_bytes > page_size:
+            raise ValueError(
+                f"GLU bwd x tile ({x_tile_bytes}B) exceeds page ({page_size}B); "
+                f"got tile_size_S={tile_sizes['S']}, tile_size_D={tile_sizes['D']}"
+            )
         tile_sizes.setdefault("B", 1)
 
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        # GLU backward consumes dy in the same last-dimension chunks produced by
+        # GEMM c/N tiles. Keep this buffer-specific so dx still conservatively
+        # represents the paired gate/up output chunks.
+        ops[0].static_dims["barrier_wait_dy_alias_D"] = "N"
         ops[0].static_dims['activation'] = ACT_MAP.get(activation, ACT_SILU)
         ops[0].static_dims['page_size'] = page_size
         return ops
@@ -792,18 +862,20 @@ class GLUBwdOp(Op):
     @cute.jit
     def load(self, page_ptr, tile_B, tile_S, tile_D,
              x_tma, x_tma_gmem, work_mbar):
-        """TMA load x tile (N × tile_S × 1) from global to smem."""
-        sX = cute.make_tensor(
+        """TMA load gate/up D chunks from global to smem."""
+        sGate = cute.make_tensor(
             cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.N, self.tile_size_S, 1)),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
         )
-        gX = cute.local_tile(
-            x_tma_gmem, (self.N, self.tile_size_S, 1), (None, None, None),
+        gGate = cute.local_tile(
+            x_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
         )
-        tXsX, tXgX = cute.nvgpu.cpasync.tma_partition(
+        tGsGate, tGgGate = cute.nvgpu.cpasync.tma_partition(
             x_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sX, 0, 3),
-            cute.group_modes(gX, 0, 3),
+            cute.group_modes(sGate, 0, 3),
+            cute.group_modes(gGate, 0, 3),
         )
 
         nbytes = Int32(self.x_tile_bytes)
@@ -812,15 +884,35 @@ class GLUBwdOp(Op):
         )
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        cute.copy(x_tma, tXgX[(None, Int32(0), tile_S, tile_B)], tXsX,
-                  tma_bar_ptr=mbar_ptr)
+
+        cute.copy(x_tma, tGgGate, tGsGate, tma_bar_ptr=mbar_ptr)
+
+        sUp = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.up_smem_offset),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gUp = cute.local_tile(
+            x_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
+        )
+        tUsUp, tUgUp = cute.nvgpu.cpasync.tma_partition(
+            x_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sUp, 0, 3),
+            cute.group_modes(gUp, 0, 3),
+        )
+        cute.copy(x_tma, tUgUp, tUsUp, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # Backward Compute
     # =========================================================================
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_S, op_config_ptr):
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, op_config_ptr):
         """GLU backward: read x from smem, dy from global, write dx to smem.
 
         dx overwrites x in smem (same N-stride per row, no barrier needed).
@@ -843,17 +935,21 @@ class GLUBwdOp(Op):
         thr_layout = cute.make_layout(32)
 
         row_start = tile_S * Int32(self.tile_size_S)
+        d_start = tile_D * Int32(self.tile_size_D)
 
         for local_row in range(warp_idx, self.tile_size_S, self.num_warps):
             row_idx = row_start + Int32(local_row)
 
             if row_idx < runtime_S:
                 # Read dy from global
-                dy_offset = (tile_B * runtime_S * Int32(self.D)
-                             + row_idx * Int32(self.D))
+                dy_offset = (
+                    tile_B * runtime_S * Int32(self.D)
+                    + row_idx * Int32(self.D)
+                    + d_start
+                )
                 dy_row = cute.make_tensor(
                     dy.iterator + dy_offset,
-                    cute.make_layout(self.D),
+                    cute.make_layout(self.tile_size_D),
                 )
                 dy_part = cute.local_partition(dy_row, thr_layout, lane_idx)
                 dy_reg = cute.make_fragment_like(dy_part)
@@ -861,8 +957,8 @@ class GLUBwdOp(Op):
 
                 # Read gate from smem (first D of row)
                 gate_row = cute.make_tensor(
-                    x_smem + Int32(local_row) * Int32(self.N),
-                    cute.make_layout(self.D),
+                    x_smem + Int32(local_row) * Int32(self.tile_size_D),
+                    cute.make_layout(self.tile_size_D),
                 )
                 gate_part = cute.local_partition(
                     gate_row, thr_layout, lane_idx)
@@ -871,8 +967,10 @@ class GLUBwdOp(Op):
 
                 # Read up from smem (last D of row)
                 up_row = cute.make_tensor(
-                    x_smem + Int32(local_row) * Int32(self.N) + Int32(self.D),
-                    cute.make_layout(self.D),
+                    x_smem
+                    + Int32(self.up_smem_offset_elems)
+                    + Int32(local_row) * Int32(self.tile_size_D),
+                    cute.make_layout(self.tile_size_D),
                 )
                 up_part = cute.local_partition(
                     up_row, thr_layout, lane_idx)
@@ -910,16 +1008,18 @@ class GLUBwdOp(Op):
                 # Write dx to smem (overwrites x, same N-stride)
                 # d_gate at [0..D), d_up at [D..N)
                 dgate_row = cute.make_tensor(
-                    x_smem + Int32(local_row) * Int32(self.N),
-                    cute.make_layout(self.D),
+                    x_smem + Int32(local_row) * Int32(self.tile_size_D),
+                    cute.make_layout(self.tile_size_D),
                 )
                 dgate_part = cute.local_partition(
                     dgate_row, thr_layout, lane_idx)
                 cute.autovec_copy(dgate_reg, dgate_part)
 
                 dup_row = cute.make_tensor(
-                    x_smem + Int32(local_row) * Int32(self.N) + Int32(self.D),
-                    cute.make_layout(self.D),
+                    x_smem
+                    + Int32(self.up_smem_offset_elems)
+                    + Int32(local_row) * Int32(self.tile_size_D),
+                    cute.make_layout(self.tile_size_D),
                 )
                 dup_part = cute.local_partition(
                     dup_row, thr_layout, lane_idx)
@@ -932,18 +1032,40 @@ class GLUBwdOp(Op):
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_D,
              dx_tma, dx_tma_gmem):
-        """TMA store dx (N × tile_S × 1) from smem to global."""
-        sDX = cute.make_tensor(
-            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-            cute.make_layout((self.N, self.tile_size_S, 1)),
-        )
-        gDX = cute.local_tile(
-            dx_tma_gmem, (self.N, self.tile_size_S, 1), (None, None, None),
-        )
-        tDXsDX, tDXgDX = cute.nvgpu.cpasync.tma_partition(
-            dx_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sDX, 0, 3),
-            cute.group_modes(gDX, 0, 3),
-        )
+        """TMA store d_gate/d_up D chunks from smem to dx."""
         with cute.arch.elect_one():
-            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, Int32(0), tile_S, tile_B)])
+            sDGate = cute.make_tensor(
+                cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+            )
+            gDGate = cute.local_tile(
+                dx_tma_gmem,
+                (self.tile_size_D, self.tile_size_S, 1),
+                (tile_D, tile_S, tile_B),
+            )
+            tDGsDGate, tDGgDGate = cute.nvgpu.cpasync.tma_partition(
+                dx_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sDGate, 0, 3),
+                cute.group_modes(gDGate, 0, 3),
+            )
+            cute.copy(dx_tma, tDGsDGate, tDGgDGate)
+
+            sDUp = cute.make_tensor(
+                cute.make_ptr(
+                    self.x_dtype,
+                    page_ptr + Int32(self.up_smem_offset),
+                    cute.AddressSpace.smem,
+                ),
+                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+            )
+            gDUp = cute.local_tile(
+                dx_tma_gmem,
+                (self.tile_size_D, self.tile_size_S, 1),
+                (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
+            )
+            tDUsDUp, tDUgDUp = cute.nvgpu.cpasync.tma_partition(
+                dx_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sDUp, 0, 3),
+                cute.group_modes(gDUp, 0, 3),
+            )
+            cute.copy(dx_tma, tDUsDUp, tDUgDUp)

@@ -317,7 +317,7 @@ class GemmOp(Op):
 
     tma_loads = {"a", "a_scale", "b"}
     tma_stores = {"c"}
-    pipeline = PipelineSpec.range_capable(range_axis=2, range_end_axis=3)
+    pipeline = PipelineSpec(page_count=1)
 
     @classmethod
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
@@ -975,6 +975,7 @@ class GemmOp(Op):
         *,
         input_k,
         output_n,
+        batch=None,
         rows=None,
         elem_bytes=2,
         has_a_scale=False,
@@ -990,6 +991,26 @@ class GemmOp(Op):
         mbar_bytes = 32
 
         preferred = []
+        if (
+            rows is not None
+            and page_size <= 32 * 1024
+            and not has_a_scale
+            and elem_bytes == 2
+            and input_k >= 2 * output_n
+            and rows >= 512
+        ):
+            preferred.append((128, 64, 32))
+        if (
+            batch is not None
+            and rows is not None
+            and page_size <= 32 * 1024
+            and not has_a_scale
+            and elem_bytes == 2
+            and batch > 1
+            and rows <= 128
+            and (output_n >= 2 * input_k or input_k >= 2 * output_n)
+        ):
+            preferred.append((128, 64, 32))
         if (
             rows is not None
             and rows >= 512
@@ -1062,6 +1083,7 @@ class GemmOp(Op):
                     page_size,
                     input_k=a.shape[-1],
                     output_n=b.shape[0],
+                    batch=a.shape[0] if a.ndim >= 3 else None,
                     rows=a.shape[-2],
                     elem_bytes=elem_bytes,
                     has_a_scale=bool(has_a_scale),

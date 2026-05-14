@@ -62,10 +62,7 @@ class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
     double-buffered stream through op-local mbarriers.
     """
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_block_size=16,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
 
     @cute.jit
@@ -437,12 +434,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
     warps then reuse that staged tile for all decode rows.
     """
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
     reads = {
         "h": (None, ("B", "S", "K")),
@@ -632,12 +624,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
 class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
     """Streaming decode LM head that returns top-1 per row without logits."""
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=0,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     reads = {
         "h": (None, ("B", "S", "K")),
         "weight": (None, ("N", "K")),
@@ -782,12 +769,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
 class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
     """Ranged residual-add RMSNorm + projection with normalized activation reuse."""
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
@@ -1010,12 +992,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
     coalesced range.
     """
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
@@ -1579,12 +1556,7 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
 class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDecodeGemmSm120Op):
     """Compute-driven fused residual-add RMSNorm plus packed QKV projection."""
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_end_axis=3,
-        range_block_size=1,
-        coalesce_ranges=True,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
@@ -1939,10 +1911,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
 class Qwen3_5PackedQkvProjectSm120Op(Op):
     """Packed QKV projection with per-head Q/K norm, RoPE, and cache writes."""
 
-    pipeline = PipelineSpec.streaming(
-        range_axis=2,
-        range_block_size=1,
-    )
+    pipeline = PipelineSpec.streaming()
     pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),

@@ -45,10 +45,7 @@ SM120_DECODE_CONSUMER_WARPS_DEFAULT = SM120_DECODE_HIDDEN_DEFAULT // SM120_DECOD
 SM120_DECODE_NUM_Q_HEADS_DEFAULT = SM120_DECODE_Q_DIM_DEFAULT // SM120_DECODE_HEAD_DIM_DEFAULT
 SM120_DECODE_NUM_KV_HEADS_DEFAULT = SM120_DECODE_KV_DIM_DEFAULT // SM120_DECODE_HEAD_DIM_DEFAULT
 SM120_DECODE_KV_GROUP_SIZE_DEFAULT = SM120_DECODE_NUM_Q_HEADS_DEFAULT // SM120_DECODE_NUM_KV_HEADS_DEFAULT
-SM120_OUTPUT_RANGE_PIPELINE = PipelineSpec.range_capable(
-    range_axis=2,
-    range_end_axis=3,
-)
+SM120_OUTPUT_RANGE_PIPELINE = PipelineSpec(page_count=1)
 
 
 def _finalize_nvfp4_matvec_schedule(op, *, page_size, group_size, k_dim):
@@ -1223,8 +1220,6 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Packed NVFP4 matvec for four same-sized projections sharing one input."""
 
     pipeline = SM120_OUTPUT_RANGE_PIPELINE
-    pipeline_auto_range_block_size = True
-    pipeline_auto_range_max_block_size = 2
     reads = {
         "a": (None, ("B", "S", "K")),
         "weight0_packed": (cutlass.Uint8, ("O", "K2")),
@@ -2056,10 +2051,7 @@ class FinalRmsTop1LmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
 class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Per-partition final RMS + packed NVFP4 LM-head top-1 partial."""
 
-    pipeline = PipelineSpec.range_capable(
-        range_axis=2,
-        range_end_axis=3,
-    )
+    pipeline = PipelineSpec(page_count=1)
     reads = {
         "x": (None, ("B", "S", "K")),
         "norm_weight": (None, ("K",)),
