@@ -157,9 +157,9 @@ def build_kernel(
         final_matvec_block=final_matvec_block,
         fa_num_splits=fa_num_splits,
         split_upgate=split_upgate,
-        page_size=page_size or 49152,
+        page_size=page_size or 32768,
     )
-    page_size = max(op.static_dims.get("page_size", page_size or 49152) for op in schedule.ops)
+    page_size = max(op.static_dims.get("page_size", page_size or 32768) for op in schedule.ops)
     kernel = Megakernel(
         schedule.ops,
         config=MegakernelConfig(
@@ -206,9 +206,9 @@ def main():
     parser.add_argument("--no-final", action="store_true")
     parser.add_argument("--threads-per-block", type=int, default=LLAMA1B_SM120_THREADS_PER_BLOCK)
     parser.add_argument("--num-sms", type=int, default=0, help="Persistent CTAs to launch; 0 uses the device/default cap")
-    parser.add_argument("--num-pages", type=int, default=0, help="Instruction page-ring pages; 0 uses auto")
+    parser.add_argument("--num-pages", type=int, default=3, help="Instruction page-ring pages; 0 uses auto")
     parser.add_argument("--mma-reg-count", type=int, default=96)
-    parser.add_argument("--page-size", type=int, default=49152)
+    parser.add_argument("--page-size", type=int, default=32768)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--rep", type=int, default=10)
     args = parser.parse_args()

@@ -68,11 +68,15 @@ def _scheduler_for_variant(variant: str):
     if variant == "default":
         return None
     if variant == "overlap":
-        return OverlapTileScheduler(fetch_stride=fetch_stride)
+        return OverlapTileScheduler(
+            fetch_stride=fetch_stride,
+            use_controller_waits_for_readiness=True,
+        )
     if variant == "overlap-adaptive":
         return OverlapTileScheduler(
             fetch_stride=fetch_stride,
             adaptive_fetch_stride=fetch_stride is None,
+            use_controller_waits_for_readiness=True,
         )
     raise ValueError(f"unknown Machete variant: {variant}")
 

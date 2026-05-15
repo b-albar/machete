@@ -153,6 +153,27 @@ def _nvfp4_ptr_dot8(
     return Float32(result)
 
 
+@dsl_user_op
+def _prefetch_ptr_l2(ptr, byte_offset: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            ptr.llvm_ptr,
+            Int32(byte_offset).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .u64 addr;\n"
+        "cvt.u64.u32 addr, $1;\n"
+        "add.u64 addr, addr, $0;\n"
+        "prefetch.global.L2 [addr];\n"
+        "}\n",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 class _DecodeMatvecSm120Base(Op):
     """Shared schedule/config helpers for decode matvec ops."""
 
@@ -220,6 +241,16 @@ class _Nvfp4WeightMixin:
             v7,
             scale,
         )
+
+    @cute.jit
+    def _prefetch_dot8_nvfp4_values(self, packed_row, scale_row, k):
+        byte_idx = k >> Int32(1)
+        if const_expr(self.group_size == 32):
+            scale_idx = k >> Int32(5)
+        else:
+            scale_idx = k // Int32(self.group_size)
+        _prefetch_ptr_l2(packed_row.iterator, byte_idx)
+        _prefetch_ptr_l2(scale_row.iterator, scale_idx * Int32(2))
 
     @cute.jit
     def _dot16_nvfp4_values(
@@ -1597,6 +1628,7 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     def __init__(self, **config):
         super().__init__(**config)
         self.eps = getattr(self, "eps", 1e-5)
+        self.prefetch_nvfp4 = getattr(self, "prefetch_nvfp4", True)
 
     @classmethod
     def schedule(
@@ -1605,6 +1637,7 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         page_size=DEFAULT_PAGE_SIZE,
         eps=1e-5,
         group_size=32,
+        prefetch_nvfp4=True,
         **tensors,
     ):
         tile_sizes = dict(tile_sizes or {})
@@ -1620,6 +1653,7 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             raise ValueError("gate/up scales G must equal x.K / group_size")
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["eps"] = eps
+        op.static_dims["prefetch_nvfp4"] = bool(prefetch_nvfp4)
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
@@ -1689,6 +1723,11 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                     full_k = Int32((self.K // 8) * 8)
                     k2 = lane_idx * Int32(8)
                     while k2 < full_k:
+                        if const_expr(self.prefetch_nvfp4):
+                            next_k = k2 + Int32(256)
+                            if next_k < full_k:
+                                self._prefetch_dot8_nvfp4_values(gate_packed_row, gate_scale_row, next_k)
+                                self._prefetch_dot8_nvfp4_values(up_packed_row, up_scale_row, next_k)
                         v0 = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
                         v1 = x_row[k2 + Int32(1)].to(Float32) * rstd * norm_row[k2 + Int32(1)].to(Float32)
                         v2 = x_row[k2 + Int32(2)].to(Float32) * rstd * norm_row[k2 + Int32(2)].to(Float32)
@@ -1945,6 +1984,7 @@ class FinalRmsTop1LmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
     """Fused final RMS + packed NVFP4 LM head that writes only top-1."""
 
     pipeline = PipelineSpec(page_count=1)
+    max_coalesced_range_tiles = 0
     reads = {
         "x": (None, ("B", "S", "K")),
         "norm_weight": (None, ("K",)),

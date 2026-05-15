@@ -188,6 +188,8 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
         tile_sizes.setdefault("H", 1)
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["page_size"] = page_size
+        op.static_dims["barrier_signal_y_alias_H"] = "V"
+        op.static_dims["barrier_signal_y_tile_size_H"] = QWEN3_5_REAL_DN_VALUE_DIM
         return [op]
 
     @cute.jit
@@ -411,6 +413,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
 class Qwen3_5SingleTokenAttentionSm120Op(Op):
     """Native S=1 decode attention for real Qwen3.5 full-attention layers."""
 
+    framework_owned_ranges = True
     reads = {
         "q": (None, ("B", "S", "QH", "HD")),
         "k": (None, ("B", "T", "KVH", "HD")),
@@ -1339,6 +1342,7 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
     page_size=DEFAULT_PAGE_SIZE,
     group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
     matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    prefetch_gate_up=True,
 ) -> DecodeLayerScheduleSm120:
     """Schedule one real Qwen3.5 DeltaNet layer with native packed NVFP4 ops.
 
@@ -1453,6 +1457,7 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
         page_size=page_size,
         eps=QWEN3_5_REAL_EPS,
         group_size=group_size,
+        prefetch_nvfp4=prefetch_gate_up,
     )
     ops += MatvecNvfp4Sm120Op.schedule(
         a=mlp_h_buf,
@@ -1500,6 +1505,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
     fa_num_splits=0,
     use_flash_attention=False,
     matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    prefetch_gate_up=True,
 ) -> DecodeLayerScheduleSm120:
     """Schedule one real Qwen3.5 full-attention layer with packed NVFP4 weights.
 
@@ -1644,6 +1650,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             page_size=page_size,
             eps=QWEN3_5_REAL_EPS,
             group_size=group_size,
+            prefetch_nvfp4=prefetch_gate_up,
         )
         ops += MatvecNvfp4Sm120Op.schedule(
             a=mlp_h_buf,
@@ -1775,6 +1782,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     fa_num_splits=0,
     use_flash_attention=False,
     matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    prefetch_gate_up=True,
 ):
     """Build the full 24-layer real Qwen3.5 NVFP4 decode schedule.
 
@@ -1819,6 +1827,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
                 fa_num_splits=fa_num_splits,
                 use_flash_attention=use_flash_attention,
                 matvec_block=matvec_block,
+                prefetch_gate_up=prefetch_gate_up,
             )
         elif layer_type == "linear_attention":
             layer = schedule_qwen3_5_deltanet_nvfp4_sm120(
@@ -1842,6 +1851,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
                 page_size=page_size,
                 group_size=group_size,
                 matvec_block=matvec_block,
+                prefetch_gate_up=prefetch_gate_up,
             )
             linear_slot += 1
         else:
@@ -1865,7 +1875,7 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
             seq_len=seq_len,
             page_size=page_size,
             group_size=group_size,
-    )
+        )
         ops.extend(final_ops)
 
     return DecodeLayerScheduleSm120(

@@ -815,6 +815,40 @@ def test_last_dim_slice_consumer_waits_on_matching_producer_region():
     assert signal_formula.compute_index((0, 0, 512)) != wait_formula.compute_index((0, 0, 0))
 
 
+def test_last_dim_region_dep_accepts_aliased_producer_tile_dim():
+    y = torch.empty((1, 1, 2048), dtype=torch.float32)
+    z = torch.empty((1, 1, 64), dtype=torch.float32)
+
+    producer = _FullMlpProducerOp.schedule(
+        y=y,
+        tile_sizes={"B": 1, "S": 1, "O": 128},
+    )[0]
+    producer.tile_counts = (1, 1, 16)
+    producer.dim_names = {"B": 0, "S": 1, "H": 2}
+    producer.tile_sizes = {"B": 1, "S": 1, "H": 1}
+    producer.static_dims["barrier_signal_y_alias_H"] = "O"
+    producer.static_dims["barrier_signal_y_tile_size_H"] = 128
+
+    consumer = _SlicedMlpConsumerOp.schedule(
+        a=y,
+        z=z,
+        tile_sizes={"B": 1, "S": 1, "O": 16},
+    )[0]
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(producer)
+    builder.add_op(consumer)
+    formulas = builder.get_op_barrier_formulas()
+    signal_formula = formulas[0][1][0]
+    wait_formula = formulas[1][0][0]
+
+    assert builder.num_barriers == 1
+    assert signal_formula.divs[2] == 16
+    assert wait_formula.expected == 16
+    assert wait_formula.compute_index((0, 0, 0)) == signal_formula.compute_index((0, 0, 0))
+    assert wait_formula.compute_index((0, 0, 0)) == signal_formula.compute_index((0, 0, 15))
+
+
 def test_overlap_scheduler_can_prioritize_newly_ready_consumers():
     producer = ScheduledOp(
         _StaticQkvChunkProducerOp,

@@ -433,6 +433,15 @@ def _coalesce_coordinate_ranges(
 
     return out
 
+
+def _instruction_range_len(instr: TileInstruction) -> int:
+    """Number of logical tiles represented by one instruction row."""
+    if instr.range_axis < 0 or instr.range_axis >= MAX_TILE_DIMS:
+        return 1
+    tiles = list(instr.tiles) + [0] * MAX_TILE_DIMS
+    return max(1, instr.range_end - tiles[instr.range_axis])
+
+
 class BackwardScheduler(TileScheduler):
     """Depth-first backward scheduler.
 
@@ -1252,6 +1261,9 @@ class InstructionStreamBuilder:
         consumer = self._op_records[dep.consumer_idx].op
         if dep.consumer_buffer not in consumer.op_cls.INPUTS:
             return False
+        controller_wait_inputs = set(getattr(consumer.op_cls, "controller_wait_inputs", set()))
+        if dep.consumer_buffer in controller_wait_inputs:
+            return False
         tma_loads = set(getattr(consumer.op_cls, "_TMA_LOADS", set()))
         tma_compute_loads = set(getattr(consumer.op_cls, "_TMA_COMPUTE_LOADS", set()))
         return dep.consumer_buffer not in (tma_loads | tma_compute_loads)
@@ -1653,10 +1665,25 @@ class InstructionStreamBuilder:
         if not prod_meta.declared_dims or not cons_meta.declared_dims:
             return None
 
-        producer_dim = prod_meta.declared_dims[-1]
+        producer_meta_dim = prod_meta.declared_dims[-1]
         consumer_dim = cons_meta.declared_dims[-1]
+        producer_dim = producer_meta_dim
         if producer_dim not in producer_only_dims:
-            return None
+            producer_dim = ""
+            for dim in producer_only_dims:
+                canonical_dim = self._static_dim_lookup(
+                    producer,
+                    prefix="barrier",
+                    role="signal",
+                    buffer_name=producer_buffer,
+                    suffix=f"alias_{dim}",
+                    fallback=producer.dim_aliases.get(dim, dim),
+                )
+                if canonical_dim == producer_meta_dim:
+                    producer_dim = dim
+                    break
+            if not producer_dim:
+                return None
         if producer_dim not in producer.dim_names:
             return None
         if consumer_dim in consumer.dim_names:
@@ -2017,20 +2044,6 @@ class InstructionStreamBuilder:
             )
         return torch.tensor(packed, dtype=torch.int32, device=device)
 
-    def expand_pipeline_instructions(
-        self,
-        instructions: List[TileInstruction],
-    ) -> List[TileInstruction]:
-        """Expand coalesced range instructions into logical per-tile rows."""
-        out: List[TileInstruction] = []
-        for instr in instructions:
-            if instr.op_idx == TileInstruction.END_MARKER:
-                out.append(instr)
-                continue
-            for logical_tile in self._logical_tiles_for_instruction(instr):
-                out.append(TileInstruction(instr.op_idx, logical_tile))
-        return out
-
     def pipeline_barrier_meta_indices(
         self,
         instructions: List[TileInstruction],
@@ -2067,93 +2080,127 @@ class InstructionStreamBuilder:
         instructions: List[TileInstruction],
         *,
         num_blocks: Optional[int] = None,
-        range_expands_predicate=None,
+        framework_expands_predicate=None,
     ) -> List[TileInstruction]:
-        """Coalesce adjacent range-owned instructions.
+        """Coalesce adjacent same-op instructions into coordinate ranges.
 
         Persistent CTAs fetch the instruction stream with a stride of
-        ``num_blocks``.  Two instructions that are adjacent in one CTA's fetch
-        stream are therefore usually not adjacent in the flat list.  When the
-        block count is known, coalesce each strided CTA stream independently
-        and interleave the streams back together.  This lets the scheduler form
-        local same-op fast-path ranges without changing cross-CTA work
-        distribution.
+        ``num_blocks``. Framework-expanded ranges must preserve that strided
+        work distribution, while op-owned ranges may be coalesced globally.
         """
         non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+
+        def _max_range_tiles_for_op(op_idx: int) -> int:
+            max_range_tiles = 0
+            if num_blocks is not None and num_blocks > 0:
+                total_tiles = max(1, int(self._op_records[op_idx].op.total_tiles))
+                max_range_tiles = max(1, math.ceil(total_tiles / max(1, int(num_blocks))))
+            op = self._op_records[op_idx].op
+            explicit = op.static_dims.get(
+                "max_coalesced_range_tiles",
+                getattr(op.op_cls, "max_coalesced_range_tiles", None),
+            )
+            return int(explicit) if explicit is not None else max_range_tiles
+
+        def _is_range(instr: TileInstruction) -> bool:
+            return instr.range_axis >= 0
+
+        def _framework_expands(instr: TileInstruction) -> bool:
+            return framework_expands_predicate is not None and bool(framework_expands_predicate(instr))
+
+        def _allow_op_owned_range(instr: TileInstruction) -> bool:
+            return _is_range(instr) and not _framework_expands(instr)
+
+        def _allow_framework_range(instr: TileInstruction) -> bool:
+            return _is_range(instr) and (
+                framework_expands_predicate is None or _framework_expands(instr)
+            )
 
         def _coalesce_flat(stream: List[TileInstruction], allow_range=None) -> List[TileInstruction]:
             out: List[TileInstruction] = []
             idx = 0
             while idx < len(stream):
+                if stream[idx].range_axis >= 0:
+                    out.append(stream[idx])
+                    idx += 1
+                    continue
                 op_idx = stream[idx].op_idx
                 run_end = idx + 1
-                while run_end < len(stream) and stream[run_end].op_idx == op_idx:
+                while (
+                    run_end < len(stream)
+                    and stream[run_end].op_idx == op_idx
+                    and stream[run_end].range_axis < 0
+                ):
                     run_end += 1
                 run = stream[idx:run_end]
                 tile_rank = len(self._op_records[op_idx].op.tile_counts)
-                max_range_tiles = 0
-                if num_blocks is not None and num_blocks > 0:
-                    max_range_tiles = max(
-                        1,
-                        math.ceil(
-                            max(1, int(self._op_records[op_idx].op.total_tiles))
-                            / max(1, int(num_blocks))
-                        ),
-                    )
                 run = _coalesce_coordinate_ranges(
                     run,
                     tile_rank=tile_rank,
-                    max_range_tiles=max_range_tiles,
+                    max_range_tiles=_max_range_tiles_for_op(op_idx),
                     allow_range=allow_range,
                 )
                 out.extend(run)
                 idx = run_end
             return out
 
-        def _is_op_owned_range(instr: TileInstruction) -> bool:
-            if instr.range_axis < 0:
-                return False
-            if range_expands_predicate is None:
-                return True
-            return not bool(range_expands_predicate(instr))
+        def _interleave_strided(coalesced: List[TileInstruction]) -> List[TileInstruction]:
+            stream_count = max(1, int(num_blocks or 1))
+            streams: List[List[TileInstruction]] = []
+            for block_idx in range(stream_count):
+                stream = [
+                    coalesced[idx]
+                    for idx in range(block_idx, len(coalesced), stream_count)
+                ]
+                streams.append(_coalesce_flat(stream, allow_range=_allow_framework_range))
 
-        def _is_framework_range(instr: TileInstruction) -> bool:
-            if instr.range_axis < 0:
-                return False
-            if range_expands_predicate is None:
-                return True
-            return bool(range_expands_predicate(instr))
+            max_stream_len = max((len(stream) for stream in streams), default=0)
+            strided_out: List[TileInstruction] = []
+            end = TileInstruction.end_instruction()
+            for stream_pos in range(max_stream_len + 1):
+                for stream in streams:
+                    if stream_pos < len(stream):
+                        strided_out.append(stream[stream_pos])
+                    else:
+                        strided_out.append(end)
+            return strided_out
 
-        global_coalesced = _coalesce_flat(non_end, allow_range=_is_op_owned_range)
-        global_out = global_coalesced + [TileInstruction.end_instruction()]
+        global_op_owned = _coalesce_flat(non_end, allow_range=_allow_op_owned_range)
+        global_out = global_op_owned + [TileInstruction.end_instruction()]
 
         if num_blocks is None or num_blocks <= 1 or len(non_end) <= 1:
             return global_out
 
-        stream_count = max(1, int(num_blocks))
-        streams: List[List[TileInstruction]] = []
-        for block_idx in range(stream_count):
-            stream = [
-                global_coalesced[idx]
-                for idx in range(block_idx, len(global_coalesced), stream_count)
-            ]
-            streams.append(_coalesce_flat(stream, allow_range=_is_framework_range))
+        def _logical_work_by_cta(instructions: List[TileInstruction]) -> List[int]:
+            work = [0 for _ in range(max(1, int(num_blocks or 1)))]
+            for idx, instr in enumerate(instructions):
+                if instr.op_idx == TileInstruction.END_MARKER:
+                    continue
+                work[idx % len(work)] += _instruction_range_len(instr)
+            return work
 
-        max_stream_len = max((len(stream) for stream in streams), default=0)
-        strided_out: List[TileInstruction] = []
-        end = TileInstruction.end_instruction()
-        for stream_pos in range(max_stream_len + 1):
-            for stream in streams:
-                if stream_pos < len(stream):
-                    strided_out.append(stream[stream_pos])
-                else:
-                    strided_out.append(end)
+        conservative = _interleave_strided(global_op_owned)
 
-        # Keep the per-CTA streams even when the globally coalesced stream is
-        # shorter. The persistent runtime fetches instruction i, i+num_blocks,
-        # ... per CTA; globally coalescing first can make one CTA own a long
-        # range that would otherwise have been distributed across fetch slots.
-        return strided_out
+        many_op_graph = len(self._op_records) > max(1, int(num_blocks or 1))
+        if not many_op_graph:
+            return conservative
+
+        global_all = _coalesce_flat(non_end, allow_range=_is_range)
+        aggressive = _interleave_strided(global_all)
+
+        aggressive_work = _logical_work_by_cta(aggressive)
+        min_work = min(aggressive_work, default=0)
+        max_work = max(aggressive_work, default=0)
+        aggressive_balanced = min_work > 0 and max_work <= max(1, math.ceil(min_work * 1.25))
+
+        if aggressive_balanced and len(aggressive) < len(conservative):
+            return aggressive
+
+        # Keep the per-CTA streams when globally coalescing framework-expanded
+        # ranges would collapse work onto too few CTAs. The persistent runtime
+        # fetches instruction i, i+num_blocks, ... per CTA, so preserving that
+        # distribution matters more than reducing metadata rows for dense ops.
+        return conservative
 
     @property
     def max_wait_deps(self) -> int:

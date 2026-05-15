@@ -38,7 +38,6 @@ from .registries import (
     validate_op_compatibility,
 )
 from .scheduling import (
-    BarrierFormula,
     INSTR_BARRIER_META_IDX,
     INSTR_RANGE_END,
     INSTR_RANGE_META,
@@ -432,7 +431,7 @@ class Megakernel:
                 ).parameters
         return active
 
-    def _range_expands_in_framework(self, op_idx: int, range_end_axis: int) -> bool:
+    def _framework_expands_range(self, op_idx: int, range_end_axis: int) -> bool:
         """Return whether the persistent shell expands a coalesced op range.
 
         If every active phase accepts the range-end tile parameter, the op owns
@@ -447,6 +446,10 @@ class Megakernel:
         if range_end_axis >= MAX_TILE_DIMS:
             return True
         op = self.ops[op_idx]
+        if bool(op.static_dims.get("framework_owned_ranges", False)) or bool(
+            getattr(op.op_cls, "framework_owned_ranges", False)
+        ):
+            return True
 
         threads_per_block = self.config.threads_per_block
         num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
@@ -696,37 +699,37 @@ class Megakernel:
         """Prepare instruction, barrier, wait_info, and config tensors on GPU."""
         if self._instructions_tensor is None:
             instructions = self._builder.build(scheduler=self._scheduler)
-            range_expansion_cache: Dict[Tuple[int, int], bool] = {}
+            framework_range_cache: Dict[Tuple[int, int], bool] = {}
 
-            def _range_expands(instr: TileInstruction) -> bool:
+            def _framework_expands_instruction_range(instr: TileInstruction) -> bool:
                 if instr.range_axis < 0:
                     return False
                 key = (instr.op_idx, instr.range_end_axis)
-                if key not in range_expansion_cache:
-                    range_expansion_cache[key] = self._range_expands_in_framework(
+                if key not in framework_range_cache:
+                    framework_range_cache[key] = self._framework_expands_range(
                         instr.op_idx,
                         instr.range_end_axis,
                     )
-                return range_expansion_cache[key]
+                return framework_range_cache[key]
 
             instructions = self._builder.coalesce_pipeline_instructions(
                 instructions,
                 num_blocks=self.num_sms,
-                range_expands_predicate=_range_expands,
+                framework_expands_predicate=_framework_expands_instruction_range,
             )
             (
                 barrier_meta_indices,
                 expanded_instructions,
             ) = self._builder.pipeline_barrier_meta_indices(
                 instructions,
-                expand_predicate=_range_expands,
+                expand_predicate=_framework_expands_instruction_range,
             )
 
             def _runtime_instruction(instr: TileInstruction) -> TileInstruction:
                 if (
                     instr.op_idx == TileInstruction.END_MARKER
                     or instr.range_axis < 0
-                    or _range_expands(instr)
+                    or _framework_expands_instruction_range(instr)
                 ):
                     return instr
                 tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))

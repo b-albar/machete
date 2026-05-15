@@ -384,11 +384,13 @@ def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
     )
     from machete.kernels.qwen_3_5 import (
         Qwen3_5DeltaNetCoreSm120Op,
+        QWEN3_5_REAL_DN_NUM_HEADS,
         QWEN3_5_REAL_HIDDEN,
         QWEN3_5_REAL_INTERMEDIATE,
         QWEN3_5_REAL_ROTARY_D2,
         schedule_qwen3_5_deltanet_nvfp4_sm120,
     )
+    from machete.megakernel.scheduling import InstructionStreamBuilder
 
     dtype = torch.bfloat16
     batch, seq_len = 1, 1
@@ -461,6 +463,14 @@ def test_real_qwen_deltanet_nvfp4_schedule_uses_native_ops():
     assert RmsGateUpSiluNvfp4Sm120Op in op_classes
     assert op_classes[-1] is MatvecNvfp4Sm120Op
     assert layer.ops[3].op_cls is Qwen3_5DeltaNetCoreSm120Op
+
+    builder = InstructionStreamBuilder()
+    for op in layer.ops:
+        builder.add_op(op)
+    formulas = builder.get_op_barrier_formulas()
+    deltanet_signal = formulas[3][1][0]
+    residual_wait = next(wait for wait in formulas[4][0] if wait.base == deltanet_signal.base)
+    assert residual_wait.expected == QWEN3_5_REAL_DN_NUM_HEADS
 
 
 def test_real_qwen_deltanet_core_matches_reference():

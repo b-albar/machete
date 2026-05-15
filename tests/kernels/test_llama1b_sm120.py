@@ -34,6 +34,7 @@ def test_llama1b_sm120_fused_upgate_matches_reference():
         gate_weight=gate_weight,
         y=y,
         tile_sizes={"S": 1, "O": 8},
+        page_size=32768,
         eps=1e-5,
     )
     assert ops[0].tile_sizes["O"] == 8
@@ -42,8 +43,8 @@ def test_llama1b_sm120_fused_upgate_matches_reference():
         ops,
         config=MegakernelConfig(
             threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
-            page_size=49152,
-            num_pages=2,
+            page_size=32768,
+            num_pages=3,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
         ),
@@ -97,7 +98,7 @@ def test_llama1b_sm120_grouped_attention_matches_reference():
         ops,
         config=MegakernelConfig(
             threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
-            page_size=49152,
+            page_size=32768,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
         ),
@@ -146,7 +147,7 @@ def test_llama1b_sm120_split_attention_matches_reference():
         ops,
         config=MegakernelConfig(
             threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
-            page_size=49152,
+            page_size=32768,
             loader_idle_sleep_ns=0,
             mma_reg_count=96,
         ),
@@ -205,10 +206,11 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         v_cache=v_fused,
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     fused = Megakernel(
         fused_ops,
-        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=32768, num_pages=3, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     fused.run(validate=False)
 
@@ -223,6 +225,7 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         dst_cache=k_split,
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     split_ops += Llama1BRmsVCacheSm120Op.schedule(
         x=x,
@@ -234,10 +237,11 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
         dst_cache=v_split,
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     split = Megakernel(
         split_ops,
-        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=32768, num_pages=3, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     split.run(validate=False)
     torch.cuda.synchronize()
@@ -246,8 +250,8 @@ def test_llama1b_sm120_fused_kv_cache_matches_split_ops():
     torch.testing.assert_close(v_fused[:, cache_pos], v_split[:, cache_pos], atol=1e-3, rtol=1e-3)
 
 
-def test_llama1b_sm120_single_stage_final_head_matches_reference():
-    from machete.kernels.llama1b import LLAMA1B_HIDDEN, Llama1BFinalRmsLmHeadSingleStageSm120Op
+def test_llama1b_sm120_kstream_final_head_matches_reference():
+    from machete.kernels.llama1b import LLAMA1B_HIDDEN, Llama1BFinalRmsLmHeadKStreamSm120Op
     from machete.megakernel import Megakernel, MegakernelConfig
 
     major, _minor = torch.cuda.get_device_capability()
@@ -262,14 +266,15 @@ def test_llama1b_sm120_single_stage_final_head_matches_reference():
     weight = torch.randn(vocab, LLAMA1B_HIDDEN, device="cuda", dtype=dtype) * 0.02
     logits = torch.empty(batch, seq_len, vocab, device="cuda", dtype=dtype)
 
-    ops = Llama1BFinalRmsLmHeadSingleStageSm120Op.schedule(
+    ops = Llama1BFinalRmsLmHeadKStreamSm120Op.schedule(
         x=x,
         norm_weight=norm_weight,
         weight=weight,
         logits=logits,
         tile_sizes={"S": 1, "O": 16},
+        page_size=32768,
     )
-    page_size = max(op.static_dims.get("page_size", 49152) for op in ops)
+    page_size = max(op.static_dims.get("page_size", 32768) for op in ops)
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
@@ -353,10 +358,11 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
         kv_group_size=kv_group_size,
+        page_size=32768,
     )
     fused = Megakernel(
         fused_ops,
-        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=32768, num_pages=3, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     fused.run(validate=False)
 
@@ -371,6 +377,7 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         residual_out=residual_split,
         q=q_split,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     split_ops += Llama1BRmsKCacheSm120Op.schedule(
         x=x,
@@ -382,6 +389,7 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         dst_cache=k_split,
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     split_ops += Llama1BRmsVCacheSm120Op.schedule(
         x=x,
@@ -393,10 +401,11 @@ def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
         dst_cache=v_split,
         cache_pos=cache_pos,
         tile_sizes={"S": 1, "O": LLAMA1B_SM120_QKV_HEAD_BLOCK},
+        page_size=32768,
     )
     split = Megakernel(
         split_ops,
-        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=49152, loader_idle_sleep_ns=0, mma_reg_count=96),
+        config=MegakernelConfig(threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK, page_size=32768, num_pages=3, loader_idle_sleep_ns=0, mma_reg_count=96),
     )
     split.run(validate=False)
     torch.cuda.synchronize()

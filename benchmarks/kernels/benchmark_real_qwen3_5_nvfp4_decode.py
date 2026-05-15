@@ -16,7 +16,7 @@ import time
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig
+from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
 from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
 from machete.kernels.qwen_3_5 import (
     QWEN3_5_REAL_DN_CONV_CHANNELS,
@@ -265,18 +265,31 @@ def _schedule_body(args, weights, buffers):
         fa_num_splits=args.fa_num_splits,
         use_flash_attention=args.use_flash_attention,
         matvec_block=args.matvec_block,
+        prefetch_gate_up=args.prefetch_gate_up,
     )
     return schedule
 
 
 def _make_replay_kernel(args, ops, keep_alive):
+    scheduler = None
+    if args.scheduler == "overlap":
+        scheduler = OverlapTileScheduler(
+            use_controller_waits_for_readiness=True,
+        )
+    elif args.scheduler == "overlap-adaptive":
+        scheduler = OverlapTileScheduler(
+            adaptive_fetch_stride=True,
+            use_controller_waits_for_readiness=True,
+        )
     kernel = Megakernel(
         ops,
         config=MegakernelConfig(
             num_pages=args.num_pages,
             page_size=args.page_size,
             threads_per_block=args.threads,
+            mma_reg_count=args.mma_reg_count,
         ),
+        scheduler=scheduler,
     )
     kernel._keep_alive = keep_alive
     return kernel
@@ -362,7 +375,13 @@ def main():
     parser.add_argument("--context-len", type=int, default=128)
     parser.add_argument("--page-size", type=int, default=32768)
     parser.add_argument("--num-pages", type=int, default=2)
-    parser.add_argument("--threads", type=int, default=256)
+    parser.add_argument("--threads", type=int, default=512)
+    parser.add_argument(
+        "--mma-reg-count",
+        type=int,
+        default=96,
+        help="Registers requested for compute warps; NVFP4 decode is compute-only and does not need the GEMM default.",
+    )
     parser.add_argument("--matvec-block", type=int, default=16)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=2)
@@ -370,6 +389,16 @@ def main():
     parser.add_argument("--top-partitions", type=int, default=0)
     parser.add_argument("--fa-num-splits", type=int, default=0)
     parser.add_argument("--use-flash-attention", action="store_true")
+    parser.add_argument(
+        "--prefetch-gate-up",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=("default", "overlap", "overlap-adaptive"),
+        default="overlap",
+    )
     parser.add_argument("--dummy-weights", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-final", action="store_true")
@@ -381,10 +410,12 @@ def main():
     print(
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
+        f"threads={args.threads}, mma_reg_count={args.mma_reg_count}, "
         f"top_partitions={'sms' if args.top_partitions <= 0 else args.top_partitions}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
-        f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}",
+        f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}, "
+        f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}",
         flush=True,
     )
     t0 = time.perf_counter()

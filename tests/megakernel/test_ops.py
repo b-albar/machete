@@ -38,6 +38,10 @@ class _RangeCapableNOPOp(_NOPOp):
     pipeline = PipelineSpec(page_count=1)
 
 
+class _UncappedRangeNOPOp(_RangeCapableNOPOp):
+    max_coalesced_range_tiles = 0
+
+
 class _AliasPhaseOp(Op):
     load_phase = "load_impl"
     compute_phase = "compute_impl"
@@ -97,10 +101,8 @@ def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
     ]
     assert [(instr.range_axis, instr.range_end_axis) for instr in non_end] == [(2, 3)]
     assert [instr.range_end for instr in non_end] == [10]
-    assert [
-        instr.tiles for instr in builder.expand_pipeline_instructions(instructions)
-        if instr.op_idx != TileInstruction.END_MARKER
-    ] == [
+    _, expanded = builder.pipeline_barrier_meta_indices(instructions)
+    assert [instr.tiles for instr in expanded if instr.op_idx != TileInstruction.END_MARKER] == [
         (0, 0, 0, 0),
         (0, 0, 1, 0),
         (0, 0, 2, 0),
@@ -138,6 +140,52 @@ def test_pipeline_range_coalesces_per_cta_fetch_stream():
         (0, 0, 0, 0),
     ]
     assert [instr.range_end for instr in coalesced[:2]] == [10, 110]
+
+
+def test_framework_expanded_ranges_preserve_cta_distribution():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 110),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+    instructions = []
+    for i in range(10):
+        instructions.append(TileInstruction(0, (0, 0, i)))
+        instructions.append(TileInstruction(0, (0, 0, 100 + i)))
+    instructions.append(TileInstruction.end_instruction())
+
+    coalesced = builder.coalesce_pipeline_instructions(
+        instructions,
+        num_blocks=2,
+        framework_expands_predicate=lambda instr: instr.range_axis >= 0,
+    )
+
+    assert [instr.tiles for instr in coalesced] == [
+        (0, 0, 0, 0),
+        (0, 0, 100, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]
+    assert [instr.range_end for instr in coalesced[:2]] == [10, 110]
+
+
+def test_op_can_request_uncapped_coordinate_range():
+    op = ScheduledOp(
+        _UncappedRangeNOPOp,
+        tile_counts=(1, 1, 16),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+
+    coalesced = builder.coalesce_pipeline_instructions(builder.build(), num_blocks=4)
+    work = [instr for instr in coalesced if instr.op_idx != TileInstruction.END_MARKER]
+
+    assert len(work) == 1
+    assert work[0].tiles == (0, 0, 0, 0)
+    assert work[0].range_end == 16
 
 
 def test_phase_aliases_bind_concrete_instance_methods():
