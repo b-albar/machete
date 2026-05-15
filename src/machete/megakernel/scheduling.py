@@ -18,17 +18,15 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Tuple, Type, Union
+from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type, Union
 
 from .instruction_layout import (
     INSTR_BARRIER_META_IDX,
     INSTR_OP_IDX,
+    INSTR_RANGE_END,
     INSTR_RANGE_META,
-    INSTR_TILE_0,
-    INSTR_TILE_1,
-    INSTR_TILE_2,
-    INSTR_TILE_3,
-    INSTR_TILE_4,
+    INSTR_TILE_01,
+    INSTR_TILE_23,
     INSTRUCTION_WORDS,
 )
 from .ops import MAX_TILE_DIMS, Op, ScheduledOp, last_dim_slice_region, tensor_meta_overlaps
@@ -102,8 +100,11 @@ class TileInstruction:
     """A single tile work instruction for the persistent megakernel.
 
     Flat encoding in global memory:
-    [0]  op_idx: Which operation (indexes into op list), or -1 for end marker
-    [1:] tile coordinates followed by the barrier metadata row index
+    [0]  low 16 bits: op_idx, high 16 bits: range metadata
+    [1]  tile_0 | (tile_1 << 16)
+    [2]  tile_2 | (tile_3 << 16)
+    [3]  barrier metadata row index
+    [4]  range end coordinate
 
     Barrier wait/signal formulas stay in compact side tensors. The instruction
     carries the row index into those side tensors so replay does not need to
@@ -114,6 +115,7 @@ class TileInstruction:
     tiles: Tuple[int, ...]  # Up to MAX_TILE_DIMS tile indices
     range_axis: int = -1
     range_end_axis: int = -1
+    range_end: int = 0
 
     # Sentinel for end of stream
     END_MARKER: int = -1
@@ -128,16 +130,43 @@ class TileInstruction:
             barrier_meta_idx: Row in the wait/signal side metadata tensors.
         """
         if self.op_idx == self.END_MARKER:
-            return [self.op_idx] + [0] * (INSTRUCTION_WORDS - 1)
+            return [0xFFFF] + [0] * (INSTRUCTION_WORDS - 1)
+        if self.op_idx < 0 or self.op_idx > 0xFFFE:
+            raise ValueError(f"Instruction op_idx must fit in uint16, got {self.op_idx}")
+        if barrier_meta_idx < 0 or barrier_meta_idx > 0x7FFFFFFF:
+            raise ValueError(
+                f"Instruction barrier_meta_idx must fit in int32, got {barrier_meta_idx}"
+            )
         padded_tiles = list(self.tiles) + [0] * (MAX_TILE_DIMS - len(self.tiles))
+        if len(padded_tiles) != MAX_TILE_DIMS:
+            raise ValueError(f"Instruction tile rank exceeds {MAX_TILE_DIMS}")
+        for tile in padded_tiles:
+            if tile < 0 or tile > 0xFFFF:
+                raise ValueError(f"Instruction tile coordinate must fit in uint16, got {tile}")
         range_meta = 0
         if self.range_axis >= 0 and self.range_end_axis >= 0:
+            if self.range_axis >= MAX_TILE_DIMS:
+                raise ValueError(f"range_axis must be < {MAX_TILE_DIMS}, got {self.range_axis}")
+            if self.range_end_axis < 0 or self.range_end_axis > 0xE:
+                raise ValueError(
+                    f"range_end_axis must fit in 4 encoded bits, got {self.range_end_axis}"
+                )
+            if self.range_end < 0 or self.range_end > 0xFFFF:
+                raise ValueError(f"range_end must fit in uint16, got {self.range_end}")
             range_meta = (self.range_axis + 1) | ((self.range_end_axis + 1) << 4)
+        tile_01 = padded_tiles[0] | (padded_tiles[1] << 16)
+        tile_23 = padded_tiles[2] | (padded_tiles[3] << 16)
+        op_range = self.op_idx | (range_meta << 16)
+
+        def _signed_i32(word: int) -> int:
+            return word if word <= 0x7FFFFFFF else word - 0x100000000
+
         return [
-            self.op_idx,
-            *padded_tiles,
+            _signed_i32(op_range),
+            _signed_i32(tile_01),
+            _signed_i32(tile_23),
             barrier_meta_idx,
-            range_meta,
+            self.range_end,
         ]
 
     @classmethod
@@ -334,11 +363,12 @@ def _coalesce_coordinate_ranges(
     *,
     tile_rank: int,
     max_range_tiles: int = 0,
+    allow_range=None,
 ) -> List[TileInstruction]:
     """Coalesce adjacent same-op tiles that form a contiguous coordinate range."""
     if not instructions:
         return []
-    if tile_rank <= 0 or tile_rank >= MAX_TILE_DIMS:
+    if tile_rank <= 0 or tile_rank > MAX_TILE_DIMS:
         return instructions
 
     range_end_axis = tile_rank
@@ -388,15 +418,18 @@ def _coalesce_coordinate_ranges(
             end += 1
             idx += 1
 
-        tiles[range_end_axis] = end
-        out.append(
-            TileInstruction(
-                op_idx=first.op_idx,
-                tiles=tuple(tiles),
-                range_axis=range_axis,
-                range_end_axis=range_end_axis,
-            )
+        range_instr = TileInstruction(
+            op_idx=first.op_idx,
+            tiles=tuple(tiles[:MAX_TILE_DIMS]),
+            range_axis=range_axis,
+            range_end_axis=range_end_axis,
+            range_end=end,
         )
+        if allow_range is not None and not allow_range(range_instr):
+            out.append(first)
+            idx = idx - (end - start - 1)
+            continue
+        out.append(range_instr)
 
     return out
 
@@ -448,11 +481,13 @@ class OverlapTileScheduler(TileScheduler):
         adaptive_fetch_stride: bool = False,
         prefer_data_movement: bool = True,
         prefer_ready_consumers: bool = False,
+        use_controller_waits_for_readiness: bool = False,
     ):
         self.fetch_stride = fetch_stride
         self.adaptive_fetch_stride = bool(adaptive_fetch_stride)
         self.prefer_data_movement = prefer_data_movement
         self.prefer_ready_consumers = prefer_ready_consumers
+        self.use_controller_waits_for_readiness = bool(use_controller_waits_for_readiness)
         self._bound_num_blocks: Optional[int] = None
 
     def bind_num_blocks(self, num_blocks: int) -> None:
@@ -672,13 +707,18 @@ class InstructionStreamBuilder:
         """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
         self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
+        self._cached_controller_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
+        self._cached_compute_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
         self._barrier_count: Optional[int] = None
         self._op_wait_counts: Dict[int, int] = {}
+        self._op_compute_wait_counts: Dict[int, int] = {}
         self._op_signal_counts: Dict[int, int] = {}
 
     def _invalidate_resolution_cache(self) -> None:
         """Clear cached formulas after the op list changes."""
         self._cached_formulas = None
+        self._cached_controller_wait_formulas = None
+        self._cached_compute_wait_formulas = None
         self._barrier_count = None
 
     def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
@@ -689,18 +729,17 @@ class InstructionStreamBuilder:
         end_axis = instr.range_end_axis
         if range_axis < 0:
             return [instr.tiles]
-        if end_axis < 0 or end_axis >= MAX_TILE_DIMS or end_axis == range_axis:
+        if end_axis < 0 or end_axis > MAX_TILE_DIMS or end_axis == range_axis:
             return [instr.tiles]
         tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
         start = tiles[range_axis]
-        end = tiles[end_axis]
+        end = instr.range_end
         if end <= start:
             return [instr.tiles]
         out: List[Tuple[int, ...]] = []
         for axis_value in range(start, end):
             logical = list(tiles)
             logical[range_axis] = axis_value
-            logical[end_axis] = 0
             out.append(tuple(logical))
         return out
 
@@ -1143,6 +1182,20 @@ class InstructionStreamBuilder:
         self._barrier_count = count
         return formulas, count
 
+    def _resolve_compute_wait_formulas(self) -> Dict[int, List[BarrierFormula]]:
+        """Return dependency waits that can be delayed until compute phase."""
+        self._resolve()
+        if self._cached_compute_wait_formulas is None:
+            return {i: [] for i in range(len(self._op_records))}
+        return self._cached_compute_wait_formulas
+
+    def _resolve_controller_wait_formulas(self) -> Dict[int, List[BarrierFormula]]:
+        """Return dependency waits that must run before load phase."""
+        formulas, _ = self._resolve()
+        if self._cached_controller_wait_formulas is None:
+            return {i: waits for i, (waits, _signals) in formulas.items()}
+        return self._cached_controller_wait_formulas
+
     def _resolve_linear_chain_formulas(
         self,
     ) -> Tuple[
@@ -1187,6 +1240,21 @@ class InstructionStreamBuilder:
             barrier_counter += op.total_tiles
 
         return formulas, barrier_counter
+
+    def _dep_wait_can_move_to_compute(self, dep: _DepPair) -> bool:
+        """Whether a consumer dependency is needed by compute but not TMA load.
+
+        If the dependency backs a TMA-loaded tensor, the controller must wait
+        before load so TMA does not read producer output early. If it backs a
+        non-TMA input, load can prefetch the op's independent TMA operands and
+        compute waits immediately before consuming the dependent input.
+        """
+        consumer = self._op_records[dep.consumer_idx].op
+        if dep.consumer_buffer not in consumer.op_cls.INPUTS:
+            return False
+        tma_loads = set(getattr(consumer.op_cls, "_TMA_LOADS", set()))
+        tma_compute_loads = set(getattr(consumer.op_cls, "_TMA_COMPUTE_LOADS", set()))
+        return dep.consumer_buffer not in (tma_loads | tma_compute_loads)
 
     @staticmethod
     def _buffer_static_keys(prefix: str, role: str, buffer_name: str, suffix: str) -> Tuple[str, ...]:
@@ -1731,6 +1799,12 @@ class InstructionStreamBuilder:
         formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {
             i: ([], []) for i in range(len(self._op_records))
         }
+        controller_wait_formulas: Dict[int, List[BarrierFormula]] = {
+            i: [] for i in range(len(self._op_records))
+        }
+        compute_wait_formulas: Dict[int, List[BarrierFormula]] = {
+            i: [] for i in range(len(self._op_records))
+        }
         barrier_counter = 0
         signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int, int], int] = {}
 
@@ -1849,20 +1923,25 @@ class InstructionStreamBuilder:
                     )
                     barrier_counter += num_barriers
 
-                # Consumer wait formula
-                formulas[cons_idx][0].append(
-                    BarrierFormula(
-                        base=signal_base,
-                        coeffs=consumer_coeffs,
-                        divs=consumer_divs,
-                        offset=consumer_offset,
-                        expected=expected,
-                        guard_min=consumer_guard_min,
-                        guard_max=consumer_guard_max,
-                        guard_coeffs=consumer_guard_coeffs,
-                    )
+                wait_formula = BarrierFormula(
+                    base=signal_base,
+                    coeffs=consumer_coeffs,
+                    divs=consumer_divs,
+                    offset=consumer_offset,
+                    expected=expected,
+                    guard_min=consumer_guard_min,
+                    guard_max=consumer_guard_max,
+                    guard_coeffs=consumer_guard_coeffs,
                 )
+                if self._dep_wait_can_move_to_compute(dep):
+                    formulas[cons_idx][0].append(wait_formula)
+                    compute_wait_formulas[cons_idx].append(wait_formula)
+                else:
+                    formulas[cons_idx][0].append(wait_formula)
+                    controller_wait_formulas[cons_idx].append(wait_formula)
 
+        self._cached_controller_wait_formulas = controller_wait_formulas
+        self._cached_compute_wait_formulas = compute_wait_formulas
         return formulas, barrier_counter
 
     def build(self, scheduler: Optional[TileScheduler] = None) -> List[TileInstruction]:
@@ -1888,10 +1967,20 @@ class InstructionStreamBuilder:
 
         if hasattr(scheduler, "schedule_with_formulas"):
             formulas, _ = self._resolve()
+            schedule_formulas = formulas
+            if getattr(scheduler, "use_controller_waits_for_readiness", False):
+                controller_wait_formulas = self._resolve_controller_wait_formulas()
+                schedule_formulas = {
+                    op_idx: (
+                        controller_wait_formulas.get(op_idx, []),
+                        signal_formulas,
+                    )
+                    for op_idx, (_wait_formulas, signal_formulas) in formulas.items()
+                }
             instructions = scheduler.schedule_with_formulas(
                 self._op_records,
                 edges,
-                formulas,
+                schedule_formulas,
             )
         else:
             instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
@@ -1978,6 +2067,7 @@ class InstructionStreamBuilder:
         instructions: List[TileInstruction],
         *,
         num_blocks: Optional[int] = None,
+        range_expands_predicate=None,
     ) -> List[TileInstruction]:
         """Coalesce adjacent range-owned instructions.
 
@@ -1991,7 +2081,7 @@ class InstructionStreamBuilder:
         """
         non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
 
-        def _coalesce_flat(stream: List[TileInstruction]) -> List[TileInstruction]:
+        def _coalesce_flat(stream: List[TileInstruction], allow_range=None) -> List[TileInstruction]:
             out: List[TileInstruction] = []
             idx = 0
             while idx < len(stream):
@@ -2014,12 +2104,27 @@ class InstructionStreamBuilder:
                     run,
                     tile_rank=tile_rank,
                     max_range_tiles=max_range_tiles,
+                    allow_range=allow_range,
                 )
                 out.extend(run)
                 idx = run_end
             return out
 
-        global_coalesced = _coalesce_flat(non_end)
+        def _is_op_owned_range(instr: TileInstruction) -> bool:
+            if instr.range_axis < 0:
+                return False
+            if range_expands_predicate is None:
+                return True
+            return not bool(range_expands_predicate(instr))
+
+        def _is_framework_range(instr: TileInstruction) -> bool:
+            if instr.range_axis < 0:
+                return False
+            if range_expands_predicate is None:
+                return True
+            return bool(range_expands_predicate(instr))
+
+        global_coalesced = _coalesce_flat(non_end, allow_range=_is_op_owned_range)
         global_out = global_coalesced + [TileInstruction.end_instruction()]
 
         if num_blocks is None or num_blocks <= 1 or len(non_end) <= 1:
@@ -2028,8 +2133,11 @@ class InstructionStreamBuilder:
         stream_count = max(1, int(num_blocks))
         streams: List[List[TileInstruction]] = []
         for block_idx in range(stream_count):
-            stream = [non_end[idx] for idx in range(block_idx, len(non_end), stream_count)]
-            streams.append(_coalesce_flat(stream))
+            stream = [
+                global_coalesced[idx]
+                for idx in range(block_idx, len(global_coalesced), stream_count)
+            ]
+            streams.append(_coalesce_flat(stream, allow_range=_is_framework_range))
 
         max_stream_len = max((len(stream) for stream in streams), default=0)
         strided_out: List[TileInstruction] = []
@@ -2041,7 +2149,11 @@ class InstructionStreamBuilder:
                 else:
                     strided_out.append(end)
 
-        return strided_out if len(strided_out) < len(global_out) else global_out
+        # Keep the per-CTA streams even when the globally coalesced stream is
+        # shorter. The persistent runtime fetches instruction i, i+num_blocks,
+        # ... per CTA; globally coalescing first can make one CTA own a long
+        # range that would otherwise have been distributed across fetch slots.
+        return strided_out
 
     @property
     def max_wait_deps(self) -> int:
@@ -2072,9 +2184,14 @@ class InstructionStreamBuilder:
         """
         import torch
 
-        formulas, _ = self._resolve()
+        controller_wait_formulas = self._resolve_controller_wait_formulas()
         raw_wait_data = [
-            self._build_wait_info_entry(instr, formulas)
+            self._build_wait_info_entry(
+                instr,
+                {instr.op_idx: (controller_wait_formulas.get(instr.op_idx, []), [])}
+                if instr.op_idx != TileInstruction.END_MARKER
+                else {},
+            )
             for instr in instructions
         ]
         max_waits = max(1, max((len(entry) // 2 for entry in raw_wait_data), default=0))
@@ -2085,6 +2202,58 @@ class InstructionStreamBuilder:
                 padded.extend([-1, 0])
             wait_data.append(padded)
         self._op_wait_counts = self._max_counts_by_op(instructions, raw_wait_data, pair_width=2)
+        empty = [-1, 0] * max_waits
+        if num_blocks is not None and num_blocks > 0:
+            seen_waits = [dict() for _ in range(num_blocks)]
+            for idx, entry in enumerate(wait_data):
+                block_idx = idx % num_blocks
+                if entry == empty:
+                    continue
+                compacted: List[int] = []
+                for pair_idx in range(max_waits):
+                    barrier_idx = entry[pair_idx * 2]
+                    expected = entry[pair_idx * 2 + 1]
+                    if barrier_idx < 0:
+                        continue
+                    if seen_waits[block_idx].get(barrier_idx, 0) >= expected:
+                        continue
+                    compacted.extend([barrier_idx, expected])
+                    seen_waits[block_idx][barrier_idx] = expected
+                while len(compacted) < max_waits * 2:
+                    compacted.extend([-1, 0])
+                wait_data[idx] = compacted
+
+        return torch.tensor(wait_data, dtype=torch.int32, device=device)
+
+    def build_compute_wait_info_tensor(
+        self,
+        instructions,
+        device="cuda",
+        num_blocks: Optional[int] = None,
+    ):
+        """Pre-compute waits that are delayed until compute phase."""
+        import torch
+
+        wait_formulas = self._resolve_compute_wait_formulas()
+        raw_wait_data = [
+            self._build_wait_info_entry(
+                instr,
+                {instr.op_idx: (wait_formulas.get(instr.op_idx, []), [])}
+                if instr.op_idx != TileInstruction.END_MARKER
+                else {},
+            )
+            for instr in instructions
+        ]
+        max_waits = max(1, max((len(entry) // 2 for entry in raw_wait_data), default=0))
+        wait_data = []
+        for entry in raw_wait_data:
+            padded = list(entry)
+            while len(padded) < max_waits * 2:
+                padded.extend([-1, 0])
+            wait_data.append(padded)
+        self._op_compute_wait_counts = self._max_counts_by_op(
+            instructions, raw_wait_data, pair_width=2
+        )
         empty = [-1, 0] * max_waits
         if num_blocks is not None and num_blocks > 0:
             seen_waits = [dict() for _ in range(num_blocks)]
@@ -2223,11 +2392,9 @@ __all__ = [
     "INSTR_BARRIER_META_IDX",
     "INSTR_OP_IDX",
     "INSTR_RANGE_META",
-    "INSTR_TILE_0",
-    "INSTR_TILE_1",
-    "INSTR_TILE_2",
-    "INSTR_TILE_3",
-    "INSTR_TILE_4",
+    "INSTR_RANGE_END",
+    "INSTR_TILE_01",
+    "INSTR_TILE_23",
     "TileInstruction",
     "TileScheduler",
     "BackwardScheduler",

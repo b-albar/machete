@@ -320,20 +320,16 @@ def load_instruction_to_smem(
         """
         {
             .reg .u64 %gaddr;
-            .reg .u32 %w0, %w1, %w2, %w3, %w4, %w5, %w6, %w7;
+            .reg .u32 %w0, %w1, %w2, %w3, %w4;
             mad.wide.u32 %gaddr, $1, $3, $0;
             ld.global.b32 %w0, [%gaddr];
             ld.global.b32 %w1, [%gaddr+4];
             ld.global.b32 %w2, [%gaddr+8];
             ld.global.b32 %w3, [%gaddr+12];
             ld.global.b32 %w4, [%gaddr+16];
-            ld.global.b32 %w5, [%gaddr+20];
-            ld.global.b32 %w6, [%gaddr+24];
-            ld.global.b32 %w7, [%gaddr+28];
             st.shared.v2.b32 [$2], {%w0, %w1};
             st.shared.v2.b32 [$2+8], {%w2, %w3};
-            st.shared.v2.b32 [$2+16], {%w4, %w5};
-            st.shared.v2.b32 [$2+24], {%w6, %w7};
+            st.shared.b32 [$2+16], %w4;
         }
         """,
         "l,r,r,r",

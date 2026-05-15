@@ -16,7 +16,9 @@ from machete.megakernel.scheduling import (
     BarrierFormula,
     INSTR_BARRIER_META_IDX,
     INSTR_OP_IDX,
-    INSTR_TILE_0,
+    INSTR_RANGE_END,
+    INSTR_TILE_01,
+    INSTR_TILE_23,
     INSTRUCTION_WORDS,
     InstructionStreamBuilder,
     TileInstruction,
@@ -91,23 +93,24 @@ def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
     non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
 
     assert [instr.tiles for instr in non_end] == [
-        (0, 0, 0, 10, 0),
+        (0, 0, 0, 0),
     ]
     assert [(instr.range_axis, instr.range_end_axis) for instr in non_end] == [(2, 3)]
+    assert [instr.range_end for instr in non_end] == [10]
     assert [
         instr.tiles for instr in builder.expand_pipeline_instructions(instructions)
         if instr.op_idx != TileInstruction.END_MARKER
     ] == [
-        (0, 0, 0, 0, 0),
-        (0, 0, 1, 0, 0),
-        (0, 0, 2, 0, 0),
-        (0, 0, 3, 0, 0),
-        (0, 0, 4, 0, 0),
-        (0, 0, 5, 0, 0),
-        (0, 0, 6, 0, 0),
-        (0, 0, 7, 0, 0),
-        (0, 0, 8, 0, 0),
-        (0, 0, 9, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 1, 0),
+        (0, 0, 2, 0),
+        (0, 0, 3, 0),
+        (0, 0, 4, 0),
+        (0, 0, 5, 0),
+        (0, 0, 6, 0),
+        (0, 0, 7, 0),
+        (0, 0, 8, 0),
+        (0, 0, 9, 0),
     ]
 
 
@@ -129,11 +132,12 @@ def test_pipeline_range_coalesces_per_cta_fetch_stream():
     coalesced = builder.coalesce_pipeline_instructions(instructions, num_blocks=2)
 
     assert [instr.tiles for instr in coalesced] == [
-        (0, 0, 0, 10, 0),
-        (0, 0, 100, 110, 0),
-        (0, 0, 0, 0, 0),
-        (0, 0, 0, 0, 0),
+        (0, 0, 0, 0),
+        (0, 0, 100, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
     ]
+    assert [instr.range_end for instr in coalesced[:2]] == [10, 110]
 
 
 def test_phase_aliases_bind_concrete_instance_methods():
@@ -421,21 +425,23 @@ class TestTileInstructionPacking:
         instr = TileInstruction(op_idx=1, tiles=(5, 2, 0))
         packed = instr.pack()
         assert len(packed) == INSTRUCTION_WORDS
-        assert INSTRUCTION_WORDS == 8
+        assert INSTRUCTION_WORDS == 5
 
     def test_pack_fields(self):
         """Fields should pack op index, tile coordinates, and barrier metadata."""
         instr = TileInstruction(op_idx=3, tiles=(7, 1, 2))
         packed = instr.pack(barrier_meta_idx=99)
         assert packed[INSTR_OP_IDX] == 3
-        assert packed[INSTR_TILE_0:INSTR_TILE_0 + MAX_TILE_DIMS] == [7, 1, 2, 0, 0]
+        assert packed[INSTR_TILE_01] == 7 | (1 << 16)
+        assert packed[INSTR_TILE_23] == 2
         assert packed[INSTR_BARRIER_META_IDX] == 99
+        assert packed[INSTR_RANGE_END] == 0
 
     def test_end_marker_packs_correctly(self):
         """End marker should have op_idx == END_MARKER."""
         end = TileInstruction.end_instruction()
         packed = end.pack()
-        assert packed[0] == TileInstruction.END_MARKER
+        assert packed[0] == 0xFFFF
 
     def test_build_tensor_shape(self):
         """GPU tensor should have shape [num_instructions, INSTRUCTION_WORDS]."""
@@ -457,9 +463,12 @@ class TestTileInstructionPacking:
 
         for i, instr in enumerate(instructions):
             row = tensor[i].tolist()
-            assert row[0] == instr.op_idx, f"Instruction {i} op_idx mismatch"
+            row_op = row[INSTR_OP_IDX] & 0xFFFF
             if instr.op_idx != TileInstruction.END_MARKER:
-                assert row[INSTR_TILE_0] == instr.tiles[0], f"Instruction {i} tile mismatch"
+                assert row_op == instr.op_idx, f"Instruction {i} op_idx mismatch"
+                assert row[INSTR_TILE_01] & 0xFFFF == instr.tiles[0], f"Instruction {i} tile mismatch"
+            else:
+                assert row_op == 0xFFFF, f"Instruction {i} end marker mismatch"
 
 
 # =============================================================================

@@ -16,15 +16,17 @@ Architecture (SM_90+ / Hopper+):
     - Tensor core warp MMA: MmaF16BF16Op(16, 8, 16)
     - Supports fp16 and bf16 inputs, fp32 accumulation across all K blocks
     - K is handled via an internal double-buffered loop in compute
-    - TMA for all G->S loads: first 2 K-blocks by DMA warp, rest by
-      elected MMA thread in compute via compute-local mbarriers
+    - TMA for all G->S loads is issued by the loader warp: the first two
+      K-blocks use the framework work mbarrier, later K-blocks use
+      op-local kblock_ready mbarriers
     - Regular TMA store for C
     - LdMatrix for warp-cooperative smem->register reads
 
 Pipelined phases:
-    load:    TMA G->S of first 2 K-blocks of A and B into 2 smem buffers.
-    compute: Process K-blocks 0-1 (TMA-loaded by DMA), then TMA double-buffered
-             loop for K-blocks 2+ (elected MMA thread). LdMatrix + MMA per K-block.
+    load:    TMA G->S of all A/B K-blocks into 2 smem buffers.
+    compute: Process K-blocks 0-1 once the framework work mbarrier is ready,
+             then wait on op-local kblock_ready mbarriers for K-blocks 2+.
+             LdMatrix + MMA per K-block.
              Epilogue: R->S.
     store:   TMA store S->G of C[tile_S, tile_N]
 
@@ -143,7 +145,8 @@ def _gemm_epilogue_store_no_mbar_inval_helper(smem_ptr, tidx, tiled_mma, acc,
 @cute.jit
 def _gemm_compute_unscaled_core(page_ptr, tidx,
                                 a_dtype, b_dtype, c_dtype,
-                                num_mma_warps, num_mma_threads,
+                                num_mma_warps_m, num_mma_warps_n,
+                                num_mma_threads,
                                 tile_size_S, tile_size_N, tile_K,
                                 buf_stride, b_offset, mbar_offset,
                                 swz_B_ab, swz_B_c,
@@ -151,18 +154,11 @@ def _gemm_compute_unscaled_core(page_ptr, tidx,
     """Shared unscaled GEMM compute core for forward decode-style paths."""
     mma_op = cute.nvgpu.warp.MmaF16BF16Op(
         a_dtype, Float32, (16, 8, 16))
-    if cutlass.const_expr(tile_size_S <= 16):
-        tiled_mma = cute.make_tiled_mma(
-            mma_op,
-            cute.make_layout((1, num_mma_warps, 1)),
-            permutation_mnk=(16, num_mma_warps * 16, 16),
-        )
-    else:
-        tiled_mma = cute.make_tiled_mma(
-            mma_op,
-            cute.make_layout((num_mma_warps, 1, 1)),
-            permutation_mnk=(num_mma_warps * 16, 16, 16),
-        )
+    tiled_mma = cute.make_tiled_mma(
+        mma_op,
+        cute.make_layout((num_mma_warps_m, num_mma_warps_n, 1)),
+        permutation_mnk=(num_mma_warps_m * 16, num_mma_warps_n * 16, 16),
+    )
     thr_mma = tiled_mma.get_slice(tidx)
 
     swz = cute.make_swizzle(swz_B_ab, 4, 3)
@@ -300,9 +296,8 @@ class GemmOp(Op):
     Tile dimensions: (B, S, N) with tile_B=1 always.
     B and S are shared with downstream ops (RoPE, GDN) for tile-level barriers.
 
-    K is handled via double-buffered TMA pipelining: the DMA warp TMA-loads
-    the first 2 K-blocks, then an elected MMA thread issues TMA loads for
-    K-blocks 2+ using compute-local mbarriers.
+    K is handled via double-buffered TMA pipelining: the loader warp issues
+    all K-block TMA loads, while compute releases each buffer after MMA uses it.
     """
 
     reads = {
@@ -375,11 +370,23 @@ class GemmOp(Op):
         )
 
         self.num_k_blocks = (self.K + self.tile_K - 1) // self.tile_K
-        self.num_mma_warps = self.threads_per_row // 32
-        if self.tile_size_S <= 16:
+        available_mma_warps = self.threads_per_row // 32
+        if self.tile_size_S > 16:
+            self.num_mma_warps_m = min(
+                available_mma_warps, max(1, self.tile_size_S // 16)
+            )
+            self.num_mma_warps_n = min(
+                max(1, available_mma_warps // self.num_mma_warps_m),
+                max(1, self.tile_size_N // 16),
+            )
+        else:
             # Decode GEMMs have only one M tile; spread MMA warps across N
             # instead of issuing duplicate M work from idle fixed-CTA threads.
-            self.num_mma_warps = min(self.num_mma_warps, max(1, self.tile_size_N // 32))
+            self.num_mma_warps_m = 1
+            self.num_mma_warps_n = min(
+                available_mma_warps, max(1, self.tile_size_N // 32)
+            )
+        self.num_mma_warps = self.num_mma_warps_m * self.num_mma_warps_n
         self.num_mma_threads = self.num_mma_warps * 32
 
         self.tma_k_blocks = min(2, self.num_k_blocks)
@@ -393,7 +400,7 @@ class GemmOp(Op):
             self.swz_B_ab = 1   # SW32
 
         # 4 op-managed mbarriers after double-buffer data (32 bytes):
-        #   buf_free[0,1]:     compute → store warp (buffer read, safe to overwrite)
+        #   buf_free[0,1]:     compute -> load warp (buffer read, safe to overwrite)
         #   kblock_ready[0,1]: TMA hw → compute (new K-block data arrived)
         self.mbar_offset = 2 * self.buf_stride
         self.ab_tma_bytes = self.buf_stride  # A + (a_scale) + B per buffer
@@ -470,7 +477,7 @@ class GemmOp(Op):
         return _layout_str(B, tma_tile_shape)
 
     # =========================================================================
-    # Forward Load: TMA G->S (called by load warp and store warp)
+    # Forward Load: TMA G->S (called by loader warp)
     # =========================================================================
 
     @cute.jit
@@ -602,7 +609,7 @@ class GemmOp(Op):
             _k_block = _k_block + Int32(1)
 
     # =========================================================================
-    # Forward Compute: Pure MMA (no TMA — store warp handles K-block loads)
+    # Forward Compute: Pure MMA (TMA is issued concurrently by the loader warp)
     # =========================================================================
 
     @cute.jit
@@ -610,11 +617,12 @@ class GemmOp(Op):
         """GEMM compute with double-buffered K-block processing.
 
         K-blocks 0-1: TMA-loaded by load warp (in buf 0 and buf 1).
-        K-blocks 2+:  TMA-loaded by store warp via load(iter 1+).
+        K-blocks 2+:  TMA-loaded by the same load warp using op-local
+        kblock_ready mbarriers.
 
         Compute signals buf_free[k%2] after reading each K-block so the
-        store warp can overwrite the buffer. For K-blocks 2+, compute
-        waits on kblock_ready[k%2] before reading.
+        load warp can overwrite the buffer. For K-blocks 2+, compute waits
+        on kblock_ready[k%2] before reading.
 
         After all K-blocks: epilogue converts fp32 acc to output dtype in smem.
         """
@@ -625,8 +633,12 @@ class GemmOp(Op):
             self.a_dtype, Float32, (16, 8, 16))
         tiled_mma = cute.make_tiled_mma(
             mma_op,
-            cute.make_layout((self.num_mma_warps, 1, 1)),
-            permutation_mnk=(self.num_mma_warps * 16, 16, 16),
+            cute.make_layout((self.num_mma_warps_m, self.num_mma_warps_n, 1)),
+            permutation_mnk=(
+                self.num_mma_warps_m * 16,
+                self.num_mma_warps_n * 16,
+                16,
+            ),
         )
         thr_mma = tiled_mma.get_slice(tidx)
 
@@ -743,7 +755,7 @@ class GemmOp(Op):
         # =====================================================================
         # Process all K-blocks through one dynamic loop.
         # K-blocks 0-1 were loaded by the load warp; K-blocks 2+ wait on the
-        # store warp's compute-local TMA pipeline.
+        # loader warp's op-local TMA pipeline.
         # =====================================================================
         _kr_phase_0 = Int32(0)
         _kr_phase_1 = Int32(0)
@@ -857,7 +869,8 @@ class GemmOp(Op):
                 page_ptr,
                 tidx,
                 self.a_dtype, self.b_dtype, self.c_dtype,
-                self.num_mma_warps, self.num_mma_threads,
+                self.num_mma_warps_m, self.num_mma_warps_n,
+                self.num_mma_threads,
                 self.tile_size_S, self.tile_size_N, self.tile_K,
                 self.buf_stride, self.b_offset, self.mbar_offset,
                 self.swz_B_ab, self.swz_B_c,
@@ -991,32 +1004,40 @@ class GemmOp(Op):
         mbar_bytes = 32
 
         preferred = []
-        if (
+        plain_32k_bf16 = (
             rows is not None
             and page_size <= 32 * 1024
             and not has_a_scale
             and elem_bytes == 2
+        )
+        if (
+            plain_32k_bf16
             and input_k >= 2 * output_n
             and rows >= 512
         ):
             preferred.append((128, 64, 32))
+            if input_k >= 4 * output_n:
+                preferred.append((128, 128, 16))
         if (
             batch is not None
-            and rows is not None
-            and page_size <= 32 * 1024
-            and not has_a_scale
-            and elem_bytes == 2
+            and plain_32k_bf16
             and batch > 1
             and rows <= 128
             and (output_n >= 2 * input_k or input_k >= 2 * output_n)
         ):
             preferred.append((128, 64, 32))
         if (
-            rows is not None
+            plain_32k_bf16
+            and rows >= 1024
+            and input_k <= 512
+            and output_n >= input_k
+        ):
+            # Weight-gradient GEMMs with small reduction depth benefit more
+            # from halving N and doubling K than from the larger C tile.
+            preferred.append((128, 64, 32))
+        if (
+            plain_32k_bf16
             and rows >= 512
-            and page_size <= 32 * 1024
-            and not has_a_scale
-            and elem_bytes == 2
         ):
             preferred.extend([(128, 128, 16), (128, 64, 32)])
         if output_n >= 2 * input_k:

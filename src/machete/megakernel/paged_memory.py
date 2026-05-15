@@ -37,8 +37,7 @@ TILE_INFO_TILE_0: int = 2
 TILE_INFO_TILE_1: int = 3
 TILE_INFO_TILE_2: int = 4
 TILE_INFO_TILE_3: int = 5
-TILE_INFO_TILE_4: int = 6
-TILE_INFO_INSTRUCTION_IDX: int = 7
+TILE_INFO_INSTRUCTION_IDX: int = 6
 TILE_INFO_OP_CONFIG: int = 8
 TILE_INFO_PAGE_ID: int = 10
 
@@ -309,12 +308,12 @@ class NPageLayout:
 
     # Scratch area layout (ring buffer):
     # - Per-slot tile info: num_slots * 48 bytes
-    #   [op_idx, handler_idx, tile_0..tile_4, instruction_idx, op_config_ptr, page_id]
+    #   [op_idx, handler_idx, tile_0..tile_3, instruction_idx, op_config_ptr, page_id]
     # - Flags: 32 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
     # - Instruction queue: IQ_DEPTH * replay instruction row bytes
     # - Mbarriers: 2 * num_slots * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 48  # Per-slot tile metadata (8 int32 + 1 int64 + page_id + pad)
+    _TILE_INFO_SIZE: int = 48  # Per-slot tile metadata with aligned int64 config pointer
     _IQ_ENTRY_SIZE: int = INSTRUCTION_ROW_BYTES
     _FLAGS_SIZE: int = 36  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)

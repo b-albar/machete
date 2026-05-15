@@ -314,7 +314,8 @@ def test_op_pipeline_drives_flat_range_coalescing():
         if instr.op_idx != TileInstruction.END_MARKER
     ]
     assert len(work) == 1
-    assert work[0].tiles[:2] == (0, 16)
+    assert work[0].tiles[0] == 0
+    assert work[0].range_end == 16
 
 
 def test_pipeline_is_resource_metadata_not_a_second_phase_api():
@@ -463,7 +464,7 @@ def test_pipeline_ops_can_coalesce_flat_instruction_stream():
     instructions = builder.coalesce_pipeline_instructions(builder.build())
 
     ranges = [
-        (instr.tiles[0], instr.tiles[1])
+        (instr.tiles[0], instr.range_end)
         for instr in instructions
         if instr.op_idx != TileInstruction.END_MARKER
     ]
@@ -707,9 +708,15 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     first_qkv = next(instr for instr in instructions if instr.op_idx == 0)
     first_finalize = next(instr for instr in instructions if instr.op_idx == 1)
 
-    assert first_qkv.tiles == (0, 0, 0, 4, 0)
-    assert builder._build_signal_info_entry(first_qkv, formulas) == [0, 0, 0, 0]
-    assert builder._build_wait_info_entry(first_finalize, formulas) == [0, 4]
+    assert first_qkv.tiles == (0, 0, 0, 0)
+    assert first_qkv.range_end == layer.ops[0].tile_counts[2]
+    qkv_signals = builder._build_signal_info_entry(first_qkv, formulas)
+    assert qkv_signals == [idx // 4 for idx in range(first_qkv.range_end)]
+    assert builder._build_wait_info_entry(first_finalize, formulas) == [
+        value
+        for barrier_idx in range(first_finalize.range_end)
+        for value in (barrier_idx, 4)
+    ]
 
 
 def test_barrier_formula_supports_half_open_tile_interval_guard():

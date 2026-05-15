@@ -14,7 +14,7 @@ Usage:
     tile_fn = compile_phase(instance, "compute", tensor_param_names=['t0', 't1'])
 
     # Returns @cute.jit function with signature:
-    #   fn(page_ptr: Int32, tile_0..tile_4: Int32,
+    #   fn(page_ptr: Int32, tile_0..tile_3: Int32,
     #      op_config_ptr: Int64, t0, t1) -> None
 """
 
@@ -38,11 +38,12 @@ _linecache_entries: list = []
 _compile_counter = 0
 
 
-@lru_cache(maxsize=None)
-def _compile_generated_source(source: str, label: str):
-    """Compile generated source once per `(source, label)` pair."""
+def _generated_source_filename(source: str, label: str) -> str:
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
-    filename = f"<{label}>_{digest}"
+    return f"<{label}>_{digest}"
+
+
+def _cache_generated_source(source: str, filename: str) -> None:
     linecache.cache[filename] = (
         len(source),
         None,
@@ -51,6 +52,13 @@ def _compile_generated_source(source: str, label: str):
     )
     if filename not in _linecache_entries:
         _linecache_entries.append(filename)
+
+
+@lru_cache(maxsize=None)
+def _compile_generated_source(source: str, label: str):
+    """Compile generated source once per `(source, label)` pair."""
+    filename = _generated_source_filename(source, label)
+    _cache_generated_source(source, filename)
     return compile(source, filename, "exec")
 
 
@@ -68,6 +76,8 @@ def exec_generated_source(source: str, label: str, exec_globals: dict) -> dict:
     Returns:
         The exec_globals dict (same object, for convenience).
     """
+    filename = _generated_source_filename(source, label)
+    _cache_generated_source(source, filename)
     code = _compile_generated_source(source, label)
     exec(code, exec_globals)
     return exec_globals
@@ -75,13 +85,7 @@ def exec_generated_source(source: str, label: str, exec_globals: dict) -> dict:
 
 def _register_generated_source(source: str, filename: str) -> None:
     """Register generated source in linecache for readable tracebacks."""
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        source.splitlines(True),
-        filename,
-    )
-    _linecache_entries.append(filename)
+    _cache_generated_source(source, filename)
 
 
 # =============================================================================
@@ -169,7 +173,7 @@ def _tile_call_args(op_cls, method_params: set) -> List[str]:
             tile_param = f"tile_{dim_name}"
             if tile_param in method_params:
                 call_args.append(f"tile_{op_cls.DIM_NAMES[dim_name]}")
-    for axis in range(5):
+    for axis in range(MAX_TILE_DIMS):
         tile_param = f"tile_{axis}"
         if tile_param in method_params and tile_param not in call_args:
             call_args.append(tile_param)

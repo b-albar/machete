@@ -48,7 +48,7 @@ from .interpreter import ld_global_i32, ld_global_i64
 # Constants
 # =============================================================================
 
-MAX_TILE_DIMS = 5  # Matches TMA's 5D tensor capability
+MAX_TILE_DIMS = 4
 
 _SCHEDULING_STATIC_DIM_PREFIXES = ("barrier_", "pipeline_", "load_replay_")
 
@@ -1397,6 +1397,16 @@ class ScheduledOp:
         """Populate default dim-name metadata from the op class."""
         if self.dim_names is None:
             self.dim_names = getattr(self.op_cls, "DIM_NAMES", {})
+        if len(self.tile_counts) > MAX_TILE_DIMS:
+            raise ValueError(
+                f"{self.op_cls.__name__} has {len(self.tile_counts)} tile dims, "
+                f"max supported is {MAX_TILE_DIMS}"
+            )
+        for count in self.tile_counts:
+            if count < 1 or count > 0xFFFF:
+                raise ValueError(
+                    f"{self.op_cls.__name__} tile counts must be in [1, 65535], got {count}"
+                )
 
     @property
     def ndims(self) -> int:

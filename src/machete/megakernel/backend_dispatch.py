@@ -16,7 +16,7 @@ from .backend_ir import PHASE_NAMES
 from .compile import compile_phase
 from .interpreter import ld_global_i32
 from .noinline import _flatten_ir_values, _rebuild
-from .ops import build_op_config
+from .ops import MAX_TILE_DIMS, build_op_config
 
 
 @dataclass(frozen=True)
@@ -480,10 +480,10 @@ def make_local_switch_binder(
         def _binder(*args):
             handler_local_idx = args[0]
             page_ptr = args[1]
-            tile_vals = args[2:7]
-            op_config_ptr = args[7]
+            tile_vals = args[2:2 + MAX_TILE_DIMS]
+            op_config_ptr = args[2 + MAX_TILE_DIMS]
 
-            cursor = 8
+            cursor = 3 + MAX_TILE_DIMS
             work_mbar = None
             if is_load:
                 work_mbar = args[cursor]
@@ -524,10 +524,10 @@ def make_local_switch_binder(
     else:
         def _binder(*args):
             page_ptr = args[0]
-            tile_vals = args[1:6]
-            op_config_ptr = args[6]
+            tile_vals = args[1:1 + MAX_TILE_DIMS]
+            op_config_ptr = args[1 + MAX_TILE_DIMS]
 
-            cursor = 7
+            cursor = 2 + MAX_TILE_DIMS
             work_mbar = None
             if is_load:
                 work_mbar = args[cursor]
@@ -667,10 +667,10 @@ def make_transport_record_binder(
         def _binder(*args):
             handler_local_idx = args[0]
             page_ptr = args[1]
-            tile_vals = args[2:7]
-            op_config_ptr = args[7]
+            tile_vals = args[2:2 + MAX_TILE_DIMS]
+            op_config_ptr = args[2 + MAX_TILE_DIMS]
 
-            cursor = 8
+            cursor = 3 + MAX_TILE_DIMS
             work_mbar = None
             if is_load:
                 work_mbar = args[cursor]
@@ -717,10 +717,10 @@ def make_transport_record_binder(
     else:
         def _binder(*args):
             page_ptr = args[0]
-            tile_vals = args[1:6]
-            op_config_ptr = args[6]
+            tile_vals = args[1:1 + MAX_TILE_DIMS]
+            op_config_ptr = args[1 + MAX_TILE_DIMS]
 
-            cursor = 7
+            cursor = 2 + MAX_TILE_DIMS
             work_mbar = None
             if is_load:
                 work_mbar = args[cursor]
