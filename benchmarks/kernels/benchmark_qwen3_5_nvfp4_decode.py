@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark the composable Machete real-Qwen3.5 NVFP4 decode graph.
+"""Benchmark the composable Machete Qwen3.5 NVFP4 decode graph.
 
 This benchmark targets the same model shape as Luce's Qwen/Qwen3.5-0.8B path:
 24 hybrid layers, 18 DeltaNet layers, 6 full-attention layers, hidden=1024,
@@ -19,26 +19,26 @@ import torch
 from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
 from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
 from machete.kernels.qwen_3_5 import (
-    QWEN3_5_REAL_DN_CONV_CHANNELS,
-    QWEN3_5_REAL_DN_CONV_KERNEL,
-    QWEN3_5_REAL_DN_NUM_HEADS,
-    QWEN3_5_REAL_DN_VALUE_DIM,
-    QWEN3_5_REAL_DN_V_SIZE,
-    QWEN3_5_REAL_HEAD_DIM,
-    QWEN3_5_REAL_HIDDEN,
-    QWEN3_5_REAL_INTERMEDIATE,
-    QWEN3_5_REAL_KV_DIM,
-    QWEN3_5_REAL_LAYER_TYPES,
-    QWEN3_5_REAL_NUM_KV_HEADS,
-    QWEN3_5_REAL_NUM_LAYERS,
-    QWEN3_5_REAL_Q_DIM,
-    QWEN3_5_REAL_Q_RAW_DIM,
-    QWEN3_5_REAL_ROTARY_D2,
-    QWEN3_5_REAL_VOCAB,
+    QWEN3_5_NVFP4_DN_CONV_CHANNELS,
+    QWEN3_5_NVFP4_DN_CONV_KERNEL,
+    QWEN3_5_NVFP4_DN_NUM_HEADS,
+    QWEN3_5_NVFP4_DN_VALUE_DIM,
+    QWEN3_5_NVFP4_DN_V_SIZE,
+    QWEN3_5_NVFP4_HEAD_DIM,
+    QWEN3_5_NVFP4_HIDDEN,
+    QWEN3_5_NVFP4_INTERMEDIATE,
+    QWEN3_5_NVFP4_KV_DIM,
+    QWEN3_5_LAYER_TYPES,
+    QWEN3_5_NVFP4_NUM_KV_HEADS,
+    QWEN3_5_NVFP4_NUM_LAYERS,
+    QWEN3_5_NVFP4_Q_DIM,
+    QWEN3_5_NVFP4_Q_RAW_DIM,
+    QWEN3_5_NVFP4_ROTARY_D2,
+    QWEN3_5_NVFP4_VOCAB,
     schedule_qwen3_5_final_nvfp4_sm120,
-    schedule_qwen3_5_real_nvfp4_decode_sm120,
+    schedule_qwen3_5_nvfp4_decode_sm120,
 )
-from machete.kernels.qwen_3_5.real_nvfp4_ops import QWEN3_5_REAL_DN_KEY_DIM
+from machete.kernels.qwen_3_5.nvfp4_ops import QWEN3_5_NVFP4_DN_KEY_DIM
 
 
 def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> NVFP4Tensor:
@@ -47,7 +47,7 @@ def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> NVFP4Tensor:
     return NVFP4Tensor(packed, scales, group_size=group_size, rows=rows, cols=cols)
 
 
-def _qweight_real(weight: torch.Tensor, group_size: int = 32) -> NVFP4Tensor:
+def _qweight(weight: torch.Tensor, group_size: int = 32) -> NVFP4Tensor:
     return quantize_nvfp4_weight(weight.contiguous(), group_size=group_size)
 
 
@@ -57,44 +57,44 @@ def _qwen_rms_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _make_dummy_weights(context_len: int, dtype: torch.dtype, group_size: int) -> dict:
     weights = {
-        "cos": torch.ones(context_len + 1, QWEN3_5_REAL_ROTARY_D2, device="cuda", dtype=dtype),
-        "sin": torch.zeros(context_len + 1, QWEN3_5_REAL_ROTARY_D2, device="cuda", dtype=dtype),
-        "final_norm": torch.ones(QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype),
+        "cos": torch.ones(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "sin": torch.zeros(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "final_norm": torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype),
     }
-    for layer_idx, layer_type in enumerate(QWEN3_5_REAL_LAYER_TYPES):
+    for layer_idx, layer_type in enumerate(QWEN3_5_LAYER_TYPES):
         pfx = f"layer.{layer_idx}"
-        weights[f"{pfx}.attn_norm"] = torch.ones(QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype)
-        weights[f"{pfx}.mlp_norm"] = torch.ones(QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype)
-        weights[f"{pfx}.W_gate_nvfp4"] = _qweight_empty(QWEN3_5_REAL_INTERMEDIATE, QWEN3_5_REAL_HIDDEN, group_size)
-        weights[f"{pfx}.W_up_nvfp4"] = _qweight_empty(QWEN3_5_REAL_INTERMEDIATE, QWEN3_5_REAL_HIDDEN, group_size)
-        weights[f"{pfx}.W_down_nvfp4"] = _qweight_empty(QWEN3_5_REAL_HIDDEN, QWEN3_5_REAL_INTERMEDIATE, group_size)
+        weights[f"{pfx}.attn_norm"] = torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype)
+        weights[f"{pfx}.mlp_norm"] = torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype)
+        weights[f"{pfx}.W_gate_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_INTERMEDIATE, QWEN3_5_NVFP4_HIDDEN, group_size)
+        weights[f"{pfx}.W_up_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_INTERMEDIATE, QWEN3_5_NVFP4_HIDDEN, group_size)
+        weights[f"{pfx}.W_down_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_INTERMEDIATE, group_size)
         if layer_type == "full_attention":
-            weights[f"{pfx}.q_norm"] = torch.ones(QWEN3_5_REAL_HEAD_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.k_norm"] = torch.ones(QWEN3_5_REAL_HEAD_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_q_nvfp4"] = _qweight_empty(QWEN3_5_REAL_Q_RAW_DIM, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_k_nvfp4"] = _qweight_empty(QWEN3_5_REAL_KV_DIM, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_v_nvfp4"] = _qweight_empty(QWEN3_5_REAL_KV_DIM, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_o_nvfp4"] = _qweight_empty(QWEN3_5_REAL_HIDDEN, QWEN3_5_REAL_Q_DIM, group_size)
+            weights[f"{pfx}.q_norm"] = torch.ones(QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.k_norm"] = torch.ones(QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_q_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_Q_RAW_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_k_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_KV_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_v_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_KV_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_o_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_Q_DIM, group_size)
         else:
-            weights[f"{pfx}.linear_norm"] = torch.ones(QWEN3_5_REAL_DN_VALUE_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight_empty(QWEN3_5_REAL_DN_CONV_CHANNELS, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_z_nvfp4"] = _qweight_empty(QWEN3_5_REAL_DN_V_SIZE, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_beta_nvfp4"] = _qweight_empty(QWEN3_5_REAL_DN_NUM_HEADS, QWEN3_5_REAL_HIDDEN, group_size)
-            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight_empty(QWEN3_5_REAL_DN_NUM_HEADS, QWEN3_5_REAL_HIDDEN, group_size)
+            weights[f"{pfx}.linear_norm"] = torch.ones(QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_CONV_CHANNELS, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_z_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_V_SIZE, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_beta_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_HIDDEN, group_size)
             weights[f"{pfx}.conv_weight"] = torch.zeros(
-                QWEN3_5_REAL_DN_CONV_CHANNELS,
-                QWEN3_5_REAL_DN_CONV_KERNEL,
+                QWEN3_5_NVFP4_DN_CONV_CHANNELS,
+                QWEN3_5_NVFP4_DN_CONV_KERNEL,
                 device="cuda",
                 dtype=dtype,
             )
-            weights[f"{pfx}.a_log"] = torch.zeros(QWEN3_5_REAL_DN_NUM_HEADS, device="cuda", dtype=dtype)
-            weights[f"{pfx}.dt_bias"] = torch.zeros(QWEN3_5_REAL_DN_NUM_HEADS, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_out_nvfp4"] = _qweight_empty(QWEN3_5_REAL_HIDDEN, QWEN3_5_REAL_DN_V_SIZE, group_size)
-    weights["lm_head_nvfp4"] = _qweight_empty(QWEN3_5_REAL_VOCAB, QWEN3_5_REAL_HIDDEN, group_size)
+            weights[f"{pfx}.a_log"] = torch.zeros(QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
+            weights[f"{pfx}.dt_bias"] = torch.zeros(QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_out_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_DN_V_SIZE, group_size)
+    weights["lm_head_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_VOCAB, QWEN3_5_NVFP4_HIDDEN, group_size)
     return weights
 
 
-def _load_real_weights(model_name: str, context_len: int, dtype: torch.dtype, group_size: int) -> dict:
+def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_size: int) -> dict:
     from transformers import AutoConfig, AutoModelForCausalLM
 
     config = AutoConfig.from_pretrained(model_name)
@@ -107,37 +107,37 @@ def _load_real_weights(model_name: str, context_len: int, dtype: torch.dtype, gr
     ).eval()
     state = model.state_dict()
     weights = {
-        "cos": torch.ones(context_len + 1, QWEN3_5_REAL_ROTARY_D2, device="cuda", dtype=dtype),
-        "sin": torch.zeros(context_len + 1, QWEN3_5_REAL_ROTARY_D2, device="cuda", dtype=dtype),
+        "cos": torch.ones(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "sin": torch.zeros(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
         "final_norm": _qwen_rms_weight(state["model.norm.weight"]),
     }
-    for layer_idx, layer_type in enumerate(QWEN3_5_REAL_LAYER_TYPES):
+    for layer_idx, layer_type in enumerate(QWEN3_5_LAYER_TYPES):
         pfx = f"layer.{layer_idx}"
         hf = f"model.layers.{layer_idx}"
         weights[f"{pfx}.attn_norm"] = _qwen_rms_weight(state[f"{hf}.input_layernorm.weight"])
         weights[f"{pfx}.mlp_norm"] = _qwen_rms_weight(state[f"{hf}.post_attention_layernorm.weight"])
-        weights[f"{pfx}.W_gate_nvfp4"] = _qweight_real(state[f"{hf}.mlp.gate_proj.weight"], group_size)
-        weights[f"{pfx}.W_up_nvfp4"] = _qweight_real(state[f"{hf}.mlp.up_proj.weight"], group_size)
-        weights[f"{pfx}.W_down_nvfp4"] = _qweight_real(state[f"{hf}.mlp.down_proj.weight"], group_size)
+        weights[f"{pfx}.W_gate_nvfp4"] = _qweight(state[f"{hf}.mlp.gate_proj.weight"], group_size)
+        weights[f"{pfx}.W_up_nvfp4"] = _qweight(state[f"{hf}.mlp.up_proj.weight"], group_size)
+        weights[f"{pfx}.W_down_nvfp4"] = _qweight(state[f"{hf}.mlp.down_proj.weight"], group_size)
         if layer_type == "full_attention":
             weights[f"{pfx}.q_norm"] = _qwen_rms_weight(state[f"{hf}.self_attn.q_norm.weight"])
             weights[f"{pfx}.k_norm"] = _qwen_rms_weight(state[f"{hf}.self_attn.k_norm.weight"])
-            weights[f"{pfx}.W_q_nvfp4"] = _qweight_real(state[f"{hf}.self_attn.q_proj.weight"], group_size)
-            weights[f"{pfx}.W_k_nvfp4"] = _qweight_real(state[f"{hf}.self_attn.k_proj.weight"], group_size)
-            weights[f"{pfx}.W_v_nvfp4"] = _qweight_real(state[f"{hf}.self_attn.v_proj.weight"], group_size)
-            weights[f"{pfx}.W_o_nvfp4"] = _qweight_real(state[f"{hf}.self_attn.o_proj.weight"], group_size)
+            weights[f"{pfx}.W_q_nvfp4"] = _qweight(state[f"{hf}.self_attn.q_proj.weight"], group_size)
+            weights[f"{pfx}.W_k_nvfp4"] = _qweight(state[f"{hf}.self_attn.k_proj.weight"], group_size)
+            weights[f"{pfx}.W_v_nvfp4"] = _qweight(state[f"{hf}.self_attn.v_proj.weight"], group_size)
+            weights[f"{pfx}.W_o_nvfp4"] = _qweight(state[f"{hf}.self_attn.o_proj.weight"], group_size)
         else:
             weights[f"{pfx}.linear_norm"] = state[f"{hf}.linear_attn.norm.weight"].contiguous()
-            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight_real(state[f"{hf}.linear_attn.in_proj_qkv.weight"], group_size)
-            weights[f"{pfx}.W_z_nvfp4"] = _qweight_real(state[f"{hf}.linear_attn.in_proj_z.weight"], group_size)
-            weights[f"{pfx}.W_beta_nvfp4"] = _qweight_real(state[f"{hf}.linear_attn.in_proj_b.weight"], group_size)
-            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight_real(state[f"{hf}.linear_attn.in_proj_a.weight"], group_size)
+            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_qkv.weight"], group_size)
+            weights[f"{pfx}.W_z_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_z.weight"], group_size)
+            weights[f"{pfx}.W_beta_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_b.weight"], group_size)
+            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_a.weight"], group_size)
             weights[f"{pfx}.conv_weight"] = state[f"{hf}.linear_attn.conv1d.weight"].squeeze(1).contiguous()
             weights[f"{pfx}.a_log"] = state[f"{hf}.linear_attn.A_log"].contiguous()
             weights[f"{pfx}.dt_bias"] = state[f"{hf}.linear_attn.dt_bias"].contiguous()
-            weights[f"{pfx}.W_out_nvfp4"] = _qweight_real(state[f"{hf}.linear_attn.out_proj.weight"], group_size)
+            weights[f"{pfx}.W_out_nvfp4"] = _qweight(state[f"{hf}.linear_attn.out_proj.weight"], group_size)
     lm_head = state.get("lm_head.weight", state["model.embed_tokens.weight"]).contiguous()
-    weights["lm_head_nvfp4"] = _qweight_real(lm_head, group_size)
+    weights["lm_head_nvfp4"] = _qweight(lm_head, group_size)
     del model
     torch.cuda.empty_cache()
     return weights
@@ -146,31 +146,31 @@ def _load_real_weights(model_name: str, context_len: int, dtype: torch.dtype, gr
 def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
     batch = 1
     seq_len = 1
-    x = [torch.zeros(batch, seq_len, QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS + 1)]
-    residual = [torch.zeros_like(x[0]) for _ in range(QWEN3_5_REAL_NUM_LAYERS + 1)]
+    x = [torch.zeros(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS + 1)]
+    residual = [torch.zeros_like(x[0]) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS + 1)]
     k_cache = [
-        torch.zeros(batch, context_len + 1, QWEN3_5_REAL_NUM_KV_HEADS, QWEN3_5_REAL_HEAD_DIM, device="cuda", dtype=dtype)
-        for _ in range(QWEN3_5_REAL_NUM_LAYERS)
+        torch.zeros(batch, context_len + 1, QWEN3_5_NVFP4_NUM_KV_HEADS, QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
+        for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)
     ]
     v_cache = [torch.zeros_like(k) for k in k_cache]
-    q_raw = [torch.empty(batch, seq_len, QWEN3_5_REAL_Q_RAW_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
-    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_REAL_KV_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
-    q_gate = [torch.empty(batch, seq_len, QWEN3_5_REAL_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
-    q_buf = [torch.empty(batch, seq_len, QWEN3_5_REAL_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
+    q_raw = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_RAW_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_NVFP4_KV_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    q_gate = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    q_buf = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
     attn_out = [torch.empty_like(q) for q in q_buf]
-    norm = [torch.empty(batch, seq_len, QWEN3_5_REAL_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
-    qkv = [torch.empty(batch, seq_len, QWEN3_5_REAL_DN_CONV_CHANNELS, device="cuda", dtype=dtype) for _ in range(18)]
-    z = [torch.empty(batch, seq_len, QWEN3_5_REAL_DN_V_SIZE, device="cuda", dtype=dtype) for _ in range(18)]
-    beta = [torch.empty(batch, seq_len, QWEN3_5_REAL_DN_NUM_HEADS, device="cuda", dtype=dtype) for _ in range(18)]
+    norm = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    qkv = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_CONV_CHANNELS, device="cuda", dtype=dtype) for _ in range(18)]
+    z = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_V_SIZE, device="cuda", dtype=dtype) for _ in range(18)]
+    beta = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype) for _ in range(18)]
     alpha = [torch.empty_like(b) for b in beta]
     dn_out = [torch.empty_like(v) for v in z]
-    mlp = [torch.empty(batch, seq_len, QWEN3_5_REAL_INTERMEDIATE, device="cuda", dtype=dtype) for _ in range(QWEN3_5_REAL_NUM_LAYERS)]
+    mlp = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_INTERMEDIATE, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
     dn_state = [
-        torch.zeros(batch, QWEN3_5_REAL_DN_NUM_HEADS, QWEN3_5_REAL_DN_KEY_DIM, QWEN3_5_REAL_DN_VALUE_DIM, device="cuda")
+        torch.zeros(batch, QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_DN_KEY_DIM, QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda")
         for _ in range(18)
     ]
     conv = [
-        torch.zeros(batch, QWEN3_5_REAL_DN_CONV_CHANNELS, QWEN3_5_REAL_DN_CONV_KERNEL, device="cuda")
+        torch.zeros(batch, QWEN3_5_NVFP4_DN_CONV_CHANNELS, QWEN3_5_NVFP4_DN_CONV_KERNEL, device="cuda")
         for _ in range(18)
     ]
     top_values = torch.empty(batch, seq_len, device="cuda", dtype=torch.float32)
@@ -231,7 +231,7 @@ def _schedule_body(args, weights, buffers):
         top_partial_values,
         top_partial_indices,
     ) = buffers
-    schedule = schedule_qwen3_5_real_nvfp4_decode_sm120(
+    schedule = schedule_qwen3_5_nvfp4_decode_sm120(
         batch=1,
         seq_len=1,
         cache_pos=args.context_len,
@@ -304,7 +304,7 @@ def build_kernel(args):
     weights = (
         _make_dummy_weights(args.context_len, dtype, args.group_size)
         if args.dummy_weights
-        else _load_real_weights(args.model, args.context_len, dtype, args.group_size)
+        else _load_weights(args.model, args.context_len, dtype, args.group_size)
     )
     buffers = _make_buffers(args.context_len, dtype, top_partitions)
     (
@@ -433,7 +433,7 @@ def main():
     print("timing hot launches...", flush=True)
     ms = time_kernel(kernel, args.warmup, args.rep)
     print(
-        f"machete_real_qwen_nvfp4_decode: {ms:.3f} ms/token, "
+        f"machete_qwen_nvfp4_decode: {ms:.3f} ms/token, "
         f"{1000.0 / ms:.1f} tok/s, ops={len(kernel.ops)}, "
         f"tiles={kernel.total_tiles}, instructions={kernel._num_instructions}, "
         f"page_size={args.page_size}, num_pages={args.num_pages}"

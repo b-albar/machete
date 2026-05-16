@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Machete Authors
-"""Native CuTe DSL decode schedules for real Qwen3.5-0.8B NVFP4.
+"""Native CuTe DSL decode schedules for Qwen3.5-0.8B NVFP4.
 
 This file contains Machete megakernel-op schedules only. It does not import or
 delegate to external CUDA extensions.
@@ -34,38 +34,33 @@ from machete.megakernel.interpreter import named_barrier_sync
 from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec
 
 
-QWEN3_5_REAL_NUM_LAYERS = 24
-QWEN3_5_REAL_HIDDEN = 1024
-QWEN3_5_REAL_INTERMEDIATE = 3584
-QWEN3_5_REAL_VOCAB = 248320
-QWEN3_5_REAL_NUM_Q_HEADS = 8
-QWEN3_5_REAL_NUM_KV_HEADS = 2
-QWEN3_5_REAL_HEAD_DIM = 256
-QWEN3_5_REAL_ROTARY_D2 = 32
-QWEN3_5_REAL_Q_DIM = QWEN3_5_REAL_NUM_Q_HEADS * QWEN3_5_REAL_HEAD_DIM
-QWEN3_5_REAL_Q_RAW_DIM = 2 * QWEN3_5_REAL_Q_DIM
-QWEN3_5_REAL_KV_DIM = QWEN3_5_REAL_NUM_KV_HEADS * QWEN3_5_REAL_HEAD_DIM
-QWEN3_5_REAL_KV_GROUP_SIZE = QWEN3_5_REAL_NUM_Q_HEADS // QWEN3_5_REAL_NUM_KV_HEADS
-QWEN3_5_REAL_DECODE_S = 1
-QWEN3_5_REAL_EPS = 1e-6
-QWEN3_5_REAL_NVFP4_GROUP_SIZE = 32
-QWEN3_5_REAL_DN_NUM_HEADS = 16
-QWEN3_5_REAL_DN_KEY_DIM = 128
-QWEN3_5_REAL_DN_VALUE_DIM = 128
-QWEN3_5_REAL_DN_QK_SIZE = QWEN3_5_REAL_DN_NUM_HEADS * QWEN3_5_REAL_DN_KEY_DIM
-QWEN3_5_REAL_DN_V_SIZE = QWEN3_5_REAL_DN_NUM_HEADS * QWEN3_5_REAL_DN_VALUE_DIM
-QWEN3_5_REAL_DN_CONV_CHANNELS = 2 * QWEN3_5_REAL_DN_QK_SIZE + QWEN3_5_REAL_DN_V_SIZE
-QWEN3_5_REAL_DN_CONV_KERNEL = 4
-QWEN3_5_REAL_MATVEC_BLOCK = 16
-QWEN3_5_REAL_FLASH_ATTN_MIN_CONTEXT = 4096
-QWEN3_5_REAL_LAYER_TYPES = (
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-    "linear_attention", "linear_attention", "linear_attention", "full_attention",
-)
+QWEN3_5_NVFP4_NUM_LAYERS = 24
+QWEN3_5_NVFP4_HIDDEN = 1024
+QWEN3_5_NVFP4_INTERMEDIATE = 3584
+QWEN3_5_NVFP4_VOCAB = 248320
+QWEN3_5_NVFP4_NUM_Q_HEADS = 8
+QWEN3_5_NVFP4_NUM_KV_HEADS = 2
+QWEN3_5_NVFP4_HEAD_DIM = 256
+QWEN3_5_NVFP4_ROTARY_D2 = 32
+QWEN3_5_NVFP4_Q_DIM = QWEN3_5_NVFP4_NUM_Q_HEADS * QWEN3_5_NVFP4_HEAD_DIM
+QWEN3_5_NVFP4_Q_RAW_DIM = 2 * QWEN3_5_NVFP4_Q_DIM
+QWEN3_5_NVFP4_KV_DIM = QWEN3_5_NVFP4_NUM_KV_HEADS * QWEN3_5_NVFP4_HEAD_DIM
+QWEN3_5_NVFP4_KV_GROUP_SIZE = QWEN3_5_NVFP4_NUM_Q_HEADS // QWEN3_5_NVFP4_NUM_KV_HEADS
+QWEN3_5_NVFP4_DECODE_S = 1
+QWEN3_5_NVFP4_EPS = 1e-6
+QWEN3_5_NVFP4_GROUP_SIZE = 32
+QWEN3_5_NVFP4_DN_NUM_HEADS = 16
+QWEN3_5_NVFP4_DN_KEY_DIM = 128
+QWEN3_5_NVFP4_DN_VALUE_DIM = 128
+QWEN3_5_NVFP4_DN_QK_SIZE = QWEN3_5_NVFP4_DN_NUM_HEADS * QWEN3_5_NVFP4_DN_KEY_DIM
+QWEN3_5_NVFP4_DN_V_SIZE = QWEN3_5_NVFP4_DN_NUM_HEADS * QWEN3_5_NVFP4_DN_VALUE_DIM
+QWEN3_5_NVFP4_DN_CONV_CHANNELS = 2 * QWEN3_5_NVFP4_DN_QK_SIZE + QWEN3_5_NVFP4_DN_V_SIZE
+QWEN3_5_NVFP4_DN_CONV_KERNEL = 4
+QWEN3_5_NVFP4_MATVEC_BLOCK = 16
+QWEN3_5_NVFP4_FLASH_ATTN_MIN_CONTEXT = 4096
+QWEN3_5_NVFP4_FP32_NEG_INF = -3.4028234663852886e38
+QWEN3_5_NVFP4_ATTN_SCALE = 0.0625
+QWEN3_5_LAYER_TYPES = ("linear_attention", "linear_attention", "linear_attention", "full_attention") * 6
 
 
 @cute.jit
@@ -151,7 +146,7 @@ def _schedule_nvfp4_quad_projection(
 
 
 class Qwen3_5DeltaNetCoreSm120Op(Op):
-    """Native real-Qwen3.5 DeltaNet decode recurrence core.
+    """Native Qwen3.5 DeltaNet decode recurrence core.
 
     Inputs are the already-projected decode vectors for one token:
     ``qkv`` contains raw Q, K, V convolution channels; ``z`` is the output
@@ -189,7 +184,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["page_size"] = page_size
         op.static_dims["barrier_signal_y_alias_H"] = "V"
-        op.static_dims["barrier_signal_y_tile_size_H"] = QWEN3_5_REAL_DN_VALUE_DIM
+        op.static_dims["barrier_signal_y_tile_size_H"] = QWEN3_5_NVFP4_DN_VALUE_DIM
         return [op]
 
     @cute.jit
@@ -200,7 +195,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
     def _k_ptr(self, page_ptr):
         return cute.make_ptr(
             cutlass.Float32,
-            page_ptr + Int32(QWEN3_5_REAL_DN_KEY_DIM * 4),
+            page_ptr + Int32(QWEN3_5_NVFP4_DN_KEY_DIM * 4),
             cute.AddressSpace.smem,
         )
 
@@ -208,7 +203,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
     def _v_ptr(self, page_ptr):
         return cute.make_ptr(
             cutlass.Float32,
-            page_ptr + Int32(2 * QWEN3_5_REAL_DN_KEY_DIM * 4),
+            page_ptr + Int32(2 * QWEN3_5_NVFP4_DN_KEY_DIM * 4),
             cute.AddressSpace.smem,
         )
 
@@ -222,22 +217,22 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
         row_idx = tile_S * Int32(self.tile_size_S)
         head = tile_H
 
-        q_s = cute.make_tensor(self._q_ptr(page_ptr), cute.make_layout(QWEN3_5_REAL_DN_KEY_DIM))
-        k_s = cute.make_tensor(self._k_ptr(page_ptr), cute.make_layout(QWEN3_5_REAL_DN_KEY_DIM))
-        v_s = cute.make_tensor(self._v_ptr(page_ptr), cute.make_layout(QWEN3_5_REAL_DN_VALUE_DIM))
+        q_s = cute.make_tensor(self._q_ptr(page_ptr), cute.make_layout(QWEN3_5_NVFP4_DN_KEY_DIM))
+        k_s = cute.make_tensor(self._k_ptr(page_ptr), cute.make_layout(QWEN3_5_NVFP4_DN_KEY_DIM))
+        v_s = cute.make_tensor(self._v_ptr(page_ptr), cute.make_layout(QWEN3_5_NVFP4_DN_VALUE_DIM))
 
         if row_idx < Int32(self.S):
             qkv_base = tile_B * Int32(self.qkv_stride_B) + row_idx * Int32(self.qkv_stride_S)
             conv_base = tile_B * Int32(self.conv_buf_stride_B)
             regions = Int32(0)
             while regions < Int32(3):
-                ch_count = Int32(QWEN3_5_REAL_DN_KEY_DIM)
-                head_offset = head * Int32(QWEN3_5_REAL_DN_KEY_DIM)
+                ch_count = Int32(QWEN3_5_NVFP4_DN_KEY_DIM)
+                head_offset = head * Int32(QWEN3_5_NVFP4_DN_KEY_DIM)
                 if regions == Int32(1):
-                    head_offset = Int32(QWEN3_5_REAL_DN_QK_SIZE) + head * Int32(QWEN3_5_REAL_DN_KEY_DIM)
+                    head_offset = Int32(QWEN3_5_NVFP4_DN_QK_SIZE) + head * Int32(QWEN3_5_NVFP4_DN_KEY_DIM)
                 if regions == Int32(2):
-                    head_offset = Int32(2 * QWEN3_5_REAL_DN_QK_SIZE) + head * Int32(QWEN3_5_REAL_DN_VALUE_DIM)
-                    ch_count = Int32(QWEN3_5_REAL_DN_VALUE_DIM)
+                    head_offset = Int32(2 * QWEN3_5_NVFP4_DN_QK_SIZE) + head * Int32(QWEN3_5_NVFP4_DN_VALUE_DIM)
+                    ch_count = Int32(QWEN3_5_NVFP4_DN_VALUE_DIM)
                 elem = tidx
                 while elem < ch_count:
                     ch = head_offset + elem
@@ -278,27 +273,27 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
             if warp_idx == Int32(0):
                 ss = Float32(0.0)
                 i = lane_idx
-                while i < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while i < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     qv = q_s[i]
                     ss = ss + qv * qv
                     i = i + Int32(32)
                 ss = cute.arch.warp_reduction(ss, operator.add)
                 n = cute.math.rsqrt(ss + Float32(1.0e-6), fastmath=True) * Float32(0.08838834764831845)
                 i2 = lane_idx
-                while i2 < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while i2 < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     q_s[i2] = q_s[i2] * n
                     i2 = i2 + Int32(32)
             if warp_idx == Int32(1):
                 ss_k = Float32(0.0)
                 ik = lane_idx
-                while ik < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while ik < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     kv = k_s[ik]
                     ss_k = ss_k + kv * kv
                     ik = ik + Int32(32)
                 ss_k = cute.arch.warp_reduction(ss_k, operator.add)
                 nk = cute.math.rsqrt(ss_k + Float32(1.0e-6), fastmath=True)
                 ik2 = lane_idx
-                while ik2 < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while ik2 < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     k_s[ik2] = k_s[ik2] * nk
                     ik2 = ik2 + Int32(32)
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
@@ -325,7 +320,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
 
             kq = Float32(0.0)
             kk = lane_idx
-            while kk < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+            while kk < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                 kq = kq + k_s[kk] * q_s[kk]
                 kk = kk + Int32(32)
             kq = cute.arch.warp_reduction(kq, operator.add)
@@ -344,15 +339,15 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
             out_base = (
                 tile_B * Int32(self.y_stride_B)
                 + row_idx * Int32(self.y_stride_S)
-                + head * Int32(QWEN3_5_REAL_DN_VALUE_DIM)
+                + head * Int32(QWEN3_5_NVFP4_DN_VALUE_DIM)
             )
             y_row = cute.make_tensor(y.iterator + out_base, cute.make_layout(self.D))
             j = warp_idx
-            while j < Int32(QWEN3_5_REAL_DN_VALUE_DIM):
+            while j < Int32(QWEN3_5_NVFP4_DN_VALUE_DIM):
                 stk = Float32(0.0)
                 sqv = Float32(0.0)
                 i3 = lane_idx
-                while i3 < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while i3 < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     st = state_head[(Int32(j), i3)]
                     stk = stk + st * k_s[i3]
                     sqv = sqv + st * q_s[i3]
@@ -362,7 +357,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
                 err = (v_s[Int32(j)] - stk) * beta_h
                 o_j = decay * sqv + err * kq
                 i4 = lane_idx
-                while i4 < Int32(QWEN3_5_REAL_DN_KEY_DIM):
+                while i4 < Int32(QWEN3_5_NVFP4_DN_KEY_DIM):
                     st_old = state_head[(Int32(j), i4)]
                     state_head[(Int32(j), i4)] = st_old * decay + k_s[i4] * err
                     i4 = i4 + Int32(32)
@@ -374,7 +369,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
             # Output RMS + z gate in-place on this head's value vector.
             sq_out = Float32(0.0)
             jj = tidx
-            while jj < Int32(QWEN3_5_REAL_DN_VALUE_DIM):
+            while jj < Int32(QWEN3_5_NVFP4_DN_VALUE_DIM):
                 ov = y_row[jj].to(Float32)
                 sq_out = sq_out + ov * ov
                 jj = jj + Int32(self.threads_per_row)
@@ -391,7 +386,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
                 total = cute.arch.warp_reduction(total, operator.add)
                 if lane_idx == Int32(0):
                     q_s[Int32(0)] = cute.math.rsqrt(
-                        total * Float32(1.0 / QWEN3_5_REAL_DN_VALUE_DIM) + Float32(QWEN3_5_REAL_EPS),
+                        total * Float32(1.0 / QWEN3_5_NVFP4_DN_VALUE_DIM) + Float32(QWEN3_5_NVFP4_EPS),
                         fastmath=True,
                     )
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
@@ -402,8 +397,8 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
             )
             norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.D))
             j2 = tidx
-            while j2 < Int32(QWEN3_5_REAL_DN_VALUE_DIM):
-                idx = head * Int32(QWEN3_5_REAL_DN_VALUE_DIM) + j2
+            while j2 < Int32(QWEN3_5_NVFP4_DN_VALUE_DIM):
+                idx = head * Int32(QWEN3_5_NVFP4_DN_VALUE_DIM) + j2
                 ov = y_row[j2].to(Float32)
                 gate = _silu(z_row[idx].to(Float32))
                 y_row[j2] = (ov * rstd * norm_row[j2].to(Float32) * gate).to(self.y_dtype)
@@ -411,7 +406,7 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
 
 
 class Qwen3_5SingleTokenAttentionSm120Op(Op):
-    """Native S=1 decode attention for real Qwen3.5 full-attention layers."""
+    """Native S=1 decode attention for Qwen3.5 full-attention layers."""
 
     framework_owned_ranges = True
     reads = {
@@ -474,7 +469,7 @@ class Qwen3_5SingleTokenAttentionSm120Op(Op):
         )
         q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.HD))
 
-        row_max = Float32(-3.4028234663852886e38)
+        row_max = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
         n = warp_idx
         while n < Int32(self.T):
             k_base = (
@@ -488,7 +483,7 @@ class Qwen3_5SingleTokenAttentionSm120Op(Op):
             while d < Int32(self.HD):
                 acc = acc + q_row[d].to(Float32) * k_row[d].to(Float32)
                 d = d + Int32(32)
-            score = cute.arch.warp_reduction(acc, operator.add) * Float32(0.0625)
+            score = cute.arch.warp_reduction(acc, operator.add) * Float32(QWEN3_5_NVFP4_ATTN_SCALE)
             if lane_idx == Int32(0):
                 scores[n] = score
                 if score > row_max:
@@ -499,7 +494,7 @@ class Qwen3_5SingleTokenAttentionSm120Op(Op):
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
         if warp_idx == Int32(0):
-            partial_max = Float32(-3.4028234663852886e38)
+            partial_max = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
             w = lane_idx
             while w < Int32(num_warps):
                 val = scratch[w]
@@ -592,7 +587,8 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
         )
         q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.HD))
 
-        row_max = Float32(-3.4028234663852886e38)
+        # Phase 1: compute QK scores and each warp's local softmax max.
+        row_max = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
         n = warp_idx
         while n < Int32(self.T):
             k_base = (
@@ -606,7 +602,7 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
             while d < Int32(self.HD):
                 acc = acc + q_row[d].to(Float32) * k_row[d].to(Float32)
                 d = d + Int32(32)
-            score = cute.arch.warp_reduction(acc, operator.add) * Float32(0.0625)
+            score = cute.arch.warp_reduction(acc, operator.add) * Float32(QWEN3_5_NVFP4_ATTN_SCALE)
             if lane_idx == Int32(0):
                 scores[n] = score
                 if score > row_max:
@@ -616,8 +612,9 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
             scratch[warp_idx] = row_max
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        # Phase 2: reduce warp-local maxima to a row max for stable softmax.
         if warp_idx == Int32(0):
-            partial_max = Float32(-3.4028234663852886e38)
+            partial_max = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
             w = lane_idx
             while w < Int32(num_warps):
                 val = scratch[w]
@@ -629,6 +626,7 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
                 scratch[Int32(0)] = row_max
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        # Phase 3: compute exp(score - row_max) partial sums per warp.
         rmax = scratch[Int32(0)]
         row_sum_part = Float32(0.0)
         n2 = warp_idx * Int32(32) + lane_idx
@@ -640,6 +638,7 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
             scratch[warp_idx] = row_sum_part
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        # Phase 4: reduce the softmax denominator and store its reciprocal.
         if warp_idx == Int32(0):
             row_sum = Float32(0.0)
             w2 = lane_idx
@@ -651,6 +650,7 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
                 scratch[Int32(1)] = Float32(1.0) / row_sum
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        # Phase 5: normalize scores in shared memory to probabilities.
         rinv = scratch[Int32(1)]
         n_prob = tidx
         while n_prob < Int32(self.T):
@@ -658,6 +658,7 @@ class Qwen3_5GatedSingleTokenAttentionSm120Op(Qwen3_5SingleTokenAttentionSm120Op
             n_prob = n_prob + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        # Phase 6: accumulate softmax(QK) V, apply sigmoid gate, and store.
         out_base = (
             tile_B * Int32(self.o_stride_B)
             + tile_QH * Int32(self.o_stride_QH)
@@ -805,7 +806,7 @@ class Qwen3_5StagedPartialAttentionSm120Op(Op):
         q_base = tile_B * Int32(self.q_stride_B) + tile_QH * Int32(self.q_stride_QH)
         q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(self.HD))
 
-        local_max = Float32(-3.4028234663852886e38)
+        local_max = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
         local_t = warp_idx
         while local_t < Int32(self.tile_size_T):
             global_t = start_t + local_t
@@ -823,9 +824,9 @@ class Qwen3_5StagedPartialAttentionSm120Op(Op):
                     kval = k_row[d].to(Float32)
                 acc = acc + q_row[d].to(Float32) * kval
                 d = d + Int32(32)
-            score = cute.arch.warp_reduction(acc, operator.add) * Float32(0.0625)
+            score = cute.arch.warp_reduction(acc, operator.add) * Float32(QWEN3_5_NVFP4_ATTN_SCALE)
             if global_t >= Int32(self.T):
-                score = Float32(-3.4028234663852886e38)
+                score = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
             if lane_idx == Int32(0):
                 scores[local_t] = score
                 if score > local_max:
@@ -836,7 +837,7 @@ class Qwen3_5StagedPartialAttentionSm120Op(Op):
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
         if warp_idx == Int32(0):
-            max_part = Float32(-3.4028234663852886e38)
+            max_part = Float32(QWEN3_5_NVFP4_FP32_NEG_INF)
             w = lane_idx
             while w < Int32(num_warps):
                 val = scratch[w]
@@ -919,7 +920,7 @@ def schedule_qwen3_5_staged_attention_sm120(
     k,
     v,
     o,
-    kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
+    kv_group_size=QWEN3_5_NVFP4_KV_GROUP_SIZE,
     context_block=16,
     page_size=DEFAULT_PAGE_SIZE,
 ):
@@ -1016,7 +1017,7 @@ def schedule_qwen3_5_flash_decode_attention_sm120(
     k,
     v,
     o,
-    kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
+    kv_group_size=QWEN3_5_NVFP4_KV_GROUP_SIZE,
     page_size=DEFAULT_PAGE_SIZE,
     num_splits=0,
 ):
@@ -1216,7 +1217,7 @@ class Qwen3_5QGateRopeCacheSm120Op(Op):
                 ss_q = ss_q + qv * qv
                 d = d + Int32(1)
             scratch[tidx] = cute.math.rsqrt(
-                ss_q * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_REAL_EPS),
+                ss_q * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_NVFP4_EPS),
                 fastmath=True,
             )
         if tidx < Int32(self.kv_heads):
@@ -1228,7 +1229,7 @@ class Qwen3_5QGateRopeCacheSm120Op(Op):
                 ss_k = ss_k + kv * kv
                 kd = kd + Int32(1)
             scratch[Int32(self.q_heads) + tidx] = cute.math.rsqrt(
-                ss_k * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_REAL_EPS),
+                ss_k * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_NVFP4_EPS),
                 fastmath=True,
             )
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
@@ -1340,11 +1341,11 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
     dn_state,
     conv_buf,
     page_size=DEFAULT_PAGE_SIZE,
-    group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
-    matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    group_size=QWEN3_5_NVFP4_GROUP_SIZE,
+    matvec_block=QWEN3_5_NVFP4_MATVEC_BLOCK,
     prefetch_gate_up=True,
 ) -> DecodeLayerScheduleSm120:
-    """Schedule one real Qwen3.5 DeltaNet layer with native packed NVFP4 ops.
+    """Schedule one Qwen3.5 DeltaNet layer with native packed NVFP4 ops.
 
     This is the linear-attention layer path. All dense projections are scheduled
     as Machete ops; the recurrent DeltaNet body is a single CuTe DSL op that
@@ -1381,12 +1382,12 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
         y=norm_buf,
         tile_sizes={"S": seq_len},
         page_size=page_size,
-        eps=QWEN3_5_REAL_EPS,
+        eps=QWEN3_5_NVFP4_EPS,
     )
     q0 = 0
-    k0 = QWEN3_5_REAL_DN_QK_SIZE
-    v0 = 2 * QWEN3_5_REAL_DN_QK_SIZE
-    end = QWEN3_5_REAL_DN_CONV_CHANNELS
+    k0 = QWEN3_5_NVFP4_DN_QK_SIZE
+    v0 = 2 * QWEN3_5_NVFP4_DN_QK_SIZE
+    end = QWEN3_5_NVFP4_DN_CONV_CHANNELS
     qkv_q_buf = _last_dim_slice(qkv_buf, q0, k0)
     qkv_k_buf = _last_dim_slice(qkv_buf, k0, v0)
     qkv_v_buf = _last_dim_slice(qkv_buf, v0, end)
@@ -1455,7 +1456,7 @@ def schedule_qwen3_5_deltanet_nvfp4_sm120(
         y=mlp_h_buf,
         tile_sizes={"S": seq_len, "D": matvec_block},
         page_size=page_size,
-        eps=QWEN3_5_REAL_EPS,
+        eps=QWEN3_5_NVFP4_EPS,
         group_size=group_size,
         prefetch_nvfp4=prefetch_gate_up,
     )
@@ -1501,13 +1502,13 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
     attn_out_buf,
     mlp_h_buf,
     page_size=DEFAULT_PAGE_SIZE,
-    group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
+    group_size=QWEN3_5_NVFP4_GROUP_SIZE,
     fa_num_splits=0,
     use_flash_attention=False,
-    matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    matvec_block=QWEN3_5_NVFP4_MATVEC_BLOCK,
     prefetch_gate_up=True,
 ) -> DecodeLayerScheduleSm120:
-    """Schedule one real Qwen3.5 full-attention layer with packed NVFP4 weights.
+    """Schedule one Qwen3.5 full-attention layer with packed NVFP4 weights.
 
     Expected packed-weight keys for ``layer_idx``:
     ``W_q_nvfp4``, ``W_k_nvfp4``, ``W_v_nvfp4``, ``W_o_nvfp4``,
@@ -1521,15 +1522,15 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
         cos = weights["cos"][cache_pos : cache_pos + seq_len]
         sin = weights["sin"][cache_pos : cache_pos + seq_len]
         if q_raw_buf is None:
-            q_raw_buf = torch.empty(batch, seq_len, QWEN3_5_REAL_Q_RAW_DIM, dtype=q_buf.dtype, device=q_buf.device)
+            q_raw_buf = torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_RAW_DIM, dtype=q_buf.dtype, device=q_buf.device)
         if kv_raw_buf is None:
-            kv_raw_buf = torch.empty(batch, seq_len, 2 * QWEN3_5_REAL_KV_DIM, dtype=q_buf.dtype, device=q_buf.device)
+            kv_raw_buf = torch.empty(batch, seq_len, 2 * QWEN3_5_NVFP4_KV_DIM, dtype=q_buf.dtype, device=q_buf.device)
         if q_gate_buf is None:
             q_gate_buf = torch.empty_like(q_buf)
-        q_4d = q_buf.view(batch, seq_len, QWEN3_5_REAL_NUM_Q_HEADS, QWEN3_5_REAL_HEAD_DIM)
+        q_4d = q_buf.view(batch, seq_len, QWEN3_5_NVFP4_NUM_Q_HEADS, QWEN3_5_NVFP4_HEAD_DIM)
         k_window = k_cache[:, : cache_pos + seq_len]
         v_window = v_cache[:, : cache_pos + seq_len]
-        o_4d = attn_out_buf.view(batch, seq_len, QWEN3_5_REAL_NUM_Q_HEADS, QWEN3_5_REAL_HEAD_DIM)
+        o_4d = attn_out_buf.view(batch, seq_len, QWEN3_5_NVFP4_NUM_Q_HEADS, QWEN3_5_NVFP4_HEAD_DIM)
 
         def qparts(name):
             qweight = weights[f"{pfx}.{name}_nvfp4"]
@@ -1544,8 +1545,8 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
         down_packed, down_scales = qparts("W_down")
 
         ops = []
-        k_raw_buf = kv_raw_buf[:, :, :QWEN3_5_REAL_KV_DIM]
-        v_raw_buf = kv_raw_buf[:, :, QWEN3_5_REAL_KV_DIM : 2 * QWEN3_5_REAL_KV_DIM]
+        k_raw_buf = kv_raw_buf[:, :, :QWEN3_5_NVFP4_KV_DIM]
+        v_raw_buf = kv_raw_buf[:, :, QWEN3_5_NVFP4_KV_DIM : 2 * QWEN3_5_NVFP4_KV_DIM]
 
         ops += RmsAddNormSm120Op.schedule(
             x=x_in,
@@ -1555,7 +1556,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             y=norm_buf,
             tile_sizes={"S": seq_len},
             page_size=page_size,
-            eps=QWEN3_5_REAL_EPS,
+            eps=QWEN3_5_NVFP4_EPS,
         )
         ops += MatvecNvfp4Sm120Op.schedule(
             a=norm_buf,
@@ -1607,7 +1608,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
                 k=k_window,
                 v=v_window,
                 o=o_4d,
-                kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
+                kv_group_size=QWEN3_5_NVFP4_KV_GROUP_SIZE,
                 page_size=page_size,
                 num_splits=fa_num_splits,
             )
@@ -1619,7 +1620,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
                 v=v_window,
                 gate=q_gate_buf,
                 o=o_4d,
-                kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
+                kv_group_size=QWEN3_5_NVFP4_KV_GROUP_SIZE,
                 page_size=page_size,
             )
         if use_flash_attention:
@@ -1648,7 +1649,7 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
             y=mlp_h_buf,
             tile_sizes={"S": seq_len, "D": matvec_block},
             page_size=page_size,
-            eps=QWEN3_5_REAL_EPS,
+            eps=QWEN3_5_NVFP4_EPS,
             group_size=group_size,
             prefetch_nvfp4=prefetch_gate_up,
         )
@@ -1686,15 +1687,15 @@ def schedule_qwen3_5_full_attention_nvfp4_sm120(
         attn_out_buf=attn_out_buf,
         mlp_h_buf=mlp_h_buf,
         page_size=page_size,
-        eps=QWEN3_5_REAL_EPS,
+        eps=QWEN3_5_NVFP4_EPS,
         group_size=group_size,
         fa_num_splits=fa_num_splits,
-        hidden_size=QWEN3_5_REAL_HIDDEN,
-        intermediate_size=QWEN3_5_REAL_INTERMEDIATE,
-        num_q_heads=QWEN3_5_REAL_NUM_Q_HEADS,
-        num_kv_heads=QWEN3_5_REAL_NUM_KV_HEADS,
-        head_dim=QWEN3_5_REAL_HEAD_DIM,
-        kv_group_size=QWEN3_5_REAL_KV_GROUP_SIZE,
+        hidden_size=QWEN3_5_NVFP4_HIDDEN,
+        intermediate_size=QWEN3_5_NVFP4_INTERMEDIATE,
+        num_q_heads=QWEN3_5_NVFP4_NUM_Q_HEADS,
+        num_kv_heads=QWEN3_5_NVFP4_NUM_KV_HEADS,
+        head_dim=QWEN3_5_NVFP4_HEAD_DIM,
+        kv_group_size=QWEN3_5_NVFP4_KV_GROUP_SIZE,
         matvec_block=matvec_block,
     )
 
@@ -1713,9 +1714,9 @@ def schedule_qwen3_5_final_nvfp4_sm120(
     top_partial_indices=None,
     seq_len,
     page_size=DEFAULT_PAGE_SIZE,
-    group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
+    group_size=QWEN3_5_NVFP4_GROUP_SIZE,
 ):
-    """Schedule final residual plus packed NVFP4 LM head for real Qwen3.5."""
+    """Schedule final residual plus packed NVFP4 LM head for Qwen3.5."""
 
     return schedule_final_nvfp4_sm120(
         x=x,
@@ -1730,7 +1731,7 @@ def schedule_qwen3_5_final_nvfp4_sm120(
         top_partial_indices=top_partial_indices,
         seq_len=seq_len,
         page_size=page_size,
-        eps=QWEN3_5_REAL_EPS,
+        eps=QWEN3_5_NVFP4_EPS,
         group_size=group_size,
     )
 
@@ -1739,14 +1740,14 @@ def _layer_resource(resource, layer_idx, slot=None):
     if isinstance(resource, (list, tuple)):
         return resource[layer_idx if slot is None else slot]
     if hasattr(resource, "dim") and resource.dim() > 0:
-        if slot is not None and resource.shape[0] == QWEN3_5_REAL_LAYER_TYPES.count("linear_attention"):
+        if slot is not None and resource.shape[0] == QWEN3_5_LAYER_TYPES.count("linear_attention"):
             return resource[slot]
-        if resource.shape[0] == QWEN3_5_REAL_NUM_LAYERS:
+        if resource.shape[0] == QWEN3_5_NVFP4_NUM_LAYERS:
             return resource[layer_idx]
     return resource
 
 
-def schedule_qwen3_5_real_nvfp4_decode_sm120(
+def schedule_qwen3_5_nvfp4_decode_sm120(
     *,
     batch,
     seq_len,
@@ -1778,13 +1779,13 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     top_partial_values=None,
     top_partial_indices=None,
     page_size=DEFAULT_PAGE_SIZE,
-    group_size=QWEN3_5_REAL_NVFP4_GROUP_SIZE,
+    group_size=QWEN3_5_NVFP4_GROUP_SIZE,
     fa_num_splits=0,
     use_flash_attention=False,
-    matvec_block=QWEN3_5_REAL_MATVEC_BLOCK,
+    matvec_block=QWEN3_5_NVFP4_MATVEC_BLOCK,
     prefetch_gate_up=True,
 ):
-    """Build the full 24-layer real Qwen3.5 NVFP4 decode schedule.
+    """Build the full 24-layer Qwen3.5 NVFP4 decode schedule.
 
     ``x_buffers`` and ``residual_buffers`` must contain one entry per layer
     boundary: index 0 is model input state and index 24 is final layer output.
@@ -1792,16 +1793,16 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
     lists/tensors on their leading dimension.
     """
 
-    if len(x_buffers) < QWEN3_5_REAL_NUM_LAYERS + 1:
+    if len(x_buffers) < QWEN3_5_NVFP4_NUM_LAYERS + 1:
         raise ValueError("x_buffers must contain 25 layer-boundary tensors")
-    if len(residual_buffers) < QWEN3_5_REAL_NUM_LAYERS + 1:
+    if len(residual_buffers) < QWEN3_5_NVFP4_NUM_LAYERS + 1:
         raise ValueError("residual_buffers must contain 25 layer-boundary tensors")
 
     ops = []
     keep = []
     attention_configs = []
     linear_slot = 0
-    for layer_idx, layer_type in enumerate(QWEN3_5_REAL_LAYER_TYPES):
+    for layer_idx, layer_type in enumerate(QWEN3_5_LAYER_TYPES):
         if layer_type == "full_attention":
             layer = schedule_qwen3_5_full_attention_nvfp4_sm120(
                 layer_idx=layer_idx,
@@ -1862,9 +1863,9 @@ def schedule_qwen3_5_real_nvfp4_decode_sm120(
 
     if final_norm is not None:
         final_ops = schedule_qwen3_5_final_nvfp4_sm120(
-            x=x_buffers[QWEN3_5_REAL_NUM_LAYERS],
-            residual_in=residual_buffers[QWEN3_5_REAL_NUM_LAYERS],
-            residual_out=residual_buffers[QWEN3_5_REAL_NUM_LAYERS],
+            x=x_buffers[QWEN3_5_NVFP4_NUM_LAYERS],
+            residual_in=residual_buffers[QWEN3_5_NVFP4_NUM_LAYERS],
+            residual_out=residual_buffers[QWEN3_5_NVFP4_NUM_LAYERS],
             final_norm=final_norm,
             lm_head_nvfp4=lm_head_nvfp4,
             logits=logits,
@@ -1892,28 +1893,28 @@ __all__ = [
     "Qwen3_5GatedSingleTokenAttentionSm120Op",
     "Qwen3_5QkvRopeCacheSm120Op",
     "Qwen3_5SingleTokenAttentionSm120Op",
-    "QWEN3_5_REAL_DECODE_S",
-    "QWEN3_5_REAL_DN_CONV_CHANNELS",
-    "QWEN3_5_REAL_DN_CONV_KERNEL",
-    "QWEN3_5_REAL_DN_NUM_HEADS",
-    "QWEN3_5_REAL_DN_VALUE_DIM",
-    "QWEN3_5_REAL_DN_V_SIZE",
-    "QWEN3_5_REAL_EPS",
-    "QWEN3_5_REAL_HEAD_DIM",
-    "QWEN3_5_REAL_HIDDEN",
-    "QWEN3_5_REAL_INTERMEDIATE",
-    "QWEN3_5_REAL_KV_DIM",
-    "QWEN3_5_REAL_KV_GROUP_SIZE",
-    "QWEN3_5_REAL_LAYER_TYPES",
-    "QWEN3_5_REAL_NUM_KV_HEADS",
-    "QWEN3_5_REAL_NUM_LAYERS",
-    "QWEN3_5_REAL_NUM_Q_HEADS",
-    "QWEN3_5_REAL_Q_DIM",
-    "QWEN3_5_REAL_Q_RAW_DIM",
-    "QWEN3_5_REAL_ROTARY_D2",
-    "QWEN3_5_REAL_VOCAB",
+    "QWEN3_5_NVFP4_DECODE_S",
+    "QWEN3_5_NVFP4_DN_CONV_CHANNELS",
+    "QWEN3_5_NVFP4_DN_CONV_KERNEL",
+    "QWEN3_5_NVFP4_DN_NUM_HEADS",
+    "QWEN3_5_NVFP4_DN_VALUE_DIM",
+    "QWEN3_5_NVFP4_DN_V_SIZE",
+    "QWEN3_5_NVFP4_EPS",
+    "QWEN3_5_NVFP4_HEAD_DIM",
+    "QWEN3_5_NVFP4_HIDDEN",
+    "QWEN3_5_NVFP4_INTERMEDIATE",
+    "QWEN3_5_NVFP4_KV_DIM",
+    "QWEN3_5_NVFP4_KV_GROUP_SIZE",
+    "QWEN3_5_LAYER_TYPES",
+    "QWEN3_5_NVFP4_NUM_KV_HEADS",
+    "QWEN3_5_NVFP4_NUM_LAYERS",
+    "QWEN3_5_NVFP4_NUM_Q_HEADS",
+    "QWEN3_5_NVFP4_Q_DIM",
+    "QWEN3_5_NVFP4_Q_RAW_DIM",
+    "QWEN3_5_NVFP4_ROTARY_D2",
+    "QWEN3_5_NVFP4_VOCAB",
     "schedule_qwen3_5_final_nvfp4_sm120",
     "schedule_qwen3_5_deltanet_nvfp4_sm120",
     "schedule_qwen3_5_full_attention_nvfp4_sm120",
-    "schedule_qwen3_5_real_nvfp4_decode_sm120",
+    "schedule_qwen3_5_nvfp4_decode_sm120",
 ]

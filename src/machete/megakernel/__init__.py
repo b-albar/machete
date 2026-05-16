@@ -19,6 +19,7 @@ from .ops import (
     DEFAULT_PAGE_SIZE,
     InstructionPageProtocol,
     Op,
+    StreamingPipelineOpMixin,
     PageRole,
     PipelineABI,
     PipelineSpec,
@@ -80,6 +81,7 @@ from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
 __all__ = [
     # Operation Protocol
     "Op",
+    "StreamingPipelineOpMixin",
     "PageRole",
     "SemaphoreRole",
     "InstructionPageProtocol",

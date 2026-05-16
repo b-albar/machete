@@ -30,9 +30,8 @@ from machete.megakernel.interpreter import (
 )
 from machete.megakernel.ops import (
     DEFAULT_PAGE_SIZE,
-    PipelineABI,
-    PipelineSpec,
     Op,
+    StreamingPipelineOpMixin,
     config_dim_i32,
 )
 
@@ -55,21 +54,19 @@ QWEN3_5_GATE_UP_TILE = {"S": 16, "N": 128, "K": 32}
 QWEN3_5_REDUCTION_DIM_PER_WARP = 512
 
 
-class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
+class Qwen3_5StagedDecodeGemmSm120Op(StreamingPipelineOpMixin, GemmOp):
     """Decode GEMM with loader-owned staged K streaming.
 
     The load warp streams every K block and the MMA warps consume the
     double-buffered stream through op-local mbarriers.
     """
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
-
     @cute.jit
     def load(self, page_ptr, tile_B, tile_S, tile_N,
              a_tma, a_tma_gmem, a_scale_tma, a_scale_tma_gmem,
              b_tma, b_tma_gmem,
              work_mbar):
+        # Phase 1: initialize double-buffer barriers for the staged K stream.
         swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
 
         bf_0 = page_ptr + Int32(self.mbar_offset)
@@ -86,6 +83,7 @@ class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
 
         k_block = Int32(0)
         while k_block < Int32(self.num_k_blocks):
+            # Phase 2: wait for compute to release the next A/B staging buffer.
             buf_idx = k_block % Int32(2)
             buf_base = page_ptr + buf_idx * Int32(self.buf_stride)
 
@@ -96,6 +94,7 @@ class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
                 if buf_idx == Int32(1):
                     mbarrier_wait(bf_1, bf_phase)
 
+            # Phase 3: bind the activation, optional scale, and weight TMA tiles.
             sA_ptr = cute.recast_ptr(
                 cute.make_ptr(self.a_dtype, buf_base, cute.AddressSpace.smem),
                 swz,
@@ -176,6 +175,8 @@ class Qwen3_5StagedDecodeGemmSm120Op(GemmOp):
                 cute.group_modes(gB, 0, 2),
             )
 
+            # Phase 4: issue the first TMA wave on the framework barrier, then
+            # continue on op-local ready barriers for subsequent K blocks.
             if k_block < Int32(2):
                 mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
                 if k_block == Int32(0):
@@ -289,6 +290,7 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
     def load(self, page_ptr, tile_B, tile_S, tile_N,
              a, residual_in, norm_weight, residual_out,
              b_tma, b_tma_gmem, work_mbar):
+        # Phase 1: initialize barriers and compute residual-add RMS stats.
         swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
 
         bf_0 = page_ptr + Int32(self.mbar_offset)
@@ -338,6 +340,7 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
 
         k_block = Int32(0)
         while k_block < Int32(self.num_k_blocks):
+            # Phase 2: wait for compute to release the next normalized-A/B buffer.
             buf_idx = k_block % Int32(2)
             buf_base = page_ptr + buf_idx * Int32(self.buf_stride)
 
@@ -348,6 +351,7 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
                 if buf_idx == Int32(1):
                     mbarrier_wait(bf_1, bf_phase)
 
+            # Phase 3: materialize the normalized activation K block into smem.
             sA = cute.make_tensor(
                 cute.recast_ptr(
                     cute.make_ptr(self.a_dtype, buf_base, cute.AddressSpace.smem),
@@ -378,6 +382,7 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
                         sA[(local_k, local_row, Int32(0))] = val.to(self.a_dtype)
                     local_k = local_k + Int32(32)
 
+            # Phase 4: bind and stream the matching weight K block.
             sB_ptr = cute.recast_ptr(
                 cute.make_ptr(
                     self.b_dtype,
@@ -426,7 +431,7 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
             k_block = k_block + Int32(1)
 
 
-class Qwen3_5RangedLmHeadSm120Op(Op):
+class Qwen3_5RangedLmHeadSm120Op(StreamingPipelineOpMixin, Op):
     """Decode LM-head matvec with staged TMA weight tiles.
 
     Each instruction owns one 16-vocab block. The load warp stages the
@@ -434,8 +439,6 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
     warps then reuse that staged tile for all decode rows.
     """
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
     reads = {
         "h": (None, ("B", "S", "K")),
         "weight": (None, ("N", "K")),
@@ -476,6 +479,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_N, tile_3, weight_tma, weight_tma_gmem, work_mbar):
+        # Phase 1: initialize the double-buffer ownership and TMA-ready barriers.
         bf_0 = page_ptr + Int32(self.mbar_offset)
         bf_1 = page_ptr + Int32(self.mbar_offset + 8)
         kr_0 = page_ptr + Int32(self.mbar_offset + 16)
@@ -493,6 +497,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
         block_idx = tile_N
         iter_idx = Int32(0)
         while block_idx < tile_3:
+            # Phase 2: wait until compute releases the buffer we are about to refill.
             buf_idx = iter_idx % Int32(2)
             buf_base = page_ptr + buf_idx * Int32(self.staged_weight_bytes)
 
@@ -503,6 +508,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
                 if buf_idx == Int32(1):
                     mbarrier_wait(bf_1, bf_phase)
 
+            # Phase 3: describe the staged weight tile and matching global TMA tile.
             sW = cute.make_tensor(
                 cute.make_ptr(self.weight_dtype, buf_base, cute.AddressSpace.smem, assumed_align=128),
                 cute.make_layout((self.K, self.tile_size_N), stride=(1, self.K)),
@@ -520,6 +526,9 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
                 cute.group_modes(gW, 0, 2),
             )
             nbytes = Int32(self.staged_weight_bytes)
+
+            # Phase 4: issue the first load on the framework-provided barrier, then
+            # use op-local barriers for the rest of the double-buffered stream.
             if iter_idx == Int32(0):
                 mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
                 with cute.arch.elect_one():
@@ -555,6 +564,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3, h, logits):
+        # Phase 1: derive thread roles and the double-buffer synchronization state.
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -568,6 +578,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
         block_idx = tile_N
         iter_idx = Int32(0)
         while block_idx < tile_3:
+            # Phase 2: wait until the load phase has filled the next weight buffer.
             buf_idx = iter_idx % Int32(2)
             if iter_idx > Int32(0):
                 kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
@@ -576,6 +587,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
                 if buf_idx == Int32(1):
                     mbarrier_wait(kr_1, kr_phase)
 
+            # Phase 3: bind the staged weight tile for this vocab block.
             staged_weight = cute.make_tensor(
                 cute.make_ptr(
                     self.weight_dtype,
@@ -586,6 +598,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
                 cute.make_layout((self.K, self.tile_size_N), stride=(1, self.K)),
             )
 
+            # Phase 4: dot each active row against the staged vocab block and store logits.
             for local_row in range(warp_idx, self.tile_size_S, num_warps):
                 row_idx = row_start + Int32(local_row)
                 if row_idx < Int32(self.S):
@@ -611,6 +624,7 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
                                 )
                                 logits_row[vocab_idx] = total.to(self.logits_dtype)
 
+            # Phase 5: release the consumed buffer back to the load phase.
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -624,7 +638,6 @@ class Qwen3_5RangedLmHeadSm120Op(Op):
 class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
     """Streaming decode LM head that returns top-1 per row without logits."""
 
-    pipeline = PipelineSpec.streaming()
     reads = {
         "h": (None, ("B", "S", "K")),
         "weight": (None, ("N", "K")),
@@ -655,6 +668,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3, h, top_values, top_indices):
+        # Phase 1: initialize per-warp state and double-buffer synchronization.
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -671,6 +685,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
         block_idx = tile_N
         iter_idx = Int32(0)
         while block_idx < tile_3:
+            # Phase 2: wait for the next staged LM-head weight block.
             buf_idx = iter_idx % Int32(2)
             if iter_idx > Int32(0):
                 kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
@@ -679,6 +694,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
                 if buf_idx == Int32(1):
                     mbarrier_wait(kr_1, kr_phase)
 
+            # Phase 3: bind staged weights and update this warp's local top-1.
             staged_weight = cute.make_tensor(
                 cute.make_ptr(
                     self.weight_dtype,
@@ -707,6 +723,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
                             best_idx = vocab_idx
                     local_v = local_v + num_warps
 
+            # Phase 4: release the consumed weight buffer back to the load phase.
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -716,6 +733,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
             block_idx = block_idx + Int32(1)
             iter_idx = iter_idx + Int32(1)
 
+        # Phase 5: reduce per-warp top-1 candidates into the final row result.
         scratch_val = cute.make_tensor(
             cute.make_ptr(
                 cutlass.Float32,
@@ -759,6 +777,7 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
             top_values_row[Int32(0)] = final_best_val.to(self.top_values_dtype)
             top_indices_row[Int32(0)] = final_best_idx
 
+        # Phase 6: invalidate op-local barriers after the streamed range completes.
         if tidx == Int32(0):
             mbarrier_inval(bf_0)
             mbarrier_inval(bf_1)
@@ -766,11 +785,9 @@ class Qwen3_5Top1LmHeadSm120Op(Qwen3_5RangedLmHeadSm120Op):
             mbarrier_inval(kr_1)
 
 
-class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
+class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(StreamingPipelineOpMixin, Op):
     """Ranged residual-add RMSNorm + projection with normalized activation reuse."""
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
         "residual_in": (None, ("B", "S", "K")),
@@ -824,6 +841,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
     def load(self, page_ptr, tile_B, tile_S, tile_N, tile_3,
              a, residual_in, norm_weight, residual_out,
              b_tma, b_tma_gmem, op_config_ptr, work_mbar):
+        # Phase 1: normalize the active rows once and keep them resident in smem.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         lane_idx = cute.arch.lane_idx()
         row_start = tile_S * Int32(self.tile_size_S)
@@ -861,6 +879,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
                     norm_row[k2] = val.to(self.a_dtype)
                     k2 = k2 + Int32(32)
 
+        # Phase 2: initialize double-buffer barriers for the ranged weight stream.
         bf_0 = page_ptr + Int32(self.mbar_offset)
         bf_1 = page_ptr + Int32(self.mbar_offset + 8)
         kr_0 = page_ptr + Int32(self.mbar_offset + 16)
@@ -877,6 +896,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
         block_idx = tile_N
         iter_idx = Int32(0)
         while block_idx < tile_3:
+            # Phase 3: wait for compute to release the next weight buffer.
             buf_idx = iter_idx % Int32(2)
             buf_base = page_ptr + Int32(self.norm_bytes) + buf_idx * Int32(self.staged_weight_bytes)
             if iter_idx > Int32(0):
@@ -885,6 +905,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
                     mbarrier_wait(bf_0, bf_phase)
                 if buf_idx == Int32(1):
                     mbarrier_wait(bf_1, bf_phase)
+            # Phase 4: bind the staged weight block and issue the TMA load.
             sB = cute.make_tensor(
                 cute.make_ptr(self.b_dtype, buf_base, cute.AddressSpace.smem, assumed_align=128),
                 cute.make_layout((self.K, self.tile_size_N), stride=(1, self.K)),
@@ -929,6 +950,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3, c, op_config_ptr):
+        # Phase 1: bind normalized activations and double-buffer synchronization state.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         tidx = cute.arch.thread_idx()[0]
         warp_idx = cute.arch.warp_idx()
@@ -944,6 +966,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
         block_idx = tile_N
         iter_idx = Int32(0)
         while block_idx < tile_3:
+            # Phase 2: wait for the next staged weight block.
             buf_idx = iter_idx % Int32(2)
             if iter_idx > Int32(0):
                 kr_phase = ((iter_idx - Int32(1)) // Int32(2)) % Int32(2)
@@ -951,6 +974,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
                     mbarrier_wait(kr_0, kr_phase)
                 if buf_idx == Int32(1):
                     mbarrier_wait(kr_1, kr_phase)
+            # Phase 3: compute the ranged matvec block and store C.
             staged_weight = cute.make_tensor(
                 cute.make_ptr(
                     self.b_dtype,
@@ -972,6 +996,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
                                 c_base = tile_B * Int32(self.c_stride_B) + row_idx * Int32(self.c_stride_S)
                                 c_row = cute.make_tensor(c.iterator + c_base, cute.make_layout(self.N))
                                 c_row[n_idx] = total.to(self.c_dtype)
+            # Phase 4: release the consumed buffer back to the load phase.
             named_barrier_sync(Int32(2), Int32(self.threads_per_row))
             if tidx == Int32(0):
                 if buf_idx == Int32(0):
@@ -982,7 +1007,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(Op):
             iter_idx = iter_idx + Int32(1)
 
 
-class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
+class Qwen3_5RMSAddRangedDecodeGemmSm120Op(StreamingPipelineOpMixin, Op):
     """Tensor-core ranged residual-add RMSNorm + projection.
 
     This is the fast version of the ranged decode op: the load warp computes
@@ -992,8 +1017,6 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
     coalesced range.
     """
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
         "residual_in": (None, ("B", "S", "K")),
@@ -1108,6 +1131,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
     def load(self, page_ptr, tile_B, tile_S, tile_N, tile_3,
              a, residual_in, norm_weight, residual_out,
              b_tma, b_tma_gmem, op_config_ptr, work_mbar):
+        # Phase 1: compute residual-add RMSNorm and stage all normalized A blocks.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         lane_idx = cute.arch.lane_idx()
         row_start = tile_S * Int32(self.tile_size_S)
@@ -1156,6 +1180,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
                     sA_norm[(norm_local_k, Int32(local_row))] = val.to(self.a_dtype)
                     k2 = k2 + Int32(32)
 
+        # Phase 2: initialize the B-stream double-buffer barriers.
         bf_0 = page_ptr + Int32(self.mbar_offset)
         bf_1 = page_ptr + Int32(self.mbar_offset + 8)
         kr_0 = page_ptr + Int32(self.mbar_offset + 16)
@@ -1176,6 +1201,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
         while block_idx < tile_3:
             k_block = Int32(0)
             while k_block < Int32(self.num_k_blocks):
+                # Phase 3: wait for compute to release a B buffer, then refill it.
                 buf_idx = stream_idx % Int32(2)
                 buf_base = page_ptr + Int32(self.norm_bytes) + buf_idx * Int32(self.buf_stride)
                 if stream_idx >= Int32(2):
@@ -1232,6 +1258,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3, c_tma, c_tma_gmem, op_config_ptr):
+        # Phase 1: configure warp-level MMA fragments and smem views.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         tidx = cute.arch.thread_idx()[0]
         if tidx < Int32(self.num_mma_threads):
@@ -1317,6 +1344,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
             stream_idx = Int32(0)
             block_idx = tile_N
             while block_idx < tile_3:
+                # Phase 2: accumulate one output-N block across all staged K blocks.
                 acc = cute.make_fragment(
                     tiled_mma.partition_shape_C((self.tile_size_S, self.tile_size_N)),
                     Float32,
@@ -1324,6 +1352,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
                 acc.fill(0.0)
                 k_idx = Int32(0)
                 while k_idx < Int32(self.num_k_blocks):
+                    # Phase 3: wait on the staged B block, run MMA, and release the buffer.
                     sA_k = cute.make_tensor(
                         cute.recast_ptr(
                             cute.make_ptr(
@@ -1393,6 +1422,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
                     stream_idx = stream_idx + Int32(1)
                     k_idx = k_idx + Int32(1)
 
+                # Phase 4: write the accumulator to smem and TMA-store the C tile.
                 _gemm_epilogue_store_no_mbar_inval_helper(
                     page_ptr + Int32(self.c_offset),
                     tidx,
@@ -1441,6 +1471,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(Op):
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
                 block_idx = block_idx + Int32(1)
 
+            # Phase 5: invalidate op-local barriers after the ranged stream completes.
             if tidx == Int32(0):
                 mbarrier_inval(bf_0)
                 mbarrier_inval(bf_1)
@@ -1498,6 +1529,7 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
 
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_N, qk_sumsq, c_tma, c_tma_gmem, op_config_ptr):
+        # Phase 1: TMA-store the projected chunk from smem to C.
         swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
         sC = cute.make_tensor(
             cute.recast_ptr(
@@ -1526,6 +1558,7 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
         with cute.arch.elect_one():
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
 
+        # Phase 2: accumulate per-head chunk sums of squares for Q/K normalization.
         head = tile_N // Int32(self.head_chunks)
         chunk = tile_N - head * Int32(self.head_chunks)
         if head < Int32(self.num_qk_heads):
@@ -1556,8 +1589,6 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
 class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDecodeGemmSm120Op):
     """Compute-driven fused residual-add RMSNorm plus packed QKV projection."""
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
         "residual_in": (None, ("B", "S", "K")),
@@ -1672,6 +1703,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
     def compute(self, page_ptr, tile_B, tile_S, tile_N, tile_3,
                 a, residual_in, norm_weight, residual_out, qk_sumsq,
                 b_tma, b_tma_gmem, c_tma, c_tma_gmem, op_config_ptr):
+        # Phase 1: initialize TMA barriers and RMS scratch for compute-owned streaming.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         tidx = cute.arch.thread_idx()[0]
         if tidx < Int32(self.num_mma_threads):
@@ -1686,6 +1718,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
                 mbarrier_init(kr_1, Int32(1))
             mbarrier_init_fence()
 
+            # Phase 2: compute residual-add RMS statistics and residual output.
             rstd_scratch = cute.make_tensor(
                 cute.make_ptr(
                     cutlass.Float32,
@@ -1719,6 +1752,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
                         )
             named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
+            # Phase 3: configure MMA fragments and double-buffered A/B views.
             mma_op = cute.nvgpu.warp.MmaF16BF16Op(self.a_dtype, Float32, (16, 8, 16))
             tiled_mma = cute.make_tiled_mma(
                 mma_op,
@@ -1784,6 +1818,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
 
             block_idx = tile_N
             while block_idx < tile_3:
+                # Phase 4: preload B blocks, fill A blocks, and accumulate one C block.
                 first_blocks = Int32(2)
                 if Int32(self.num_k_blocks) < first_blocks:
                     first_blocks = Int32(self.num_k_blocks)
@@ -1844,6 +1879,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
                         )
                     k_idx = k_idx + Int32(1)
 
+                # Phase 5: store C, compute Q/K chunk norms, and TMA-store the chunk.
                 _gemm_epilogue_store_no_mbar_inval_helper(
                     page_ptr,
                     tidx,
@@ -1903,16 +1939,15 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
                 block_idx = block_idx + Int32(1)
 
+            # Phase 6: invalidate compute-owned ready barriers.
             if tidx == Int32(0):
                 mbarrier_inval(kr_0)
                 mbarrier_inval(kr_1)
 
 
-class Qwen3_5PackedQkvProjectSm120Op(Op):
+class Qwen3_5PackedQkvProjectSm120Op(StreamingPipelineOpMixin, Op):
     """Packed QKV projection with per-head Q/K norm, RoPE, and cache writes."""
 
-    pipeline = PipelineSpec.streaming()
-    pipeline_abi = PipelineABI.op_owned()
     reads = {
         "a": (None, ("B", "S", "K")),
         "b": (None, ("P", "K")),
@@ -2015,6 +2050,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
     @cute.jit
     def load(self, page_ptr, tile_B, tile_S, tile_H,
              a, b_tma, b_tma_gmem, op_config_ptr, work_mbar):
+        # Phase 1: stage the input activation blocks once for all head chunks.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         lane_idx = cute.arch.lane_idx()
         row_start = tile_S * Int32(self.tile_size_S)
@@ -2045,6 +2081,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
                     sA_norm[(norm_local_k, Int32(local_row))] = a_row[k]
                     k = k + Int32(32)
 
+        # Phase 2: initialize double-buffer barriers for packed QKV weight chunks.
         bf_0 = page_ptr + Int32(self.mbar_offset)
         bf_1 = page_ptr + Int32(self.mbar_offset + 8)
         kr_0 = page_ptr + Int32(self.mbar_offset + 16)
@@ -2066,6 +2103,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
             out_block = tile_H * Int32(self.num_head_blocks) + head_block
             k_block = Int32(0)
             while k_block < Int32(self.num_k_blocks):
+                # Phase 3: wait for a reusable weight buffer and issue the next TMA load.
                 buf_idx = stream_idx % Int32(2)
                 buf_base = page_ptr + Int32(self.norm_bytes) + buf_idx * Int32(self.buf_stride)
                 if stream_idx >= Int32(2):
@@ -2121,6 +2159,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
     @cute.jit
     def _store_head(self, page_ptr, tile_B, tile_S, tile_H, qkv, dst_k, dst_v,
                     q_norm_weight, k_norm_weight, cos, sin, op_config_ptr):
+        # Phase 1: normalize/rotate the completed head and update the relevant cache.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         tidx = cute.arch.thread_idx()[0]
         lane_idx = cute.arch.lane_idx()
@@ -2256,6 +2295,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_H,
                 qkv, dst_k, dst_v, q_norm_weight, k_norm_weight, cos, sin, op_config_ptr):
+        # Phase 1: configure MMA fragments and staged output scratch for one head.
         tidx = cute.arch.thread_idx()[0]
         if tidx < Int32(self.num_mma_threads):
             runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
@@ -2346,6 +2386,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
             stream_idx = Int32(0)
             head_block = Int32(0)
             while head_block < Int32(self.num_head_blocks):
+                # Phase 2: accumulate one 64-wide head chunk across all K blocks.
                 acc = cute.make_fragment(
                     tiled_mma.partition_shape_C((self.tile_size_S, self.tile_N)),
                     Float32,
@@ -2353,6 +2394,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
                 acc.fill(0.0)
                 k_idx = Int32(0)
                 while k_idx < Int32(self.num_k_blocks):
+                    # Phase 3: wait for the staged weight chunk, run MMA, and release it.
                     sA_k = cute.make_tensor(
                         cute.recast_ptr(
                             cute.make_ptr(
@@ -2392,6 +2434,7 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
                     stream_idx = stream_idx + Int32(1)
                     k_idx = k_idx + Int32(1)
 
+                # Phase 4: stage the projected chunk and update Q/K norm partials.
                 _gemm_epilogue_store_no_mbar_inval_helper(
                     page_ptr + Int32(self.c_offset),
                     tidx,
@@ -2472,10 +2515,12 @@ class Qwen3_5PackedQkvProjectSm120Op(Op):
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
                 head_block = head_block + Int32(1)
 
+            # Phase 5: finalize Q/K heads after all chunks have contributed to sumsq.
             if tile_H < Int32(self.num_q_heads + self.num_kv_heads):
                 self._store_head(page_ptr, tile_B, tile_S, tile_H, qkv, dst_k, dst_v,
                                  q_norm_weight, k_norm_weight, cos, sin, op_config_ptr)
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
+            # Phase 6: invalidate op-local streaming barriers.
             if tidx == Int32(0):
                 mbarrier_inval(bf_0)
                 mbarrier_inval(bf_1)
@@ -2531,6 +2576,7 @@ class Qwen3_5PackedQkvFinalizeSm120Op(Op):
         dst_k,
         op_config_ptr,
     ):
+        # Phase 1: choose the row/head work assigned to each warp.
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         row_start = tile_S * Int32(self.tile_size_S)
         head = tile_H * Int32(self.tile_size_H)
@@ -2547,6 +2593,7 @@ class Qwen3_5PackedQkvFinalizeSm120Op(Op):
                     + head * Int32(self.qkv_stride_H)
                 )
                 qkv_row = cute.make_tensor(qkv.iterator + qkv_base, cute.make_layout(self.D))
+                # Phase 2: Q heads are RMS-normalized and RoPE-rotated in place.
                 if head < Int32(self.num_q_heads):
                     total = Float32(0.0)
                     for chunk in cutlass.range_constexpr(QWEN3_5_HEAD_DIM // 64):
@@ -2583,6 +2630,7 @@ class Qwen3_5PackedQkvFinalizeSm120Op(Op):
                             * w_row[d_norm].to(Float32)
                         ).to(self.qkv_dtype)
                         d_norm = d_norm + Int32(32)
+                # Phase 3: K heads are normalized, RoPE-rotated, and copied to cache.
                 elif head < Int32(self.num_q_heads + self.num_kv_heads):
                     kv_h = head - Int32(self.num_q_heads)
                     dst_base = (
@@ -2670,6 +2718,7 @@ class Qwen3_5QKNormRopeKCacheStoreSm120Op(_BaseQKNormRopeOp):
 
     @cute.jit
     def store(self, page_ptr, tile_M, tile_H, q, norm_weight, cos, sin, dst_k, op_config_ptr):
+        # Phase 1: copy the already normalized/rotated K rows from smem to cache.
         runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
         s2g = cute.make_copy_atom(
             CopyBulkS2GOp(),
@@ -2724,6 +2773,7 @@ class Qwen3_5VCacheStoreSm120Op(Op):
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_H, src_v, dst_v, op_config_ptr):
+        # Phase 1: copy each active V row into the cache window.
         tidx = cute.arch.thread_idx()[0]
         runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
         seq_start = tile_S * Int32(self.tile_size_S)

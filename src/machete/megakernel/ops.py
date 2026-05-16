@@ -346,6 +346,13 @@ class PipelineABI:
         return cls(kind=cls.KIND_STAGED, execution=cls.EXECUTION_OP_OWNED)
 
 
+class StreamingPipelineOpMixin:
+    """Mixin for ops that manage their own staged streaming pipeline."""
+
+    pipeline: ClassVar[PipelineSpec] = PipelineSpec.streaming()
+    pipeline_abi: ClassVar[PipelineABI] = PipelineABI.op_owned()
+
+
 def is_compile_static_dim(name: str) -> bool:
     """Return whether a static dim should specialize device code.
 
@@ -1434,6 +1441,7 @@ __all__ = [
     "PageRole",
     "PipelineSpec",
     "PipelineABI",
+    "StreamingPipelineOpMixin",
     "SemaphoreRole",
     "TensorMeta",
     # Protocol
