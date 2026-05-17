@@ -328,7 +328,3 @@ class TestGLM4PatchingEdgeCases:
         patch_causal_lm(model)
 
         assert not hasattr(model, "_machete_original_forward")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

@@ -33,11 +33,9 @@ The suite is organized by responsibility first, then by subsystem.
 - `megakernel`
   Framework and persistent-runtime tests under `tests/megakernel`
 - `patching`
-  Model patching tests under `tests/patching` and `tests/test_patch.py`
+  Model patching tests under `tests/patching`
 - `deps`
   Scheduler dependency-mapping coverage under `tests/megakernel/deps`
-- `arch_sm100`
-  Architecture-specific SM100 coverage
 - `arch_sm120`
   Architecture-specific SM120 coverage
 
@@ -69,7 +67,7 @@ Markers are attached automatically from `tests/conftest.py`, so file layout and 
 - Heavy framework integration:
   - `tests/megakernel/test_communicate.py`
   - `tests/megakernel/test_integration_gpu.py`
-  - `tests/megakernel/test_qwen3_5_prefill.py`
+  - `tests/megakernel/test_qwen_nvfp4_ops.py`
 - Fast kernel smoke:
   - `tests/kernels/test_activation.py`
   - `tests/kernels/test_glu.py`

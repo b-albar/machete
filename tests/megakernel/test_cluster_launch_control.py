@@ -358,6 +358,3 @@ def test_clc_kernel_compilation():
     kernel(stream)
     torch.cuda.synchronize()
     print("CLC kernel launched and completed successfully!")
-
-
-if __name__ == "__main__":

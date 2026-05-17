@@ -1266,6 +1266,10 @@ class InstructionStreamBuilder:
             return False
         tma_loads = set(getattr(consumer.op_cls, "_TMA_LOADS", set()))
         tma_compute_loads = set(getattr(consumer.op_cls, "_TMA_COMPUTE_LOADS", set()))
+        if dep.consumer_buffer in tma_compute_loads:
+            return True
+        if consumer.op_cls.load is not Op.load:
+            return False
         return dep.consumer_buffer not in (tma_loads | tma_compute_loads)
 
     @staticmethod

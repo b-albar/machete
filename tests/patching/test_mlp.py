@@ -302,7 +302,3 @@ class TestMLPEdgeCases:
 
         out = mlp(x)
         assert out.shape == (1, 1, 64)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

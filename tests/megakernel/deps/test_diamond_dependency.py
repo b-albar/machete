@@ -224,7 +224,7 @@ class TestDiamondDependencyGPU:
         )
 
     def test_three_branch_diamond(self):
-        """
+        r"""
         Diamond with three parallel branches.
 
                   A

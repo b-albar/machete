@@ -306,7 +306,3 @@ class TestLinearCrossEntropyIntegration:
         loss_machete = machete_lm(x, target)
 
         assert torch.allclose(loss_std, loss_machete, atol=1e-5)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

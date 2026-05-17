@@ -227,7 +227,3 @@ class TestMacheteRoPEEdgeCases:
 
         q_rotated, _ = rope(q)
         assert q_rotated.shape == q.shape
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

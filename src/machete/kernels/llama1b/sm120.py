@@ -139,7 +139,7 @@ class _Llama1BStagedWeightMatvecSm120Base(StreamingPipelineOpMixin, Op):
         return MegakernelConfig(
             threads_per_block=(LLAMA1B_SM120_CONSUMER_WARPS + NUM_DMA_WARPS) * 32,
             page_size=page_size,
-            mma_reg_count=96,
+            mma_reg_count=128,
         )
 
     @classmethod
@@ -3129,7 +3129,7 @@ class Llama1BDecodeAttentionSm120Op(Op):
         return MegakernelConfig(
             threads_per_block=LLAMA1B_CONSUMER_WARPS * 32,
             page_size=LLAMA1B_SM120_MIN_STAGED_PAGE_SIZE,
-            mma_reg_count=96,
+            mma_reg_count=128,
         )
 
     @classmethod

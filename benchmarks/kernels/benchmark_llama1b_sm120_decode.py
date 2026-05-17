@@ -116,7 +116,7 @@ def build_kernel(
     threads_per_block: int = LLAMA1B_SM120_THREADS_PER_BLOCK,
     num_sms: int | None = None,
     num_pages: int | None = None,
-    mma_reg_count: int = 96,
+    mma_reg_count: int = 128,
     page_size: int | None = None,
 ):
     if cache_len < 1:
@@ -207,7 +207,7 @@ def main():
     parser.add_argument("--threads-per-block", type=int, default=LLAMA1B_SM120_THREADS_PER_BLOCK)
     parser.add_argument("--num-sms", type=int, default=0, help="Persistent CTAs to launch; 0 uses the device/default cap")
     parser.add_argument("--num-pages", type=int, default=3, help="Instruction page-ring pages; 0 uses auto")
-    parser.add_argument("--mma-reg-count", type=int, default=96)
+    parser.add_argument("--mma-reg-count", type=int, default=128)
     parser.add_argument("--page-size", type=int, default=32768)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--rep", type=int, default=10)

@@ -8,7 +8,7 @@ def get_nop_op():
     """Return a test-only no-op op without importing CUTLASS at module import time."""
     from machete.megakernel.ops import Op
 
-    class NopOp(Op):
+    class _NOPOp(Op):
         pass
 
-    return NopOp
+    return _NOPOp

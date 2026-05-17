@@ -30,8 +30,6 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
     parts = path.parts
     if "kernels" in parts:
         markers = ["kernels", "gpu"]
-        if path.name in {"test_attention_sm_100.py", "test_gemm_sm100.py"}:
-            markers.append("arch_sm100")
         if path.name == "test_attention_sm_120.py":
             markers.append("arch_sm120")
         if path.name in {
@@ -48,7 +46,6 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
             "test_gated_delta_net.py",
             "test_moe_gemm.py",
             "test_moe_gemm_bwd.py",
-            "test_moe_tp.py",
             "test_rmsnorm_gemm.py",
         }:
             markers.append("integration")
@@ -58,7 +55,6 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
             "test_attention_sm_120.py",
             "test_gated_delta_net.py",
             "test_gemm_kblock_multipass.py",
-            "test_gemm_sm100.py",
             "test_flash_decoding.py",
         }:
             markers.append("slow")
@@ -95,11 +91,11 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
         }:
             markers.append("slow")
         return tuple(markers)
-    if "patching" in parts or path.name == "test_patch.py":
+    if "patching" in parts:
         markers = ["patching"]
         if path.name in {"test_linear.py", "test_rope.py", "test_attention.py"}:
             markers.append("unit")
-        if path.name in {"test_qwen.py", "test_glm4.py", "test_patch.py"}:
+        if path.name in {"test_qwen.py", "test_glm4.py", "test_llama.py"}:
             markers.append("integration")
         if path.name in {"test_qwen.py", "test_glm4.py"}:
             markers.append("slow")

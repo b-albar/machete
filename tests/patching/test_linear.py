@@ -199,7 +199,3 @@ class TestMacheteLinearEdgeCases:
         # Should work (falls back due to bias)
         out = machete_linear(x)
         assert out.shape == (2, 16, 128)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

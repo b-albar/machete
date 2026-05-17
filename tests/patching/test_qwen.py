@@ -333,7 +333,3 @@ class TestQwenPatchingEdgeCases:
 
         # Should not be patched
         assert not hasattr(model, "_machete_original_forward")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

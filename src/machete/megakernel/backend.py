@@ -132,6 +132,33 @@ def _build_compile_key(
     tma_args: Dict[str, Tuple[str, ...]],
 ) -> Tuple[Any, ...]:
     """Build the compile-time handler signature for one scheduled op."""
+    unique_tensor_dims = {
+        name: tuple(dims)
+        for name, _dtype, dims in getattr(op.op_cls, "_UNIQUE_TENSORS", ())
+    }
+    dynamic_dims = set(getattr(op.op_cls, "_DYNAMIC_DIM_OVERRIDES", ()))
+
+    def _canonical_strides() -> Tuple[Tuple[str, Tuple[int, ...]], ...]:
+        if not op.tensor_strides:
+            return ()
+
+        canonical = []
+        for tensor_name, strides in sorted(op.tensor_strides.items()):
+            dims = unique_tensor_dims.get(tensor_name)
+            if dims is None:
+                canonical.append((tensor_name, tuple(strides)))
+                continue
+
+            values = []
+            for dim_name, stride in zip(dims, strides):
+                dim_extent = op.static_dims.get(dim_name)
+                if dim_name in dynamic_dims or dim_extent == 1:
+                    values.append(None)
+                else:
+                    values.append(stride)
+            canonical.append((tensor_name, tuple(values)))
+        return tuple(canonical)
+
     static_dims_key = (
         tuple(
             sorted(
@@ -147,10 +174,7 @@ def _build_compile_key(
         tuple(sorted((name, dtype.__name__) for name, dtype in op.tensor_dtypes.items()))
         if op.tensor_dtypes else ()
     )
-    strides_key = (
-        tuple(sorted(op.tensor_strides.items()))
-        if op.tensor_strides else ()
-    )
+    strides_key = _canonical_strides()
     return (
         op.op_cls,
         tile_sizes_key,
