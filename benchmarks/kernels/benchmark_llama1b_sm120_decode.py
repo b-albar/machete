@@ -25,6 +25,7 @@ from machete.kernels.llama1b import (
     LLAMA1B_SM120_MATVEC_BLOCK,
     LLAMA1B_SM120_THREADS_PER_BLOCK,
     LLAMA1B_VOCAB,
+    llama1b_sm120_auto_fa_num_splits,
     schedule_decode_model_sm120,
 )
 from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
@@ -40,6 +41,7 @@ def make_llama1b_decode_state(
     cache_len: int,
     num_layers: int,
     include_final: bool,
+    top1_final: bool = False,
     dtype=torch.bfloat16,
 ):
     weights = {
@@ -82,11 +84,15 @@ def make_llama1b_decode_state(
     attn_out_buf = torch.empty_like(q_buf)
     mlp_h_buf = torch.empty(batch, 1, LLAMA1B_INTERMEDIATE, dtype=dtype, device="cuda")
 
-    final_norm = lm_head = logits = None
+    final_norm = lm_head = logits = top_values = top_indices = None
     if include_final:
         final_norm = torch.ones(LLAMA1B_HIDDEN, dtype=dtype, device="cuda")
         lm_head = _randn((LLAMA1B_VOCAB, LLAMA1B_HIDDEN), dtype=dtype)
-        logits = torch.empty(batch, 1, LLAMA1B_VOCAB, dtype=dtype, device="cuda")
+        if top1_final:
+            top_values = torch.empty(batch, 1, dtype=torch.float32, device="cuda")
+            top_indices = torch.empty(batch, 1, dtype=torch.int32, device="cuda")
+        else:
+            logits = torch.empty(batch, 1, LLAMA1B_VOCAB, dtype=dtype, device="cuda")
 
     return {
         "weights": weights,
@@ -100,6 +106,8 @@ def make_llama1b_decode_state(
         "final_norm": final_norm,
         "lm_head": lm_head,
         "logits": logits,
+        "top_values": top_values,
+        "top_indices": top_indices,
     }
 
 
@@ -111,6 +119,8 @@ def build_kernel(
     include_final: bool,
     matvec_block: int,
     final_matvec_block: int,
+    top1_final: bool = False,
+    top1_partitions: int = 128,
     fa_num_splits: int = 0,
     split_upgate: bool = True,
     threads_per_block: int = LLAMA1B_SM120_THREADS_PER_BLOCK,
@@ -135,9 +145,10 @@ def build_kernel(
         cache_len=cache_len,
         num_layers=num_layers,
         include_final=include_final,
+        top1_final=top1_final,
     )
     if fa_num_splits < 0:
-        fa_num_splits = 8 if cache_len < 384 else min(64, max(16, cache_len // 8))
+        fa_num_splits = llama1b_sm120_auto_fa_num_splits(cache_len, num_layers=num_layers)
     schedule = schedule_decode_model_sm120(
         batch=batch,
         cache_pos=cache_len - 1,
@@ -153,6 +164,9 @@ def build_kernel(
         final_norm=state["final_norm"],
         lm_head=state["lm_head"],
         logits=state["logits"],
+        top_values=state["top_values"],
+        top_indices=state["top_indices"],
+        top1_partitions=top1_partitions,
         matvec_block=matvec_block,
         final_matvec_block=final_matvec_block,
         fa_num_splits=fa_num_splits,
@@ -204,6 +218,8 @@ def main():
     parser.add_argument("--no-split-upgate", dest="split_upgate", action="store_false", help="Use one full-width up/gate op")
     parser.set_defaults(split_upgate=True)
     parser.add_argument("--no-final", action="store_true")
+    parser.add_argument("--top1-final", action="store_true", help="Write only final top-1 value/index instead of full logits")
+    parser.add_argument("--top1-partitions", type=int, default=128, help="Vocab partitions for the top-1 final head")
     parser.add_argument("--threads-per-block", type=int, default=LLAMA1B_SM120_THREADS_PER_BLOCK)
     parser.add_argument("--num-sms", type=int, default=0, help="Persistent CTAs to launch; 0 uses the device/default cap")
     parser.add_argument("--num-pages", type=int, default=3, help="Instruction page-ring pages; 0 uses auto")
@@ -217,14 +233,20 @@ def main():
         raise RuntimeError("CUDA is required")
 
     include_final = not args.no_final
+    if args.top1_final and not include_final:
+        raise ValueError("--top1-final requires final head output; remove --no-final")
+    if args.top1_partitions < 1:
+        raise ValueError("--top1-partitions must be >= 1")
     resolved_fa_num_splits = args.fa_num_splits
     if resolved_fa_num_splits < 0:
-        resolved_fa_num_splits = 8 if args.cache_len < 384 else min(64, max(16, args.cache_len // 8))
+        resolved_fa_num_splits = llama1b_sm120_auto_fa_num_splits(args.cache_len, num_layers=args.layers)
     kernel, keep_alive = build_kernel(
         batch=args.batch,
         cache_len=args.cache_len,
         num_layers=args.layers,
         include_final=include_final,
+        top1_final=args.top1_final,
+        top1_partitions=args.top1_partitions,
         matvec_block=args.matvec_block,
         final_matvec_block=args.final_matvec_block,
         fa_num_splits=resolved_fa_num_splits,
@@ -240,7 +262,9 @@ def main():
     print(
         "llama1b_sm120_decode "
         f"batch={args.batch} cache_len={args.cache_len} layers={args.layers} "
-        f"final={include_final} matvec_block={args.matvec_block} final_matvec_block={args.final_matvec_block} "
+        f"final={include_final} top1_final={args.top1_final} "
+        f"top1_partitions={args.top1_partitions} "
+        f"matvec_block={args.matvec_block} final_matvec_block={args.final_matvec_block} "
         f"range=auto "
         f"fa_num_splits={resolved_fa_num_splits} split_upgate={args.split_upgate} scheduler=overlap "
         f"threads_per_block={args.threads_per_block} num_sms={args.num_sms or 'auto'} num_pages={kernel._layout.num_pages} "

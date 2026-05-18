@@ -4,10 +4,46 @@
 import pytest
 import torch
 
-from machete.kernels.llama1b import LLAMA1B_SM120_QKV_HEAD_BLOCK, LLAMA1B_SM120_THREADS_PER_BLOCK
+from machete.kernels.llama1b import (
+    LLAMA1B_HIDDEN,
+    LLAMA1B_SM120_FINAL_MATVEC_BLOCK,
+    LLAMA1B_SM120_QKV_HEAD_BLOCK,
+    LLAMA1B_SM120_THREADS_PER_BLOCK,
+)
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _require_sm120():
+    major, _minor = torch.cuda.get_device_capability()
+    if major < 12:
+        pytest.skip("SM120 required")
+
+
+def _run_ops(ops, page_size=32768):
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    kernel = Megakernel(
+        ops,
+        config=MegakernelConfig(
+            threads_per_block=LLAMA1B_SM120_THREADS_PER_BLOCK,
+            page_size=page_size,
+            loader_idle_sleep_ns=0,
+            mma_reg_count=96,
+        ),
+    )
+    kernel.run(validate=False)
+    torch.cuda.synchronize()
+
+
+def _top1_buffers(batch, seq_len, vocab, device="cuda"):
+    vocab_tiles = (vocab + LLAMA1B_SM120_FINAL_MATVEC_BLOCK - 1) // LLAMA1B_SM120_FINAL_MATVEC_BLOCK
+    partial_values = torch.empty(batch, seq_len, vocab_tiles, device=device, dtype=torch.float32)
+    partial_indices = torch.empty_like(partial_values, dtype=torch.int32)
+    top_values = torch.empty(batch, seq_len, device=device, dtype=torch.float32)
+    top_indices = torch.empty(batch, seq_len, device=device, dtype=torch.int32)
+    return partial_values, partial_indices, top_values, top_indices
 
 
 def test_llama1b_sm120_fused_upgate_matches_reference():
@@ -294,6 +330,102 @@ def test_llama1b_sm120_kstream_final_head_matches_reference():
         1e-5,
     ) @ weight.float().t()
     torch.testing.assert_close(logits.float(), ref, atol=3e-2, rtol=3e-2)
+
+
+def test_llama1b_sm120_kstream_final_head_top1_matches_reference():
+    from machete.kernels.llama1b import (
+        Llama1BFinalRmsTop1PartialLmHeadKStreamSm120Op,
+        Llama1BReduceTop1PartialsSm120Op,
+    )
+
+    _require_sm120()
+
+    torch.manual_seed(6)
+    dtype = torch.bfloat16
+    batch, seq_len, vocab = 1, 1, 128
+    x = torch.randn(batch, seq_len, LLAMA1B_HIDDEN, device="cuda", dtype=dtype)
+    norm_weight = torch.randn(LLAMA1B_HIDDEN, device="cuda", dtype=dtype)
+    weight = torch.randn(vocab, LLAMA1B_HIDDEN, device="cuda", dtype=dtype) * 0.02
+    partial_values, partial_indices, top_values, top_indices = _top1_buffers(batch, seq_len, vocab)
+
+    ops = Llama1BFinalRmsTop1PartialLmHeadKStreamSm120Op.schedule(
+        x=x,
+        norm_weight=norm_weight,
+        weight=weight,
+        partial_values=partial_values,
+        partial_indices=partial_indices,
+        tile_sizes={"S": 1, "P": 1},
+        page_size=32768,
+        vocab_block=LLAMA1B_SM120_FINAL_MATVEC_BLOCK,
+    )
+    ops += Llama1BReduceTop1PartialsSm120Op.schedule(
+        partial_values=partial_values,
+        partial_indices=partial_indices,
+        top_values=top_values,
+        top_indices=top_indices,
+        tile_sizes={"S": 1},
+        page_size=32768,
+    )
+    _run_ops(ops)
+
+    ref = torch.nn.functional.rms_norm(
+        x.float(),
+        (LLAMA1B_HIDDEN,),
+        norm_weight.float(),
+        1e-5,
+    ) @ weight.float().t()
+    ref_values, ref_indices = ref.max(dim=-1)
+    torch.testing.assert_close(top_values, ref_values, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(top_indices, ref_indices.to(torch.int32), atol=0, rtol=0)
+
+
+def test_llama1b_sm120_kstream_final_add_head_top1_matches_reference():
+    from machete.kernels.llama1b import (
+        Llama1BFinalAddRmsTop1PartialLmHeadKStreamSm120Op,
+        Llama1BReduceTop1PartialsSm120Op,
+    )
+
+    _require_sm120()
+
+    torch.manual_seed(7)
+    dtype = torch.bfloat16
+    batch, seq_len, vocab = 1, 1, 128
+    x = torch.randn(batch, seq_len, LLAMA1B_HIDDEN, device="cuda", dtype=dtype)
+    residual = torch.randn_like(x)
+    norm_weight = torch.randn(LLAMA1B_HIDDEN, device="cuda", dtype=dtype)
+    weight = torch.randn(vocab, LLAMA1B_HIDDEN, device="cuda", dtype=dtype) * 0.02
+    partial_values, partial_indices, top_values, top_indices = _top1_buffers(batch, seq_len, vocab)
+
+    ops = Llama1BFinalAddRmsTop1PartialLmHeadKStreamSm120Op.schedule(
+        x=x,
+        residual_in=residual,
+        norm_weight=norm_weight,
+        weight=weight,
+        partial_values=partial_values,
+        partial_indices=partial_indices,
+        tile_sizes={"S": 1, "P": 1},
+        page_size=32768,
+        vocab_block=LLAMA1B_SM120_FINAL_MATVEC_BLOCK,
+    )
+    ops += Llama1BReduceTop1PartialsSm120Op.schedule(
+        partial_values=partial_values,
+        partial_indices=partial_indices,
+        top_values=top_values,
+        top_indices=top_indices,
+        tile_sizes={"S": 1},
+        page_size=32768,
+    )
+    _run_ops(ops)
+
+    ref = torch.nn.functional.rms_norm(
+        (x + residual).float(),
+        (LLAMA1B_HIDDEN,),
+        norm_weight.float(),
+        1e-5,
+    ) @ weight.float().t()
+    ref_values, ref_indices = ref.max(dim=-1)
+    torch.testing.assert_close(top_values, ref_values, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(top_indices, ref_indices.to(torch.int32), atol=0, rtol=0)
 
 
 def test_llama1b_sm120_fused_qkv_cache_matches_split_ops():
