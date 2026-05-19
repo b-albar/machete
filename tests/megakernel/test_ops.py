@@ -60,6 +60,18 @@ class _ComputeTmaLoadOp(Op):
     tma_compute_loads = {"x"}
 
 
+class _ProducerTensorOp(Op):
+    writes = {"x": (torch.float16, ("M",))}
+    tile = ("M",)
+
+
+class _ComputeWaitConsumerOp(Op):
+    reads = {"x": (torch.float16, ("M",))}
+    writes = {"y": (torch.float16, ("M",))}
+    tile = ("M",)
+    tma_compute_loads = {"x"}
+
+
 class _SerialNonTmaLoadOp(Op):
     reads = {"x": (torch.float16, ("M",))}
     writes = {"y": (torch.float16, ("M",))}
@@ -202,6 +214,41 @@ def test_compute_phase_tma_load_declaration_is_registered():
     assert _ComputeTmaLoadOp._TMA_LOADS == set()
     assert _ComputeTmaLoadOp.gen_tma_param_names("compute") == [
         ("x_tma", "x_tma_gmem", "x")
+    ]
+
+
+def test_controller_wait_readiness_keeps_compute_wait_dependencies_ordered():
+    """Controller-only readiness can deadlock finite page rings."""
+    builder = InstructionStreamBuilder()
+    builder.add_op(
+        ScheduledOp(
+            _ProducerTensorOp,
+            tile_counts=(4,),
+            dim_names={"M": 0},
+            tile_sizes={"M": 1},
+        )
+    )
+    builder.add_op(
+        ScheduledOp(
+            _ComputeWaitConsumerOp,
+            tile_counts=(4,),
+            dim_names={"M": 0},
+            tile_sizes={"M": 1},
+        )
+    )
+
+    instructions = builder.build(
+        scheduler=OverlapTileScheduler(
+            fetch_stride=4,
+            use_controller_waits_for_readiness=True,
+        )
+    )
+
+    assert [(instr.op_idx, instr.tiles[0]) for instr in instructions[:4]] == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
     ]
 
 

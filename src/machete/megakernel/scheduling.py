@@ -2000,14 +2000,12 @@ class InstructionStreamBuilder:
             formulas, _ = self._resolve()
             schedule_formulas = formulas
             if getattr(scheduler, "use_controller_waits_for_readiness", False):
-                controller_wait_formulas = self._resolve_controller_wait_formulas()
-                schedule_formulas = {
-                    op_idx: (
-                        controller_wait_formulas.get(op_idx, []),
-                        signal_formulas,
-                    )
-                    for op_idx, (_wait_formulas, signal_formulas) in formulas.items()
-                }
+                # Host-side readiness must include compute-delayed waits too.
+                # Otherwise the scheduler can enqueue consumers before their
+                # producers, those consumers can acquire the finite page ring,
+                # and the kernel can deadlock while their compute phases wait
+                # for producers that cannot acquire pages.
+                schedule_formulas = formulas
             instructions = scheduler.schedule_with_formulas(
                 self._op_records,
                 edges,
