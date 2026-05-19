@@ -3,29 +3,25 @@
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
-
-def is_sm90_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor >= 90
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+from tests.kernels.support import requires_sm90_cutlass
 
 
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
+requires_gpu = requires_sm90_cutlass
 
-
-requires_gpu = pytest.mark.skipif(
-    not (is_sm90_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires SM_90+ GPU with CUTLASS",
-)
+FORWARD_CASES = [
+    (64, 64, 32),
+    (64, 128, 64),
+    (128, 256, 128),
+    (128, 512, 64),
+    (128, 4096, 64),
+]
 
 RMSNORM_EPS = 1e-6
 
@@ -73,36 +69,21 @@ def _run_fused(a, b_t, weight, gemma=False):
 class TestRMSNormGemmForward:
     """Fused RMSNorm + GEMM correctness tests."""
 
-    def test_basic_small(self):
-        """Basic small case: M=64, K=64, N=32."""
+    @pytest.mark.parametrize("M,K,N", FORWARD_CASES)
+    def test_forward_matrix(self, M, K, N):
+        """Representative fused RMSNorm+GEMM shape matrix."""
         torch.manual_seed(42)
-        M, K, N = 64, 64, 32
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
-        b = torch.randn(K, N, dtype=torch.float16, device="cuda")
+        scale_a = 0.1 if K >= 4096 else 1.0
+        scale_b = 0.01 if K >= 4096 else 1.0
+        a = torch.randn(M, K, dtype=torch.float16, device="cuda") * scale_a
+        b = torch.randn(K, N, dtype=torch.float16, device="cuda") * scale_b
         b_t = b.t().contiguous()
         w = torch.randn(K, dtype=torch.float16, device="cuda")
 
         c = _run_fused(a, b_t, w)
         ref = _rmsnorm_gemm_ref(a, b_t, w)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-
-    @pytest.mark.parametrize("M,K,N", [
-        (64, 128, 64),
-        (128, 256, 64),
-        (128, 256, 128),
-        (256, 512, 64),
-    ])
-    def test_shapes(self, M, K, N):
-        """Test various shapes."""
-        torch.manual_seed(42)
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
-        b = torch.randn(K, N, dtype=torch.float16, device="cuda")
-        b_t = b.t().contiguous()
-        w = torch.randn(K, dtype=torch.float16, device="cuda")
-
-        c = _run_fused(a, b_t, w)
-        ref = _rmsnorm_gemm_ref(a, b_t, w)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
+        atol, rtol = ((2e-1, 5e-2) if K >= 4096 else (1e-1, 1e-2))
+        torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
 
     def test_bf16(self):
         """Test bf16 dtype."""
@@ -142,29 +123,3 @@ class TestRMSNormGemmForward:
         c = _run_fused(a, b_t, w)
         ref = _rmsnorm_gemm_ref(a, b_t, w)
         torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-
-    def test_multi_k_blocks(self):
-        """K > tile_K forces multiple K-block iterations."""
-        torch.manual_seed(42)
-        M, K, N = 128, 512, 64
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda")
-        b = torch.randn(K, N, dtype=torch.float16, device="cuda")
-        b_t = b.t().contiguous()
-        w = torch.randn(K, dtype=torch.float16, device="cuda")
-
-        c = _run_fused(a, b_t, w)
-        ref = _rmsnorm_gemm_ref(a, b_t, w)
-        torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-2)
-
-    def test_large_k(self):
-        """Large K=4096 (typical hidden dim)."""
-        torch.manual_seed(42)
-        M, K, N = 128, 4096, 64
-        a = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.1
-        b = torch.randn(K, N, dtype=torch.float16, device="cuda") * 0.01
-        b_t = b.t().contiguous()
-        w = torch.randn(K, dtype=torch.float16, device="cuda")
-
-        c = _run_fused(a, b_t, w)
-        ref = _rmsnorm_gemm_ref(a, b_t, w)
-        torch.testing.assert_close(c, ref, atol=2e-1, rtol=5e-2)

@@ -59,6 +59,7 @@ class GDNOutputOp(Op):
         "o": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = set()
 
     def __init__(self, **config):
@@ -92,9 +93,6 @@ class GDNOutputOp(Op):
         self.uv_copy_dim1 = self.BV // self.async_copy_elems
         self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # Smem layout (no primary Q buffer — Q loaded per K-block):
         #   buf_a:  [BT, BK]     (Q_bk cpasync; reused for scores [BT,BT] after K-loop)
         #   buf_b:  [BT, BK]     (K_bk cpasync; reused for scores after K-loop)
@@ -111,7 +109,7 @@ class GDNOutputOp(Op):
         gbuf_start = self._s_v_offset + self.BT * self.BV * self.elem_bytes
         self._gbuf_offset = ((gbuf_start + 15) // 16) * 16
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

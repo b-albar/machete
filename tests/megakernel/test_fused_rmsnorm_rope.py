@@ -107,7 +107,3 @@ class TestFusedRMSNormRoPE:
             kernel.run()
 
             torch.testing.assert_close(q, q_ref, **get_tolerances(dtype), msg="Fused RMSNorm+RoPE output mismatch")
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

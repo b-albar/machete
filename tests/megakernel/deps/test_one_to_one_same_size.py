@@ -263,7 +263,3 @@ class TestOneToOneSameSizeGPU:
         assert torch.equal(buf3, expected), (
             f"Expected {expected.tolist()}, got {buf3.tolist()}"
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

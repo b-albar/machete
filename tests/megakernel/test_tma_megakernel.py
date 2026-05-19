@@ -8,13 +8,18 @@ Tests that the megakernel framework correctly:
 3. Op's load/store methods use TMA copy atoms for async DMA
 """
 
+import importlib.util
+
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
-from machete.megakernel.megakernel import Megakernel
+from machete.megakernel.megakernel import Megakernel, MegakernelConfig
 from machete.megakernel.ops import Op
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 from machete.utils.testing import is_hopper_available
@@ -141,3 +146,95 @@ class TestTMAMegakernel:
         ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         Megakernel(ops).run()
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_add_one_multi_wave(self):
+        """A resident CTA can process more than one TMA tile without hanging."""
+        M = TILE_M * 4
+        torch.manual_seed(42)
+        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=2, threads_per_block=128),
+        ).run()
+        torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_replay_rejects_dma_only_thread_geometry(self):
+        """TMA replay must not silently launch with no compute warps."""
+        torch.manual_seed(42)
+        x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        with pytest.raises(RuntimeError, match="at least one compute warp"):
+            Megakernel(ops, config=MegakernelConfig(threads_per_block=96)).compile()
+
+    def test_tma_add_one_single_tile_noinline(self):
+        """Noinline path should rebuild exec TMA from runtime desc pointers."""
+        torch.manual_seed(42)
+        x = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        ops = TMAAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        Megakernel(ops, config=MegakernelConfig()).run()
+        torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_repeated_identical_ops_share_handler_but_keep_distinct_bindings(self):
+        """Shared handlers must still dispatch per-op tensor bindings correctly."""
+        torch.manual_seed(42)
+        x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        x1 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y1 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+
+        ops = (
+            TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M})
+            + TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M})
+        )
+        kernel = Megakernel(ops)
+
+        assert len(kernel._backend_ir.handler_specs) == 1
+
+        kernel.run()
+
+        torch.testing.assert_close(y0, x0 + 1.0, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_repeated_tma_ops_keep_distinct_bindings(self):
+        """Repeated TMA ops must preserve distinct desc slots."""
+        torch.manual_seed(42)
+        x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        x1 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y1 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+
+        ops = (
+            TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M})
+            + TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M})
+        )
+        kernel = Megakernel(ops, config=MegakernelConfig())
+
+        assert len(kernel._backend_ir.handler_specs) == 1
+
+        kernel.run()
+
+        torch.testing.assert_close(y0, x0 + 1.0, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)
+
+    def test_tma_kernel_cache_reuse_across_same_shape_allocations(self):
+        """Compiled TMA kernels should be reusable across same-shape reallocations."""
+        torch.manual_seed(42)
+
+        x0 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y0 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        k0 = Megakernel(TMAAddOneOp.schedule(x=x0, y=y0, tile_sizes={"M": TILE_M}))
+        k0.compile()
+
+        x1 = torch.randn(TILE_M, N_STATIC, dtype=torch.float16, device="cuda")
+        y1 = torch.full((TILE_M, N_STATIC), -999.0, dtype=torch.float16, device="cuda")
+        k1 = Megakernel(TMAAddOneOp.schedule(x=x1, y=y1, tile_sizes={"M": TILE_M}))
+        k1.compile()
+
+        assert k0._compiled_kernel is k1._compiled_kernel
+
+        k1.run()
+        torch.testing.assert_close(y1, x1 + 1.0, atol=1e-3, rtol=1e-3)

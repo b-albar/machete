@@ -39,4 +39,25 @@ def qknorm_rope_pytorch(q, norm_weight, cos, sin, eps=1e-6):
     return out
 
 
-__all__ = ["qknorm_rope_pytorch"]
+def qknorm_rope_backward_pytorch(q, norm_weight, cos, sin, dout, eps=1e-6):
+    """Reference backward for fused per-head RMSNorm + RoPE.
+
+    Args:
+        q: (B, S, H, D)
+        norm_weight: (D,)
+        cos: (S, D2)
+        sin: (S, D2)
+        dout: upstream gradient with same shape as q
+        eps: RMSNorm epsilon
+
+    Returns:
+        (dq, d_norm_weight), both float32 tensors.
+    """
+    q_ = q.detach().float().requires_grad_(True)
+    w_ = norm_weight.detach().float().requires_grad_(True)
+    out = qknorm_rope_pytorch(q_, w_, cos.float(), sin.float(), eps)
+    out.backward(dout.float())
+    return q_.grad, w_.grad
+
+
+__all__ = ["qknorm_rope_pytorch", "qknorm_rope_backward_pytorch"]

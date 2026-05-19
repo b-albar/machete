@@ -8,6 +8,7 @@ Supports both:
 """
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable, Any, Optional
 
@@ -44,12 +45,95 @@ class KernelBenchSpec:
             output zeroing, etc.). Called BEFORE the timed region so it does
             not inflate kernel timing.
         stream: A (torch.cuda.Stream, CUstream) pair.
+        use_host_timer: If True, benchmark with host wall-clock time and
+            explicit CUDA synchronization instead of CUDA events. This is less
+            pure, but some persistent megakernel paths are not stable under
+            event-based timing.
     """
 
     launch_fn: Callable
     setup_fn: Optional[Callable] = None
     stream: Any = None
+    use_host_timer: bool = False
+    metadata: Optional[str] = None
     _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
+
+
+def combine_megakernel_bench_spec(
+    kernels: list[Any],
+    setup_fn: Optional[Callable] = None,
+    keep_alive: Any = None,
+) -> KernelBenchSpec:
+    """Create one benchmark spec that launches several megakernels in sequence.
+
+    This is used for split-kernel baselines such as pre-attention / attention /
+    post-attention pipelines. The helper deliberately reuses each megakernel's
+    real launch path instead of rebuilding benchmark-only argument lists in the
+    benchmark scripts.
+    """
+    if not CUTLASS_AVAILABLE:
+        raise RuntimeError("CUTLASS is not available")
+
+    for kernel in kernels:
+        kernel.compile()
+        kernel._cache_launch_state()
+
+    def _setup():
+        if setup_fn is not None:
+            setup_fn()
+        # Each kernel resets its own barriers in run(). Keep the benchmark
+        # setup free of kernel-specific launch plumbing.
+
+    def _launch():
+        for kernel in kernels:
+            kernel.run(sync=False, validate=False)
+
+    torch_stream = torch.cuda.current_stream()
+
+    return KernelBenchSpec(
+        launch_fn=_launch,
+        setup_fn=_setup,
+        stream=(torch_stream, None),
+        use_host_timer=True,
+        _keep_alive=(kernels, keep_alive),
+    )
+
+
+def chain_kernel_bench_specs(
+    specs: list[KernelBenchSpec],
+    setup_fn: Optional[Callable] = None,
+    keep_alive: Any = None,
+) -> KernelBenchSpec:
+    """Create one benchmark spec that launches several existing specs in sequence.
+
+    Unlike ``combine_megakernel_bench_spec()``, this operates on already-built
+    ``KernelBenchSpec`` objects. It is useful for end-to-end model benchmarks
+    that are composed from several fused megakernels built through existing
+    helpers.
+    """
+    if not specs:
+        raise ValueError("expected at least one KernelBenchSpec")
+
+    torch_stream, cu_stream = specs[0].stream
+
+    def _setup():
+        if setup_fn is not None:
+            setup_fn()
+        for spec in specs:
+            if spec.setup_fn is not None:
+                spec.setup_fn()
+
+    def _launch():
+        for spec in specs:
+            spec.launch_fn()
+
+    return KernelBenchSpec(
+        launch_fn=_launch,
+        setup_fn=_setup,
+        stream=(torch_stream, cu_stream),
+        use_host_timer=any(spec.use_host_timer for spec in specs),
+        _keep_alive=(specs, keep_alive),
+    )
 
 
 # =============================================================================

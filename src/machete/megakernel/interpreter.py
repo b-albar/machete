@@ -13,11 +13,16 @@ from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
+from .instruction_layout import INSTRUCTION_ROW_BYTES
+
 # Counter for unique PTX labels across inline asm invocations.
 # PTX labels are function-scoped (not block-scoped), so multiple
 # inlined copies of the same asm template would collide without
 # unique names.
 _ptx_label_counter = 0
+
+# The instruction tensor stores one compact replay header plus tile coords.
+_INSTRUCTION_ROW_STRIDE_BYTES = INSTRUCTION_ROW_BYTES
 
 
 # =============================================================================
@@ -66,6 +71,55 @@ def global_barrier_wait(
         "{done}: "
         "}}".format(loop=_loop, done=_done),
         "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def global_barrier_wait_relaxed(
+    barrier_ptr: Int64,
+    barrier_idx: Int32,
+    expected: Int32,
+    sleep_ns: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Wait on a global barrier using configurable-sleep acquire polling.
+
+    The producer signals the barrier after writing global outputs.  The wait
+    load must therefore be acquire-scoped; a volatile poll can observe the
+    counter update before the consumer sees the producer's data writes.
+    """
+    global _ptx_label_counter
+    _ptx_label_counter += 1
+    _loop = "LBB_bwait_relaxed_loop_{}".format(_ptx_label_counter)
+    _done = "LBB_bwait_relaxed_done_{}".format(_ptx_label_counter)
+
+    llvm.inline_asm(
+        None,
+        [
+            barrier_ptr.ir_value(loc=loc, ip=ip),
+            barrier_idx.ir_value(loc=loc, ip=ip),
+            expected.ir_value(loc=loc, ip=ip),
+            sleep_ns.ir_value(loc=loc, ip=ip),
+        ],
+        "{{ "
+        ".reg .pred %p; "
+        ".reg .u32 %val; "
+        ".reg .u64 %addr; "
+        "mad.wide.u32 %addr, $1, 4, $0; "
+        "{loop}: "
+        "ld.acquire.gpu.global.b32 %val, [%addr]; "
+        "setp.ge.u32 %p, %val, $2; "
+        "@%p bra {done}; "
+        "nanosleep.u32 $3; "
+        "bra {loop}; "
+        "{done}: "
+        "}}".format(loop=_loop, done=_done),
+        "l,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -231,38 +285,6 @@ def global_barrier_signal_gpu(
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
-
-@dsl_user_op
-def atomic_add_acq_rel_gpu_i32(
-    base_ptr: Int64,
-    idx: Int32,
-    loc=None,
-    ip=None,
-) -> Int32:
-    """Atomic increment (add 1) with acquire-release semantics, GPU scope.
-
-    Computes address as base_ptr + idx * 4, then atomically adds 1.
-    Returns the OLD value before the increment. Used for cross-block
-    coordination: release ensures this block's prior writes are visible,
-    acquire ensures the caller sees other blocks' released writes.
-    """
-    return llvm.inline_asm(
-        Int32.mlir_type,
-        [base_ptr.ir_value(loc=loc, ip=ip), idx.ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .u64 %addr;
-            mad.wide.u32 %addr, $2, 4, $1;
-            atom.add.acq_rel.gpu.global.u32 $0, [%addr], 1;
-        }
-        """,
-        "=r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 # =============================================================================
 # Instruction Stream Access
 # =============================================================================
@@ -277,16 +299,14 @@ def load_instruction_to_smem(
     loc=None,
     ip=None,
 ) -> None:
-    """Load a flat instruction (2 words) from global memory to shared memory.
+    """Load one packed instruction row from global memory to shared memory.
 
-    Uses 1x ld.global.v2.b32 to load both instruction words (op_idx +
-    linear_tile_idx), then 1x st.shared.v2.b32 to write them to shared
-    memory.  v2 loads require 8-byte alignment, which is satisfied for
-    all instruction indices with 8-byte stride.
+    The instruction tensor is laid out as
+    ``[num_instructions, INSTRUCTION_WORDS]`` int32 values.
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
-        instr_idx: Instruction index (byte offset = instr_idx * 8)
+        instr_idx: Instruction row index
         smem_dest: Shared memory destination address (must be 8-byte aligned)
     """
     llvm.inline_asm(
@@ -295,20 +315,29 @@ def load_instruction_to_smem(
             instr_ptr.ir_value(loc=loc, ip=ip),
             instr_idx.ir_value(loc=loc, ip=ip),
             smem_dest.ir_value(loc=loc, ip=ip),
+            Int32(_INSTRUCTION_ROW_STRIDE_BYTES).ir_value(loc=loc, ip=ip),
         ],
         """
         {
             .reg .u64 %gaddr;
-            .reg .u32 %w0, %w1;
-            mad.wide.u32 %gaddr, $1, 8, $0;
-            ld.global.v2.b32 {%w0, %w1}, [%gaddr];
+            .reg .u32 %w0, %w1, %w2, %w3, %w4;
+            mad.wide.u32 %gaddr, $1, $3, $0;
+            ld.global.b32 %w0, [%gaddr];
+            ld.global.b32 %w1, [%gaddr+4];
+            ld.global.b32 %w2, [%gaddr+8];
+            ld.global.b32 %w3, [%gaddr+12];
+            ld.global.b32 %w4, [%gaddr+16];
             st.shared.v2.b32 [$2], {%w0, %w1};
+            st.shared.v2.b32 [$2+8], {%w2, %w3};
+            st.shared.b32 [$2+16], %w4;
         }
         """,
-        "l,r,r",
+        "l,r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -781,22 +810,23 @@ def prefetch_instruction(
 
     Args:
         instr_ptr: Pointer to instruction array in global memory (64-bit)
-        instr_idx: Instruction index (byte offset = instr_idx * 8)
+        instr_idx: Instruction row index
     """
     llvm.inline_asm(
         None,
         [
             instr_ptr.ir_value(loc=loc, ip=ip),
             instr_idx.ir_value(loc=loc, ip=ip),
+            Int32(_INSTRUCTION_ROW_STRIDE_BYTES).ir_value(loc=loc, ip=ip),
         ],
         """
         {
             .reg .u64 %gaddr;
-            mad.wide.u32 %gaddr, $1, 8, $0;
+            mad.wide.u32 %gaddr, $1, $2, $0;
             prefetch.global.L2 [%gaddr];
         }
         """,
-        "l,r",
+        "l,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -805,6 +835,7 @@ def prefetch_instruction(
 
 __all__ = [
     "global_barrier_wait",
+    "global_barrier_wait_relaxed",
     "global_barrier_signal",
     "global_barrier_signal_gpu",
     "check_barrier_ready",

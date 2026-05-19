@@ -59,6 +59,7 @@ class GDNStateRecurrenceOp(Op):
         "h_states": (None, ("B", "NT", "NH", "K", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = set()
 
     def __init__(self, **config):
@@ -92,9 +93,6 @@ class GDNStateRecurrenceOp(Op):
         self.uv_copy_dim1 = self.BV // self.async_copy_elems
         self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # Configurable pipeline stages (can be 1 or 2)
         self.num_stages = getattr(self, "num_stages", 2)
 
@@ -113,7 +111,7 @@ class GDNStateRecurrenceOp(Op):
         gbuf_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._gbuf_offset = ((gbuf_start + 15) // 16) * 16
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling

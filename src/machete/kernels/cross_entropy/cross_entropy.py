@@ -8,15 +8,15 @@ kernel using online softmax (2-pass over vocabulary dimension V):
     Pass 2: Compute softmax gradients, write to grad_logits (V-blocks via TMA)
 
 Architecture:
-    DMA warps:  Load logits V-blocks via TMA (double-buffered).
-                Store warp dispatches remaining TMA loads (iter 1+).
+    DMA warps:  Load logits V-blocks via an op-owned TMA loop
+                (double-buffered).
     MMA warps:  All warps cooperatively reduce over V via cross-warp reduction.
                 Read V-blocks from smem, write gradients directly to global.
 
-Mbarrier protocol (double-buffered, same as FlashAttentionSm100Op):
+Mbarrier protocol (double-buffered):
     4 op-managed mbarriers: smem_consumed[0,1], kblock_ready[0,1]
     Phase formula: phase(g) = ((g - 1) // 2) % 2 for global_iter g >= 1.
-    Iter 0 uses framework work_mbar (not kblock_ready).
+    Iter 0 uses the framework work_mbar; later loads use kblock_ready.
 """
 
 import operator
@@ -85,6 +85,8 @@ class CrossEntropyOp(Op):
     }
     tile = ("BT",)
     tma_loads = {"logits"}
+    load_phase = "load_logits"
+    compute_phase = "compute_ce"
 
     @classmethod
     def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
@@ -125,14 +127,6 @@ class CrossEntropyOp(Op):
         self.mbar_offset = self.buf_bytes * 2
         self.scratch_offset = self.mbar_offset + 32  # after 4×8 mbarriers
 
-        # Inner iters for DMA: pass 1 + pass 2
-        self.inner_iters = 2 * self.n_v_blocks
-        self.inner_depth = 2
-
-        # Override compute and load methods
-        self.compute = self.compute_ce
-        self.load = self.load_logits
-
     # =========================================================================
     # Scheduling
     # =========================================================================
@@ -157,8 +151,6 @@ class CrossEntropyOp(Op):
         V = ops[0].static_dims["V"]
         block_v, _, _ = _compute_block_v(page_size, elem_bytes, V=V)
         ops[0].static_dims["block_v"] = block_v
-        ops[0].static_dims["inner_depth"] = 2
-
         return ops
 
     @classmethod
@@ -182,66 +174,39 @@ class CrossEntropyOp(Op):
     @cute.jit
     def load_logits(self, page_ptr, tile_BT,
                     logits_tma, logits_tma_gmem,
-                    work_mbar, inner_iter_idx):
-        """TMA load dispatched by inner_iter_idx.
+                    work_mbar):
+        """TMA load logits V-blocks for both softmax passes."""
 
-        iter 0:   Init mbarriers. TMA logits V-block 0 → buf 0 (work_mbar).
-        iter k>0: Wait smem_consumed[buf], TMA V-block → buf (kblock_ready[buf]).
-        """
-        buf_idx = inner_iter_idx % Int32(2)
-        buf_base = page_ptr + buf_idx * Int32(self.buf_bytes)
-        v_block = inner_iter_idx % Int32(self.n_v_blocks)
-
-        # Op-managed mbarrier addresses
         _sc_0 = page_ptr + Int32(self.mbar_offset)
         _sc_1 = page_ptr + Int32(self.mbar_offset + 8)
         _kr_0 = page_ptr + Int32(self.mbar_offset + 16)
         _kr_1 = page_ptr + Int32(self.mbar_offset + 24)
 
-        if inner_iter_idx == Int32(0):
-            # --- Init mbarriers ---
-            with cute.arch.elect_one():
-                mbarrier_init(_sc_0, Int32(1))
-                mbarrier_init(_sc_1, Int32(1))
-                mbarrier_init(_kr_0, Int32(1))
-                mbarrier_init(_kr_1, Int32(1))
-            mbarrier_init_fence()
-            # Pre-arrive smem_consumed[1]: buf 1 starts empty
-            with cute.arch.elect_one():
-                mbarrier_arrive(_sc_1)
+        with cute.arch.elect_one():
+            mbarrier_init(_sc_0, Int32(1))
+            mbarrier_init(_sc_1, Int32(1))
+            mbarrier_init(_kr_0, Int32(1))
+            mbarrier_init(_kr_1, Int32(1))
+        mbarrier_init_fence()
 
-            # TMA load V-block 0 → buf 0 using framework work_mbar
-            sL = cute.make_tensor(
-                cute.make_ptr(self.logits_dtype, buf_base,
-                              cute.AddressSpace.smem),
-                cute.make_layout((self.BLOCK_V, 1)),
-            )
-            gL = cute.local_tile(
-                logits_tma_gmem, (self.BLOCK_V, 1), (None, None),
-            )
-            tLsL, tLgL = cute.nvgpu.cpasync.tma_partition(
-                logits_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sL, 0, 2),
-                cute.group_modes(gL, 0, 2),
-            )
-            mbar_ptr = cute.make_ptr(
-                cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-            nbytes = Int32(self.buf_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
-            cute.copy(logits_tma,
-                      tLgL[(None, v_block, tile_BT)],
-                      tLsL, tma_bar_ptr=mbar_ptr)
+        # Buffer 1 is initially empty and available if the first later load
+        # targets it before compute has consumed anything.
+        with cute.arch.elect_one():
+            mbarrier_arrive(_sc_1)
 
-        if inner_iter_idx > Int32(0):
-            # Wait smem_consumed[buf] — compute freed this buffer
-            sc_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-            if buf_idx == Int32(0):
-                mbarrier_wait(_sc_0, sc_phase)
-            if buf_idx == Int32(1):
-                mbarrier_wait(_sc_1, sc_phase)
+        global_iter = Int32(0)
+        while global_iter < Int32(2 * self.n_v_blocks):
+            buf_idx = global_iter % Int32(2)
+            buf_base = page_ptr + buf_idx * Int32(self.buf_bytes)
+            v_block = global_iter % Int32(self.n_v_blocks)
 
-            # TMA load V-block → buf, signal kblock_ready[buf]
+            if global_iter > Int32(0):
+                sc_phase = ((global_iter - Int32(1)) // Int32(2)) % Int32(2)
+                if buf_idx == Int32(0):
+                    mbarrier_wait(_sc_0, sc_phase)
+                if buf_idx == Int32(1):
+                    mbarrier_wait(_sc_1, sc_phase)
+
             sL = cute.make_tensor(
                 cute.make_ptr(self.logits_dtype, buf_base,
                               cute.AddressSpace.smem),
@@ -256,22 +221,31 @@ class CrossEntropyOp(Op):
                 cute.group_modes(gL, 0, 2),
             )
             nbytes = Int32(self.buf_bytes)
-            if buf_idx == Int32(0):
+            if global_iter == Int32(0):
+                _mbar_ptr = cute.make_ptr(
+                    cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                cute.copy(logits_tma,
+                          tLgL[(None, v_block, tile_BT)],
+                          tLsL, tma_bar_ptr=_mbar_ptr)
+
+            if global_iter > Int32(0):
                 _kr_ptr = cute.make_ptr(
                     cutlass.Int64, _kr_0, cute.AddressSpace.smem)
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_kr_0, nbytes)
+                if buf_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(_kr_0, nbytes)
+                if buf_idx == Int32(1):
+                    _kr_ptr = cute.make_ptr(
+                        cutlass.Int64, _kr_1, cute.AddressSpace.smem)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(_kr_1, nbytes)
                 cute.copy(logits_tma,
                           tLgL[(None, v_block, tile_BT)],
                           tLsL, tma_bar_ptr=_kr_ptr)
-            if buf_idx == Int32(1):
-                _kr_ptr = cute.make_ptr(
-                    cutlass.Int64, _kr_1, cute.AddressSpace.smem)
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_kr_1, nbytes)
-                cute.copy(logits_tma,
-                          tLgL[(None, v_block, tile_BT)],
-                          tLsL, tma_bar_ptr=_kr_ptr)
+
+            global_iter = global_iter + Int32(1)
 
     # =========================================================================
     # Compute — Fused Forward + Backward with TMA V-blocks

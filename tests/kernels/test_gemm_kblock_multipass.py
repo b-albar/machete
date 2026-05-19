@@ -16,26 +16,46 @@ import io
 
 import pytest
 import torch
+from tests.kernels.support import requires_sm90_cutlass
 
 
-def is_sm90_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor >= 90
+requires_gpu = requires_sm90_cutlass
 
+SINGLE_PASS_CASES = [
+    (64, 64, 32, torch.float16, 64, 32, 32, None),
+    (64, 96, 32, torch.float16, 64, 32, 32, None),
+    (64, 128, 32, torch.float16, 64, 32, 32, None),
+    (64, 256, 32, torch.float16, 64, 32, 32, None),
+]
 
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
+MULTIPASS_CASES = [
+    (128, 64, 32, torch.float16, 64, 32, 32, None),
+    (128, 96, 32, torch.float16, 64, 32, 32, None),
+    (128, 128, 32, torch.float16, 64, 32, 32, None),
+    (128, 256, 32, torch.float16, 64, 32, 32, None),
+    (256, 64, 32, torch.float16, 64, 32, 32, None),
+    (256, 128, 32, torch.float16, 64, 32, 32, None),
+    (128, 128, 64, torch.float16, 64, 32, 32, None),
+    (256, 128, 64, torch.float16, 64, 32, 32, None),
+    (256, 64, 64, torch.bfloat16, 64, 32, 32, None),
+    (128, 128, 32, torch.float16, 64, 32, 64, 32768),
+    (128, 64, 32, torch.float16, 64, 32, 16, None),
+    (128, 32, 32, torch.float16, 64, 32, 32, None),
+]
 
-
-requires_gpu = pytest.mark.skipif(
-    not (is_sm90_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires SM_90+ GPU with CUTLASS",
-)
+DOUBLE_BUFFER_CASES = [
+    (64, 64, 32, torch.float16, 64, 32, 32, None),
+    (64, 96, 32, torch.float16, 64, 32, 32, None),
+    (64, 128, 32, torch.float16, 64, 32, 32, None),
+    (64, 256, 32, torch.float16, 64, 32, 32, None),
+    (64, 64, 32, torch.float16, 64, 32, 16, None),
+    (128, 64, 32, torch.float16, 64, 32, 32, None),
+    (128, 128, 32, torch.float16, 64, 32, 32, None),
+    (256, 128, 32, torch.float16, 64, 32, 32, None),
+    (128, 128, 64, torch.float16, 64, 32, 32, None),
+    (256, 128, 64, torch.float16, 64, 32, 32, None),
+    (256, 128, 64, torch.bfloat16, 64, 32, 32, None),
+]
 
 
 # =============================================================================
@@ -110,21 +130,10 @@ class TestGemmKBlockSinglePass:
     These should always work since the DMA loop runs once.
     """
 
-    def test_2_k_blocks(self):
-        """K=64, tile_K=32 → 2 K-blocks, 1 tile."""
-        _gemm_case(64, 64, 32, torch.float16)
-
-    def test_4_k_blocks(self):
-        """K=128, tile_K=32 → 4 K-blocks, 1 tile."""
-        _gemm_case(64, 128, 32, torch.float16)
-
-    def test_8_k_blocks(self):
-        """K=256, tile_K=32 → 8 K-blocks, 1 tile."""
-        _gemm_case(64, 256, 32, torch.float16)
-
-    def test_3_k_blocks_odd(self):
-        """K=96, tile_K=32 → 3 K-blocks (odd), 1 tile."""
-        _gemm_case(64, 96, 32, torch.float16)
+    @pytest.mark.parametrize("M,K,N,dtype,tile_m,tile_n,tile_k,page_size", SINGLE_PASS_CASES)
+    def test_single_pass_matrix(self, M, K, N, dtype, tile_m, tile_n, tile_k, page_size):
+        """Representative single-pass K-block cases."""
+        _gemm_case(M, K, N, dtype, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, page_size=page_size)
 
 
 # =============================================================================
@@ -139,78 +148,10 @@ class TestGemmKBlockMultiPass:
     each tile has TMA load of first 2 K-blocks + cpasync for the rest.
     """
 
-    # ----- 2 tiles, varying K-blocks -----
-
-    def test_2_tiles_2_kblocks(self):
-        """2 M-tiles × 2 K-blocks (even K). Simplest multi-pass."""
-        _gemm_case(128, 64, 32, torch.float16)
-
-    def test_2_tiles_3_kblocks(self):
-        """2 M-tiles × 3 K-blocks (odd K). Phase tracking differs for odd K."""
-        _gemm_case(128, 96, 32, torch.float16)
-
-    def test_2_tiles_4_kblocks(self):
-        """2 M-tiles × 4 K-blocks (even K)."""
-        _gemm_case(128, 128, 32, torch.float16)
-
-    def test_2_tiles_8_kblocks(self):
-        """2 M-tiles × 8 K-blocks (even K, many iterations)."""
-        _gemm_case(128, 256, 32, torch.float16)
-
-    # ----- 4+ tiles with slot reuse -----
-
-    def test_4_tiles_2_kblocks(self):
-        """4 M-tiles × 2 K-blocks. With 2 pages, each slot used twice."""
-        _gemm_case(256, 64, 32, torch.float16)
-
-    def test_4_tiles_3_kblocks(self):
-        """4 M-tiles × 3 K-blocks (odd K). Slot reuse + odd phase."""
-        _gemm_case(256, 96, 32, torch.float16)
-
-    def test_4_tiles_4_kblocks(self):
-        """4 M-tiles × 4 K-blocks. Heavy multi-pass."""
-        _gemm_case(256, 128, 32, torch.float16)
-
-    # ----- Multi-tile in both M and N -----
-
-    def test_mn_tiles_2_kblocks(self):
-        """2×2 tile grid × 2 K-blocks. 4 tiles total."""
-        _gemm_case(128, 64, 64, torch.float16)
-
-    def test_mn_tiles_4_kblocks(self):
-        """2×2 tile grid × 4 K-blocks. 4 tiles, heavy K-loop."""
-        _gemm_case(128, 128, 64, torch.float16)
-
-    # ----- Stress: many tiles × many K-blocks -----
-
-    def test_8_tiles_4_kblocks(self):
-        """4×2 tile grid × 4 K-blocks. 8 tiles, each slot reused 4x."""
-        _gemm_case(256, 128, 64, torch.float16)
-
-    def test_8_tiles_2_kblocks_bf16(self):
-        """Same as above but bf16. Verify dtype doesn't affect framework."""
-        _gemm_case(256, 64, 64, torch.bfloat16)
-
-    # ----- Different tile_K sizes -----
-
-    def test_tile_k_64_multipass(self):
-        """tile_K=64, K=128 → 2 K-blocks. Larger tile, fewer iters."""
-        _gemm_case(128, 128, 32, torch.float16, tile_k=64,
-                   page_size=32768)
-
-    def test_tile_k_16_multipass(self):
-        """tile_K=16, K=64 → 4 K-blocks. Smallest tile, most iters."""
-        _gemm_case(128, 64, 32, torch.float16, tile_k=16)
-
-    # ----- Single K-block (no cpasync), multi-pass baseline -----
-
-    def test_multi_pass_no_cpasync(self):
-        """2 tiles × 1 K-block. Multi-pass WITHOUT cpasync — must work."""
-        _gemm_case(128, 32, 32, torch.float16)
-
-    def test_4_tiles_no_cpasync(self):
-        """4 tiles × 1 K-block. Slot reuse without cpasync."""
-        _gemm_case(256, 32, 32, torch.float16)
+    @pytest.mark.parametrize("M,K,N,dtype,tile_m,tile_n,tile_k,page_size", MULTIPASS_CASES)
+    def test_multipass_matrix(self, M, K, N, dtype, tile_m, tile_n, tile_k, page_size):
+        """Representative multi-pass K-block matrix."""
+        _gemm_case(M, K, N, dtype, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, page_size=page_size)
 
 
 # =============================================================================
@@ -225,25 +166,10 @@ class TestGemmDoubleBufferSinglePass:
     K-blocks 2+. Smem budget: 2 * (A_tile + B_tile) <= page_size.
     """
 
-    def test_2_k_blocks_depth2(self):
-        """K=64, tile_K=32 → 2 K-blocks. Exactly fills both buffers."""
-        _gemm_case(64, 64, 32, torch.float16)
-
-    def test_3_k_blocks_depth2(self):
-        """K=96, tile_K=32 → 3 K-blocks. Two TMA + one cpasync."""
-        _gemm_case(64, 96, 32, torch.float16)
-
-    def test_4_k_blocks_depth2(self):
-        """K=128, tile_K=32 → 4 K-blocks. Full double-buffer pipeline."""
-        _gemm_case(64, 128, 32, torch.float16)
-
-    def test_8_k_blocks_depth2(self):
-        """K=256, tile_K=32 → 8 K-blocks. Many overlapped iterations."""
-        _gemm_case(64, 256, 32, torch.float16)
-
-    def test_tile_k16_depth2(self):
-        """tile_K=16, K=64 → 4 K-blocks. Smallest tile + double buffer."""
-        _gemm_case(64, 64, 32, torch.float16, tile_k=16)
+    @pytest.mark.parametrize("M,K,N,dtype,tile_m,tile_n,tile_k,page_size", SINGLE_PASS_CASES[:4] + [DOUBLE_BUFFER_CASES[4]])
+    def test_double_buffer_single_pass_matrix(self, M, K, N, dtype, tile_m, tile_n, tile_k, page_size):
+        """Representative double-buffer single-pass cases."""
+        _gemm_case(M, K, N, dtype, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, page_size=page_size)
 
 
 @requires_gpu
@@ -254,26 +180,7 @@ class TestGemmDoubleBufferMultiPass:
     correct phase tracking across tile boundaries.
     """
 
-    def test_2_tiles_2_kblocks_depth2(self):
-        """2 M-tiles × 2 K-blocks."""
-        _gemm_case(128, 64, 32, torch.float16)
-
-    def test_2_tiles_4_kblocks_depth2(self):
-        """2 M-tiles × 4 K-blocks."""
-        _gemm_case(128, 128, 32, torch.float16)
-
-    def test_4_tiles_4_kblocks_depth2(self):
-        """4 M-tiles × 4 K-blocks. Heavy multi-pass."""
-        _gemm_case(256, 128, 32, torch.float16)
-
-    def test_mn_tiles_4_kblocks_depth2(self):
-        """2×2 tile grid × 4 K-blocks."""
-        _gemm_case(128, 128, 64, torch.float16)
-
-    def test_8_tiles_4_kblocks_depth2(self):
-        """4×2 tile grid × 4 K-blocks. 8 tiles, each slot reused."""
-        _gemm_case(256, 128, 64, torch.float16)
-
-    def test_8_tiles_depth2_bf16(self):
-        """8 tiles × 4 K-blocks, bf16."""
-        _gemm_case(256, 128, 64, torch.bfloat16)
+    @pytest.mark.parametrize("M,K,N,dtype,tile_m,tile_n,tile_k,page_size", DOUBLE_BUFFER_CASES[5:])
+    def test_double_buffer_multipass_matrix(self, M, K, N, dtype, tile_m, tile_n, tile_k, page_size):
+        """Representative double-buffer multi-pass cases."""
+        _gemm_case(M, K, N, dtype, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, page_size=page_size)

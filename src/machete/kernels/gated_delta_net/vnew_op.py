@@ -61,6 +61,7 @@ class GDNVNewOp(Op):
         "v_new":    (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "S", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"w"}
 
     @classmethod
@@ -115,8 +116,6 @@ class GDNVNewOp(Op):
         self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
         # TMA double-buffer for W
-        self.inner_iters = max(1, self.NK - 1)
-        self.inner_depth = 1
         self._tma_k_blocks = min(2, self.NK)
         self._w_buf_bytes = self.BT * self.BK * self.elem_bytes
         self._buf_stride = self._w_buf_bytes
@@ -137,7 +136,7 @@ class GDNVNewOp(Op):
         mbar_start = self._s_uv_offset + self.BT * self.BV * self.elem_bytes
         self._mbar_offset = ((mbar_start + 7) // 8) * 8
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling
@@ -215,17 +214,9 @@ class GDNVNewOp(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_B, tile_NH, tile_S, tile_V,
-             w_tma, w_tma_gmem, work_mbar, inner_iter_idx):
-        """TMA W load: NK sub-blocks [BT, BK] into double buffer.
-
-        iter 0 (load warp):  Init mbarriers, TMA W[0..min(2,NK)-1],
-                              signal work_mbar.
-        iter 1+ (store warp): Wait buf_free[buf], TMA W[k_block],
-                              signal kblock_ready[buf].
-        """
+             w_tma, w_tma_gmem, work_mbar):
+        """TMA W load through an op-owned NK loop."""
         swz = cute.make_swizzle(self.swizzle_B, 4, 3)
-
-        mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
 
         _bf_0 = page_ptr + Int32(self._mbar_offset)
         _bf_1 = page_ptr + Int32(self._mbar_offset + 8)
@@ -234,64 +225,24 @@ class GDNVNewOp(Op):
 
         merged_t = tile_B * Int32(self.S // self.BT) + tile_S
 
-        if inner_iter_idx == Int32(0):
-            # Init op-managed mbarriers
-            with cute.arch.elect_one():
-                mbarrier_init(_bf_0, Int32(1))
-                mbarrier_init(_bf_1, Int32(1))
-                mbarrier_init(_kr_0, Int32(1))
-                mbarrier_init(_kr_1, Int32(1))
-            mbarrier_init_fence()
+        with cute.arch.elect_one():
+            mbarrier_init(_bf_0, Int32(1))
+            mbarrier_init(_bf_1, Int32(1))
+            mbarrier_init(_kr_0, Int32(1))
+            mbarrier_init(_kr_1, Int32(1))
+        mbarrier_init_fence()
 
-            # Signal expected TMA bytes on framework work_mbar
-            nbytes = Int32(self._tma_w_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
-
-            # TMA W[0..min(2,NK)-1] into double buffer
-            for _k in cutlass.range_constexpr(self._tma_k_blocks):
-                _buf_base = page_ptr + Int32(_k * self._buf_stride)
-                sW = cute.make_tensor(
-                    cute.recast_ptr(
-                        cute.make_ptr(self.w_dtype, _buf_base,
-                                      cute.AddressSpace.smem),
-                        swz, dtype=self.w_dtype),
-                    cute.make_layout((self.BK, 1, self.BT),
-                                     stride=(1, self.BK, self.BK)),
-                )
-                gW = cute.local_tile(
-                    w_tma_gmem,
-                    (self.BK, 1, self.BT),
-                    (None, None, None),
-                )
-                tWsW, tWgW = cute.nvgpu.cpasync.tma_partition(
-                    w_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sW, 0, 3), cute.group_modes(gW, 0, 3),
-                )
-                cute.copy(w_tma, tWgW[(None, Int32(_k), tile_NH, merged_t)],
-                          tWsW, tma_bar_ptr=mbar_ptr)
-
-        if inner_iter_idx > Int32(0):
-            # Store warp: load W[k_block] into freed buffer
-            _k_block = inner_iter_idx + Int32(1)
+        _k_block = Int32(0)
+        while _k_block < Int32(self.NK):
             _buf_idx = _k_block % Int32(2)
-
-            # Wait for compute to free this buffer
-            _bf_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-            if _buf_idx == Int32(0):
-                mbarrier_wait(_bf_0, _bf_phase)
-            if _buf_idx == Int32(1):
-                mbarrier_wait(_bf_1, _bf_phase)
-
-            # Set up TMA bar for kblock_ready
             _buf_base = _buf_idx * Int32(self._buf_stride) + page_ptr
-            _kr_mbar = _kr_0
-            if _buf_idx == Int32(1):
-                _kr_mbar = _kr_1
-            _kr_ptr = cute.make_ptr(cutlass.Int64, _kr_mbar,
-                                    cute.AddressSpace.smem)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(_kr_mbar, Int32(self._w_buf_bytes))
+
+            if _k_block >= Int32(2):
+                _bf_phase = ((_k_block - Int32(2)) // Int32(2)) % Int32(2)
+                if _buf_idx == Int32(0):
+                    mbarrier_wait(_bf_0, _bf_phase)
+                if _buf_idx == Int32(1):
+                    mbarrier_wait(_bf_1, _bf_phase)
 
             sW = cute.make_tensor(
                 cute.recast_ptr(
@@ -310,8 +261,29 @@ class GDNVNewOp(Op):
                 w_tma, Int32(0), cute.make_layout(1),
                 cute.group_modes(sW, 0, 3), cute.group_modes(gW, 0, 3),
             )
-            cute.copy(w_tma, tWgW[(None, _k_block, tile_NH, merged_t)],
-                      tWsW, tma_bar_ptr=_kr_ptr)
+
+            if _k_block < Int32(2):
+                _mbar_ptr = cute.make_ptr(
+                    cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+                if _k_block == Int32(0):
+                    nbytes = Int32(self._tma_w_bytes)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                cute.copy(w_tma, tWgW[(None, _k_block, tile_NH, merged_t)],
+                          tWsW, tma_bar_ptr=_mbar_ptr)
+
+            if _k_block >= Int32(2):
+                _kr_mbar = _kr_0
+                if _buf_idx == Int32(1):
+                    _kr_mbar = _kr_1
+                _kr_ptr = cute.make_ptr(cutlass.Int64, _kr_mbar,
+                                        cute.AddressSpace.smem)
+                with cute.arch.elect_one():
+                    mbarrier_arrive_expect_tx(_kr_mbar, Int32(self._w_buf_bytes))
+                cute.copy(w_tma, tWgW[(None, _k_block, tile_NH, merged_t)],
+                          tWsW, tma_bar_ptr=_kr_ptr)
+
+            _k_block = _k_block + Int32(1)
 
     # =========================================================================
     # Compute — v_new = u - w @ h_states (TMA W double-buffer + cpasync h)

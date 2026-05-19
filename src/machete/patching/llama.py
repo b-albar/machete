@@ -8,8 +8,7 @@ import torch
 
 try:
     from flash_attn.cute import flash_attn_func
-except ImportError as e:
-    print(f"Failed to import flash_attn_cute: {e}")
+except ImportError:
     flash_attn_func = None
 
 
@@ -103,15 +102,17 @@ def make_attention_forward():
 def patch_attention(module):
     """Patch Llama attention module with optimized forward.
 
-    No-op if flash-attn-cute is not available.
+    If flash-attn-cute is unavailable, keep the original forward in place but
+    still record the patch marker so top-level patch/unpatch state remains
+    consistent.
     """
-    if flash_attn_func is None:
-        return  # flash-attn-cute not available, skip patching
-
     if hasattr(module, "_machete_original_forward"):
         return  # Already patched
 
     module._machete_original_forward = module.forward
+    if flash_attn_func is None:
+        return
+
     module.forward = types.MethodType(make_attention_forward(), module)
 
 

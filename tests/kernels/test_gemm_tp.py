@@ -9,9 +9,13 @@ Tests:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 
 def _is_sm90_or_newer():
@@ -77,6 +81,38 @@ def _gemm_ref(a, b_t):
 class TestGemmTPSingleGPU:
     """TP subclasses with same-device peer buffer to exercise communicate()."""
 
+    @staticmethod
+    def _make_repeated_column_parallel_kernel(num_layers: int):
+        from machete.megakernel import Megakernel, MegakernelConfig
+        from machete.kernels.gemm import GemmColumnParallelOp
+
+        ops = []
+        c = torch.zeros(1, 64, 32, dtype=torch.float16, device="cuda")
+        peer_c = torch.zeros(1, 64, 32, dtype=torch.float16, device="cuda")
+        for _ in range(num_layers):
+            a = torch.randn(1, 64, 64, dtype=torch.float16, device="cuda")
+            b = torch.randn(32, 64, dtype=torch.float16, device="cuda")
+            ops += GemmColumnParallelOp.schedule(a=a, b=b, c=c)
+
+        base_config = GemmColumnParallelOp.kernel_config(ops)
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(
+                num_sms=4,
+                threads_per_block=base_config.threads_per_block,
+                page_size=base_config.page_size,
+                peer_buffers={"c": [peer_c]},
+                peer_barriers=_alloc_peer_barriers(ops),
+                device_idx=0,
+                num_devices=2,
+            ),
+        )
+        kernel._prepare_tensors()
+        kernel._prepare_cute_tensors()
+        kernel._prepare_tma_tensors()
+        kernel._prepare_peer_tma_tensors()
+        return kernel
+
     @requires_gpu
     def test_column_parallel_smoke(self):
         """GemmColumnParallelOp broadcasts C to same-device peer buffer."""
@@ -109,6 +145,40 @@ class TestGemmTPSingleGPU:
         ref = _gemm_ref(a.squeeze(0), b)
         torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(peer_c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
+
+    @requires_gpu
+    def test_column_parallel_layer_scaling_keeps_kernel_shape_constant(self):
+        """Repeated TP layers should reuse one handler shape and grow metadata linearly."""
+        k2 = self._make_repeated_column_parallel_kernel(2)
+        k32 = self._make_repeated_column_parallel_kernel(32)
+
+        assert len(k2._backend_ir.handler_specs) == 1
+        assert len(k32._backend_ir.handler_specs) == 1
+
+        assert k2._phase_local_transport_position_widths["load"] == k32._phase_local_transport_position_widths["load"]
+        assert k2._phase_local_transport_position_widths["store"] == k32._phase_local_transport_position_widths["store"]
+        assert k2._phase_local_transport_position_widths["communicate"] == k32._phase_local_transport_position_widths["communicate"]
+        assert k2._phase_local_desc_slot_widths["load"] == k32._phase_local_desc_slot_widths["load"]
+        assert k2._phase_local_desc_slot_widths["store"] == k32._phase_local_desc_slot_widths["store"]
+        assert k2._phase_local_desc_slot_widths["communicate"] == k32._phase_local_desc_slot_widths["communicate"]
+
+        assert k2._backend_ir.handler_specs[0].compile_key == k32._backend_ir.handler_specs[0].compile_key
+
+        for phase in ("load", "store", "communicate"):
+            t2 = k2._phase_local_transport_position_tensors[phase]
+            t32 = k32._phase_local_transport_position_tensors[phase]
+            if t2 is None or t32 is None:
+                assert t2 is None and t32 is None
+            else:
+                assert t2.numel() * 16 == t32.numel()
+
+        for phase in ("load", "store", "communicate"):
+            t2 = k2._phase_local_desc_slot_tensors[phase]
+            t32 = k32._phase_local_desc_slot_tensors[phase]
+            if t2 is None or t32 is None:
+                assert t2 is None and t32 is None
+            else:
+                assert t2.numel() * 16 == t32.numel()
 
     @requires_gpu
     def test_row_parallel_smoke(self):
@@ -347,8 +417,3 @@ class TestGemmTPRowParallel:
         torch.testing.assert_close(c.squeeze(0), ref, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(
             peer_c.squeeze(0).to("cuda:0"), ref, atol=1e-1, rtol=1e-2)
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main(["-v", __file__]))

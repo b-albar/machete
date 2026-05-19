@@ -2,9 +2,13 @@
 """Flash Attention kernels for the megakernel framework."""
 
 from .sm_100 import FlashAttentionSm100Op
-from .sm_120 import FlashAttentionSm120Op
+from .sm_120 import FlashAttentionSm120Op, FlashAttentionSm120PackGQAOp, FlashAttentionSm120DirectOp
 from .sm_120_bwd import FlashAttentionSm120BwdOp
-from .flash_decoding import FlashDecodingSplitOp, flash_decoding_schedule
+from .dpsum import AttentionDPSumOp
+from .flash_decoding import (
+    FlashDecodingSplitOp,
+    flash_decoding_schedule,
+)
 
 import torch
 
@@ -42,7 +46,8 @@ def _max_attention_page_size(device=None):
 
 
 def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
-                             kv_group_size=1, lse=None):
+                             kv_group_size=1, lse=None, write_lse=None,
+                             num_mma_warps=None):
     """Schedule attention with auto-dispatch between FA and FlashDecoding.
 
     Uses FlashDecoding for decode-like workloads where there aren't enough
@@ -65,7 +70,10 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
         if lse is not None:
             lse = lse.unsqueeze(0)
 
-    B, H, M, D = q.shape
+    if FlashAttentionOp is FlashAttentionSm120Op and q.ndim == 4:
+        B, M, H, D = q.shape
+    else:
+        B, H, M, D = q.shape
     elem = q.element_size()
 
     # Auto-detect max page_size for attention
@@ -90,10 +98,13 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
     fd_kv_min = 2 * 16 * D * elem  # 2 KV buffers × 16 rows minimum
     fd_possible = (fd_q_bytes + fd_kv_min <= page_size and M >= 16 and M % 16 == 0)
 
-    # Dispatch: use FD when too few tiles to saturate SMs.
-    # Exception: single head with large M (>64) — combine overhead dominates.
+    # Dispatch: use FD only for decode-like short-query workloads.
+    # At moderate prefill lengths like M=128, FA2-style attention is still the
+    # better path even when the tile count looks low, because FlashDecoding's
+    # split/combine overhead dominates.
     use_fd = (fd_possible
               and total_tiles < num_SMs // 2
+              and M <= 64
               and (total_tiles >= 2 or M <= 64))
 
     tensors = dict(q=q, k=k, v=v, o=o)
@@ -110,6 +121,8 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
     else:
         ops = FlashAttentionOp.schedule(
             causal=causal, page_size=page_size, kv_group_size=kv_group_size,
+            write_lse=write_lse,
+            num_mma_warps=num_mma_warps,
             **tensors,
         )
         config = FlashAttentionOp.kernel_config(ops)
@@ -118,7 +131,8 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
 
 __all__ = [
-    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120BwdOp",
+    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120DirectOp", "FlashAttentionSm120BwdOp",
+    "AttentionDPSumOp",
     "FlashDecodingSplitOp", "flash_decoding_schedule",
     "flash_attention_schedule",
 ]

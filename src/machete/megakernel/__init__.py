@@ -7,7 +7,7 @@ instruction stream and fine-grained tile-level barriers for maximum
 pipeline overlap between operations.
 
 Usage:
-    from machete.megakernel import Megakernel
+    from machete.megakernel import Megakernel, config_dim_i32, config_flat_tensor
     from machete.kernels.rms_norm import RMSNormOp
 
     ops = RMSNormOp.schedule(x=x, weight=w, y=y)
@@ -17,10 +17,19 @@ Usage:
 
 from .ops import (
     DEFAULT_PAGE_SIZE,
+    InstructionPageProtocol,
     Op,
+    StreamingPipelineOpMixin,
+    PageRole,
+    PipelineABI,
+    PipelineSpec,
     ScheduledOp,
+    SemaphoreRole,
     TensorMeta,
     build_op_config,
+    config_dim_i32,
+    config_ptr_i64,
+    config_flat_tensor,
 )
 
 from .registries import (
@@ -32,7 +41,16 @@ from .registries import (
 from .scheduling import (
     BarrierFormula,
     INSTRUCTION_WORDS,
+    INSTR_BARRIER_META_IDX,
+    INSTR_OP_IDX,
+    INSTR_RANGE_END,
+    INSTR_RANGE_META,
+    INSTR_TILE_01,
+    INSTR_TILE_23,
     TileInstruction,
+    TileScheduler,
+    BackwardScheduler,
+    OverlapTileScheduler,
     InstructionStreamBuilder,
 )
 
@@ -63,19 +81,37 @@ from .utils import dump_ptx, dump_sass, dump_cubin, extract_cubin
 __all__ = [
     # Operation Protocol
     "Op",
+    "StreamingPipelineOpMixin",
+    "PageRole",
+    "SemaphoreRole",
+    "InstructionPageProtocol",
+    "PipelineSpec",
+    "PipelineABI",
     "ScheduledOp",
     "TensorMeta",
     "PeerBufferRegistry",
     "PeerTMARegistry",
     "validate_op_compatibility",
     "build_op_config",
+    "config_dim_i32",
+    "config_ptr_i64",
+    "config_flat_tensor",
     # Barrier Formulas
     "BarrierFormula",
     # Compilation
     "cleanup_linecache",
     # Instruction Stream
     "INSTRUCTION_WORDS",
+    "INSTR_BARRIER_META_IDX",
+    "INSTR_OP_IDX",
+    "INSTR_RANGE_END",
+    "INSTR_RANGE_META",
+    "INSTR_TILE_01",
+    "INSTR_TILE_23",
     "TileInstruction",
+    "TileScheduler",
+    "BackwardScheduler",
+    "OverlapTileScheduler",
     "InstructionStreamBuilder",
     # Configuration & Megakernel
     "DEFAULT_PAGE_SIZE",

@@ -6,20 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.support import is_sm90_available
 from machete.patching.ops.linear import (
     MacheteLinear,
     patch_linear,
     unpatch_linear,
     HAS_QUACK_LINEAR,
 )
-
-
-def is_sm90_available():
-    """Check if SM90+ GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 # =============================================================================
@@ -206,7 +199,3 @@ class TestMacheteLinearEdgeCases:
         # Should work (falls back due to bias)
         out = machete_linear(x)
         assert out.shape == (2, 16, 128)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

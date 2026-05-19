@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests.support import is_sm90_available
 from machete.patching.ops.mlp import (
     MacheteMLP,
     MacheteGatedMLP,
@@ -13,14 +14,6 @@ from machete.patching.ops.mlp import (
     unpatch_gated_mlp,
     HAS_QUACK_MLP,
 )
-
-
-def is_sm90_available():
-    """Check if SM90+ GPU is available."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
 
 
 def mlp_pytorch_ref(x, fc1_weight, fc2_weight, activation="gelu"):
@@ -309,7 +302,3 @@ class TestMLPEdgeCases:
 
         out = mlp(x)
         assert out.shape == (1, 1, 64)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

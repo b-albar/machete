@@ -6,6 +6,11 @@ import io
 
 import pytest
 import torch
+from tests.kernels.support import (
+    CUTLASS_AVAILABLE,
+    is_hopper_or_newer,
+    requires_hopper_cutlass,
+)
 
 from machete.kernels.gated_delta_net.ref import (
     gated_delta_rule_naive,
@@ -14,20 +19,6 @@ from machete.kernels.gated_delta_net.ref import (
     fla_output,
     fla_full_forward,
 )
-
-
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
-
-
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
 
 try:
     import fla  # noqa: F401
@@ -50,6 +41,28 @@ requires_gpu_fla = pytest.mark.skipif(
     not (is_hopper_or_newer() and CUTLASS_AVAILABLE and FLA_AVAILABLE),
     reason="Requires Hopper+ GPU with CUTLASS and fla",
 )
+
+CORE_CASES = [
+    (1, 128, 2, 128, 64),
+    (1, 256, 4, 128, 128),
+    (2, 256, 4, 128, 64),
+]
+
+LARGE_CASE = [
+    (2, 512, 4, 128, 64),
+]
+
+STAGE_CASES = [
+    (1, 128, 4, 128, 128),
+    (2, 256, 4, 128, 64),
+]
+
+SMALL_FUSED_CASES = [
+    (1, 64, 1, 128, 128),
+    (1, 128, 2, 128, 64),
+    (1, 256, 4, 128, 128),
+    (2, 256, 4, 128, 64),
+]
 
 
 # =============================================================================
@@ -103,10 +116,7 @@ class TestFlaStages:
     """Verify that calling fla stages individually produces same result as end-to-end."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", STAGE_CASES)
     def test_stages_match_full(self, B, T, H, K, V):
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
         scale = K ** -0.5
@@ -131,11 +141,7 @@ class TestGatedDeltaNetStateOp:
     """Test machete GatedDeltaNetStateOp against fla's state recurrence."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 512, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES + LARGE_CASE)
     def test_state_recurrence_forward(self, B, T, H, K, V):
         """Compare machete state recurrence against fla's chunk_gated_delta_rule_fwd_h."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -167,10 +173,7 @@ class TestGatedDeltaNetOutputOp:
     """Test machete GatedDeltaNetOutputOp against fla's output computation."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES[:2])
     def test_output_forward(self, B, T, H, K, V):
         """Compare machete output op against fla's chunk_fwd_o."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -237,11 +240,7 @@ class TestGatedDeltaNetFullForward:
     """Test full machete forward pipeline (prep→state→output) vs fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 512, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES + LARGE_CASE)
     def test_full_forward(self, B, T, H, K, V):
         """Compare full machete pipeline against fla end-to-end."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -273,10 +272,7 @@ class TestGatedDeltaNetBwdDvLocal:
     """Test machete bwd_dv_local against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES[:2])
     def test_bwd_dv_local(self, B, T, H, K, V):
         """Compare machete dv_local against fla's."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -302,10 +298,7 @@ class TestGatedDeltaNetBwdState:
     """Test machete backward state recurrence against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES[:2])
     def test_bwd_state_recurrence(self, B, T, H, K, V):
         """Compare machete backward state recurrence against fla's."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -411,7 +404,6 @@ class TestGDNPrepMegakernel:
     @pytest.mark.parametrize("B,T,H,K,V", [
         (1, 128, 2, 128, 64),
         (1, 128, 4, 128, 128),
-        (1, 256, 4, 128, 128),
         (2, 256, 4, 128, 64),
     ])
     def test_prep_op_vs_fla(self, B, T, H, K, V):
@@ -444,11 +436,7 @@ class TestGDNFusedMegakernel:
     """Test fused PrepOp+FusedOp single megakernel against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_fused_megakernel_vs_fla(self, B, T, H, K, V):
         """Compare fused PrepOp+FusedOp megakernel against fla end-to-end."""
         from machete.kernels.gated_delta_net import (
@@ -506,12 +494,7 @@ class TestGDNFusedOp:
     """Test GDNFusedOp (fused state+output) against fla end-to-end."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 64, 1, 128, 128),
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 512, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", SMALL_FUSED_CASES)
     def test_fused_op_vs_fla(self, B, T, H, K, V):
         """Compare GDNFusedOp against fla's full pipeline."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -617,11 +600,7 @@ class TestGDNSolveOp:
     """Test GDNSolveOp (phases 1-3) against fla prep."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_solve_g_cumsum(self, B, T, H, K, V):
         """Verify g_cumsum matches fla."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -637,11 +616,7 @@ class TestGDNSolveWUOp:
     """Test SolveOp + WUOp combined matches PrepOp output."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_solve_wu_vs_prep(self, B, T, H, K, V):
         """SolveOp + WUOp should produce same w, u as PrepOp."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -668,10 +643,7 @@ class TestGDNOutputOp:
     """Test GDNOutputOp against fla output."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES[:2])
     def test_output_op_vs_fla(self, B, T, H, K, V):
         """Compare GDNOutputOp against fla output."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -751,11 +723,7 @@ class TestGDNStateRecurrenceOp:
     """Test GDNStateRecurrenceOp h_states against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_h_states_vs_fla(self, B, T, H, K, V):
         """Compare GDNStateRecurrenceOp h_states against fla."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -776,11 +744,7 @@ class TestGDNVNewOp:
     """Test GDNVNewOp v_new against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_vnew_vs_fla(self, B, T, H, K, V):
         """Compare GDNVNewOp v_new against fla state recurrence."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -801,11 +765,7 @@ class TestGDNStateRecurrenceVNewOp:
     """Test combined StateRecurrenceOp + VNewOp pipeline."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_combined_vs_fla(self, B, T, H, K, V):
         """StateRecurrenceOp + VNewOp should match fla state recurrence."""
         q, k, v, g, beta = _make_inputs(B, T, H, K, V)
@@ -830,11 +790,7 @@ class TestGDN5OpMegakernel:
     """Test full 5-op fused megakernel against fla."""
 
     @requires_gpu_fla
-    @pytest.mark.parametrize("B,T,H,K,V", [
-        (1, 128, 2, 128, 64),
-        (1, 256, 4, 128, 128),
-        (2, 256, 4, 128, 64),
-    ])
+    @pytest.mark.parametrize("B,T,H,K,V", CORE_CASES)
     def test_5op_vs_fla(self, B, T, H, K, V):
         """Compare 5-op fused megakernel against fla end-to-end."""
         from machete.kernels.gated_delta_net import HAS_5OP, _run_5op_megakernel

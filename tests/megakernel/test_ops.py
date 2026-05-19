@@ -8,16 +8,23 @@ barrier formula computation, dependency chains, and instruction packing.
 
 import pytest
 import torch
-from machete.megakernel.ops import Op
+import cutlass.cute as cute
+from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
+from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, build_op_config
+from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
-    TileInstruction,
-    InstructionStreamBuilder,
+    INSTR_BARRIER_META_IDX,
+    INSTR_OP_IDX,
+    INSTR_RANGE_END,
+    INSTR_TILE_01,
+    INSTR_TILE_23,
     INSTRUCTION_WORDS,
+    InstructionStreamBuilder,
+    TileInstruction,
     TileScheduler,
     BackwardScheduler,
-    get_default_scheduler,
-    set_default_scheduler,
+    OverlapTileScheduler,
 )
 from typing import ClassVar, List
 
@@ -25,6 +32,249 @@ from typing import ClassVar, List
 class _NOPOp(Op):
     """Test-only no-op for barrier formula and instruction stream tests."""
     pass
+
+
+class _RangeCapableNOPOp(_NOPOp):
+    pipeline = PipelineSpec(page_count=1)
+
+
+class _UncappedRangeNOPOp(_RangeCapableNOPOp):
+    max_coalesced_range_tiles = 0
+
+
+class _AliasPhaseOp(Op):
+    load_phase = "load_impl"
+    compute_phase = "compute_impl"
+
+    def load_impl(self, page_ptr, tile_M, x):
+        pass
+
+    def compute_impl(self, page_ptr, tile_M, y):
+        pass
+
+
+class _ComputeTmaLoadOp(Op):
+    reads = {"x": (torch.float16, ("M", "K"))}
+    writes = {"y": (torch.float16, ("M", "K"))}
+    tile = ("M",)
+    tma_compute_loads = {"x"}
+
+
+class _SerialNonTmaLoadOp(Op):
+    reads = {"x": (torch.float16, ("M",))}
+    writes = {"y": (torch.float16, ("M",))}
+    tile = ("M",)
+
+    @cute.jit
+    def load(self, page_ptr, tile_M, x, work_mbar):
+        pass
+
+
+class _CollectiveNonTmaLoadOp(_SerialNonTmaLoadOp):
+    collective_non_tma_load = True
+
+
+class _RangeCapableSerialNonTmaLoadOp(_SerialNonTmaLoadOp):
+    pipeline = PipelineSpec(page_count=1)
+
+
+def test_pipeline_spec_no_longer_declares_range_metadata():
+    spec = PipelineSpec(page_count=1)
+
+    assert spec.page_count == 1
+
+
+def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 10),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+
+    instructions = builder.coalesce_pipeline_instructions(builder.build())
+    non_end = [instr for instr in instructions if instr.op_idx != TileInstruction.END_MARKER]
+
+    assert [instr.tiles for instr in non_end] == [
+        (0, 0, 0, 0),
+    ]
+    assert [(instr.range_axis, instr.range_end_axis) for instr in non_end] == [(2, 3)]
+    assert [instr.range_end for instr in non_end] == [10]
+    _, expanded = builder.pipeline_barrier_meta_indices(instructions)
+    assert [instr.tiles for instr in expanded if instr.op_idx != TileInstruction.END_MARKER] == [
+        (0, 0, 0, 0),
+        (0, 0, 1, 0),
+        (0, 0, 2, 0),
+        (0, 0, 3, 0),
+        (0, 0, 4, 0),
+        (0, 0, 5, 0),
+        (0, 0, 6, 0),
+        (0, 0, 7, 0),
+        (0, 0, 8, 0),
+        (0, 0, 9, 0),
+    ]
+
+
+def test_pipeline_range_coalesces_per_cta_fetch_stream():
+    """Same-op tiles consecutive per CTA should form ranges even if interleaved globally."""
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 110),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+    instructions = []
+    for i in range(10):
+        instructions.append(TileInstruction(0, (0, 0, i)))
+        instructions.append(TileInstruction(0, (0, 0, 100 + i)))
+    instructions.append(TileInstruction.end_instruction())
+
+    coalesced = builder.coalesce_pipeline_instructions(instructions, num_blocks=2)
+
+    assert [instr.tiles for instr in coalesced] == [
+        (0, 0, 0, 0),
+        (0, 0, 100, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]
+    assert [instr.range_end for instr in coalesced[:2]] == [10, 110]
+
+
+def test_framework_expanded_ranges_preserve_cta_distribution():
+    op = ScheduledOp(
+        _RangeCapableNOPOp,
+        tile_counts=(1, 1, 110),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+    instructions = []
+    for i in range(10):
+        instructions.append(TileInstruction(0, (0, 0, i)))
+        instructions.append(TileInstruction(0, (0, 0, 100 + i)))
+    instructions.append(TileInstruction.end_instruction())
+
+    coalesced = builder.coalesce_pipeline_instructions(
+        instructions,
+        num_blocks=2,
+        framework_expands_predicate=lambda instr: instr.range_axis >= 0,
+    )
+
+    assert [instr.tiles for instr in coalesced] == [
+        (0, 0, 0, 0),
+        (0, 0, 100, 0),
+        (0, 0, 0, 0),
+        (0, 0, 0, 0),
+    ]
+    assert [instr.range_end for instr in coalesced[:2]] == [10, 110]
+
+
+def test_op_can_request_uncapped_coordinate_range():
+    op = ScheduledOp(
+        _UncappedRangeNOPOp,
+        tile_counts=(1, 1, 16),
+        dim_names={"B": 0, "S": 1, "O": 2},
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(op)
+
+    coalesced = builder.coalesce_pipeline_instructions(builder.build(), num_blocks=4)
+    work = [instr for instr in coalesced if instr.op_idx != TileInstruction.END_MARKER]
+
+    assert len(work) == 1
+    assert work[0].tiles == (0, 0, 0, 0)
+    assert work[0].range_end == 16
+
+
+def test_phase_aliases_bind_concrete_instance_methods():
+    op = _AliasPhaseOp()
+
+    assert op.load.__func__ is _AliasPhaseOp.load_impl
+    assert op.compute.__func__ is _AliasPhaseOp.compute_impl
+    assert _phase_param_names_for_instance(op, "load") == ("page_ptr", "tile_M", "x")
+    assert _phase_param_names_for_instance(op, "compute") == ("page_ptr", "tile_M", "y")
+
+
+def test_compute_phase_tma_load_declaration_is_registered():
+    assert _ComputeTmaLoadOp._TMA_COMPUTE_LOADS == {"x"}
+    assert _ComputeTmaLoadOp._TMA_LOADS == set()
+    assert _ComputeTmaLoadOp.gen_tma_param_names("compute") == [
+        ("x_tma", "x_tma_gmem", "x")
+    ]
+
+
+def test_non_tma_loads_default_to_elect_one_wrapper():
+    from machete.megakernel.compile import compile_phase, _linecache_entries
+    import linecache
+
+    compile_phase(_SerialNonTmaLoadOp(), "load", tensor_param_names=["x"])
+    source = "".join(linecache.cache[_linecache_entries[-1]][2])
+
+    assert "with cute.arch.elect_one():" in source
+
+
+def test_collective_non_tma_load_owns_dma_warp_and_mbarrier():
+    from machete.megakernel.compile import compile_phase, _linecache_entries
+    import linecache
+
+    compile_phase(_CollectiveNonTmaLoadOp(), "load", tensor_param_names=["x"])
+    source = "".join(linecache.cache[_linecache_entries[-1]][2])
+
+    assert "with cute.arch.elect_one():" not in source
+    assert "_instance.load(page_ptr, tile_0, x, work_mbar)" in source
+
+
+def test_barrier_static_dims_do_not_specialize_device_code():
+    """Barrier metadata is scheduler-only and must not duplicate handlers."""
+    op_a = ScheduledOp(
+        _NOPOp,
+        static_dims={"M": 16, "barrier_wait_alias_H": "layer_0"},
+    )
+    op_b = ScheduledOp(
+        _NOPOp,
+        static_dims={"M": 16, "barrier_wait_alias_H": "layer_1"},
+    )
+
+    key_a = _build_compile_key(
+        op_a,
+        all_local_tensor_names=(),
+        local_tensor_names={phase: () for phase in ("load", "compute", "store", "communicate")},
+        local_tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tensor_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+    )
+    key_b = _build_compile_key(
+        op_b,
+        all_local_tensor_names=(),
+        local_tensor_names={phase: () for phase in ("load", "compute", "store", "communicate")},
+        local_tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tensor_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+        tma_args={phase: () for phase in ("load", "compute", "store", "communicate")},
+    )
+
+    assert key_a == key_b
+    assert build_op_config(op_a)["M"] == 16
+    assert "barrier_wait_alias_H" not in build_op_config(op_a)
+
+
+def test_tile_sizes_specialize_device_code():
+    """Tile sizes are used in CuTe compile-time loops and must key handlers."""
+    op_a = ScheduledOp(_NOPOp, tile_sizes={"M": 16})
+    op_b = ScheduledOp(_NOPOp, tile_sizes={"M": 64})
+
+    common = {
+        "all_local_tensor_names": (),
+        "local_tensor_names": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "local_tma_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "tensor_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+        "tma_args": {phase: () for phase in ("load", "compute", "store", "communicate")},
+    }
+
+    assert _build_compile_key(op_a, **common) != _build_compile_key(op_b, **common)
+    assert build_op_config(op_a)["tile_size_M"] == 16
+    assert build_op_config(op_b)["tile_size_M"] == 64
 
 
 # =============================================================================
@@ -223,22 +473,23 @@ class TestTileInstructionPacking:
         instr = TileInstruction(op_idx=1, tiles=(5, 2, 0))
         packed = instr.pack()
         assert len(packed) == INSTRUCTION_WORDS
-        assert INSTRUCTION_WORDS == 2
+        assert INSTRUCTION_WORDS == 5
 
     def test_pack_fields(self):
-        """Fields should pack as [op_idx, linear_tile_idx]."""
-        # tiles=(7, 1, 2) with tile_counts needed for strides
+        """Fields should pack op index, tile coordinates, and barrier metadata."""
         instr = TileInstruction(op_idx=3, tiles=(7, 1, 2))
-        # strides for tile_counts (8, 3, 4) → (12, 4, 1)
-        packed = instr.pack(strides=(12, 4, 1))
-        assert packed[0] == 3  # op_idx
-        assert packed[1] == 7 * 12 + 1 * 4 + 2 * 1  # linear = 90
+        packed = instr.pack(barrier_meta_idx=99)
+        assert packed[INSTR_OP_IDX] == 3
+        assert packed[INSTR_TILE_01] == 7 | (1 << 16)
+        assert packed[INSTR_TILE_23] == 2
+        assert packed[INSTR_BARRIER_META_IDX] == 99
+        assert packed[INSTR_RANGE_END] == 0
 
     def test_end_marker_packs_correctly(self):
         """End marker should have op_idx == END_MARKER."""
         end = TileInstruction.end_instruction()
         packed = end.pack()
-        assert packed[0] == TileInstruction.END_MARKER
+        assert packed[0] == 0xFFFF
 
     def test_build_tensor_shape(self):
         """GPU tensor should have shape [num_instructions, INSTRUCTION_WORDS]."""
@@ -251,7 +502,7 @@ class TestTileInstructionPacking:
         assert tensor.dtype == torch.int32
 
     def test_build_tensor_roundtrip(self):
-        """Packed tensor values should encode [op_idx, linear_tile_idx]."""
+        """Packed tensor values should encode op index and tile coordinates."""
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         builder.add_op(_NOPOp, tile_counts=(4,))
@@ -260,10 +511,12 @@ class TestTileInstructionPacking:
 
         for i, instr in enumerate(instructions):
             row = tensor[i].tolist()
-            assert row[0] == instr.op_idx, f"Instruction {i} op_idx mismatch"
+            row_op = row[INSTR_OP_IDX] & 0xFFFF
             if instr.op_idx != TileInstruction.END_MARKER:
-                # Linear index should match the tile index for 1D ops
-                assert row[1] == instr.tiles[0], f"Instruction {i} linear mismatch"
+                assert row_op == instr.op_idx, f"Instruction {i} op_idx mismatch"
+                assert row[INSTR_TILE_01] & 0xFFFF == instr.tiles[0], f"Instruction {i} tile mismatch"
+            else:
+                assert row_op == 0xFFFF, f"Instruction {i} end marker mismatch"
 
 
 # =============================================================================
@@ -293,6 +546,55 @@ class _FanInOp(Op):
     """Test op that consumes both 'x' and 'y'."""
     INPUTS: ClassVar[List[str]] = ["x", "y"]
     OUTPUTS: ClassVar[List[str]] = []
+
+
+class _PackedQKVProducerOp(Op):
+    reads = {}
+    writes = {"qkv": (None, ("B", "S", "N"))}
+    tile = ("B", "S")
+    OUTPUTS: ClassVar[List[str]] = ["qkv"]
+
+
+class _PackedQConsumerOp(Op):
+    reads = {"q": (None, ("B", "S", "Q"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["q"]
+
+
+class _PackedKConsumerOp(Op):
+    reads = {"k": (None, ("B", "S", "K"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["k"]
+
+
+class _PackedVConsumerOp(Op):
+    reads = {"v": (None, ("B", "S", "V"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["v"]
+
+
+class _PackedV4DConsumerOp(Op):
+    reads = {"v": (None, ("B", "S", "H", "D"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["v"]
+
+
+class _ScratchWriterOp(Op):
+    reads = {}
+    writes = {"x": (None, ("B", "S"))}
+    tile = ("B", "S")
+    OUTPUTS: ClassVar[List[str]] = ["x"]
+
+
+class _ScratchReaderOp(Op):
+    reads = {"x": (None, ("B", "S"))}
+    writes = {}
+    tile = ("B", "S")
+    INPUTS: ClassVar[List[str]] = ["x"]
 
 
 class TestNamedBufferDeps:
@@ -378,8 +680,69 @@ class TestNamedBufferDeps:
         assert c_wait.coeffs[0] == 1  # batch maps to producer's dim 0
         assert c_wait.coeffs[1] == 0  # seqlen not in producer (broadcast)
         assert c_wait.compute_index((0, 0, 0)) == 0  # (batch=0, seqlen=0) → barrier 0
-        assert c_wait.compute_index((0, 7, 0)) == 0  # (batch=0, seqlen=7) → barrier 0
-        assert c_wait.compute_index((2, 5, 0)) == 2  # (batch=2, seqlen=5) → barrier 2
+
+    def test_packed_qkv_views_resolve_dependencies(self):
+        """Packed producer output should feed q/k/v slice consumers."""
+        qkv = torch.empty(1, 4, 12)
+        q = qkv[:, :, :8]
+        k = qkv[:, :, 8:10]
+        v = qkv[:, :, 10:]
+
+        prod = _PackedQKVProducerOp.schedule(
+            qkv=qkv,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        q_cons = _PackedQConsumerOp.schedule(
+            q=q,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        k_cons = _PackedKConsumerOp.schedule(
+            k=k,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        v_cons = _PackedVConsumerOp.schedule(
+            v=v,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+
+        validate_op_compatibility([prod, q_cons, k_cons, v_cons], TensorRegistry.from_ops([prod, q_cons, k_cons, v_cons]))
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(q_cons)
+        builder.add_op(k_cons)
+        builder.add_op(v_cons)
+        formulas = builder.get_op_barrier_formulas()
+        assert builder.num_barriers == 4
+
+        for op_idx in (1, 2, 3):
+            wait = formulas[op_idx][0]
+            assert len(wait) == 1
+            assert wait[0].expected == 1
+            assert wait[0].base == formulas[0][1][0].base
+
+    def test_packed_flat_producer_feeds_rank_changed_view(self):
+        """Flat producer output should feed a BSHD slice view of same storage."""
+        qkv = torch.empty(1, 4, 12)
+        v_4d = qkv.view(1, 4, 3, 4)[:, :, 2:, :]
+
+        prod = _PackedQKVProducerOp.schedule(
+            qkv=qkv,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+        v_cons = _PackedV4DConsumerOp.schedule(
+            v=v_4d,
+            tile_sizes={"B": 1, "S": 1},
+        )[0]
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(v_cons)
+        formulas = builder.get_op_barrier_formulas()
+
+        wait = formulas[1][0]
+        assert len(wait) == 1
+        assert wait[0].expected == 1
 
     def test_fan_in(self):
         """OpA → "x", OpB → "y", OpC reads ["x", "y"]. OpC has 2 wait formulas."""
@@ -403,7 +766,7 @@ class TestNamedBufferDeps:
         assert c_waits[0].base != c_waits[1].base
 
     def test_fan_out(self):
-        """OpA → "x", both OpB and OpC read "x". OpA has 2 signal formulas."""
+        """OpA → "x", both OpB and OpC read "x". OpA signals once."""
         builder = InstructionStreamBuilder()
         builder.add_op(_ProducerOp, tile_counts=(4,),
                        dim_names={"batch": 0})
@@ -414,12 +777,26 @@ class TestNamedBufferDeps:
                        dim_names={"batch": 0})
         formulas = builder.get_op_barrier_formulas()
 
-        # OpA signals 2 barrier sets (one per downstream consumer)
+        # Both consumers can wait on the same producer-side readiness signal.
         p_signals = formulas[0][1]
-        assert len(p_signals) == 2
+        assert len(p_signals) == 1
 
-        # Different barrier bases for each edge
-        assert p_signals[0].base != p_signals[1].base
+        assert formulas[1][0][0].base == p_signals[0].base
+        assert formulas[2][0][0].base == p_signals[0].base
+
+    def test_reused_scratch_antideps_do_not_accumulate_waits(self):
+        """Repeated scratch reuse should keep wait formulas on the frontier."""
+        scratch = torch.empty(1, 8)
+        builder = InstructionStreamBuilder()
+        for _ in range(8):
+            builder.add_op(_ScratchWriterOp.schedule(
+                x=scratch, tile_sizes={"B": 1, "S": 1},
+            )[0])
+            builder.add_op(_ScratchReaderOp.schedule(
+                x=scratch, tile_sizes={"B": 1, "S": 1},
+            )[0])
+
+        assert builder.max_wait_deps <= 2
 
     def test_buffer_not_produced_is_external(self):
         """Consuming a buffer with no producer is treated as an external input."""
@@ -630,21 +1007,6 @@ class TestLevelBatchedScheduling:
 class TestSchedulerAPI:
     """Test the tile scheduler abstraction and different schedulers."""
 
-    def test_default_scheduler_is_backward(self):
-        """Default scheduler should be BackwardScheduler."""
-        scheduler = get_default_scheduler()
-        assert isinstance(scheduler, BackwardScheduler)
-
-    def test_set_default_scheduler(self):
-        """Can change the default scheduler globally."""
-        original = get_default_scheduler()
-        try:
-            backward = BackwardScheduler()
-            set_default_scheduler(backward)
-            assert get_default_scheduler() is backward
-        finally:
-            set_default_scheduler(original)
-
     def test_explicit_scheduler_parameter(self):
         """Can pass scheduler directly to build()."""
         builder = InstructionStreamBuilder()
@@ -700,6 +1062,112 @@ class TestSchedulerAPI:
         """TileScheduler base class cannot be instantiated directly."""
         with pytest.raises(TypeError):
             TileScheduler()
+
+    def test_overlap_scheduler_preserves_stride_for_ready_chain_tiles(self):
+        """OverlapTileScheduler should preserve broad producer/consumer waves."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+        ]
+
+    def test_overlap_scheduler_respects_fetch_stride_waves(self):
+        """Stride-aware overlap should not create same-round dependencies."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_NOPOp, tile_counts=(8,))
+
+        instructions = builder.build(scheduler=OverlapTileScheduler(fetch_stride=4))[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (0, 4), (0, 5), (0, 6), (0, 7),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+            (1, 4), (1, 5), (1, 6), (1, 7),
+        ]
+
+    def test_overlap_scheduler_adaptive_fetch_stride_uses_wider_small_waves(self):
+        """Adaptive overlap can use two CTA waves for short instruction streams."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_NOPOp, tile_counts=(8,))
+        scheduler = OverlapTileScheduler(adaptive_fetch_stride=True)
+        scheduler.bind_num_blocks(4)
+
+        instructions = builder.build(scheduler=scheduler)[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:8]] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (0, 4), (0, 5), (0, 6), (0, 7),
+        ]
+
+    def test_overlap_scheduler_waits_for_many_to_one_dependencies(self):
+        """Many-to-one consumers must wait until all producer tiles have signaled."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            _ProducerOp,
+            tile_counts=(2, 3),
+            dim_names={"batch": 0, "seq": 1},
+        )
+        builder.add_op(
+            _ConsumerOp,
+            tile_counts=(2,),
+            dim_names={"batch": 0},
+        )
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+        positions = {(i.op_idx, i.tiles): pos for pos, i in enumerate(instructions)}
+
+        for batch in range(2):
+            consumer_pos = positions[(1, (batch,))]
+            producer_positions = [
+                positions[(0, (batch, seq))]
+                for seq in range(3)
+            ]
+            assert consumer_pos > max(producer_positions)
+
+    def test_overlap_scheduler_all_tiles_present(self):
+        """OverlapTileScheduler must emit every tile exactly once."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+
+        instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
+
+        assert len(instructions) == 12
+        assert {
+            (i.op_idx, i.tiles[0], i.tiles[1])
+            for i in instructions
+        } == {
+            (op_idx, m, n)
+            for op_idx in (0, 1)
+            for m in range(3)
+            for n in range(2)
+        }
+
+    def test_overlap_ready_does_not_prioritize_independent_sinks(self):
+        """Ready-consumer mode should not move unrelated sinks ahead of the chain."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        instructions = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=2,
+                prefer_data_movement=False,
+                prefer_ready_consumers=True,
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:2]] == [
+            (0, 0), (0, 1),
+        ]
 
 
 # =============================================================================

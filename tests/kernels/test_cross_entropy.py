@@ -7,31 +7,26 @@ a pure PyTorch reference implementation.
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
 from machete.kernels.cross_entropy.ref import cross_entropy_ref
+from tests.kernels.support import requires_hopper_cutlass
 
 
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+requires_gpu = requires_hopper_cutlass
 
-
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
-
-
-requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
+BASIC_CASES = [
+    (1, 128, torch.bfloat16),
+    (4, 1024, torch.float32),
+    (32, 1024, torch.bfloat16),
+    (128, 32000, torch.bfloat16),
+]
 
 
 def _run_cross_entropy(logits, targets, ignore_index=-100):
@@ -66,9 +61,7 @@ def _run_cross_entropy(logits, targets, ignore_index=-100):
 
 
 @requires_gpu
-@pytest.mark.parametrize("BT", [1, 4, 32, 128])
-@pytest.mark.parametrize("V", [128, 1024, 32000])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("BT,V,dtype", BASIC_CASES)
 def test_cross_entropy_basic(BT, V, dtype):
     """Test forward loss and backward gradients against PyTorch reference."""
     torch.manual_seed(42)

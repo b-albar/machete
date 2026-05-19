@@ -16,9 +16,11 @@ With N pages, up to N-1 loads can overlap with compute.
 from dataclasses import dataclass
 from typing import Tuple
 
-from cutlass import Int32
+from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
+
+from .instruction_layout import INSTRUCTION_ROW_BYTES
 
 
 # =============================================================================
@@ -27,6 +29,17 @@ from cutlass._mlir.dialects import llvm
 
 MAX_PAGES: int = 16  # Maximum number of pages
 IQ_DEPTH: int = 4  # Instruction queue depth for out-of-order loading
+
+# Per-slot tile-info layout in shared memory (int32 slots, plus one int64).
+TILE_INFO_OP_IDX: int = 0
+TILE_INFO_HANDLER_IDX: int = 1
+TILE_INFO_TILE_0: int = 2
+TILE_INFO_TILE_1: int = 3
+TILE_INFO_TILE_2: int = 4
+TILE_INFO_TILE_3: int = 5
+TILE_INFO_INSTRUCTION_IDX: int = 6
+TILE_INFO_OP_CONFIG: int = 8
+TILE_INFO_PAGE_ID: int = 10
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -41,6 +54,8 @@ FLAG_DISPATCH_LOAD: int = 4    # Controller → Loader: page slot to load next
 FLAG_PRODUCE_IDX: int = 16     # Controller: produce counter (read by store warp)
 FLAG_STORE_IDX: int = 20       # Store warp: store counter (read by controller)
 FLAG_LOAD_DONE: int = 24       # Controller: signals all instructions consumed
+FLAG_DATA_RELEASE_IDX: int = 28  # Store warp: physical page release counter
+FLAG_DATA_PRODUCE_IDX: int = 32  # Controller: physical page produce counter
 
 
 # =============================================================================
@@ -198,6 +213,50 @@ def st_shared_v2_b32(
     )
 
 
+@dsl_user_op
+def st_shared_i64(
+    smem_addr: Int32,
+    value: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store a 64-bit integer to shared memory."""
+    llvm.inline_asm(
+        None,
+        [smem_addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "st.shared.b64 [$0], $1;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def ld_shared_i64(
+    smem_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int64:
+    """Load a 64-bit integer from shared memory."""
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(64),
+        [smem_addr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.b64 $0, [$1];",
+        "=l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
 # =============================================================================
 # N-Page Buffer Layout (Generalized Pipelined Execution)
 # =============================================================================
@@ -245,16 +304,18 @@ class NPageLayout:
 
     num_pages: int = 2
     page_size: int = 16384
+    num_slots: int | None = None
 
     # Scratch area layout (ring buffer):
-    # - Per-page tile info: num_pages * 8 bytes [op_idx, linear_tile_idx] per page
-    # - Flags: 28 bytes (see FLAG_* constants for active offsets;
+    # - Per-slot tile info: num_slots * 48 bytes
+    #   [op_idx, handler_idx, tile_0..tile_3, instruction_idx, op_config_ptr, page_id]
+    # - Flags: 32 bytes (see FLAG_* constants for active offsets;
     #          offsets 0 and 8 are reserved/unused)
-    # - Instruction queue: IQ_DEPTH * 8 bytes (out-of-order instruction lookahead)
-    # - Mbarriers: 2 * num_pages * 8 bytes [work_notify + compute_done]
-    _TILE_INFO_SIZE: int = 8   # Per-page: op_idx + linear_tile_idx (2 int32s)
-    _IQ_ENTRY_SIZE: int = 8  # Per IQ slot: op_idx + linear_tile_idx (2 int32s)
-    _FLAGS_SIZE: int = 28  # See FLAG_* constants for layout; includes 2 reserved slots
+    # - Instruction queue: IQ_DEPTH * replay instruction row bytes
+    # - Mbarriers: 2 * num_slots * 8 bytes [work_notify + compute_done]
+    _TILE_INFO_SIZE: int = 48  # Per-slot tile metadata with aligned int64 config pointer
+    _IQ_ENTRY_SIZE: int = INSTRUCTION_ROW_BYTES
+    _FLAGS_SIZE: int = 36  # See FLAG_* constants for layout; includes 2 reserved slots
     _MBARRIER_SIZE: int = 8  # Per mbarrier object (8 bytes, 8-byte aligned)
 
     def __post_init__(self):
@@ -263,10 +324,16 @@ class NPageLayout:
             raise ValueError(f"num_pages must be >= 1, got {self.num_pages}")
         if self.num_pages > MAX_PAGES:
             raise ValueError(f"num_pages must be <= {MAX_PAGES}, got {self.num_pages}")
+        if self.num_slots is None:
+            self.num_slots = self.num_pages
+        if self.num_slots < 1:
+            raise ValueError(f"num_slots must be >= 1, got {self.num_slots}")
+        if self.num_slots > MAX_PAGES:
+            raise ValueError(f"num_slots must be <= {MAX_PAGES}, got {self.num_slots}")
 
         # Scratch region layout: [tile_info][flags][iq][mbarriers]
         self.ring_state_offset = 0
-        self.flags_offset = self.num_pages * self._TILE_INFO_SIZE
+        self.flags_offset = self.num_slots * self._TILE_INFO_SIZE
         self.iq_offset = _align_up(self.flags_offset + self._FLAGS_SIZE, 8)
 
         # mbarrier array layout (each 8 bytes, MUST be 8-byte aligned per PTX):
@@ -277,7 +344,7 @@ class NPageLayout:
             self.iq_offset + IQ_DEPTH * self._IQ_ENTRY_SIZE, 8
         )
 
-        num_mbarriers = 2 * self.num_pages  # work_notify + compute_done
+        num_mbarriers = 2 * self.num_slots  # work_notify + compute_done
         raw_scratch_size = (
             self.mbarrier_offset
             + num_mbarriers * self._MBARRIER_SIZE
@@ -294,21 +361,13 @@ class NPageLayout:
         # Total size
         self.total_size = self.pages_start + self.num_pages * self.aligned_page_size
 
-    def get_page_offset(self, page_idx: int) -> int:
-        """Get offset for a specific page."""
-        if page_idx < 0 or page_idx >= self.num_pages:
-            raise ValueError(
-                f"Invalid page_idx {page_idx}, must be 0 to {self.num_pages - 1}"
-            )
-        return self.pages_start + page_idx * self.aligned_page_size
-
     def work_notify_mbar_offset(self, slot_idx: int) -> int:
         """Get offset to the work_notify mbarrier for a given work slot."""
         return self.mbarrier_offset + slot_idx * self._MBARRIER_SIZE
 
-    def compute_done_mbar_offset(self, page_idx: int) -> int:
-        """Get offset to the compute_done mbarrier for a given page."""
-        return self.mbarrier_offset + self.num_pages * self._MBARRIER_SIZE + page_idx * self._MBARRIER_SIZE
+    def compute_done_mbar_offset(self, slot_idx: int) -> int:
+        """Get offset to the compute_done mbarrier for a given work slot."""
+        return self.mbarrier_offset + self.num_slots * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
 
     @classmethod
     def for_device(
@@ -365,6 +424,7 @@ class NPageLayout:
         return (
             f"NPageLayout(\n"
             f"  num_pages={self.num_pages},\n"
+            f"  num_slots={self.num_slots},\n"
             f"  page_size={self.page_size // 1024}KB,\n"
             f"  total_size={self.total_size // 1024}KB,\n"
             f"  scratch_size={self.scratch_size}B,\n"
@@ -372,6 +432,117 @@ class NPageLayout:
             f"  aligned_page_size={self.aligned_page_size}\n"
             f")"
         )
+
+
+@dataclass(frozen=True)
+class PipelinePageLayout:
+    """Layout for pipeline-local storage inside one megakernel page."""
+
+    page_count: int
+    page_bytes: int
+    semaphore_count: int = 0
+    scratch_bytes: int = 0
+
+    def __post_init__(self):
+        if self.page_count < 1:
+            raise ValueError("page_count must be >= 1")
+        if self.page_bytes < 0:
+            raise ValueError("page_bytes must be non-negative")
+        if self.semaphore_count < 0:
+            raise ValueError("semaphore_count must be non-negative")
+        if self.scratch_bytes < 0:
+            raise ValueError("scratch_bytes must be non-negative")
+
+    @property
+    def pages_offset(self) -> int:
+        return 0
+
+    @property
+    def semaphores_offset(self) -> int:
+        return _align_up(self.page_count * self.page_bytes, 8)
+
+    @property
+    def scratch_offset(self) -> int:
+        return _align_up(
+            self.semaphores_offset + self.semaphore_count * NPageLayout._MBARRIER_SIZE,
+            16,
+        )
+
+    @property
+    def total_size(self) -> int:
+        return _align_up(self.scratch_offset + self.scratch_bytes, 128)
+
+    def page_offset(self, page_idx: int) -> int:
+        if page_idx < 0 or page_idx >= self.page_count:
+            raise IndexError(
+                f"pipeline page {page_idx} out of range for {self.page_count} pages"
+            )
+        return self.pages_offset + page_idx * self.page_bytes
+
+    def activation_page_offset(self) -> int:
+        return self.page_offset(0)
+
+    def weight_page_offset(
+        self,
+        *,
+        input_stage: int,
+        page_in_stage: int,
+        input_stages: int,
+        stage_pages: int,
+    ) -> int:
+        if input_stage < 0 or input_stage >= input_stages:
+            raise IndexError(
+                f"input_stage {input_stage} out of range for {input_stages} stages"
+            )
+        if page_in_stage < 0 or page_in_stage >= stage_pages:
+            raise IndexError(
+                f"page_in_stage {page_in_stage} out of range for {stage_pages} pages"
+            )
+        return self.page_offset(1 + input_stage * stage_pages + page_in_stage)
+
+    def semaphore_offset(self, sem_idx: int) -> int:
+        if sem_idx < 0 or sem_idx >= self.semaphore_count:
+            raise IndexError(
+                f"pipeline semaphore {sem_idx} out of range for {self.semaphore_count} semaphores"
+            )
+        return self.semaphores_offset + sem_idx * NPageLayout._MBARRIER_SIZE
+
+    @staticmethod
+    def activations_arrived_sem() -> int:
+        return 0
+
+    @staticmethod
+    def weights_arrived_sem(input_stage: int) -> int:
+        return 1 + input_stage
+
+    @staticmethod
+    def weights_finished_sem(input_stages: int, input_stage: int) -> int:
+        return 1 + input_stages + input_stage
+
+    @staticmethod
+    def outputs_arrived_sem(input_stages: int, output_stage: int) -> int:
+        return 1 + 2 * input_stages + output_stage
+
+    @staticmethod
+    def outputs_finished_sem(
+        input_stages: int,
+        output_stages: int,
+        output_stage: int,
+    ) -> int:
+        return 1 + 2 * input_stages + output_stages + output_stage
+
+    def output_scratch_offset(
+        self,
+        *,
+        output_stage: int,
+        output_stages: int,
+    ) -> int:
+        if output_stage < 0 or output_stage >= output_stages:
+            raise IndexError(
+                f"output_stage {output_stage} out of range for {output_stages} stages"
+            )
+        stage_bytes = self.scratch_bytes // max(1, output_stages)
+        return self.scratch_offset + output_stage * stage_bytes
 
 
 __all__ = [
@@ -388,4 +559,5 @@ __all__ = [
     "ld_shared_v2_b32",
     "st_shared_v2_b32",
     "NPageLayout",
+    "PipelinePageLayout",
 ]

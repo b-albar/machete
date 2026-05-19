@@ -4,15 +4,18 @@
 Provides cutedsl-trace integration for visualizing per-SM tile timelines
 (load, compute, store, and wait events).
 
-Three lanes per CTA:
-    lane 0 = Load warp (load, dep_wait)
+Four lanes per CTA:
+    lane 0 = Load warp (load)
     lane 1 = MMA warp 0 (compute, data_wait)
     lane 2 = Store warp (store, compute_wait)
+    lane 3 = Controller warp (dep_wait, ring_full_wait)
 """
 
 import math
 from dataclasses import dataclass, field
 from typing import List
+
+import torch
 
 
 @dataclass
@@ -28,9 +31,13 @@ class TracingState:
     dep_wait_fmt: int = 0
     data_wait_fmt: int = 0
     compute_wait_fmt: int = 0
+    ring_full_wait_fmt: int = 0
+    load_fmts_tensor: object = None
+    compute_fmts_tensor: object = None
+    store_fmts_tensor: object = None
 
 
-def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
+def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
     """Set up cutedsl-trace builder and trace types.
 
     Creates per-(op_class, phase) TraceTypes so load/compute/store events
@@ -68,7 +75,7 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
         state.store_fmts.append(seen_classes[cls_name]["store"].id)
 
     # Wait event types
-    for wait_name in ("dep_wait", "data_wait", "compute_wait"):
+    for wait_name in ("dep_wait", "data_wait", "compute_wait", "ring_full_wait"):
         tt = TraceType(
             name=wait_name,
             label_string=wait_name.replace("_", " "),
@@ -80,6 +87,7 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
     state.dep_wait_fmt = state.trace_types["dep_wait"].id
     state.data_wait_fmt = state.trace_types["data_wait"].id
     state.compute_wait_fmt = state.trace_types["compute_wait"].id
+    state.ring_full_wait_fmt = state.trace_types["ring_full_wait"].id
 
     state.block_type = BlockType(
         name="CTA",
@@ -102,18 +110,34 @@ def setup_tracing(ops, num_sms, total_tiles) -> TracingState:
         label_string="SM {lane} Store",
         tooltip_string="Store warp on SM {lane}",
     )
+    controller_track = TrackType(
+        name="Controller",
+        label_string="SM {lane} Controller",
+        tooltip_string="Controller warp on SM {lane}",
+    )
 
-    # 3 lanes: load, MMA, store; enough events per tile
+    # 4 lanes: load, MMA, store, controller; enough events per tile.
     tiles_per_sm = math.ceil(total_tiles / num_sms)
-    max_events = tiles_per_sm * 3 + 16
+    max_events = tiles_per_sm * 8 + 256
     state.builder = DynamicTraceBuilder(
-        num_lanes=3,
+        num_lanes=4,
         max_events_per_lane=max_events,
         grid_dims=(num_sms, 1, 1),
     )
     state.builder.set_track_type(load_track, lane=0)
     state.builder.set_track_type(mma_track, lane=1)
     state.builder.set_track_type(store_track, lane=2)
+    state.builder.set_track_type(controller_track, lane=3)
+
+    state.load_fmts_tensor = torch.tensor(
+        state.load_fmts, dtype=torch.int32, device=device
+    )
+    state.compute_fmts_tensor = torch.tensor(
+        state.compute_fmts, dtype=torch.int32, device=device
+    )
+    state.store_fmts_tensor = torch.tensor(
+        state.store_fmts, dtype=torch.int32, device=device
+    )
 
     return state
 
@@ -141,6 +165,24 @@ def write_trace(state: TracingState, filename: str) -> None:
 def write_trace_perfetto(state: TracingState, filename: str) -> None:
     """Write trace as Perfetto JSON. Only valid after run() with tracing=True."""
     _make_writer(state).write_perfetto(filename)
+
+
+def ensure_device_trace_buffer(state: TracingState) -> None:
+    """Ensure the trace builder owns a CUDA buffer before kernel launch."""
+    if state is None or state.builder is None:
+        return
+    buffer = getattr(state.builder, "_buffer", None)
+    if hasattr(buffer, "data_ptr"):
+        return
+    grid_x, grid_y, grid_z = state.builder.grid_dims
+    total_bytes = (
+        state.builder.row_stride_bytes
+        * state.builder.num_lanes
+        * grid_x
+        * grid_y
+        * grid_z
+    )
+    state.builder._allocate_buffer(total_bytes)
 
 
 def resolve_tracing_blocks(source: str, tracing: bool) -> str:
@@ -206,7 +248,7 @@ def get_trace_exec_globals(state: TracingState) -> dict:
     code has been stripped from the source by resolve_tracing_blocks).
     """
     if state is not None:
-        import cutlass
+        from cutlass import Int64
         from cutedsl_trace.device import (
             start as trace_start,
             begin_lane_dynamic_raw,
@@ -214,19 +256,18 @@ def get_trace_exec_globals(state: TracingState) -> dict:
             finish_lane_dynamic_raw,
         )
         return {
-            "num_ops": len(state.load_fmts),
-            "range_constexpr": cutlass.range_constexpr,
             "trace_start": trace_start,
             "begin_lane_dynamic_raw": begin_lane_dynamic_raw,
             "end_event_dynamic_raw_1": end_event_dynamic_raw_1,
             "finish_lane_dynamic_raw": finish_lane_dynamic_raw,
             "trace_row_stride": state.builder.row_stride_bytes,
-            "trace_load_fmts": state.load_fmts,
-            "trace_compute_fmts": state.compute_fmts,
-            "trace_store_fmts": state.store_fmts,
+            "trace_load_fmt_ptr": Int64(state.load_fmts_tensor.data_ptr()),
+            "trace_compute_fmt_ptr": Int64(state.compute_fmts_tensor.data_ptr()),
+            "trace_store_fmt_ptr": Int64(state.store_fmts_tensor.data_ptr()),
             "trace_dep_wait_fmt": state.dep_wait_fmt,
             "trace_data_wait_fmt": state.data_wait_fmt,
             "trace_compute_wait_fmt": state.compute_wait_fmt,
+            "trace_ring_full_wait_fmt": state.ring_full_wait_fmt,
         }
     else:
         # Trace code is stripped from the source by resolve_tracing_blocks,

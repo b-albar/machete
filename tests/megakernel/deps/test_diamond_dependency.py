@@ -224,7 +224,7 @@ class TestDiamondDependencyGPU:
         )
 
     def test_three_branch_diamond(self):
-        """
+        r"""
         Diamond with three parallel branches.
 
                   A
@@ -328,7 +328,3 @@ class TestDiamondDependencyGPU:
         assert torch.equal(e, expected), (
             f"Expected {expected.tolist()}, got {e.tolist()}"
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

@@ -7,12 +7,8 @@ Tests the instruction stream builder and persistent megakernel implementation.
 
 import pytest
 import torch
-from machete.megakernel.ops import Op
 
-
-class _NOPOp(Op):
-    """Test-only no-op for persistent kernel tests."""
-    pass
+from tests.megakernel.support import get_nop_op
 
 
 # =============================================================================
@@ -26,10 +22,11 @@ class TestMegakernelHost:
     def test_init(self):
         """Test megakernel initialization."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
 
         ops = [
-            ScheduledOp(_NOPOp, tile_counts=(16,)),
-            ScheduledOp(_NOPOp, tile_counts=(16,)),
+            ScheduledOp(NopOp, tile_counts=(16,)),
+            ScheduledOp(NopOp, tile_counts=(16,)),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -43,8 +40,9 @@ class TestMegakernelHost:
     def test_repr(self):
         """Test string representation."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
 
-        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
+        ops = [ScheduledOp(NopOp, tile_counts=(4,))]
         config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
@@ -55,11 +53,26 @@ class TestMegakernelHost:
     def test_create_megakernel(self):
         """Test factory function."""
         from machete.megakernel import create_megakernel, ScheduledOp
+        NopOp = get_nop_op()
 
-        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
+        ops = [ScheduledOp(NopOp, tile_counts=(4,))]
         kernel = create_megakernel(ops, num_sms=4)
 
         assert kernel.num_sms == 4
+
+    def test_runtime_cache_key_ignores_tile_counts(self):
+        """Runtime metadata should absorb tile-count changes for the shell key."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
+
+        config = MegakernelConfig(num_sms=1, num_pages=1)
+        k0 = Megakernel([ScheduledOp(NopOp, tile_counts=(4,))], config=config, device="cpu")
+        k1 = Megakernel([ScheduledOp(NopOp, tile_counts=(9,))], config=config, device="cpu")
+
+        k0._prepare_tensors()
+        k1._prepare_tensors()
+
+        assert k0._make_cache_key() == k1._make_cache_key()
 
 
 # =============================================================================
@@ -82,8 +95,9 @@ class TestMegakernelGPU:
     def test_nop_kernel_run(self, num_ops):
         """Test running _NOPOp kernels with barrier reset across multiple runs."""
         from machete.megakernel import Megakernel, ScheduledOp
+        NopOp = get_nop_op()
 
-        ops = [ScheduledOp(_NOPOp, tile_counts=(8,)) for _ in range(num_ops)]
+        ops = [ScheduledOp(NopOp, tile_counts=(8,)) for _ in range(num_ops)]
         kernel = Megakernel(ops)
 
         # Run multiple times to verify barrier reset
@@ -98,8 +112,9 @@ class TestMegakernelPagedMemory:
     def test_smem_size_from_layout(self):
         """Test that smem_size is computed from NPageLayout."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = get_nop_op()
 
-        ops = [ScheduledOp(_NOPOp, tile_counts=(4,))]
+        ops = [ScheduledOp(NopOp, tile_counts=(4,))]
         config = MegakernelConfig(num_sms=8)
         kernel = Megakernel(ops, config=config, device="cpu")
 
@@ -107,7 +122,3 @@ class TestMegakernelPagedMemory:
         # Double-buffer layout has scratch + 2 pages
         assert kernel.smem_size > 0
         assert kernel.smem_size >= 2 * config.page_size
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

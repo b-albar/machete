@@ -19,11 +19,15 @@ Correctness is verified by writing results to global memory tensors and
 asserting on host-side readback. printf calls are kept for human debugging.
 """
 
+import importlib.util
 import struct
 
 import pytest
 import torch
 from typing import ClassVar, List
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 import cutlass.cute as cute
 from cutlass import Int32, Int64
@@ -53,6 +57,38 @@ def _pack_ptr(config, offset, ptr):
 _stamp_result_ptr = 0
 _check_result_ptr = 0
 _check_stale_ptr = 0
+
+
+def _assert_i32_sequence(actual, values, label):
+    expected = torch.tensor(values, dtype=torch.int32, device="cuda")
+    assert torch.equal(actual, expected), (
+        f"{label} mismatch: got {actual.tolist()}, expected {expected.tolist()}"
+    )
+
+
+def _assert_linear_op(actual, scale, bias, label):
+    _assert_i32_sequence(actual, [i * scale + bias for i in range(len(actual))], label)
+
+
+def _run_stamp_check_case(num_tiles, *, num_sms=None):
+    global _stamp_result_ptr, _check_result_ptr, _check_stale_ptr
+
+    stamp_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
+    check_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
+    check_stale = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
+
+    _stamp_result_ptr = stamp_results.data_ptr()
+    _check_result_ptr = check_results.data_ptr()
+    _check_stale_ptr = check_stale.data_ptr()
+
+    ops = [
+        ScheduledOp(StampOp, tile_counts=(num_tiles,)),
+        ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
+    ]
+    config = MegakernelConfig() if num_sms is None else MegakernelConfig(num_sms=num_sms)
+    kernel = Megakernel(ops, config=config)
+    kernel.run()
+    return stamp_results, check_results, check_stale
 
 
 # =============================================================================
@@ -104,52 +140,18 @@ class CheckOp(Op):
 class TestSequentialOpsGPU:
     """Integration tests for sequential ops with real shared memory usage."""
 
-    def test_two_ops_dependency_and_paging(self):
-        """Two ops: StampOp -> CheckOp, 4 tiles, 2 pages (forces recycling).
+    @pytest.mark.parametrize("num_tiles", [4, 8])
+    def test_two_ops_dependency_and_paging(self, num_tiles):
+        """Two ops: StampOp -> CheckOp with page recycling.
 
         Verifies:
         - StampOp readback matches expected values
         - CheckOp readback matches expected values
-        - Page recycling: 4 tiles with only 2 pages completes without deadlock
+        - Page recycling completes without deadlock
         """
-        global _stamp_result_ptr, _check_result_ptr, _check_stale_ptr
-        num_tiles = 4
-
-        stamp_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-        check_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-        check_stale = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-
-        _stamp_result_ptr = stamp_results.data_ptr()
-        _check_result_ptr = check_results.data_ptr()
-        _check_stale_ptr = check_stale.data_ptr()
-
-        ops = [
-            ScheduledOp(StampOp, tile_counts=(num_tiles,)),
-            ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
-        ]
-        config = MegakernelConfig()
-        kernel = Megakernel(ops, config=config)
-        kernel.run()
-
-        # Verify StampOp: tile_0 * 100 + 42
-        expected_stamp = torch.tensor(
-            [i * 100 + 42 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(stamp_results, expected_stamp), (
-            f"StampOp mismatch: got {stamp_results.tolist()}, "
-            f"expected {expected_stamp.tolist()}"
-        )
-
-        # Verify CheckOp: tile_0 * 200 + 7
-        expected_check = torch.tensor(
-            [i * 200 + 7 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(check_results, expected_check), (
-            f"CheckOp mismatch: got {check_results.tolist()}, "
-            f"expected {expected_check.tolist()}"
-        )
+        stamp_results, check_results, _ = _run_stamp_check_case(num_tiles)
+        _assert_linear_op(stamp_results, 100, 42, "StampOp")
+        _assert_linear_op(check_results, 200, 7, "CheckOp")
 
     def test_single_stamp_op(self):
         """Single StampOp to verify basic page write/readback."""
@@ -163,55 +165,7 @@ class TestSequentialOpsGPU:
         kernel = Megakernel(ops)
         kernel.run()
 
-        expected = torch.tensor(
-            [i * 100 + 42 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(stamp_results, expected), (
-            f"StampOp mismatch: got {stamp_results.tolist()}, "
-            f"expected {expected.tolist()}"
-        )
-
-    def test_many_tiles_recycling(self):
-        """8 tiles with 2 pages -- stress test page recycling."""
-        global _stamp_result_ptr, _check_result_ptr, _check_stale_ptr
-        num_tiles = 8
-
-        stamp_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-        check_results = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-        check_stale = torch.zeros(num_tiles, dtype=torch.int32, device="cuda")
-
-        _stamp_result_ptr = stamp_results.data_ptr()
-        _check_result_ptr = check_results.data_ptr()
-        _check_stale_ptr = check_stale.data_ptr()
-
-        ops = [
-            ScheduledOp(StampOp, tile_counts=(num_tiles,)),
-            ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
-        ]
-        config = MegakernelConfig()
-        kernel = Megakernel(ops, config=config)
-        kernel.run()
-
-        # Verify StampOp: tile_0 * 100 + 42
-        expected_stamp = torch.tensor(
-            [i * 100 + 42 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(stamp_results, expected_stamp), (
-            f"StampOp mismatch: got {stamp_results.tolist()}, "
-            f"expected {expected_stamp.tolist()}"
-        )
-
-        # Verify CheckOp: tile_0 * 200 + 7
-        expected_check = torch.tensor(
-            [i * 200 + 7 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(check_results, expected_check), (
-            f"CheckOp mismatch: got {check_results.tolist()}, "
-            f"expected {expected_check.tolist()}"
-        )
+        _assert_linear_op(stamp_results, 100, 42, "StampOp")
 
 
 # =============================================================================
@@ -434,27 +388,9 @@ class TestComprehensiveGPU:
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
-        expected_a = torch.tensor(
-            [i * 100 + 1 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        expected_b = torch.tensor(
-            [i * 200 + 2 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        expected_c = torch.tensor(
-            [i * 300 + 3 for i in range(num_tiles)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(a_results, expected_a), (
-            f"OpA mismatch: {a_results.tolist()} != {expected_a.tolist()}"
-        )
-        assert torch.equal(b_results, expected_b), (
-            f"OpB mismatch: {b_results.tolist()} != {expected_b.tolist()}"
-        )
-        assert torch.equal(c_results, expected_c), (
-            f"OpC mismatch: {c_results.tolist()} != {expected_c.tolist()}"
-        )
+        _assert_linear_op(a_results, 100, 1, "OpA")
+        _assert_linear_op(b_results, 200, 2, "OpB")
+        _assert_linear_op(c_results, 300, 3, "OpC")
 
     @pytest.mark.parametrize("tiles_a,tiles_b", [(8, 4), (4, 8)])
     def test_mismatched_tile_counts(self, tiles_a, tiles_b):
@@ -480,16 +416,8 @@ class TestComprehensiveGPU:
         kernel = Megakernel(ops, config=config)
         kernel.run()
 
-        expected_a = torch.tensor(
-            [i * 100 + 1 for i in range(tiles_a)],
-            dtype=torch.int32, device="cuda",
-        )
-        expected_b = torch.tensor(
-            [i * 200 + 2 for i in range(tiles_b)],
-            dtype=torch.int32, device="cuda",
-        )
-        assert torch.equal(a_results, expected_a), f"OpA mismatch: {a_results.tolist()}"
-        assert torch.equal(b_results, expected_b), f"OpB mismatch: {b_results.tolist()}"
+        _assert_linear_op(a_results, 100, 1, "OpA")
+        _assert_linear_op(b_results, 200, 2, "OpB")
 
     def test_2d_tile_grid(self):
         """Single 2D op: tiles_m=4, tiles_n=3 (12 tiles).
@@ -1122,7 +1050,3 @@ class TestConfigPointerGPU:
         assert torch.equal(output_data, expected), (
             f"TensorScaleOp mismatch: got {output_data.tolist()}, expected {expected.tolist()}"
         )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

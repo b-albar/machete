@@ -103,9 +103,7 @@ class MoeGemmBwdOp(Op):
         self.num_mma_warps = self.threads_per_row // 32
         self.num_mma_threads = self.num_mma_warps * 32
 
-        # DMA TMA-loads first 2 N-blocks of dc
         self.tma_n_blocks = min(2, self.num_n_blocks)
-        self.inner_iters = max(1, self.num_n_blocks - 1)
 
         # Swizzle for dc (TMA-loaded, tile_N contiguous in smem)
         if self.tile_N % 64 == 0 and self.tile_N >= 64:
@@ -152,7 +150,7 @@ class MoeGemmBwdOp(Op):
             f"tile_M={self.tile_size_M}, tile_K={self.tile_size_K}, tile_N={self.tile_N}"
         )
 
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape,
@@ -181,12 +179,8 @@ class MoeGemmBwdOp(Op):
     @cute.jit
     def load(self, page_ptr, tile_M, tile_K,
              dc_tma, dc_tma_gmem,
-             work_mbar, inner_iter_idx):
-        """TMA load of dc N-blocks.
-
-        iter 0 (load warp):   Init mbarriers, TMA N0+N1 → buf0+buf1.
-        iter 1+ (store warp): Wait buf_free, TMA one N-block → buf.
-        """
+             work_mbar):
+        """TMA load of dc N-blocks through an op-owned loop."""
         swz = cute.make_swizzle(self.swz_dc, 4, 3)
 
         _bf_0 = page_ptr + Int32(self.mbar_offset)
@@ -194,62 +188,24 @@ class MoeGemmBwdOp(Op):
         _nr_0 = page_ptr + Int32(self.mbar_offset + 16)
         _nr_1 = page_ptr + Int32(self.mbar_offset + 24)
 
-        if inner_iter_idx == Int32(0):
-            with cute.arch.elect_one():
-                mbarrier_init(_bf_0, Int32(1))
-                mbarrier_init(_bf_1, Int32(1))
-                mbarrier_init(_nr_0, Int32(1))
-                mbarrier_init(_nr_1, Int32(1))
-            mbarrier_init_fence()
+        with cute.arch.elect_one():
+            mbarrier_init(_bf_0, Int32(1))
+            mbarrier_init(_bf_1, Int32(1))
+            mbarrier_init(_nr_0, Int32(1))
+            mbarrier_init(_nr_1, Int32(1))
+        mbarrier_init_fence()
 
-            mbar_ptr = cute.make_ptr(
-                cutlass.Int64, work_mbar, cute.AddressSpace.smem)
-            nbytes = Int32(self.tma_n_blocks * self.dc_tma_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
-
-            for _n in cutlass.range_constexpr(self.tma_n_blocks):
-                _buf_base = page_ptr + Int32(_n * self.dc_buf_stride)
-                sDC_ptr = cute.recast_ptr(
-                    cute.make_ptr(self.dc_dtype, _buf_base,
-                                  cute.AddressSpace.smem),
-                    swz, dtype=self.dc_dtype)
-                sDC = cute.make_tensor(
-                    sDC_ptr,
-                    cute.make_layout((self.tile_N, self.tile_size_M),
-                                     stride=(1, self.tile_N)))
-                gDC = cute.local_tile(
-                    dc_tma_gmem, (self.tile_N, self.tile_size_M),
-                    (None, None))
-                tDCsDC, tDCgDC = cute.nvgpu.cpasync.tma_partition(
-                    dc_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sDC, 0, 2),
-                    cute.group_modes(gDC, 0, 2))
-
-                cute.copy(dc_tma, tDCgDC[(None, Int32(_n), tile_M)],
-                          tDCsDC, tma_bar_ptr=mbar_ptr)
-
-        if inner_iter_idx > Int32(0):
-            _n_block = inner_iter_idx + Int32(1)
+        _n_block = Int32(0)
+        while _n_block < Int32(self.num_n_blocks):
             _buf_idx = _n_block % Int32(2)
-
-            _bf_phase = ((inner_iter_idx - Int32(1)) // Int32(2)) % Int32(2)
-            if _buf_idx == Int32(0):
-                mbarrier_wait(_bf_0, _bf_phase)
-            if _buf_idx == Int32(1):
-                mbarrier_wait(_bf_1, _bf_phase)
-
             _buf_base = _buf_idx * Int32(self.dc_buf_stride) + page_ptr
-            _nr_ptr = cute.make_ptr(
-                cutlass.Int64, _nr_0, cute.AddressSpace.smem)
-            if _buf_idx == Int32(0):
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_nr_0, Int32(self.dc_tma_bytes))
-            if _buf_idx == Int32(1):
-                _nr_ptr = cute.make_ptr(
-                    cutlass.Int64, _nr_1, cute.AddressSpace.smem)
-                with cute.arch.elect_one():
-                    mbarrier_arrive_expect_tx(_nr_1, Int32(self.dc_tma_bytes))
+
+            if _n_block >= Int32(2):
+                _bf_phase = ((_n_block - Int32(2)) // Int32(2)) % Int32(2)
+                if _buf_idx == Int32(0):
+                    mbarrier_wait(_bf_0, _bf_phase)
+                if _buf_idx == Int32(1):
+                    mbarrier_wait(_bf_1, _bf_phase)
 
             sDC_ptr = cute.recast_ptr(
                 cute.make_ptr(self.dc_dtype, _buf_base,
@@ -267,8 +223,33 @@ class MoeGemmBwdOp(Op):
                 cute.group_modes(sDC, 0, 2),
                 cute.group_modes(gDC, 0, 2))
 
-            cute.copy(dc_tma, tDCgDC[(None, _n_block, tile_M)],
-                      tDCsDC, tma_bar_ptr=_nr_ptr)
+            if _n_block < Int32(2):
+                _mbar_ptr = cute.make_ptr(
+                    cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+                if _n_block == Int32(0):
+                    nbytes = Int32(self.tma_n_blocks * self.dc_tma_bytes)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                cute.copy(dc_tma, tDCgDC[(None, _n_block, tile_M)],
+                          tDCsDC, tma_bar_ptr=_mbar_ptr)
+
+            if _n_block >= Int32(2):
+                _nr_ptr = cute.make_ptr(
+                    cutlass.Int64, _nr_0, cute.AddressSpace.smem)
+                if _buf_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _nr_0, Int32(self.dc_tma_bytes))
+                if _buf_idx == Int32(1):
+                    _nr_ptr = cute.make_ptr(
+                        cutlass.Int64, _nr_1, cute.AddressSpace.smem)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _nr_1, Int32(self.dc_tma_bytes))
+                cute.copy(dc_tma, tDCgDC[(None, _n_block, tile_M)],
+                          tDCsDC, tma_bar_ptr=_nr_ptr)
+
+            _n_block = _n_block + Int32(1)
 
     # =========================================================================
     # Compute: cpasync W + transposed MMA for dx

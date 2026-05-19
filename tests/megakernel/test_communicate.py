@@ -14,9 +14,13 @@ Tests the following components:
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
+
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 from machete.megakernel.ops import Op, ScheduledOp
 from machete.megakernel.registries import (
@@ -53,6 +57,33 @@ requires_multi_gpu = pytest.mark.skipif(
 TILE_M = 4
 N_STATIC = 16
 ELEM_BYTES = 2  # fp16
+
+
+def _make_xy(M=8, N=N_STATIC, *, dtype=torch.float16, device="cuda"):
+    x = torch.randn(M, N, dtype=dtype, device=device)
+    y = torch.zeros(M, N, dtype=dtype, device=device)
+    return x, y
+
+
+def _make_xyz(M=8, N=N_STATIC, *, dtype=torch.float16, device="cuda"):
+    x = torch.randn(M, N, dtype=dtype, device=device)
+    y = torch.zeros(M, N, dtype=dtype, device=device)
+    z = torch.zeros(M, N, dtype=dtype, device=device)
+    return x, y, z
+
+
+def _make_tensor_registry(ops):
+    return TensorRegistry.from_ops(ops)
+
+
+def _make_peer_buffer_registry(ops, peer_map):
+    tensor_registry = _make_tensor_registry(ops)
+    registry = PeerBufferRegistry.from_config(
+        peer_map=peer_map,
+        tensor_registry=tensor_registry,
+        ops=ops,
+    )
+    return tensor_registry, registry
 
 
 class SimpleWriteOp(Op):
@@ -125,18 +156,11 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_single_peer(self):
         """Single peer buffer is correctly registered."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-
-        registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        _, registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
         assert registry.has_peers
         assert registry.num_peers == 1
         assert len(registry.buffers) == 1
@@ -145,21 +169,14 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_multiple_peers(self):
         """Multiple peer buffers with consistent count."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peers = [
             torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
             for _ in range(3)
         ]
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-
-        registry = PeerBufferRegistry.from_config(
-            peer_map={"y": peers},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        _, registry = _make_peer_buffer_registry(ops, {"y": peers})
         assert registry.has_peers
         assert registry.num_peers == 3
         assert len(registry.buffers) == 1
@@ -167,9 +184,7 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_inconsistent_peer_count_raises(self):
         """Inconsistent peer list lengths raise ValueError."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
-        z = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y, z = _make_xyz()
 
         ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
         tensor_registry = TensorRegistry.from_ops(ops)
@@ -190,8 +205,7 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_unknown_tensor_name_raises(self):
         """Peer buffer for unknown tensor name raises ValueError."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         tensor_registry = TensorRegistry.from_ops(ops)
@@ -208,18 +222,11 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_get_peer_tensors(self):
         """get_peer_tensors returns correct tensors for canonical name."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-
-        registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        _, registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
         canonical = registry.canonical_names[0]
         peers = registry.get_peer_tensors(canonical)
         assert peers is not None
@@ -229,19 +236,48 @@ class TestPeerBufferRegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_get_peer_tensors_nonexistent(self):
         """get_peer_tensors returns None for unknown canonical name."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        _, registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
+        assert registry.get_peer_tensors("t999") is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_multiple_peer_store_canonical_names(self):
+        """Multiple peer-store tensors get one canonical name per tensor."""
+        x, y, z = _make_xyz()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        peer_z = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
+        _, registry = _make_peer_buffer_registry(ops, {"y": [peer_y], "z": [peer_z]})
+
+        assert registry.has_peers
+        assert registry.num_peers == 1
+        assert len(registry.buffers) == 2
+        assert len(registry.canonical_names) == 2
+        assert registry.get_peer_tensors(registry.canonical_names[0]) is not None
+        assert registry.get_peer_tensors(registry.canonical_names[1]) is not None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_accepts_canonical_tensor_names(self):
+        """Peer buffers may be bound directly by canonical tensor name."""
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         tensor_registry = TensorRegistry.from_ops(ops)
+        canonical_y = tensor_registry.op_mappings[0]["y"]
 
         registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
+            peer_map={canonical_y: [peer_y]},
             tensor_registry=tensor_registry,
             ops=ops,
         )
-        assert registry.get_peer_tensors("t999") is None
+
+        assert registry.canonical_names == [canonical_y]
+        assert registry.get_peer_tensors(canonical_y) == [peer_y]
 
 
 # =============================================================================
@@ -254,11 +290,10 @@ class TestPeerTMARegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_no_peer_stores_empty_registry(self):
         """Ops without peer_stores produce empty PeerTMARegistry."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
 
         ops = SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
+        tensor_registry = _make_tensor_registry(ops)
         peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
 
         registry = PeerTMARegistry.from_ops(
@@ -268,22 +303,37 @@ class TestPeerTMARegistry:
         assert registry.num_peers == 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_only_configured_peer_buffers_get_descriptors(self):
+        """Peer TMA descriptors are emitted only for tensors with peer buffers."""
+        x, y, z = _make_xyz()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
+        tensor_registry = TensorRegistry.from_ops(ops)
+        canonical_y = tensor_registry.op_mappings[0]["y"]
+        peer_buffer_registry = PeerBufferRegistry.from_config(
+            peer_map={canonical_y: [peer_y]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
+
+        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
+
+        assert registry.has_peer_tma
+        assert len(registry.descriptors) == 1
+        assert registry.descriptors[0].tensor_canonical == canonical_y
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_single_peer_store_descriptors(self):
         """Single peer store creates descriptors for each peer."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peers = [
             torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
             for _ in range(2)
         ]
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": peers},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": peers})
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
@@ -304,17 +354,11 @@ class TestPeerTMARegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_all_canonical_names(self):
         """all_canonical_names returns atom/gmem pairs for all descriptors."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
@@ -325,17 +369,11 @@ class TestPeerTMARegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_op_mappings_communicate_phase(self):
         """op_mappings maps local TMA names to canonical for communicate phase."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
@@ -350,20 +388,14 @@ class TestPeerTMARegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_get_op_peer_tma_args(self):
         """get_op_peer_tma_args returns sorted canonical names for communicate."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peers = [
             torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
             for _ in range(2)
         ]
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": peers},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": peers})
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
@@ -373,21 +405,21 @@ class TestPeerTMARegistry:
         assert len(args) == 4
         assert "ptma0_p0_atom" in args
         assert "ptma0_p1_atom" in args
+        assert args == [
+            "ptma0_p0_atom",
+            "ptma0_p0_gmem",
+            "ptma0_p1_atom",
+            "ptma0_p1_gmem",
+        ]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_descriptor_tile_shape(self):
         """TMA descriptor has correct reversed tile shape."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
@@ -399,17 +431,65 @@ class TestPeerTMARegistry:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_non_peer_op_empty_mappings(self):
         """Ops without peer_stores get empty communicate mapping."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
 
         ops = SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
+        tensor_registry = _make_tensor_registry(ops)
         peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
 
         registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
 
         assert registry.get_op_peer_tma_args(0, "communicate") == []
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_multiple_peer_store_descriptors_and_mappings(self):
+        """Multiple peer-store tensors expand to one descriptor per tensor per peer."""
+        x, y, z = _make_xyz()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        peer_z = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
+        tensor_registry, peer_buffer_registry = _make_peer_buffer_registry(
+            ops, {"y": [peer_y], "z": [peer_z]}
+        )
+        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
+
+        assert registry.has_peer_tma
+        assert registry.num_peers == 1
+        assert len(registry.descriptors) == 2
+        mapping = registry.op_mappings[(0, "communicate")]
+        assert mapping["y_p0_tma"].startswith("ptma")
+        assert mapping["y_p0_tma_gmem"].startswith("ptma")
+        assert mapping["z_p0_tma"].startswith("ptma")
+        assert mapping["z_p0_tma_gmem"].startswith("ptma")
+        args = registry.get_op_peer_tma_args(0, "communicate")
+        assert len(args) == 4
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mixed_ops_only_peer_store_op_gets_communicate_mapping(self):
+        """Only ops with peer_stores should receive communicate-phase peer TMA mappings."""
+        x, y, z = _make_xyz(M=16)
+        peer_z = torch.zeros(16, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = (
+            SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+            + PeerStoreOp.schedule(x=y, y=z, tile_sizes={"M": TILE_M})
+        )
+        tensor_registry = _make_tensor_registry(ops)
+        peer_buffer_registry = PeerBufferRegistry.from_config(
+            peer_map={tensor_registry.op_mappings[1]["y"]: [peer_z]},
+            tensor_registry=tensor_registry,
+            ops=ops,
+        )
+        registry = PeerTMARegistry.from_ops(ops, tensor_registry, peer_buffer_registry)
+
+        assert registry.get_op_peer_tma_args(0, "communicate") == []
+        args = registry.get_op_peer_tma_args(1, "communicate")
+        assert len(args) == 2
+        mapping = registry.op_mappings[(1, "communicate")]
+        assert mapping["y_p0_tma"].startswith("ptma")
+        assert mapping["y_p0_tma_gmem"].startswith("ptma")
 
 
 # =============================================================================
@@ -462,8 +542,7 @@ class TestCompileCommunicate:
         """Default no-op communicate() compiles to a valid @cute.jit function."""
         from machete.megakernel.ops import build_op_config
 
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         tensor_registry = TensorRegistry.from_ops(ops)
@@ -481,19 +560,14 @@ class TestCompileCommunicate:
         """compile_phase with TMA mapping produces valid function."""
         from machete.megakernel.ops import build_op_config
 
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
         peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
-        tensor_registry = TensorRegistry.from_ops(ops)
+        tensor_registry = _make_tensor_registry(ops)
         tensor_args = tensor_registry.get_op_tensor_args(0, PeerStoreOp)
 
-        peer_buffer_registry = PeerBufferRegistry.from_config(
-            peer_map={"y": [peer_y]},
-            tensor_registry=tensor_registry,
-            ops=ops,
-        )
+        _, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
         peer_tma_registry = PeerTMARegistry.from_ops(
             ops, tensor_registry, peer_buffer_registry)
 
@@ -511,6 +585,66 @@ class TestCompileCommunicate:
         assert fn is not None
         assert callable(fn)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_tma_communicate_with_peer_tma_mapping(self):
+        """compile_phase also works for a real op that defines TMA load/store phases."""
+        from machete.megakernel.ops import build_op_config
+
+        x, y = _make_xy()
+        peer_y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = PeerAddOneOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        tensor_registry = _make_tensor_registry(ops)
+        tensor_args = tensor_registry.get_op_tensor_args(0, PeerAddOneOp)
+        _, peer_buffer_registry = _make_peer_buffer_registry(ops, {"y": [peer_y]})
+        peer_tma_registry = PeerTMARegistry.from_ops(
+            ops, tensor_registry, peer_buffer_registry)
+
+        comm_tma_args = peer_tma_registry.get_op_peer_tma_args(0, "communicate")
+        comm_tma_mapping = peer_tma_registry.op_mappings.get((0, "communicate"), {})
+
+        config = build_op_config(ops[0], kernel_config={"threads_per_row": 128})
+        instance = PeerAddOneOp(**config)
+        fn = compile_phase(
+            instance, "communicate", tensor_param_names=tensor_args,
+            tma_param_names=comm_tma_args,
+            tma_local_mapping=comm_tma_mapping,
+        )
+        assert fn is not None
+        assert callable(fn)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_compile_communicate_multi_peer_multi_tensor_mapping(self):
+        """compile_phase accepts expanded peer TMA bindings for multiple tensors/peers."""
+        from machete.megakernel.ops import build_op_config
+
+        x, y, z = _make_xyz()
+        peers_y = [torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda") for _ in range(2)]
+        peers_z = [torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda") for _ in range(2)]
+
+        ops = MultiPeerStoreOp.schedule(x=x, y=y, z=z, tile_sizes={"M": TILE_M})
+        tensor_registry = _make_tensor_registry(ops)
+        tensor_args = tensor_registry.get_op_tensor_args(0, MultiPeerStoreOp)
+        _, peer_buffer_registry = _make_peer_buffer_registry(
+            ops, {"y": peers_y, "z": peers_z}
+        )
+        peer_tma_registry = PeerTMARegistry.from_ops(
+            ops, tensor_registry, peer_buffer_registry)
+
+        comm_tma_args = peer_tma_registry.get_op_peer_tma_args(0, "communicate")
+        comm_tma_mapping = peer_tma_registry.op_mappings.get((0, "communicate"), {})
+
+        config = build_op_config(ops[0], kernel_config={"threads_per_row": 128})
+        instance = MultiPeerStoreOp(**config)
+        fn = compile_phase(
+            instance, "communicate", tensor_param_names=tensor_args,
+            tma_param_names=comm_tma_args,
+            tma_local_mapping=comm_tma_mapping,
+        )
+        assert fn is not None
+        assert callable(fn)
+        assert len(comm_tma_args) == 8
+
 
 # =============================================================================
 # has_communicate & num_peer_barriers Tests
@@ -522,33 +656,31 @@ class TestHasCommunicateAndPeerBarriers:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_no_peer_stores_has_communicate_false(self):
         """Megakernel with no peer_stores ops has has_communicate=False."""
-        x = torch.randn(8, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(8, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy()
 
         ops = SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         kernel = Megakernel(ops)
+        assert not kernel._peer_tma_registry.has_peer_tma
         assert kernel.num_peer_barriers == 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_peer_stores_num_peer_barriers(self):
         """num_peer_barriers equals total tiles for peer-store ops."""
         M = 16
-        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy(M=M)
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         kernel = Megakernel(ops)
 
         # M=16, tile_M=4 → 4 tiles. PeerStoreOp has peer_stores → 4 barriers
+        assert not kernel._peer_tma_registry.has_peer_tma
         assert kernel.num_peer_barriers == M // TILE_M
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_mixed_ops_peer_barriers(self):
         """num_peer_barriers counts only ops with peer_stores."""
         M = 16
-        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
-        z = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y, z = _make_xyz(M=M)
 
         # SimpleWriteOp has no peer_stores, PeerStoreOp does
         ops = (
@@ -558,6 +690,42 @@ class TestHasCommunicateAndPeerBarriers:
         kernel = Megakernel(ops)
 
         # Only PeerStoreOp contributes: M/TILE_M = 4 tiles
+        assert not kernel._peer_tma_registry.has_peer_tma
+        assert kernel.num_peer_barriers == M // TILE_M
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_peer_buffers_enable_runtime_communicate_path(self):
+        """Providing peer buffers materializes peer TMA and flips the runtime communicate path on."""
+        M = 16
+        x, y = _make_xy(M=M)
+        peer_y = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+        kernel = Megakernel(ops, config=MegakernelConfig(peer_buffers={"y": [peer_y]}))
+
+        assert kernel._peer_tma_registry.has_peer_tma
+        assert kernel.num_peer_barriers == M // TILE_M
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_mixed_ops_with_peer_buffers_only_counts_peer_store_tiles(self):
+        """Runtime peer communication may be enabled globally, but barrier count still only follows peer-store ops."""
+        M = 16
+        x, y, z = _make_xyz(M=M)
+        peer_z = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+
+        ops = (
+            SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
+            + PeerStoreOp.schedule(x=y, y=z, tile_sizes={"M": TILE_M})
+        )
+        tensor_registry = _make_tensor_registry(ops)
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(
+                peer_buffers={tensor_registry.op_mappings[1]["y"]: [peer_z]}
+            ),
+        )
+
+        assert kernel._peer_tma_registry.has_peer_tma
         assert kernel.num_peer_barriers == M // TILE_M
 
 
@@ -578,8 +746,7 @@ class TestSingleGPUSmoke:
         """
         M = 16
         torch.manual_seed(42)
-        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y = _make_xy(M=M)
 
         ops = PeerStoreOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
         with contextlib.redirect_stdout(io.StringIO()):
@@ -591,9 +758,7 @@ class TestSingleGPUSmoke:
         """Mixed ops (some with peer_stores, some without) run correctly."""
         M = 16
         torch.manual_seed(42)
-        x = torch.randn(M, N_STATIC, dtype=torch.float16, device="cuda")
-        y = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
-        z = torch.zeros(M, N_STATIC, dtype=torch.float16, device="cuda")
+        x, y, z = _make_xyz(M=M)
 
         ops = (
             SimpleWriteOp.schedule(x=x, y=y, tile_sizes={"M": TILE_M})
@@ -778,8 +943,3 @@ class TestMultiGPUCommunication:
         torch.testing.assert_close(y, expected, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(
             peer_y.to("cuda:0"), expected, atol=1e-3, rtol=1e-3)
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main(["-v", __file__]))

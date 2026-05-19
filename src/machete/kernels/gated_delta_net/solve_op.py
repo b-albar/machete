@@ -63,6 +63,7 @@ class GDNSolveOp(Op):
         "a_solved": (None, ("B", "S", "NH", "BT_DIM")),
     }
     tile = ("B", "NH", "S")
+    dynamic_dims = ("B",)
     tma_loads = {"k"}
 
     @classmethod
@@ -108,10 +109,6 @@ class GDNSolveOp(Op):
         self.num_mma_warps = self.BT // 16  # 4 warps for BT=64
         self.num_mma_threads = self.num_mma_warps * 32
 
-        # DMA warp loads k via TMA in NK sub-blocks, double-buffered
-        self.inner_iters = max(1, self.NK - 1)
-        self.inner_depth = 1
-
         # Per-buffer: [BT, BK] with SW128 swizzle
         self._k_buf_bytes = self.BT * self.BK * self.elem_bytes
         self._buf_stride = self._k_buf_bytes
@@ -127,8 +124,7 @@ class GDNSolveOp(Op):
         # Phase 3: a_smem[BT, BT] fp32 at offset 0 (reuses K buffer area)
         self._a_base = 0
 
-        # Override compute method
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     # =========================================================================
     # Scheduling
@@ -211,7 +207,7 @@ class GDNSolveOp(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_B, tile_NH, tile_S,
-             k_tma, k_tma_gmem, work_mbar, inner_iter_idx):
+             k_tma, k_tma_gmem, work_mbar):
         """TMA k load: NK sub-blocks [BT, BK] into double buffer."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 
@@ -220,32 +216,31 @@ class GDNSolveOp(Op):
 
         merged_t = tile_B * Int32(self.S // self.BT) + tile_S
 
-        if inner_iter_idx == Int32(0):
-            nbytes = Int32(self._k_tma_bytes)
-            with cute.arch.elect_one():
-                mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        nbytes = Int32(self._k_tma_bytes)
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
 
-            for _k in cutlass.range_constexpr(self._tma_k_blocks):
-                _buf_base = page_ptr + Int32(_k * self._buf_stride)
-                sK = cute.make_tensor(
-                    cute.recast_ptr(
-                        cute.make_ptr(self.k_dtype, _buf_base,
-                                      cute.AddressSpace.smem),
-                        swz, dtype=self.k_dtype),
-                    cute.make_layout((self.BK, 1, self.BT),
-                                     stride=(1, self.BK, self.BK)),
-                )
-                gK = cute.local_tile(
-                    k_tma_gmem,
-                    (self.BK, 1, self.BT),
-                    (None, None, None),
-                )
-                tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
-                    k_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
-                )
-                cute.copy(k_tma, tKgK[(None, Int32(_k), tile_NH, merged_t)],
-                          tKsK, tma_bar_ptr=mbar_ptr)
+        for _k in cutlass.range_constexpr(self._tma_k_blocks):
+            _buf_base = page_ptr + Int32(_k * self._buf_stride)
+            sK = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.k_dtype, _buf_base,
+                                  cute.AddressSpace.smem),
+                    swz, dtype=self.k_dtype),
+                cute.make_layout((self.BK, 1, self.BT),
+                                 stride=(1, self.BK, self.BK)),
+            )
+            gK = cute.local_tile(
+                k_tma_gmem,
+                (self.BK, 1, self.BT),
+                (None, None, None),
+            )
+            tKsK, tKgK = cute.nvgpu.cpasync.tma_partition(
+                k_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sK, 0, 3), cute.group_modes(gK, 0, 3),
+            )
+            cute.copy(k_tma, tKgK[(None, Int32(_k), tile_NH, merged_t)],
+                      tKsK, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # Compute — Phases 1-3 + a_solved global write

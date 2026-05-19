@@ -110,6 +110,7 @@ class FlashAttentionSm100Op(Op):
         "lse": (cutlass.Float32, ("B", "H", "M")),
     }
     tile = ("B", "H", "M", "D")
+    dynamic_dims = ("B", "M", "N")
 
     tma_loads = {"q"}
     tma_stores = {"o"}
@@ -226,10 +227,6 @@ class FlashAttentionSm100Op(Op):
         else:
             self.swizzle_B = 1
 
-        # Framework inner iterations: Q loaded once by framework TMA
-        self.inner_iters = 1
-        self.inner_depth = 1
-
         # Number of MMA warps visible to framework
         self.num_mma_warps = NUM_MMA_TOTAL
         self.num_mma_threads = self.num_mma_warps * 32
@@ -327,7 +324,7 @@ class FlashAttentionSm100Op(Op):
     @cute.jit
     def load(self, page_ptr, tile_B, tile_H, tile_M, tile_D,
              q_tma, q_tma_gmem,
-             work_mbar, inner_iter_idx):
+             work_mbar):
         """TMA load Q into sQ region of page. Init op-managed mbarriers."""
         # Init op-managed mbarriers
         _mbar_base = page_ptr + Int32(self.mbar_offset)

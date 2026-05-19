@@ -129,9 +129,6 @@ def _fused_init(self):
     self.uv_copy_dim1 = self.BV // self.async_copy_elems
     self.uv_copy_dim0 = self.num_mma_threads // self.uv_copy_dim1
 
-    self.inner_iters = 1
-    self.inner_depth = 1
-
     # Smem layout (48KB page):
     #   [0]           s_primary: [BT, K or BV]  (q for fwd, do for bwd)
     #   [primary_end] s_buf:     [BT, BK] × 2   double-buffered (w/k for fwd, q/k/w for bwd)
@@ -214,6 +211,7 @@ class GDNFusedOp(Op):
         "o": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"q"}
 
     @classmethod
@@ -233,7 +231,7 @@ class GDNFusedOp(Op):
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16)
         self.q_tile_bytes = _BT * self.K * 2
         _fused_init(self)
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):
@@ -820,6 +818,7 @@ class GDNFusedBwdOp(Op):
         "dv": (None, ("B", "S", "NH", "V")),
     }
     tile = ("B", "NH", "V")
+    dynamic_dims = ("B",)
     tma_loads = {"do"}
 
     @classmethod
@@ -842,7 +841,7 @@ class GDNFusedBwdOp(Op):
         self._primary_bytes = _BT * BV * 2
         self.do_tile_bytes = self._primary_bytes
         _fused_init(self)
-        self.compute = self.compute_mma
+        self._bind_phase("compute", "compute_mma")
 
     @classmethod
     def schedule(cls, scale=None, page_size=DEFAULT_PAGE_SIZE, tile_sizes=None, **tensors):

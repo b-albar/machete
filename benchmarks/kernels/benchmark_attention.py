@@ -16,7 +16,9 @@ Usage:
 
 import contextlib
 import io
+import os
 import sys
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +36,7 @@ except ImportError:
     CUTLASS_AVAILABLE = False
 
 PAGE_SIZES = [16384, 32768, 49152, 65536]
+BACKWARD_PAGE_SIZES = [32768, 49152, 65536]
 BH_SIZES = [1, 4, 16]
 
 # CuTe DSL Flash Attention v2 (Ampere tensor core implementation)
@@ -50,6 +53,19 @@ if CUTLASS_AVAILABLE:
         CUTE_FA2_AVAILABLE = True
     except (ImportError, ModuleNotFoundError) as e:
         print(f"CuTe DSL FA2 not available: {e}")
+
+
+_DEBUG_BENCH = os.environ.get("MACHETE_BENCHMARK_DEBUG", "").lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _debug_skip(label, exc):
+    """Report why one benchmark implementation was skipped."""
+    if not _DEBUG_BENCH:
+        return
+    print(f"[benchmark_attention] skipped {label}: {type(exc).__name__}: {exc}")
+    traceback.print_exc()
 
 
 def is_hopper_or_newer():
@@ -177,7 +193,7 @@ def bench_attention(BH, M, N, D, page_size):
 
                 funcs["cute_fa2"] = _run_fa2
         except Exception:
-            pass
+            _debug_skip("cute_fa2 forward", sys.exc_info()[1])
 
     # Megakernel bf16
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
@@ -196,7 +212,7 @@ def bench_attention(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, o_mk],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel forward", sys.exc_info()[1])
 
     return funcs
 
@@ -253,7 +269,7 @@ def bench_attention_causal(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, o_mk],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel causal forward", sys.exc_info()[1])
 
     return funcs
 
@@ -271,7 +287,7 @@ _BASE_BWD_CONFIGS = [
     (8192, 8192, 128),
 ]
 
-BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in BACKWARD_PAGE_SIZES]
 
 
 @Benchmark.configs(["BH", "M", "N", "D", "page_size"], BWD_CONFIGS)
@@ -336,7 +352,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel backward", sys.exc_info()[1])
 
     return funcs
 
@@ -345,7 +361,12 @@ def bench_attention_bwd(BH, M, N, D, page_size):
 # Causal Backward Benchmark
 # =============================================================================
 
-CAUSAL_BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
+CAUSAL_BWD_CONFIGS = [
+    (bh,) + c + (ps,)
+    for c in _BASE_BWD_CONFIGS
+    for bh in BH_SIZES
+    for ps in BACKWARD_PAGE_SIZES
+]
 
 
 @Benchmark.configs(["BH", "M", "N", "D", "page_size"], CAUSAL_BWD_CONFIGS)
@@ -410,7 +431,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
                 keep_alive=[q, k, v, dout, lse, dpsum, dq_accum, dk, dv],
             )
         except Exception:
-            pass
+            _debug_skip("megakernel causal backward", sys.exc_info()[1])
 
     return funcs
 
@@ -439,6 +460,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "cute_fa2", "megakernel"],
     )
 
     print()
@@ -451,6 +473,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )
 
     print()
@@ -463,6 +486,7 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )
 
     print()
@@ -475,4 +499,5 @@ if __name__ == "__main__":
         mode="kernel",
         warmup=25,
         rep=100,
+        columns=["sdpa", "megakernel"],
     )

@@ -92,6 +92,7 @@ class Conv1dOp(Op):
         "y": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"x"}
     tma_stores = {"y"}
@@ -412,6 +413,7 @@ class Conv1dBwdOp(Op):
         "dx": (None, ("B", "S", "D")),
     }
     tile = ("B", "S", "D")
+    dynamic_dims = ("B",)
 
     tma_loads = {"dy"}
     tma_stores = {"dx"}

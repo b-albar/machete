@@ -2,21 +2,14 @@
 """
 Thread-safe cache for compiled megakernels.
 
-Caches compiled kernel objects keyed on structural shape to avoid
-~77ms CuTe DSL re-tracing per call. Instruction streams and config
-tensors are rebuilt per call (cheap CPU work).
+The preferred path is to key this cache from a prepared ``Megakernel`` via its
+runtime-dedicated structural cache key. That keeps the autograd wrapper aligned
+with ``Megakernel.compile()`` as more scheduling state moves out of the emitted
+kernel and into runtime metadata.
 
-The cache key captures everything that affects the compiled MLIR/PTX:
-- Op class types and their execution modes
-- Tile counts (barrier formulas bake tile_counts into coefficients)
-- num_sms, threads_per_block, page_size, num_pages
-
-Usage:
-    cache = KernelCache.get()
-    compiled = cache.lookup(scheduled_ops, mk_config)
-    if compiled is None:
-        # compile, then store
-        cache.store(scheduled_ops, mk_config, compiled_kernel=kernel)
+Legacy ``lookup(ops, config)`` / ``store(ops, config, ...)`` entry points are
+still supported, but callers that already constructed a ``Megakernel`` should
+use ``lookup_key()`` / ``store_key()`` to avoid duplicating key derivation.
 """
 
 import threading
@@ -59,27 +52,18 @@ class KernelCache:
         ops: List[ScheduledOp],
         config: MegakernelConfig,
     ) -> CacheKey:
-        """Build a cache key from op structure and config.
+        """Build the runtime-dedicated structural cache key for one workload."""
+        from .megakernel import Megakernel
 
-        Includes tile counts because barrier formula coefficients
-        (computed in ``_compute_formula_coeffs``) use ``tile_counts``
-        at JIT compile time.
-        """
-        op_structure = tuple(
-            (
-                op.op_cls,
-                op.tile_counts,
-                tuple(sorted(op.static_dims.items())) if op.static_dims else (),
-            )
-            for op in ops
-        )
-        return (
-            op_structure,
-            config.num_sms,
-            config.threads_per_block,
-            config.page_size,
-            config.num_pages,
-        )
+        mk = Megakernel(ops, config=config, device="cpu")
+        mk._prepare_tensors()
+        mk._prepare_tma_tensors()
+        mk._prepare_peer_tma_tensors()
+        return mk._make_cache_key()
+
+    def lookup_key(self, key: CacheKey) -> object:
+        """Look up a precomputed structural cache key. Returns None on miss."""
+        return self._cache.get(key)
 
     def lookup(
         self,
@@ -87,8 +71,16 @@ class KernelCache:
         config: MegakernelConfig,
     ) -> object:
         """Look up a cached compiled kernel. Returns None on miss."""
-        key = self.make_key(ops, config)
-        return self._cache.get(key)
+        return self.lookup_key(self.make_key(ops, config))
+
+    def store_key(
+        self,
+        key: CacheKey,
+        compiled_kernel: object,
+    ) -> None:
+        """Store a compiled kernel under a precomputed structural key."""
+        with self._lock:
+            self._cache[key] = compiled_kernel
 
     def store(
         self,
@@ -97,9 +89,7 @@ class KernelCache:
         compiled_kernel: object,
     ) -> None:
         """Store a compiled kernel in the cache."""
-        key = self.make_key(ops, config)
-        with self._lock:
-            self._cache[key] = compiled_kernel
+        self.store_key(self.make_key(ops, config), compiled_kernel)
 
     def clear(self):
         """Clear all cached kernels."""

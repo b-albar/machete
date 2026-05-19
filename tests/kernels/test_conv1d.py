@@ -7,31 +7,26 @@ PyTorch reference (F.conv1d with causal padding).
 
 import contextlib
 import io
+import importlib.util
 
 import pytest
 import torch
 
+if importlib.util.find_spec("cutlass") is None:
+    pytest.skip("Requires CUTLASS", allow_module_level=True)
+
 from machete.kernels.conv1d.ref import causal_conv1d_ref, causal_conv1d_bwd_ref
+from tests.kernels.support import requires_hopper_cutlass
 
 
-def is_hopper_or_newer():
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 9
+requires_gpu = requires_hopper_cutlass
 
-
-try:
-    import cutlass  # noqa: F401
-    CUTLASS_AVAILABLE = True
-except ImportError:
-    CUTLASS_AVAILABLE = False
-
-
-requires_gpu = pytest.mark.skipif(
-    not (is_hopper_or_newer() and CUTLASS_AVAILABLE),
-    reason="Requires Hopper+ GPU with CUTLASS",
-)
+CORE_SHAPES = [
+    (1, 64, 128, 4),
+    (2, 128, 64, 4),
+    (1, 256, 256, 4),
+    (4, 32, 128, 3),
+]
 
 
 # =============================================================================
@@ -84,12 +79,7 @@ class TestConv1dStandalone:
     """Standalone causal conv1d correctness tests."""
 
     @requires_gpu
-    @pytest.mark.parametrize("B,L,D,K", [
-        (1, 64, 128, 4),
-        (2, 128, 64, 4),
-        (1, 256, 256, 4),
-        (4, 32, 128, 3),
-    ])
+    @pytest.mark.parametrize("B,L,D,K", CORE_SHAPES)
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_conv1d_shapes(self, B, L, D, K, dtype):
         """Conv1d produces correct output for various shapes."""
@@ -209,12 +199,7 @@ class TestConv1dBackward:
     """Backward (dx gradient) correctness tests."""
 
     @requires_gpu
-    @pytest.mark.parametrize("B,L,D,K", [
-        (1, 64, 128, 4),
-        (2, 128, 64, 4),
-        (1, 256, 256, 4),
-        (4, 32, 128, 3),
-    ])
+    @pytest.mark.parametrize("B,L,D,K", CORE_SHAPES)
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_conv1d_bwd_shapes(self, B, L, D, K, dtype):
         """Conv1d backward dx matches reference for various shapes."""
@@ -284,7 +269,3 @@ class TestConv1dBackward:
         dx_ref, _ = causal_conv1d_bwd_ref(dy, x.detach(), w)
 
         torch.testing.assert_close(dx_ref, dx_autograd, rtol=1e-4, atol=1e-4)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
