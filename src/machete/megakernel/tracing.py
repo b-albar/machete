@@ -37,6 +37,17 @@ class TracingState:
     store_fmts_tensor: object = None
 
 
+def _max_events_per_lane(total_tiles: int, num_sms: int) -> int:
+    """Return trace row capacity for one CTA lane.
+
+    Backward overlap traces can generate many short wait events on the
+    controller lane. If this row is too small, trace writes spill into adjacent
+    lane rows and the host parser later sees bogus dynamic format IDs.
+    """
+    tiles_per_sm = math.ceil(max(1, int(total_tiles)) / max(1, int(num_sms)))
+    return max(1024, tiles_per_sm * 64 + 512)
+
+
 def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
     """Set up cutedsl-trace builder and trace types.
 
@@ -116,9 +127,9 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
         tooltip_string="Controller warp on SM {lane}",
     )
 
-    # 4 lanes: load, MMA, store, controller; enough events per tile.
-    tiles_per_sm = math.ceil(total_tiles / num_sms)
-    max_events = tiles_per_sm * 8 + 256
+    # 4 lanes: load, MMA, store, controller. Wait-heavy backward overlap traces
+    # need much more headroom than one event per phase.
+    max_events = _max_events_per_lane(total_tiles, num_sms)
     state.builder = DynamicTraceBuilder(
         num_lanes=4,
         max_events_per_lane=max_events,
