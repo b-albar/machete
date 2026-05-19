@@ -79,8 +79,6 @@ class StreamingOp(Op):
     # def store(...):   write staged output
 ```
 
-`inner_iter_idx` is intentionally not part of the op API. Long ranges should be expressed inside the op body so the load/compute/store protocol remains owned by one implementation.
-
 ## Built-In Areas
 
 - Attention kernels for SM100/SM120.
