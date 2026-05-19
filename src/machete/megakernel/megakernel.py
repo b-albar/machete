@@ -730,11 +730,13 @@ class Megakernel:
             # deadlock/fail with dependent staged TMA ops. Keep the two-page
             # path conservative: one logical tile per replay instruction.
             if self._layout.num_pages > 2:
-                instructions = self._builder.coalesce_pipeline_instructions(
+                coalesced_instructions = self._builder.coalesce_pipeline_instructions(
                     instructions,
                     num_blocks=self.num_sms,
                     framework_expands_predicate=_framework_expands_instruction_range,
                 )
+                if len(coalesced_instructions) <= len(instructions):
+                    instructions = coalesced_instructions
             (
                 barrier_meta_indices,
                 expanded_instructions,
@@ -1522,6 +1524,7 @@ class Megakernel:
 
         config_key = (
             self.config.threads_per_block,
+            self.config.num_sms,
             self.config.page_size,
             self.config.num_pages,
             self.config.tracing,
