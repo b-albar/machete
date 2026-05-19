@@ -63,44 +63,37 @@ def _effective_page_size(q, page_size):
     return page_size
 
 
-def _bshd_to_bhsd(x):
-    if x is None:
-        return None
-    assert x.ndim == 4, f"Expected 4D BSHD tensor, got shape={tuple(x.shape)}"
-    return x.permute(0, 2, 1, 3)
-
-
 class FlashAttentionSm120BwdOp(Op):
     """Backward pass for cooperative Flash Attention (SM120, Blackwell).
 
     Tensors:
-        k:  (BH, N, D) -- key (fp16/bf16)
-        v:  (BH, N, D) -- value
-        q:  (BH, M, D) -- query (cpasync in compute)
-        dout: (BH, M, D) -- gradient of loss w.r.t. O
-        lse: (BH, M)    -- logsumexp from forward (f32)
-        dpsum: (BH, M)  -- rowsum(dO * O), precomputed (f32)
-        dk: (BH, N, D) -- output gradient w.r.t. K
-        dv: (BH, N, D) -- output gradient w.r.t. V
-        dq: (BH, M, D) -- output gradient w.r.t. Q (TMA reduce-add)
+        k:  (B, N, H_kv, D) -- key (fp16/bf16)
+        v:  (B, N, H_kv, D) -- value
+        q:  (B, M, H, D) -- query (cpasync in compute)
+        dout: (B, M, H, D) -- gradient of loss w.r.t. O
+        lse: (B, M, H)    -- logsumexp from forward (f32)
+        dpsum: (B, M, H)  -- rowsum(dO * O), precomputed (f32)
+        dk: (B, N, H_kv, D) -- output gradient w.r.t. K
+        dv: (B, N, H_kv, D) -- output gradient w.r.t. V
+        dq: (B, M, H, D) -- output gradient w.r.t. Q (TMA reduce-add)
 
-    Tiling: tile_BH=1, tile_N from schedule, tile_D=D (full).
+    Tiling: tile_B=1, tile_N from schedule, tile_H_kv=1, tile_D=D (full).
     """
 
     reads = {
-        "k": (None, ("B", "H_kv", "N", "D")),
-        "v": (None, ("B", "H_kv", "N", "D")),
-        "q": (None, ("B", "H", "M", "D")),
-        "dout": (None, ("B", "H", "M", "D")),
-        "lse": (cutlass.Float32, ("B", "H", "M")),
-        "dpsum": (cutlass.Float32, ("B", "H", "M")),
+        "k": (None, ("B", "N", "H_kv", "D")),
+        "v": (None, ("B", "N", "H_kv", "D")),
+        "q": (None, ("B", "M", "H", "D")),
+        "dout": (None, ("B", "M", "H", "D")),
+        "lse": (cutlass.Float32, ("B", "M", "H")),
+        "dpsum": (cutlass.Float32, ("B", "M", "H")),
     }
     writes = {
-        "dk": (None, ("B", "H_kv", "N", "D")),
-        "dv": (None, ("B", "H_kv", "N", "D")),
-        "dq": (None, ("B", "H", "M", "D")),
+        "dk": (None, ("B", "N", "H_kv", "D")),
+        "dv": (None, ("B", "N", "H_kv", "D")),
+        "dq": (None, ("B", "M", "H", "D")),
     }
-    tile = ("B", "H_kv", "N", "D")
+    tile = ("B", "N", "H_kv", "D")
     dynamic_dims = ("B", "M", "N")
 
     tma_loads = {"k", "v"}
@@ -138,19 +131,16 @@ class FlashAttentionSm120BwdOp(Op):
         self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
         self.kv_group_size = getattr(self, "kv_group_size", 1)
 
-        # 4D: H/H_kv and per-dimension strides for Q/dO/dQ global reads/writes
+        # 4D: H/H_kv and per-dimension strides for Q/dO/dQ global reads/writes.
+        # Defaults assume native BMHD layout for Q/dO/dQ.
         self.H = getattr(self, 'H', self.tile_size_B * self.tile_size_H_kv * self.kv_group_size)
         self.H_kv = getattr(self, 'H_kv', self.H // self.kv_group_size)
-        self.q_b_stride = getattr(self, 'q_b_stride', self.H * self.M * self.D)
-        self.q_h_stride = getattr(self, 'q_h_stride', self.M * self.D)
-        self.q_m_stride = getattr(self, 'q_m_stride', self.D)
-        self.dq_b_stride = getattr(self, 'dq_b_stride', self.H * self.M * self.D)
-        self.dq_h_stride = getattr(self, 'dq_h_stride', self.M * self.D)
-        self.dq_m_stride = getattr(self, 'dq_m_stride', self.D)
-        self.k_tma_permuted = bool(getattr(self, "k_tma_permuted", 0))
-        self.v_tma_permuted = bool(getattr(self, "v_tma_permuted", 0))
-        self.dk_tma_permuted = bool(getattr(self, "dk_tma_permuted", 0))
-        self.dv_tma_permuted = bool(getattr(self, "dv_tma_permuted", 0))
+        self.q_b_stride = getattr(self, 'q_b_stride', self.M * self.H * self.D)
+        self.q_h_stride = getattr(self, 'q_h_stride', self.D)
+        self.q_m_stride = getattr(self, 'q_m_stride', self.H * self.D)
+        self.dq_b_stride = getattr(self, 'dq_b_stride', self.M * self.H * self.D)
+        self.dq_h_stride = getattr(self, 'dq_h_stride', self.D)
+        self.dq_m_stride = getattr(self, 'dq_m_stride', self.H * self.D)
 
         assert self.k_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120BwdOp requires fp16 or bf16, got {self.k_dtype}"
@@ -162,10 +152,10 @@ class FlashAttentionSm120BwdOp(Op):
         self.scale_log2e = self.scale_val * 1.4426950408889634074
 
         self._init_mma()
-        self._k_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.k_tma_permuted else (self.D, self.tile_size_N, 1, 1)
-        self._v_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.v_tma_permuted else (self.D, self.tile_size_N, 1, 1)
-        self._dk_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.dk_tma_permuted else (self.D, self.tile_size_N, 1, 1)
-        self._dv_tma_smem_shape = (self.D, 1, self.tile_size_N, 1) if self.dv_tma_permuted else (self.D, self.tile_size_N, 1, 1)
+        self._k_tma_smem_shape = (self.D, 1, self.tile_size_N, 1)
+        self._v_tma_smem_shape = (self.D, 1, self.tile_size_N, 1)
+        self._dk_tma_smem_shape = (self.D, 1, self.tile_size_N, 1)
+        self._dv_tma_smem_shape = (self.D, 1, self.tile_size_N, 1)
 
     def _init_mma(self):
         """Init tile sizes, smem offsets, and cpasync layout."""
@@ -258,31 +248,28 @@ class FlashAttentionSm120BwdOp(Op):
         k = tensors.get("k")
         q = tensors.get("q")
 
-        # 3D backward compat: unsqueeze batch dim
+        # 3D backward compat: reshape (BH, M, D) -> (1, M, BH, D).
         if k is not None and k.ndim == 3:
             for name in ("k", "v", "dk", "dv"):
                 if name in tensors and tensors[name] is not None:
-                    tensors[name] = tensors[name].unsqueeze(0)
+                    tensors[name] = tensors[name].unsqueeze(0).permute(0, 2, 1, 3).contiguous()
             for name in ("q", "dout", "dq"):
                 if name in tensors and tensors[name] is not None:
-                    tensors[name] = tensors[name].unsqueeze(0)
+                    tensors[name] = tensors[name].unsqueeze(0).permute(0, 2, 1, 3).contiguous()
             for name in ("lse", "dpsum"):
                 if name in tensors and tensors[name] is not None:
-                    tensors[name] = tensors[name].unsqueeze(0)
+                    tensors[name] = tensors[name].unsqueeze(0).transpose(1, 2).contiguous()
             k = tensors["k"]
             q = tensors.get("q")
         elif q is not None and q.ndim == 4:
             page_size = _effective_page_size(q, page_size)
-            for name in ("k", "v", "q", "dout", "dq", "dk", "dv"):
-                if name in tensors and tensors[name] is not None:
-                    tensors[name] = _bshd_to_bhsd(tensors[name])
             k = tensors.get("k")
             q = tensors.get("q")
 
         if k is not None:
             assert k.element_size() == 2
-            B, H_kv, N_dim, D = k.shape
-            H = q.shape[1] if q is not None else H_kv * kv_group_size
+            B, N_dim, H_kv, D = k.shape
+            H = q.shape[2] if q is not None else H_kv * kv_group_size
             eb = k.element_size()
 
             if "N" not in tile_sizes:
@@ -312,9 +299,9 @@ class FlashAttentionSm120BwdOp(Op):
         ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         if q is not None:
-            ops[0].static_dims["M"] = q.shape[2]
+            ops[0].static_dims["M"] = q.shape[1]
         if k is not None:
-            ops[0].static_dims["N"] = k.shape[2]
+            ops[0].static_dims["N"] = k.shape[1]
         if causal:
             ops[0].static_dims["causal"] = 1
         if kv_group_size > 1:
@@ -324,26 +311,15 @@ class FlashAttentionSm120BwdOp(Op):
         if k is not None:
             ops[0].static_dims["H"] = H
             ops[0].static_dims["H_kv"] = H_kv
-            if not k.is_contiguous():
-                ops[0].static_dims["k_tma_permuted"] = 1
-            v = tensors.get("v")
-            if v is not None and not v.is_contiguous():
-                ops[0].static_dims["v_tma_permuted"] = 1
-            dk = tensors.get("dk")
-            if dk is not None and not dk.is_contiguous():
-                ops[0].static_dims["dk_tma_permuted"] = 1
-            dv = tensors.get("dv")
-            if dv is not None and not dv.is_contiguous():
-                ops[0].static_dims["dv_tma_permuted"] = 1
             if q is not None:
                 ops[0].static_dims["q_b_stride"] = q.stride(0)
-                ops[0].static_dims["q_h_stride"] = q.stride(1)
-                ops[0].static_dims["q_m_stride"] = q.stride(2)
+                ops[0].static_dims["q_m_stride"] = q.stride(1)
+                ops[0].static_dims["q_h_stride"] = q.stride(2)
                 dq = tensors.get("dq")
                 if dq is not None:
                     ops[0].static_dims["dq_b_stride"] = dq.stride(0)
-                    ops[0].static_dims["dq_h_stride"] = dq.stride(1)
-                    ops[0].static_dims["dq_m_stride"] = dq.stride(2)
+                    ops[0].static_dims["dq_m_stride"] = dq.stride(1)
+                    ops[0].static_dims["dq_h_stride"] = dq.stride(2)
 
         return ops
 
@@ -367,7 +343,7 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def load(self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
+    def load(self, page_ptr, tile_B, tile_N, tile_H_kv, tile_D,
              k_tma, k_tma_gmem, v_tma, v_tma_gmem, work_mbar):
         """TMA load K and V into page (K at offset 0, V at offset kv_tile_bytes)."""
         from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
@@ -404,14 +380,8 @@ class FlashAttentionSm120BwdOp(Op):
         nbytes = Int32(2 * self.kv_tile_bytes)
         with cute.arch.elect_one():
             mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        if self.k_tma_permuted:
-            cute.copy(k_tma, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
-        else:
-            cute.copy(k_tma, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
-        if self.v_tma_permuted:
-            cute.copy(v_tma, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
-        else:
-            cute.copy(v_tma, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
+        cute.copy(k_tma, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)], tKsK, tma_bar_ptr=mbar_ptr)
+        cute.copy(v_tma, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)], tVsV, tma_bar_ptr=mbar_ptr)
 
     # =========================================================================
     # MMA Helpers
@@ -436,7 +406,7 @@ class FlashAttentionSm120BwdOp(Op):
 
     @cute.jit
     def compute_mma(
-        self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
+        self, page_ptr, tile_B, tile_N, tile_H_kv, tile_D,
         k, v, q, dout, lse, dpsum, dk, dv, dq
     ):
         """Backward compute: iterate M-blocks, accumulate dK/dV, atomicAdd dQ.
@@ -638,10 +608,10 @@ class FlashAttentionSm120BwdOp(Op):
                 )
 
                 # Global LSE, dPsum, dQ for current Q head
-                lse_head_ptr = lse.iterator + (tile_B * Int32(self.H) + q_h) * Int32(self.M)
-                g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M))
-                dpsum_head_ptr = dpsum.iterator + (tile_B * Int32(self.H) + q_h) * Int32(self.M)
-                g_dpsum = cute.make_tensor(dpsum_head_ptr, cute.make_layout(self.M))
+                lse_head_ptr = lse.iterator + tile_B * Int32(self.M) * Int32(self.H) + q_h
+                g_lse = cute.make_tensor(lse_head_ptr, cute.make_layout(self.M, stride=Int32(self.H)))
+                dpsum_head_ptr = dpsum.iterator + tile_B * Int32(self.M) * Int32(self.H) + q_h
+                g_dpsum = cute.make_tensor(dpsum_head_ptr, cute.make_layout(self.M, stride=Int32(self.H)))
                 dqa_head_ptr = dq.iterator + tile_B * Int32(self.dq_b_stride) + q_h * Int32(self.dq_h_stride)
                 g_dq = cute.make_tensor(
                     dqa_head_ptr,
@@ -908,7 +878,7 @@ class FlashAttentionSm120BwdOp(Op):
     # =========================================================================
 
     @cute.jit
-    def store(self, page_ptr, tile_B, tile_H_kv, tile_N, tile_D,
+    def store(self, page_ptr, tile_B, tile_N, tile_H_kv, tile_D,
               dk_tma, dk_tma_gmem, dv_tma, dv_tma_gmem):
         """TMA store dK and dV from shared to global memory."""
         _o_swz = cute.make_swizzle(self.swizzle_B, 4, 3)
@@ -928,10 +898,7 @@ class FlashAttentionSm120BwdOp(Op):
             cute.group_modes(sdK, 0, 4), cute.group_modes(gdK, 0, 4),
         )
         with cute.arch.elect_one():
-            if self.dk_tma_permuted:
-                cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)])
-            else:
-                cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_N, tile_H_kv, tile_B)])
+            cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)])
 
         # dV at page offset kv_tile_bytes
         sdV = cute.make_tensor(
@@ -949,10 +916,7 @@ class FlashAttentionSm120BwdOp(Op):
             cute.group_modes(sdV, 0, 4), cute.group_modes(gdV, 0, 4),
         )
         with cute.arch.elect_one():
-            if self.dv_tma_permuted:
-                cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)])
-            else:
-                cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_N, tile_H_kv, tile_B)])
+            cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)])
 
 
 __all__ = ["FlashAttentionSm120BwdOp"]

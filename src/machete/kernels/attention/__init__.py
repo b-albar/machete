@@ -2,7 +2,7 @@
 """Flash Attention kernels for the megakernel framework."""
 
 from .sm_100 import FlashAttentionSm100Op
-from .sm_120 import FlashAttentionSm120Op, FlashAttentionSm120PackGQAOp, FlashAttentionSm120DirectOp
+from .sm_120 import FlashAttentionSm120Op
 from .sm_120_bwd import FlashAttentionSm120BwdOp
 from .dpsum import AttentionDPSumOp
 from .flash_decoding import (
@@ -131,7 +131,8 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
 
 __all__ = [
-    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op", "FlashAttentionSm120DirectOp", "FlashAttentionSm120BwdOp",
+    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op",
+    "FlashAttentionSm120BwdOp",
     "AttentionDPSumOp",
     "FlashDecodingSplitOp", "flash_decoding_schedule",
     "flash_attention_schedule",
