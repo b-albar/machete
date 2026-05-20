@@ -1771,10 +1771,14 @@ class Megakernel:
         cuda_load_to_device(packed_load_args)
         checkCudaErrors((cuda_runtime.cudaError_t(err.value),))
 
+        execution_args = getattr(compiled, "execution_args", None)
+        if execution_args is None:
+            execution_args = getattr(compiled, "args_spec")
+
         compiled.jit_module = CudaDialectJitModule(
             compiled.engine,
             compiled.capi_func,
-            compiled.args_spec,
+            execution_args,
             [cuda_runtime.cudaLibrary_t(library.value)],
         )
         compiled._default_executor = JitExecutor(
