@@ -2187,17 +2187,6 @@ class InstructionStreamBuilder:
         if not many_op_graph:
             return conservative
 
-        global_all = _coalesce_flat(non_end, allow_range=_is_range)
-        aggressive = _interleave_strided(global_all)
-
-        aggressive_work = _logical_work_by_cta(aggressive)
-        min_work = min(aggressive_work, default=0)
-        max_work = max(aggressive_work, default=0)
-        aggressive_balanced = min_work > 0 and max_work <= max(1, math.ceil(min_work * 1.25))
-
-        if aggressive_balanced and len(aggressive) < len(conservative):
-            return aggressive
-
         # Keep the per-CTA streams when globally coalescing framework-expanded
         # ranges would collapse work onto too few CTAs. The persistent runtime
         # fetches instruction i, i+num_blocks, ... per CTA, so preserving that

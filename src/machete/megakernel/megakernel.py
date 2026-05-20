@@ -715,8 +715,6 @@ class Megakernel:
             def _framework_expands_instruction_range(instr: TileInstruction) -> bool:
                 if instr.range_axis < 0:
                     return False
-                if self._layout.num_pages <= 2:
-                    return True
                 key = (instr.op_idx, instr.range_end_axis)
                 if key not in framework_range_cache:
                     framework_range_cache[key] = self._framework_expands_range(
@@ -725,11 +723,23 @@ class Megakernel:
                     )
                 return framework_range_cache[key]
 
-            # With only two physical pages, replaying coalesced ranges can let
-            # one long ranged instruction monopolize the small page ring and
-            # deadlock/fail with dependent staged TMA ops. Keep the two-page
-            # path conservative: one logical tile per replay instruction.
-            if self._layout.num_pages > 2:
+            unit_range_cache: Dict[int, bool] = {}
+
+            def _op_owns_unit_range(instr: TileInstruction) -> bool:
+                if instr.op_idx == TileInstruction.END_MARKER or instr.range_axis >= 0:
+                    return False
+                op = self.ops[instr.op_idx]
+                tile_rank = len(op.tile_counts)
+                if tile_rank <= 0 or tile_rank >= MAX_TILE_DIMS:
+                    return False
+                if instr.op_idx not in unit_range_cache:
+                    unit_range_cache[instr.op_idx] = not self._framework_expands_range(
+                        instr.op_idx,
+                        tile_rank,
+                    )
+                return unit_range_cache[instr.op_idx]
+
+            if not any(op.static_dims.get("disable_instruction_coalescing", False) for op in self.ops):
                 coalesced_instructions = self._builder.coalesce_pipeline_instructions(
                     instructions,
                     num_blocks=self.num_sms,
@@ -751,6 +761,13 @@ class Megakernel:
                     or instr.range_axis < 0
                     or _framework_expands_instruction_range(instr)
                 ):
+                    if _op_owns_unit_range(instr):
+                        op = self.ops[instr.op_idx]
+                        tile_rank = len(op.tile_counts)
+                        range_axis = tile_rank - 1
+                        tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
+                        tiles[tile_rank] = tiles[range_axis] + 1
+                        return TileInstruction(instr.op_idx, tuple(tiles[:MAX_TILE_DIMS]))
                     return instr
                 tiles = list(instr.tiles) + [0] * (MAX_TILE_DIMS - len(instr.tiles))
                 if 0 <= instr.range_end_axis < MAX_TILE_DIMS:
