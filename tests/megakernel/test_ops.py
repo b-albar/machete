@@ -10,7 +10,15 @@ import pytest
 import torch
 import cutlass.cute as cute
 from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
-from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, build_op_config
+from machete.megakernel.ops import (
+    MAX_TILE_DIMS,
+    Op,
+    PipelineSpec,
+    ScheduledOp,
+    TensorMeta,
+    build_op_config,
+    tensor_meta_overlaps,
+)
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
@@ -60,7 +68,20 @@ class _ComputeTmaLoadOp(Op):
     tma_compute_loads = {"x"}
 
 
+class _WindowedBSOp(Op):
+    reads = {"x": (torch.float16, ("B", "S"))}
+    writes = {"y": (torch.float16, ("B", "S"))}
+    tile = ("B", "S")
+
+
+class _WindowedBSDOp(Op):
+    reads = {"x": (torch.float16, ("B", "S", "D"))}
+    writes = {"y": (torch.float16, ("B", "S", "D"))}
+    tile = ("B", "S")
+
+
 class _ProducerTensorOp(Op):
+    reads = {}
     writes = {"x": (torch.float16, ("M",))}
     tile = ("M",)
 
@@ -70,6 +91,21 @@ class _ComputeWaitConsumerOp(Op):
     writes = {"y": (torch.float16, ("M",))}
     tile = ("M",)
     tma_compute_loads = {"x"}
+
+
+class _CustomLoadPhaseConsumerOp(Op):
+    reads = {
+        "x": (torch.float16, ("M",)),
+        "z": (torch.float16, ("M",)),
+    }
+    writes = {"y": (torch.float16, ("M",))}
+    tile = ("M",)
+
+    def load(self, page_ptr, tile_M, z, work_mbar):
+        pass
+
+    def compute(self, page_ptr, tile_M, x):
+        pass
 
 
 class _SerialNonTmaLoadOp(Op):
@@ -94,6 +130,203 @@ def test_pipeline_spec_no_longer_declares_range_metadata():
     spec = PipelineSpec(page_count=1)
 
     assert spec.page_count == 1
+
+
+def test_dim_windows_shrink_tile_domain_but_keep_full_config_dims():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    op = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+
+    assert op.tile_counts == (1, 1)
+    assert op.tile_origin_for_axis(0) == 2
+    assert op.static_dims["B"] == 16
+    assert op.static_dims["S"] == 8
+    assert op.tensor_metas["x"].shape == (4, 8)
+    assert op.tensor_metas["x"].storage_offset == 8 * x.stride(0)
+    assert op.tensor_validation_metas["x"].shape == (16, 8)
+    assert op.tensor_validation_metas["x"].data_ptr == x.data_ptr()
+
+
+def test_dim_windows_reject_non_tiled_dimensions():
+    x = torch.empty(16, 8, 4, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="non-tiled dimension"):
+        _WindowedBSDOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"D": (0, 4)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_reject_unaligned_origins():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="must be aligned"):
+        _WindowedBSOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"B": (2, 4)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_reject_out_of_bounds_extents():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="exceeds full extent"):
+        _WindowedBSOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"B": (12, 8)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_make_disjoint_tensor_regions_independent():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    op0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    op1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+
+    assert not tensor_meta_overlaps(op0.tensor_metas["y"], op1.tensor_metas["x"])
+
+
+def test_dim_windows_dependency_resolution_skips_disjoint_later_writer():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+    cons0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(cons0)
+
+    edges = builder.dependency_plan().edges
+
+    assert any(edge.producer_idx == 0 and edge.consumer_idx == 2 for edge in edges)
+    assert not any(edge.producer_idx == 1 and edge.consumer_idx == 2 for edge in edges)
+
+
+def test_dim_windows_full_consumer_waits_for_all_overlapping_windows():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+    full_consumer = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(full_consumer)
+
+    edges = builder.dependency_plan().edges
+
+    assert any(edge.producer_idx == 0 and edge.consumer_idx == 2 for edge in edges)
+    assert any(edge.producer_idx == 1 and edge.consumer_idx == 2 for edge in edges)
+
+
+def test_dim_window_barrier_formulas_are_guarded_to_overlap():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        dim_windows={"B": (4, 4)},
+        x=x,
+        y=y,
+    )
+    full_consumer = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(full_consumer)
+
+    formulas = builder.get_op_barrier_formulas()
+    prod0_signal = formulas[0][1][0]
+    prod1_signal = formulas[1][1][0]
+    consumer_waits = formulas[2][0]
+
+    wait_from_prod0 = next(wait for wait in consumer_waits if wait.base == prod0_signal.base)
+    wait_from_prod1 = next(wait for wait in consumer_waits if wait.base == prod1_signal.base)
+
+    assert prod0_signal.is_guarded((0, 0))
+    assert prod0_signal.is_guarded((3, 0))
+    assert not prod0_signal.is_guarded((4, 0))
+    assert wait_from_prod0.is_guarded((0, 0))
+    assert wait_from_prod0.is_guarded((3, 0))
+    assert not wait_from_prod0.is_guarded((4, 0))
+    assert wait_from_prod0.compute_index((0, 0)) == prod0_signal.compute_index((0, 0))
+
+    assert prod1_signal.is_guarded((0, 0))
+    assert prod1_signal.is_guarded((3, 0))
+    assert wait_from_prod1.is_guarded((4, 0))
+    assert wait_from_prod1.is_guarded((7, 0))
+    assert not wait_from_prod1.is_guarded((3, 0))
+    assert not wait_from_prod1.is_guarded((8, 0))
+    assert wait_from_prod1.compute_index((4, 0)) == prod1_signal.compute_index((0, 0))
+    assert wait_from_prod1.compute_index((7, 0)) == prod1_signal.compute_index((3, 0))
 
 
 def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
@@ -217,6 +450,39 @@ def test_compute_phase_tma_load_declaration_is_registered():
     ]
 
 
+def test_custom_load_dep_wait_moves_to_compute_only_when_load_does_not_read_it():
+    x = torch.empty(4, dtype=torch.float16)
+    z = torch.empty_like(x)
+    y = torch.empty_like(x)
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(_ProducerTensorOp._schedule_single(tile_sizes={"M": 1}, x=x))
+    builder.add_op(_ProducerTensorOp._schedule_single(tile_sizes={"M": 1}, x=z))
+    builder.add_op(
+        _CustomLoadPhaseConsumerOp._schedule_single(
+            tile_sizes={"M": 1},
+            x=x,
+            z=z,
+            y=y,
+        )
+    )
+
+    plan = builder.dependency_plan()
+
+    assert plan.compute_wait_formulas[2]
+    assert plan.controller_wait_formulas[2]
+
+    compute_barriers = {formula.base for formula in plan.compute_wait_formulas[2]}
+    controller_barriers = {formula.base for formula in plan.controller_wait_formulas[2]}
+    signal_by_producer = {
+        producer_idx: {formula.base for formula in formulas[1]}
+        for producer_idx, formulas in plan.formulas.items()
+    }
+
+    assert compute_barriers == signal_by_producer[0]
+    assert controller_barriers == signal_by_producer[1]
+
+
 def test_controller_wait_readiness_keeps_compute_wait_dependencies_ordered():
     """Controller-only readiness can deadlock finite page rings."""
     builder = InstructionStreamBuilder()
@@ -304,6 +570,19 @@ def test_barrier_static_dims_do_not_specialize_device_code():
     assert key_a == key_b
     assert build_op_config(op_a)["M"] == 16
     assert "barrier_wait_alias_H" not in build_op_config(op_a)
+
+
+def test_page_ring_uses_one_slot_per_physical_page():
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    kernel = Megakernel(
+        [ScheduledOp(_NOPOp, tile_counts=(1,))],
+        config=MegakernelConfig(num_sms=1, num_pages=3, page_size=1024),
+    )
+
+    assert kernel._layout.num_pages == 3
+    assert kernel._layout.num_slots == 3
+    assert not kernel._use_physical_page_ring
 
 
 def test_tile_sizes_specialize_device_code():
@@ -644,6 +923,18 @@ class _ScratchReaderOp(Op):
     INPUTS: ClassVar[List[str]] = ["x"]
 
 
+class _BSHDProducerOp(Op):
+    reads = {}
+    writes = {"x": (None, ("B", "S", "H", "D"))}
+    tile = ("B", "S", "H")
+
+
+class _BSKConsumerOp(Op):
+    reads = {"x": (None, ("B", "S", "K"))}
+    writes = {"y": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
+
+
 class TestNamedBufferDeps:
     """Test dependency resolution with named buffers and dim_names."""
 
@@ -790,6 +1081,39 @@ class TestNamedBufferDeps:
         wait = formulas[1][0]
         assert len(wait) == 1
         assert wait[0].expected == 1
+
+    def test_bshd_producer_feeds_bsk_consumer_by_batch_sequence_group(self):
+        """A BSHD producer should not force each BSK consumer tile to wait for all B/S groups."""
+        b, s, h, d = 4, 128, 16, 128
+        x_bshd = torch.empty(b, s, h, d)
+        x_bsk = x_bshd.view(b, s, h * d)
+        y = torch.empty(b, s, 1)
+
+        prod = _BSHDProducerOp.schedule(
+            x=x_bshd,
+            tile_sizes={"B": 1, "S": 16, "H": 8},
+        )[0]
+        cons = _BSKConsumerOp.schedule(
+            x=x_bsk,
+            y=y,
+            tile_sizes={"B": 1, "S": 128, "N": 1},
+        )[0]
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(cons)
+        formulas = builder.get_op_barrier_formulas()
+
+        # One barrier per consumer B tile: producer S tiles 0..7 map to B0,
+        # and H contributes two producer tiles per S group.
+        assert builder.num_barriers == b
+        prod_signal = formulas[0][1][0]
+        cons_wait = formulas[1][0][0]
+        assert cons_wait.expected == (s // 16) * (h // 8)
+        assert prod_signal.compute_index((0, 0, 0)) == cons_wait.compute_index((0, 0, 0))
+        assert prod_signal.compute_index((0, 7, 1)) == cons_wait.compute_index((0, 0, 0))
+        assert prod_signal.compute_index((1, 0, 0)) == cons_wait.compute_index((1, 0, 0))
+        assert prod_signal.compute_index((3, 7, 1)) == cons_wait.compute_index((3, 0, 0))
 
     def test_fan_in(self):
         """OpA → "x", OpB → "y", OpC reads ["x", "y"]. OpC has 2 wait formulas."""
@@ -1214,6 +1538,73 @@ class TestSchedulerAPI:
 
         assert [(i.op_idx, i.tiles[0]) for i in instructions[:2]] == [
             (0, 0), (0, 1),
+        ]
+
+    def test_overlap_ready_consumer_priority_can_be_limited_by_op_name(self):
+        """Ready-consumer priority is opt-in for ops with reorder-safe semantics."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        unrestricted = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=1,
+                prefer_data_movement=False,
+                prefer_ready_consumers=True,
+            )
+        )[:-1]
+        restricted = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=1,
+                prefer_data_movement=False,
+                prefer_ready_consumers=True,
+                prefer_ready_consumer_op_names={"NoSuchOp"},
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in unrestricted[:2]] == [(0, 0), (2, 0)]
+        assert [(i.op_idx, i.tiles[0]) for i in restricted[:2]] == [(0, 0), (0, 1)]
+
+    def test_overlap_dependency_slack_keeps_ready_consumer_behind_independent_work(self):
+        """Slack gives strided CTA streams runway before consuming a newly-ready barrier."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        instructions = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=4,
+                prefer_data_movement=False,
+                dependency_slack_waves=1,
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:8]] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+        ]
+
+    def test_overlap_dependency_slack_can_be_limited_by_op_name(self):
+        """Slack should be opt-in for graphs with ops that have hidden order constraints."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        instructions = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=4,
+                prefer_data_movement=False,
+                prefer_ready_consumers=True,
+                dependency_slack_waves=1,
+                dependency_slack_op_names={"NoSuchOp"},
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[4:8]] == [
+            (2, 0), (2, 1), (2, 2), (2, 3),
         ]
 
 

@@ -125,7 +125,7 @@ def _run_attention_dpsum(dout, o):
     from machete.kernels.attention import AttentionDPSumOp
 
     dpsum = torch.empty(
-        dout.shape[0], dout.shape[2], dout.shape[1],
+        dout.shape[0], dout.shape[1], dout.shape[2],
         dtype=torch.float32, device=dout.device,
     )
     ops = AttentionDPSumOp.schedule(dout=dout, o=o, dpsum=dpsum)
@@ -263,7 +263,7 @@ class TestFlashAttentionCoopMMA:
         o = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
 
         mk = _run_attention_dpsum(dout, o)
-        ref = (dout.float() * o.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
+        ref = (dout.float() * o.float()).sum(dim=-1).contiguous()
 
         torch.testing.assert_close(mk, ref, atol=1e-4, rtol=1e-4)
 

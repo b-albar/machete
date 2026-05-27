@@ -41,6 +41,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32
 
+from .dim_windows import parse_dim_windows, resolve_schedule_domain, window_tensor_metas
 from .interpreter import ld_global_i32, ld_global_i64
 
 
@@ -785,6 +786,27 @@ def _capture_tensor_runtime_info(unique_tensors, tensors, tensor_dtypes):
     return tensor_ptrs, tensor_refs, tensor_metas, tensor_strides
 
 
+def _windowed_tensor_metas(tensor_metas, tensors, dim_windows):
+    """Restrict dependency metadata to the scheduled logical window."""
+    return window_tensor_metas(
+        tensor_metas,
+        dim_windows,
+        element_size_for_name=lambda name: tensors[name].element_size(),
+        meta_factory=lambda meta, shape, data_ptr, storage_offset: TensorMeta(
+            name=meta.name,
+            declared_dims=meta.declared_dims,
+            ndim=meta.ndim,
+            shape=shape,
+            strides=meta.strides,
+            dtype=meta.dtype,
+            is_contiguous=meta.is_contiguous,
+            data_ptr=data_ptr,
+            storage_ptr=meta.storage_ptr,
+            storage_offset=storage_offset,
+        ),
+    )
+
+
 def _classify_declared_dims(cls, unique_dims, tile_dim_names):
     """Split declared dimensions into static and dynamic sets.
 
@@ -945,17 +967,20 @@ def _process_op_declarations(cls):
 
     # Add _schedule_single() classmethod (internal — returns one ScheduledOp)
     @classmethod
-    def _schedule_single(cls, tile_sizes=None, **tensors):
+    def _schedule_single(cls, tile_sizes=None, dim_windows=None, **tensors):
         """Create a single ScheduledOp from tensor kwargs (internal).
 
         Args:
             tile_sizes: Dict mapping tile dim names to tile sizes.
                 E.g., {"M": 4}. Unspecified dims default to full extent
                 (1 tile covering entire dimension).
+            dim_windows: Optional dict mapping tiled dim names to
+                ``(origin, extent)`` in elements.
             **tensors: Tensor keyword arguments matching the declared reads/writes.
         """
         if tile_sizes is None:
             tile_sizes = {}
+        dim_windows = parse_dim_windows(dim_windows)
 
         unique_dims = cls._UNIQUE_DIMS
         unique_tensors = cls._UNIQUE_TENSORS
@@ -974,11 +999,14 @@ def _process_op_declarations(cls):
             if dim_name not in cls._DYNAMIC_DIM_OVERRIDES
         }
 
-        # Compute tile_counts from tile_sizes and full runtime dimension values.
-        resolved_tile_sizes, tile_counts = _resolve_schedule_tile_sizes(
+        # Compute tile_counts from the logical execution window. The full dim
+        # values stay in static_dims/op_config so kernels index full tensors.
+        resolved_tile_sizes, tile_counts, tile_origins = resolve_schedule_domain(
             cls._TILE_DIM_NAMES_ORDERED,
             tile_sizes,
             dim_values,
+            dim_windows,
+            _resolve_schedule_tile_sizes,
         )
 
         # Extract tensor dtypes when declared dtype is None (infer from tensor)
@@ -988,6 +1016,8 @@ def _process_op_declarations(cls):
             tensors,
             tensor_dtypes,
         )
+        tensor_validation_metas = dict(tensor_metas)
+        tensor_metas = _windowed_tensor_metas(tensor_metas, tensors, dim_windows)
 
         config_data = pack_fn(**tensors)
         op = ScheduledOp(
@@ -1000,7 +1030,9 @@ def _process_op_declarations(cls):
             tensor_refs=tensor_refs,
             dim_names=cls.DIM_NAMES,
             tile_sizes=resolved_tile_sizes,
+            tile_origins=tile_origins,
             tensor_metas=tensor_metas,
+            tensor_validation_metas=tensor_validation_metas,
             tensor_strides=tensor_strides,
         )
         return op
@@ -1246,13 +1278,13 @@ class Op:
     # =========================================================================
 
     @classmethod
-    def schedule(cls, tile_sizes=None, **tensors):
+    def schedule(cls, tile_sizes=None, dim_windows=None, **tensors):
         """Schedule op(s) from tensor kwargs. Returns a list of ScheduledOp.
 
         Subclasses override this for custom scheduling (auto-tiling, etc.).
         Default: wraps a single _schedule_single() call in a list.
         """
-        return [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        return [cls._schedule_single(tile_sizes=tile_sizes, dim_windows=dim_windows, **tensors)]
 
     # =========================================================================
     # Pipelined Execution Interface
@@ -1397,8 +1429,10 @@ class ScheduledOp:
     tensor_ptrs: Dict[str, int] = field(default_factory=dict)  # Tensor data pointers for dependency matching
     tensor_refs: Dict[str, Any] = field(default_factory=dict)  # {name: torch.Tensor} for tensor param mode
     tensor_metas: Dict[str, TensorMeta] = field(default_factory=dict)  # Per-tensor metadata (shape, strides, ndim)
+    tensor_validation_metas: Dict[str, TensorMeta] = field(default_factory=dict)  # Original full-tensor metadata
     tensor_strides: Dict[str, Tuple[int, ...]] = field(default_factory=dict)  # {name: strides} for stride init source
     dim_aliases: Dict[str, str] = field(default_factory=dict)  # Maps dim name → canonical for barrier matching
+    tile_origins: Dict[str, int] = field(default_factory=dict)  # Per-tiled-dim origin in tile units
 
     def __post_init__(self):
         """Populate default dim-name metadata from the op class."""
@@ -1413,6 +1447,15 @@ class ScheduledOp:
             if count < 1 or count > 0xFFFF:
                 raise ValueError(
                     f"{self.op_cls.__name__} tile counts must be in [1, 65535], got {count}"
+                )
+        for dim_name, origin in self.tile_origins.items():
+            if dim_name not in self.dim_names:
+                raise ValueError(
+                    f"{self.op_cls.__name__} tile origin references non-tiled dim {dim_name!r}"
+                )
+            if int(origin) < 0 or int(origin) > 0xFFFF:
+                raise ValueError(
+                    f"{self.op_cls.__name__} tile origin for {dim_name!r} must be in [0, 65535], got {origin}"
                 )
 
     @property
@@ -1430,6 +1473,13 @@ class ScheduledOp:
         if axis < len(self.tile_counts):
             return self.tile_counts[axis]
         return 1
+
+    def tile_origin_for_axis(self, axis: int) -> int:
+        """Get tile-coordinate origin for a given axis index (0..4)."""
+        for dim_name, dim_axis in self.dim_names.items():
+            if dim_axis == axis:
+                return int(self.tile_origins.get(dim_name, 0))
+        return 0
 
 __all__ = [
     # Constants

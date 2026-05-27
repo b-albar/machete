@@ -15,6 +15,7 @@ BarrierFormula objects that get baked into op handlers at JIT compile time.
 """
 
 import math
+import inspect
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -29,7 +30,36 @@ from .instruction_layout import (
     INSTR_TILE_23,
     INSTRUCTION_WORDS,
 )
-from .ops import MAX_TILE_DIMS, Op, ScheduledOp, last_dim_slice_region, tensor_meta_overlaps
+from .ops import (
+    MAX_TILE_DIMS,
+    Op,
+    ScheduledOp,
+    build_op_config,
+    last_dim_slice_region,
+    tensor_meta_overlaps,
+)
+
+
+def _op_cls_phase_param_names(op_cls: Type[Op], phase_name: str) -> Tuple[str, ...]:
+    """Return parameter names for the class-declared implementation of a phase."""
+    implementation_name = getattr(op_cls, f"{phase_name}_phase", None)
+    method = getattr(op_cls, implementation_name or phase_name, None)
+    if method is None:
+        return ()
+    return tuple(name for name in inspect.signature(method).parameters if name != "self")
+
+
+def _scheduled_op_phase_param_names(op: ScheduledOp, phase_name: str) -> Tuple[str, ...]:
+    """Return parameter names for a scheduled op's concrete phase implementation."""
+    try:
+        instance = op.op_cls(**build_op_config(op))
+    except Exception:
+        return _op_cls_phase_param_names(op.op_cls, phase_name)
+    method = getattr(instance, phase_name, None)
+    if method is None:
+        return ()
+    method_target = getattr(method, "__func__", method)
+    return tuple(name for name in inspect.signature(method_target).parameters if name != "self")
 
 
 # =============================================================================
@@ -227,6 +257,18 @@ class _DepEdge:
 
 
 @dataclass(frozen=True)
+class DependencyPlan:
+    """Resolved dependency graph and barrier formulas for one instruction stream."""
+
+    formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]
+    barrier_count: int
+    edges: List[_DepEdge]
+    consumer_deps: Dict[int, List[_DepEdge]]
+    controller_wait_formulas: Dict[int, List[BarrierFormula]]
+    compute_wait_formulas: Dict[int, List[BarrierFormula]]
+
+
+@dataclass(frozen=True)
 class _DepPair:
     """Resolved logical dependency between two scheduled ops."""
 
@@ -356,6 +398,61 @@ def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]
     for edge in edges:
         consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
     return consumer_deps
+
+
+def _build_linear_chain_dependency_plan(op_records: List["_OpRecord"]) -> DependencyPlan:
+    """Build the legacy dependency plan for ops without named buffers.
+
+    This fallback preserves old behavior for simple tests and ad-hoc kernels,
+    but keeps the no-metadata path out of the main named-buffer resolver.
+    """
+    formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {}
+    controller_wait_formulas: Dict[int, List[BarrierFormula]] = {}
+    compute_wait_formulas: Dict[int, List[BarrierFormula]] = {
+        i: [] for i in range(len(op_records))
+    }
+    edges = [
+        _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one")
+        for i in range(1, len(op_records))
+    ]
+    barrier_counter = 0
+
+    for i, rec in enumerate(op_records):
+        op = rec.op
+        signal_base = barrier_counter
+        coeffs = _linear_strides(op.tile_counts)
+        signal_formulas = [BarrierFormula(base=signal_base, coeffs=coeffs)]
+
+        wait_formulas: List[BarrierFormula] = []
+        if i > 0:
+            prev_op = op_records[i - 1].op
+            prev_base = barrier_counter - prev_op.total_tiles
+            guard = (
+                prev_op.total_tiles
+                if prev_op.total_tiles != op.total_tiles
+                else BarrierFormula.NO_GUARD
+            )
+            wait_formulas.append(
+                BarrierFormula(
+                    base=prev_base,
+                    coeffs=coeffs,
+                    expected=1,
+                    guard_max=guard,
+                )
+            )
+
+        formulas[i] = (wait_formulas, signal_formulas)
+        controller_wait_formulas[i] = wait_formulas
+        barrier_counter += op.total_tiles
+
+    return DependencyPlan(
+        formulas=formulas,
+        barrier_count=barrier_counter,
+        edges=edges,
+        consumer_deps=_group_consumer_deps(edges),
+        controller_wait_formulas=controller_wait_formulas,
+        compute_wait_formulas=compute_wait_formulas,
+    )
 
 
 def _coalesce_coordinate_ranges(
@@ -490,12 +587,34 @@ class OverlapTileScheduler(TileScheduler):
         adaptive_fetch_stride: bool = False,
         prefer_data_movement: bool = True,
         prefer_ready_consumers: bool = False,
+        prefer_ready_consumer_op_names: Optional[Set[str]] = None,
+        dependency_slack_waves: int = 0,
+        dependency_slack_op_names: Optional[Set[str]] = None,
+        dependency_slack_op_indices: Optional[Set[int]] = None,
+        dependency_slack_requires_full_op: bool = True,
         use_controller_waits_for_readiness: bool = False,
     ):
         self.fetch_stride = fetch_stride
         self.adaptive_fetch_stride = bool(adaptive_fetch_stride)
         self.prefer_data_movement = prefer_data_movement
         self.prefer_ready_consumers = prefer_ready_consumers
+        self.prefer_ready_consumer_op_names = (
+            set(prefer_ready_consumer_op_names)
+            if prefer_ready_consumer_op_names is not None
+            else None
+        )
+        self.dependency_slack_waves = max(0, int(dependency_slack_waves))
+        self.dependency_slack_op_names = (
+            set(dependency_slack_op_names)
+            if dependency_slack_op_names is not None
+            else None
+        )
+        self.dependency_slack_op_indices = (
+            {int(op_idx) for op_idx in dependency_slack_op_indices}
+            if dependency_slack_op_indices is not None
+            else None
+        )
+        self.dependency_slack_requires_full_op = bool(dependency_slack_requires_full_op)
         self.use_controller_waits_for_readiness = bool(use_controller_waits_for_readiness)
         self._bound_num_blocks: Optional[int] = None
 
@@ -556,17 +675,57 @@ class OverlapTileScheduler(TileScheduler):
                 return False
         return True
 
-    @staticmethod
+    def _waits_ready_with_slack(
+        self,
+        instr: TileInstruction,
+        wait_formulas: List[BarrierFormula],
+        barrier_counts: Dict[int, int],
+        barrier_ready_wave: Dict[int, int],
+        current_wave: int,
+        op_name: str,
+        op_idx: int,
+    ) -> bool:
+        if not self._slack_applies(op_idx, op_name):
+            return True
+        for formula in wait_formulas:
+            if formula.has_guard and not formula.is_guarded(instr.tiles):
+                continue
+            barrier_idx = formula.compute_index(instr.tiles)
+            if barrier_counts.get(barrier_idx, 0) < formula.expected:
+                return False
+            ready_wave = barrier_ready_wave.get(barrier_idx)
+            if ready_wave is not None and current_wave < ready_wave + self.dependency_slack_waves + 1:
+                return False
+        return True
+
+    def _slack_applies(self, op_idx: int, op_name: str) -> bool:
+        if self.dependency_slack_waves <= 0:
+            return False
+        slack_indices = self.dependency_slack_op_indices
+        if slack_indices is not None and op_idx not in slack_indices:
+            return False
+        slack_ops = self.dependency_slack_op_names
+        if slack_ops is not None and op_name not in slack_ops:
+            return False
+        return True
+
     def _signal(
+        self,
         instr: TileInstruction,
         signal_formulas: List[BarrierFormula],
         barrier_counts: Dict[int, int],
+        barrier_ready_wave: Dict[int, int],
+        current_wave: int,
     ) -> None:
         for formula in signal_formulas:
             if formula.has_guard and not formula.is_guarded(instr.tiles):
                 continue
             barrier_idx = formula.compute_index(instr.tiles)
-            barrier_counts[barrier_idx] = barrier_counts.get(barrier_idx, 0) + 1
+            before = barrier_counts.get(barrier_idx, 0)
+            after = before + 1
+            barrier_counts[barrier_idx] = after
+            if before < formula.expected <= after and barrier_idx not in barrier_ready_wave:
+                barrier_ready_wave[barrier_idx] = current_wave
 
     def _priority(
         self,
@@ -577,9 +736,15 @@ class OverlapTileScheduler(TileScheduler):
         depths: List[int],
         resource_scores: List[int],
         has_waits: List[bool],
+        op_names: List[str],
     ) -> Tuple[int, int, int, int, int]:
         resource_score = resource_scores[op_idx] if self.prefer_data_movement else 0
-        consumer_score = 1 if self.prefer_ready_consumers and has_waits[op_idx] else 0
+        allowed_consumers = self.prefer_ready_consumer_op_names
+        consumer_score = 1 if (
+            self.prefer_ready_consumers
+            and has_waits[op_idx]
+            and (allowed_consumers is None or op_names[op_idx] in allowed_consumers)
+        ) else 0
         return (
             consumer_score,
             depths[op_idx],
@@ -595,17 +760,28 @@ class OverlapTileScheduler(TileScheduler):
         depths: List[int],
         resource_scores: List[int],
         has_waits: List[bool],
+        op_names: List[str],
         fetch_stride: int,
     ) -> List[TileInstruction]:
         scheduled: List[TileInstruction] = []
         barrier_counts: Dict[int, int] = {}
+        barrier_ready_wave: Dict[int, int] = {}
+        current_wave = 0
 
         while candidates:
             ready = []
+            fallback_ready = []
+            base_ready_entries = []
+            pending_by_op: Dict[int, int] = {}
+            base_ready_by_op: Dict[int, int] = {}
+            slack_ready_by_op: Dict[int, int] = {}
+            for op_idx, _tile_idx, _instr in candidates:
+                pending_by_op[op_idx] = pending_by_op.get(op_idx, 0) + 1
             for pos, (op_idx, tile_idx, instr) in enumerate(candidates):
                 wait_formulas = formulas.get(op_idx, ([], []))[0]
                 if self._waits_ready(instr, wait_formulas, barrier_counts):
-                    ready.append((
+                    base_ready_by_op[op_idx] = base_ready_by_op.get(op_idx, 0) + 1
+                    entry = (
                         *self._priority(
                             op_idx=op_idx,
                             tile_idx=tile_idx,
@@ -613,15 +789,52 @@ class OverlapTileScheduler(TileScheduler):
                             depths=depths,
                             resource_scores=resource_scores,
                             has_waits=has_waits,
+                            op_names=op_names,
                         ),
                         pos,
-                    ))
+                    )
+                    base_ready_entries.append((entry, op_idx, instr, wait_formulas))
+                    fallback_ready.append(entry)
+                    if self._waits_ready_with_slack(
+                        instr,
+                        wait_formulas,
+                        barrier_counts,
+                        barrier_ready_wave,
+                        current_wave,
+                        op_names[op_idx],
+                        op_idx,
+                    ):
+                        slack_ready_by_op[op_idx] = slack_ready_by_op.get(op_idx, 0) + 1
+
+            for entry, op_idx, instr, wait_formulas in base_ready_entries:
+                if (
+                    self.dependency_slack_requires_full_op
+                    and self._slack_applies(op_idx, op_names[op_idx])
+                    and (
+                        base_ready_by_op.get(op_idx, 0) < pending_by_op.get(op_idx, 0)
+                        or slack_ready_by_op.get(op_idx, 0) < pending_by_op.get(op_idx, 0)
+                    )
+                ):
+                    continue
+                if self._waits_ready_with_slack(
+                        instr,
+                        wait_formulas,
+                        barrier_counts,
+                        barrier_ready_wave,
+                        current_wave,
+                        op_names[op_idx],
+                        op_idx,
+                ):
+                    ready.append(entry)
 
             if not ready:
-                raise RuntimeError(
-                    "OverlapTileScheduler could not find a ready tile. "
-                    "This usually indicates a cyclic or unsatisfied dependency graph."
-                )
+                if fallback_ready:
+                    ready = fallback_ready
+                else:
+                    raise RuntimeError(
+                        "OverlapTileScheduler could not find a ready tile. "
+                        "This usually indicates a cyclic or unsatisfied dependency graph."
+                    )
 
             ready.sort(reverse=True)
             selected = ready[:fetch_stride]
@@ -638,7 +851,14 @@ class OverlapTileScheduler(TileScheduler):
                 scheduled.append(instr)
             for _pos, (op_idx, _tile_idx, instr) in selected_records:
                 signal_formulas = formulas.get(op_idx, ([], []))[1]
-                self._signal(instr, signal_formulas, barrier_counts)
+                self._signal(
+                    instr,
+                    signal_formulas,
+                    barrier_counts,
+                    barrier_ready_wave,
+                    current_wave,
+                )
+            current_wave += 1
 
         return scheduled
 
@@ -654,6 +874,7 @@ class OverlapTileScheduler(TileScheduler):
         depths = _compute_op_depths(len(op_records), edges)
         resource_scores = [self._resource_score(rec.op) for rec in op_records]
         has_waits = [bool(formulas.get(rec.op_idx, ([], []))[0]) for rec in op_records]
+        op_names = [rec.op.op_cls.__name__ for rec in op_records]
         candidates: List[Tuple[int, int, TileInstruction]] = []
         for rec in op_records:
             for tile_idx, tile in enumerate(rec.tiles):
@@ -666,6 +887,7 @@ class OverlapTileScheduler(TileScheduler):
             depths,
             resource_scores,
             has_waits,
+            op_names,
             fetch_stride,
         )
 
@@ -715,20 +937,18 @@ class InstructionStreamBuilder:
     def __init__(self):
         """Initialize an empty builder and clear cached dependency formulas."""
         self._op_records: List[_OpRecord] = []
-        self._cached_formulas: Optional[Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]]] = None
+        self._cached_dependency_plan: Optional[DependencyPlan] = None
         self._cached_controller_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
         self._cached_compute_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
-        self._barrier_count: Optional[int] = None
         self._op_wait_counts: Dict[int, int] = {}
         self._op_compute_wait_counts: Dict[int, int] = {}
         self._op_signal_counts: Dict[int, int] = {}
 
     def _invalidate_resolution_cache(self) -> None:
         """Clear cached formulas after the op list changes."""
-        self._cached_formulas = None
+        self._cached_dependency_plan = None
         self._cached_controller_wait_formulas = None
         self._cached_compute_wait_formulas = None
-        self._barrier_count = None
 
     def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
         """Return logical tiles covered by one possibly range-owned instruction."""
@@ -912,6 +1132,34 @@ class InstructionStreamBuilder:
 
         return consumer_buf
 
+    def _find_producer_buffers(
+        self,
+        prod_idx: int,
+        consumer: ScheduledOp,
+        consumer_buf: str,
+    ) -> List[str]:
+        """Return all producer outputs that back a consumer input.
+
+        A single op can materialize several disjoint views into one later
+        logical buffer, for example a fused q/k/v projection that writes three
+        last-dim slices which are then consumed as one packed qkv tensor.  The
+        consumer must wait for every overlapping output region, not just the
+        first matching view.
+        """
+        prod = self._op_records[prod_idx].op
+        cons_meta = consumer.tensor_metas.get(consumer_buf)
+        matches: List[str] = []
+
+        if cons_meta is not None:
+            for prod_buf in prod.op_cls.OUTPUTS:
+                prod_meta = prod.tensor_metas.get(prod_buf)
+                if prod_meta is not None and tensor_meta_overlaps(prod_meta, cons_meta):
+                    matches.append(prod_buf)
+
+        if matches:
+            return matches
+        return [self._find_producer_buffer(prod_idx, consumer, consumer_buf)]
+
     def _find_producer(
         self,
         rec: "_OpRecord",
@@ -939,6 +1187,14 @@ class InstructionStreamBuilder:
             cand_rec = self._op_records[cand_idx]
             if buf not in cand_rec.op.op_cls.OUTPUTS:
                 continue
+            prod_meta = cand_rec.op.tensor_metas.get(buf)
+            cons_meta = rec.op.tensor_metas.get(buf)
+            if (
+                prod_meta is not None
+                and cons_meta is not None
+                and not tensor_meta_overlaps(prod_meta, cons_meta)
+            ):
+                continue
             prod_ptr = cand_rec.op.tensor_ptrs.get(buf)
             if prod_ptr is not None and cons_ptr is not None and prod_ptr != cons_ptr:
                 continue
@@ -953,6 +1209,48 @@ class InstructionStreamBuilder:
         if prod_idx is None or prod_idx == rec.op_idx:
             return None
         return prod_idx
+
+    def _find_producers(
+        self,
+        rec: "_OpRecord",
+        buf: str,
+        buffer_producers: Dict[str, int],
+        tensor_ptr_deps: Dict[Tuple[int, str], int],
+    ) -> List[int]:
+        """Find producer op indices for a consumer input.
+
+        Most buffers are single-writer regions, where the nearest producer is
+        enough. Dimension-windowed ops can materialize disjoint regions of the
+        same logical tensor, so a full-region consumer must wait for every
+        previous overlapping window.
+        """
+        has_windows = bool(rec.op.tile_origins) or any(
+            prior.op.tile_origins for prior in self._op_records[: rec.op_idx]
+        )
+        if not has_windows:
+            prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
+            return [] if prod_idx is None else [prod_idx]
+
+        cons_meta = rec.op.tensor_metas.get(buf)
+        producers: List[int] = []
+        seen: Set[int] = set()
+        for cand_idx in range(rec.op_idx - 1, -1, -1):
+            cand_rec = self._op_records[cand_idx]
+            for prod_buf in cand_rec.op.op_cls.OUTPUTS:
+                prod_meta = cand_rec.op.tensor_metas.get(prod_buf)
+                if cons_meta is not None and prod_meta is not None:
+                    if not tensor_meta_overlaps(prod_meta, cons_meta):
+                        continue
+                elif prod_buf != buf:
+                    continue
+                if cand_idx not in seen:
+                    producers.append(cand_idx)
+                    seen.add(cand_idx)
+        if producers:
+            return list(reversed(producers))
+
+        prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
+        return [] if prod_idx is None else [prod_idx]
 
     @staticmethod
     def _is_reduce_store(op: ScheduledOp, buf: str) -> bool:
@@ -972,22 +1270,23 @@ class InstructionStreamBuilder:
         # RAW edges from declared inputs.
         for rec in self._op_records:
             for buf in rec.op.op_cls.INPUTS:
-                prod_idx = self._find_producer(rec, buf, buffer_producers, tensor_ptr_deps)
-                if prod_idx is None:
+                prod_indices = self._find_producers(rec, buf, buffer_producers, tensor_ptr_deps)
+                if not prod_indices:
                     continue
-                prod_buf = self._find_producer_buffer(prod_idx, rec.op, buf)
-                seen_key = (prod_idx, rec.op_idx, prod_buf, buf)
-                if seen_key not in seen:
-                    seen.add(seen_key)
-                    raw_pairs.add((prod_idx, rec.op_idx))
-                    pairs.append(
-                        _DepPair(
-                            producer_idx=prod_idx,
-                            consumer_idx=rec.op_idx,
-                            producer_buffer=prod_buf,
-                            consumer_buffer=buf,
-                        )
-                    )
+                for prod_idx in prod_indices:
+                    for prod_buf in self._find_producer_buffers(prod_idx, rec.op, buf):
+                        seen_key = (prod_idx, rec.op_idx, prod_buf, buf)
+                        if seen_key not in seen:
+                            seen.add(seen_key)
+                            raw_pairs.add((prod_idx, rec.op_idx))
+                            pairs.append(
+                                _DepPair(
+                                    producer_idx=prod_idx,
+                                    consumer_idx=rec.op_idx,
+                                    producer_buffer=prod_buf,
+                                    consumer_buffer=buf,
+                                )
+                            )
 
                 # Split-K / row-parallel style reductions have multiple
                 # associative writers for one logical tensor. The latest writer
@@ -1162,93 +1461,47 @@ class InstructionStreamBuilder:
 
         return edges
 
-    def _resolve_edges_and_consumers(self) -> Tuple[List["_DepEdge"], Dict[int, List["_DepEdge"]]]:
-        """Resolve dependency edges and the consumer-grouped view used by schedulers."""
-        edges = self._resolve_dep_edges()
-        return edges, _group_consumer_deps(edges)
-
-    def _resolve(
-        self,
-    ) -> Tuple[
-        Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        int,
-    ]:
-        """Resolve dependencies into barrier formulas.
-
-        Returns:
-            (formulas, barrier_count)
-            formulas: {op_idx: (wait_formulas, signal_formulas)}
-        """
-        if self._cached_formulas is not None:
-            return self._cached_formulas, self._barrier_count
+    def dependency_plan(self) -> DependencyPlan:
+        """Return the resolved dependency plan for this instruction stream."""
+        if self._cached_dependency_plan is not None:
+            return self._cached_dependency_plan
 
         if self._has_named_buffers():
             formulas, count = self._resolve_named_formulas()
+            edges = self._resolve_dep_edges()
+            controller_wait_formulas = (
+                self._cached_controller_wait_formulas
+                if self._cached_controller_wait_formulas is not None
+                else {i: waits for i, (waits, _signals) in formulas.items()}
+            )
+            compute_wait_formulas = (
+                self._cached_compute_wait_formulas
+                if self._cached_compute_wait_formulas is not None
+                else {i: [] for i in range(len(self._op_records))}
+            )
+            plan = DependencyPlan(
+                formulas=formulas,
+                barrier_count=count,
+                edges=edges,
+                consumer_deps=_group_consumer_deps(edges),
+                controller_wait_formulas=controller_wait_formulas,
+                compute_wait_formulas=compute_wait_formulas,
+            )
         else:
-            formulas, count = self._resolve_linear_chain_formulas()
+            plan = _build_linear_chain_dependency_plan(self._op_records)
 
-        self._cached_formulas = formulas
-        self._barrier_count = count
-        return formulas, count
+        self._cached_dependency_plan = plan
+        self._cached_controller_wait_formulas = plan.controller_wait_formulas
+        self._cached_compute_wait_formulas = plan.compute_wait_formulas
+        return plan
 
     def _resolve_compute_wait_formulas(self) -> Dict[int, List[BarrierFormula]]:
         """Return dependency waits that can be delayed until compute phase."""
-        self._resolve()
-        if self._cached_compute_wait_formulas is None:
-            return {i: [] for i in range(len(self._op_records))}
-        return self._cached_compute_wait_formulas
+        return self.dependency_plan().compute_wait_formulas
 
     def _resolve_controller_wait_formulas(self) -> Dict[int, List[BarrierFormula]]:
         """Return dependency waits that must run before load phase."""
-        formulas, _ = self._resolve()
-        if self._cached_controller_wait_formulas is None:
-            return {i: waits for i, (waits, _signals) in formulas.items()}
-        return self._cached_controller_wait_formulas
-
-    def _resolve_linear_chain_formulas(
-        self,
-    ) -> Tuple[
-        Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]],
-        int,
-    ]:
-        """Compute barrier formulas for linear chain (no named buffers).
-
-        Each op signals its own barrier set. The next op waits on the
-        previous op's barriers with 1:1 tile index mapping.
-        """
-        formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {}
-        barrier_counter = 0
-
-        for i, rec in enumerate(self._op_records):
-            op = rec.op
-            signal_base = barrier_counter
-
-            # Own linear index strides (row-major)
-            coeffs = _linear_strides(op.tile_counts)
-
-            # Signal: own barrier
-            signal_formulas = [BarrierFormula(base=signal_base, coeffs=coeffs)]
-
-            # Wait: previous op's barrier (if exists)
-            wait_formulas: List[BarrierFormula] = []
-            if i > 0:
-                prev_op = self._op_records[i - 1].op
-                prev_base = barrier_counter - prev_op.total_tiles
-                # Guard for mismatched tile counts
-                guard = prev_op.total_tiles if prev_op.total_tiles != op.total_tiles else BarrierFormula.NO_GUARD
-                wait_formulas.append(
-                    BarrierFormula(
-                        base=prev_base,
-                        coeffs=coeffs,
-                        expected=1,
-                        guard_max=guard,
-                    )
-                )
-
-            formulas[i] = (wait_formulas, signal_formulas)
-            barrier_counter += op.total_tiles
-
-        return formulas, barrier_counter
+        return self.dependency_plan().controller_wait_formulas
 
     def _dep_wait_can_move_to_compute(self, dep: _DepPair) -> bool:
         """Whether a consumer dependency is needed by compute but not TMA load.
@@ -1268,9 +1521,19 @@ class InstructionStreamBuilder:
         tma_compute_loads = set(getattr(consumer.op_cls, "_TMA_COMPUTE_LOADS", set()))
         if dep.consumer_buffer in tma_compute_loads:
             return True
-        if consumer.op_cls.load is not Op.load:
+        if dep.consumer_buffer in tma_loads:
             return False
-        return dep.consumer_buffer not in (tma_loads | tma_compute_loads)
+
+        load_params = set(_scheduled_op_phase_param_names(consumer, "load"))
+        if "op_config_ptr" in load_params:
+            return False
+        if dep.consumer_buffer in load_params:
+            return False
+
+        if consumer.op_cls.load is not Op.load:
+            compute_params = set(_scheduled_op_phase_param_names(consumer, "compute"))
+            return dep.consumer_buffer in compute_params
+        return True
 
     @staticmethod
     def _buffer_static_keys(prefix: str, role: str, buffer_name: str, suffix: str) -> Tuple[str, ...]:
@@ -1389,7 +1652,16 @@ class InstructionStreamBuilder:
             ):
                 incompatible_dims.append(producer_dim)
             elif producer_tiles != consumer_tiles and producer_tile_size == consumer_tile_size:
-                incompatible_dims.append(producer_dim)
+                producer_start = producer.tile_origin_for_axis(producer_axis) * producer_tile_size
+                producer_end = producer_start + producer_tiles * producer_tile_size
+                consumer_start = consumer.tile_origin_for_axis(consumer_axis) * consumer_tile_size
+                consumer_end = consumer_start + consumer_tiles * consumer_tile_size
+                overlap_start = max(producer_start, consumer_start)
+                overlap_end = min(producer_end, consumer_end)
+                if overlap_end > overlap_start and (overlap_end - overlap_start) % producer_tile_size == 0:
+                    compatible_pairs.append((canonical_name, producer_dim, consumer_dim))
+                else:
+                    incompatible_dims.append(producer_dim)
             elif producer_tiles != consumer_tiles and producer_tile_size != consumer_tile_size:
                 if producer_tile_size > consumer_tile_size:
                     ratio = producer_tile_size // consumer_tile_size
@@ -1644,6 +1916,139 @@ class InstructionStreamBuilder:
             producer_offset += self._barrier_index_offset(producer, producer_dim, "signal", producer_buffer)
             consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer)
         return producer_offset, consumer_offset
+
+    @staticmethod
+    def _merge_axis_guard(
+        guard_min: int,
+        guard_max: int,
+        guard_coeffs: Optional[Tuple[int, ...]],
+        *,
+        axis: int,
+        start: int,
+        end: int,
+    ) -> Tuple[int, int, Optional[Tuple[int, ...]]]:
+        axis_coeffs = [0] * MAX_TILE_DIMS
+        axis_coeffs[axis] = 1
+        axis_coeffs_tuple = tuple(axis_coeffs)
+        if guard_coeffs is not None and guard_coeffs != axis_coeffs_tuple:
+            return guard_min, guard_max, guard_coeffs
+        return max(guard_min, start), min(guard_max, end), axis_coeffs_tuple
+
+    def _apply_window_overlap_to_formulas(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        shared_pairs: List[Tuple[str, str, str]],
+        producer_buffer: str,
+        consumer_buffer: str,
+        producer_coeffs: Tuple[int, ...],
+        consumer_coeffs: Tuple[int, ...],
+        producer_divs: Tuple[int, ...],
+        consumer_divs: Tuple[int, ...],
+        producer_offset: int,
+        consumer_offset: int,
+        producer_guard_min: int,
+        producer_guard_max: int,
+        producer_guard_coeffs: Optional[Tuple[int, ...]],
+        consumer_guard_min: int,
+        consumer_guard_max: int,
+        consumer_guard_coeffs: Optional[Tuple[int, ...]],
+    ) -> Tuple[int, int, int, int, Optional[Tuple[int, ...]], int, int, Optional[Tuple[int, ...]]]:
+        """Restrict barrier formulas to the actual overlap of windowed tile domains.
+
+        Tensor metadata overlap tells us that a producer and consumer touch the same
+        storage, but formula coordinates are local to each scheduled op. When a
+        producer is a batch window and the consumer covers the full batch, both
+        sides must map only their common local tile interval onto the same compact
+        barrier range.
+        """
+        for _canonical_name, producer_dim, consumer_dim in shared_pairs:
+            producer_axis = producer.dim_names[producer_dim]
+            consumer_axis = consumer.dim_names[consumer_dim]
+            producer_tile_size = self._barrier_tile_size(
+                producer,
+                producer_dim,
+                "signal",
+                producer_buffer,
+            )
+            consumer_tile_size = self._barrier_tile_size(
+                consumer,
+                consumer_dim,
+                "wait",
+                consumer_buffer,
+            )
+            producer_start = producer.tile_origin_for_axis(producer_axis) * producer_tile_size
+            producer_end = producer_start + producer.tiles_for_axis(producer_axis) * producer_tile_size
+            consumer_start = consumer.tile_origin_for_axis(consumer_axis) * consumer_tile_size
+            consumer_end = consumer_start + consumer.tiles_for_axis(consumer_axis) * consumer_tile_size
+            overlap_start = max(producer_start, consumer_start)
+            overlap_end = min(producer_end, consumer_end)
+            if overlap_end <= overlap_start:
+                producer_guard_min, producer_guard_max, producer_guard_coeffs = self._merge_axis_guard(
+                    producer_guard_min,
+                    producer_guard_max,
+                    producer_guard_coeffs,
+                    axis=producer_axis,
+                    start=1,
+                    end=0,
+                )
+                consumer_guard_min, consumer_guard_max, consumer_guard_coeffs = self._merge_axis_guard(
+                    consumer_guard_min,
+                    consumer_guard_max,
+                    consumer_guard_coeffs,
+                    axis=consumer_axis,
+                    start=1,
+                    end=0,
+                )
+                continue
+            if overlap_start == producer_start and overlap_end == producer_end and overlap_start == consumer_start and overlap_end == consumer_end:
+                continue
+            if (
+                (overlap_start - producer_start) % producer_tile_size != 0
+                or (overlap_end - producer_start) % producer_tile_size != 0
+                or (overlap_start - consumer_start) % consumer_tile_size != 0
+                or (overlap_end - consumer_start) % consumer_tile_size != 0
+            ):
+                continue
+
+            producer_local_start = (overlap_start - producer_start) // producer_tile_size
+            producer_local_end = (overlap_end - producer_start) // producer_tile_size
+            consumer_local_start = (overlap_start - consumer_start) // consumer_tile_size
+            consumer_local_end = (overlap_end - consumer_start) // consumer_tile_size
+            producer_div = producer_divs[producer_axis]
+            consumer_div = consumer_divs[consumer_axis]
+            if producer_local_start % producer_div != 0 or consumer_local_start % consumer_div != 0:
+                continue
+
+            producer_guard_min, producer_guard_max, producer_guard_coeffs = self._merge_axis_guard(
+                producer_guard_min,
+                producer_guard_max,
+                producer_guard_coeffs,
+                axis=producer_axis,
+                start=producer_local_start,
+                end=producer_local_end,
+            )
+            consumer_guard_min, consumer_guard_max, consumer_guard_coeffs = self._merge_axis_guard(
+                consumer_guard_min,
+                consumer_guard_max,
+                consumer_guard_coeffs,
+                axis=consumer_axis,
+                start=consumer_local_start,
+                end=consumer_local_end,
+            )
+            producer_offset -= producer_coeffs[producer_axis] * (producer_local_start // producer_div)
+            consumer_offset -= consumer_coeffs[consumer_axis] * (consumer_local_start // consumer_div)
+
+        return (
+            producer_offset,
+            consumer_offset,
+            producer_guard_min,
+            producer_guard_max,
+            producer_guard_coeffs,
+            consumer_guard_min,
+            consumer_guard_max,
+            consumer_guard_coeffs,
+        )
 
     def _last_dim_region_dep(
         self,
@@ -1924,6 +2329,34 @@ class InstructionStreamBuilder:
                     shared_pairs,
                     0,
                 )
+                (
+                    producer_offset,
+                    consumer_offset,
+                    producer_guard_min,
+                    producer_guard_max,
+                    producer_guard_coeffs,
+                    consumer_guard_min,
+                    consumer_guard_max,
+                    consumer_guard_coeffs,
+                ) = self._apply_window_overlap_to_formulas(
+                    p_op,
+                    c_op,
+                    shared_pairs,
+                    dep.producer_buffer,
+                    dep.consumer_buffer,
+                    producer_coeffs,
+                    consumer_coeffs,
+                    producer_divs,
+                    consumer_divs,
+                    producer_offset,
+                    consumer_offset,
+                    producer_guard_min,
+                    producer_guard_max,
+                    producer_guard_coeffs,
+                    consumer_guard_min,
+                    consumer_guard_max,
+                    consumer_guard_coeffs,
+                )
 
                 # Fan-out consumers can share the same producer-side readiness
                 # counter. Each consumer still keeps its own expected count.
@@ -1985,34 +2418,23 @@ class InstructionStreamBuilder:
         Returns:
             List of TileInstructions with END marker at the end.
         """
-        # Ensure formulas are resolved (sets _barrier_count)
-        self._resolve()
+        plan = self.dependency_plan()
 
         if not self._op_records:
             return [TileInstruction.end_instruction()]
-
-        edges, consumer_deps = self._resolve_edges_and_consumers()
 
         if scheduler is None:
             scheduler = BackwardScheduler()
 
         if hasattr(scheduler, "schedule_with_formulas"):
-            formulas, _ = self._resolve()
-            schedule_formulas = formulas
-            if getattr(scheduler, "use_controller_waits_for_readiness", False):
-                # Host-side readiness must include compute-delayed waits too.
-                # Otherwise the scheduler can enqueue consumers before their
-                # producers, those consumers can acquire the finite page ring,
-                # and the kernel can deadlock while their compute phases wait
-                # for producers that cannot acquire pages.
-                schedule_formulas = formulas
+            schedule_formulas = plan.formulas
             instructions = scheduler.schedule_with_formulas(
                 self._op_records,
-                edges,
+                plan.edges,
                 schedule_formulas,
             )
         else:
-            instructions = scheduler.schedule(self._op_records, consumer_deps, edges)
+            instructions = scheduler.schedule(self._op_records, plan.consumer_deps, plan.edges)
         instructions.append(TileInstruction.end_instruction())
         return instructions
 
@@ -2196,14 +2618,16 @@ class InstructionStreamBuilder:
     @property
     def max_wait_deps(self) -> int:
         """Maximum number of wait dependencies across all ops."""
-        formulas, _ = self._resolve()
-        return max((len(wf) for wf, _ in formulas.values()), default=0)
+        return max(
+            (len(waits) for waits in self.dependency_plan().controller_wait_formulas.values()),
+            default=0,
+        )
 
     @property
     def max_signal_deps(self) -> int:
         """Maximum number of signal dependencies across all ops."""
-        formulas, _ = self._resolve()
-        return max((len(sf) for _wf, sf in formulas.values()), default=0)
+        formulas = self.dependency_plan().formulas
+        return max((len(signals) for _waits, signals in formulas.values()), default=0)
 
     def build_wait_info_tensor(
         self,
@@ -2220,48 +2644,14 @@ class InstructionStreamBuilder:
         When num_blocks is provided, repeated waits along each persistent CTA's
         strided instruction stream are removed.
         """
-        import torch
-
-        controller_wait_formulas = self._resolve_controller_wait_formulas()
-        raw_wait_data = [
-            self._build_wait_info_entry(
-                instr,
-                {instr.op_idx: (controller_wait_formulas.get(instr.op_idx, []), [])}
-                if instr.op_idx != TileInstruction.END_MARKER
-                else {},
-            )
-            for instr in instructions
-        ]
-        max_waits = max(1, max((len(entry) // 2 for entry in raw_wait_data), default=0))
-        wait_data = []
-        for entry in raw_wait_data:
-            padded = list(entry)
-            while len(padded) < max_waits * 2:
-                padded.extend([-1, 0])
-            wait_data.append(padded)
-        self._op_wait_counts = self._max_counts_by_op(instructions, raw_wait_data, pair_width=2)
-        empty = [-1, 0] * max_waits
-        if num_blocks is not None and num_blocks > 0:
-            seen_waits = [dict() for _ in range(num_blocks)]
-            for idx, entry in enumerate(wait_data):
-                block_idx = idx % num_blocks
-                if entry == empty:
-                    continue
-                compacted: List[int] = []
-                for pair_idx in range(max_waits):
-                    barrier_idx = entry[pair_idx * 2]
-                    expected = entry[pair_idx * 2 + 1]
-                    if barrier_idx < 0:
-                        continue
-                    if seen_waits[block_idx].get(barrier_idx, 0) >= expected:
-                        continue
-                    compacted.extend([barrier_idx, expected])
-                    seen_waits[block_idx][barrier_idx] = expected
-                while len(compacted) < max_waits * 2:
-                    compacted.extend([-1, 0])
-                wait_data[idx] = compacted
-
-        return torch.tensor(wait_data, dtype=torch.int32, device=device)
+        tensor, counts = self._build_wait_tensor(
+            instructions,
+            self._resolve_controller_wait_formulas(),
+            device=device,
+            num_blocks=num_blocks,
+        )
+        self._op_wait_counts = counts
+        return tensor
 
     def build_compute_wait_info_tensor(
         self,
@@ -2270,9 +2660,26 @@ class InstructionStreamBuilder:
         num_blocks: Optional[int] = None,
     ):
         """Pre-compute waits that are delayed until compute phase."""
+        tensor, counts = self._build_wait_tensor(
+            instructions,
+            self._resolve_compute_wait_formulas(),
+            device=device,
+            num_blocks=num_blocks,
+        )
+        self._op_compute_wait_counts = counts
+        return tensor
+
+    def _build_wait_tensor(
+        self,
+        instructions,
+        wait_formulas: Dict[int, List[BarrierFormula]],
+        *,
+        device: str,
+        num_blocks: Optional[int],
+    ):
+        """Build padded wait tensor and per-op wait counts for one wait phase."""
         import torch
 
-        wait_formulas = self._resolve_compute_wait_formulas()
         raw_wait_data = [
             self._build_wait_info_entry(
                 instr,
@@ -2289,9 +2696,8 @@ class InstructionStreamBuilder:
             while len(padded) < max_waits * 2:
                 padded.extend([-1, 0])
             wait_data.append(padded)
-        self._op_compute_wait_counts = self._max_counts_by_op(
-            instructions, raw_wait_data, pair_width=2
-        )
+
+        op_counts = self._max_counts_by_op(instructions, raw_wait_data, pair_width=2)
         empty = [-1, 0] * max_waits
         if num_blocks is not None and num_blocks > 0:
             seen_waits = [dict() for _ in range(num_blocks)]
@@ -2313,7 +2719,7 @@ class InstructionStreamBuilder:
                     compacted.extend([-1, 0])
                 wait_data[idx] = compacted
 
-        return torch.tensor(wait_data, dtype=torch.int32, device=device)
+        return torch.tensor(wait_data, dtype=torch.int32, device=device), op_counts
 
     def build_signal_info_tensor(self, instructions, device="cuda"):
         """Pre-compute signal barrier indices per instruction.
@@ -2322,7 +2728,7 @@ class InstructionStreamBuilder:
         """
         import torch
 
-        formulas, _ = self._resolve()
+        formulas = self.dependency_plan().formulas
         raw_signal_data = [
             self._build_signal_info_entry(instr, formulas)
             for instr in instructions
@@ -2409,8 +2815,13 @@ class InstructionStreamBuilder:
             Each formula specifies how to compute a barrier index from
             tile coordinates at runtime.
         """
-        formulas, _ = self._resolve()
-        return formulas
+        return self.dependency_plan().formulas
+
+    def export_dependency_graph_csv(self, op_csv: str, tile_csv: str) -> None:
+        """Export op-level and tile-level dependency graphs as CSV files."""
+        from .dependency_graph_export import export_dependency_graph_csv
+
+        export_dependency_graph_csv(self, op_csv, tile_csv)
 
     @property
     def total_tiles(self) -> int:
@@ -2420,12 +2831,12 @@ class InstructionStreamBuilder:
     @property
     def num_barriers(self) -> int:
         """Number of barriers needed."""
-        _, count = self._resolve()
-        return count
+        return self.dependency_plan().barrier_count
 
 
 __all__ = [
     "BarrierFormula",
+    "DependencyPlan",
     "INSTRUCTION_WORDS",
     "INSTR_BARRIER_META_IDX",
     "INSTR_OP_IDX",

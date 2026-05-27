@@ -71,13 +71,13 @@ def _auto_tile_S(D, elem_bytes, page_size):
     """Compute tile_size_S from page budget minus scratch."""
     usable = page_size - SCRATCH_BYTES
     tile_s = max(1, usable // (D * elem_bytes))
-    # Large hidden-size RMSNorm saturates early; oversized row tiles mostly
-    # increase barrier traffic and persistent-shell latency. Keep a moderately
-    # larger tile at 32 KB, then clamp to 4 rows once more page budget is
-    # available.
+    # Large hidden-size RMSNorm is usually part of a producer/consumer chain in
+    # fused layers. At 32 KB pages, oversized row tiles underfeed persistent CTAs
+    # and leave less independent work for page overlap; small row groups give the
+    # scheduler enough ready tiles without shrinking the hidden dimension tile.
     if D >= 1024:
         if page_size <= 32 * 1024:
-            return min(tile_s, 8)
+            return min(tile_s, 2)
         return min(tile_s, 4)
     return tile_s
 

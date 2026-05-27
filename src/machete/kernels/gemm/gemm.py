@@ -1361,3 +1361,195 @@ class GemmRowParallelOp(GemmOp):
 
         # All warp threads issue TMA (warp-collective). 1 warp = 1 atomic add.
         cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+
+
+class ProjectionDaReduceGemmOp(GemmRowParallelOp):
+    """Projection dA GEMM split over the reduction dimension inside one op.
+
+    Computes atomic partials for C[B,S,N] += A[B,S,K_r] @ B[N,K_r]^T for each
+    reduction chunk R. The private ``_chunk`` tensor exists only to expose R as
+    a scheduler tile dimension; kernels do not read it.
+    """
+
+    reads = {
+        "a": (None, ("B", "S", "K")),
+        "a_scale": (None, ("B", "S", "K")),
+        "b": (None, ("N", "K")),
+        "_chunk": (cutlass.Int32, ("R",)),
+    }
+    writes = {"c": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N", "R")
+    tma_loads = {"a", "a_scale", "b"}
+    tma_stores = set()
+    tma_reduce_stores = {"c"}
+    peer_reduce_stores = set()
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.reduce_tile_n = getattr(self, "reduce_tile_n", self.K)
+        self.reduce_k_block_offset = getattr(self, "reduce_k_block_offset", 0)
+        self.num_k_blocks = (self.reduce_tile_n + self.tile_K - 1) // self.tile_K
+        self.tma_k_blocks = min(2, self.num_k_blocks)
+
+    @cute.jit
+    def load(self, page_ptr, tile_B, tile_S, tile_N, tile_R,
+             a_tma, a_tma_gmem, a_scale_tma, a_scale_tma_gmem,
+             b_tma, b_tma_gmem,
+             work_mbar):
+        """TMA load A/B K-blocks for one reduction chunk."""
+        swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
+
+        _bf_0 = page_ptr + Int32(self.mbar_offset)
+        _bf_1 = page_ptr + Int32(self.mbar_offset + 8)
+        _kr_0 = page_ptr + Int32(self.mbar_offset + 16)
+        _kr_1 = page_ptr + Int32(self.mbar_offset + 24)
+
+        with cute.arch.elect_one():
+            mbarrier_init(_bf_0, Int32(self.num_mma_warps))
+            mbarrier_init(_bf_1, Int32(self.num_mma_warps))
+            mbarrier_init(_kr_0, Int32(1))
+            mbarrier_init(_kr_1, Int32(1))
+        mbarrier_init_fence()
+
+        _chunk_base = (
+            tile_R * Int32((self.reduce_tile_n + self.tile_K - 1) // self.tile_K)
+            + Int32(self.reduce_k_block_offset)
+        )
+
+        _k_block = Int32(0)
+        while _k_block < Int32(self.num_k_blocks):
+            _global_k_block = _chunk_base + _k_block
+            _buf_idx = _k_block % Int32(2)
+            _buf_base = _buf_idx * Int32(self.buf_stride) + page_ptr
+
+            if _k_block >= Int32(2):
+                _bf_phase = ((_k_block - Int32(2)) // Int32(2)) % Int32(2)
+                if _buf_idx == Int32(0):
+                    mbarrier_wait(_bf_0, _bf_phase)
+                if _buf_idx == Int32(1):
+                    mbarrier_wait(_bf_1, _bf_phase)
+
+            sA_ptr = cute.recast_ptr(
+                cute.make_ptr(self.a_dtype, _buf_base,
+                              cute.AddressSpace.smem),
+                swz, dtype=self.a_dtype)
+            sA = cute.make_tensor(
+                sA_ptr,
+                cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                 stride=(1, self.tile_K,
+                                         self.tile_K * self.tile_size_S)))
+            gA = cute.local_tile(
+                a_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                (None, None, None))
+            tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+                a_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(gA, 0, 3))
+
+            sScale_ptr = cute.recast_ptr(
+                cute.make_ptr(self.a_scale_dtype,
+                              _buf_base + Int32(self.a_scale_offset),
+                              cute.AddressSpace.smem),
+                swz, dtype=self.a_scale_dtype)
+            sScale = cute.make_tensor(
+                sScale_ptr,
+                cute.make_layout((self.tile_K, self.tile_size_S, 1),
+                                 stride=(1, self.tile_K,
+                                         self.tile_K * self.tile_size_S)))
+            gScale = cute.local_tile(
+                a_scale_tma_gmem, (self.tile_K, self.tile_size_S, 1),
+                (None, None, None))
+            tScaleS, tScaleG = cute.nvgpu.cpasync.tma_partition(
+                a_scale_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sScale, 0, 3),
+                cute.group_modes(gScale, 0, 3))
+
+            sB_ptr = cute.recast_ptr(
+                cute.make_ptr(self.b_dtype,
+                              _buf_base + Int32(self.b_offset),
+                              cute.AddressSpace.smem),
+                swz, dtype=self.b_dtype)
+            sB = cute.make_tensor(
+                sB_ptr,
+                cute.make_layout((self.tile_K, self.tile_size_N),
+                                 stride=(1, self.tile_K)))
+            gB = cute.local_tile(
+                b_tma_gmem, (self.tile_K, self.tile_size_N), (None, None))
+            tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+                b_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB, 0, 2))
+
+            if _k_block < Int32(2):
+                _mbar_ptr = cute.make_ptr(
+                    cutlass.Int64, work_mbar, cute.AddressSpace.smem)
+                if _k_block == Int32(0):
+                    nbytes = Int32(self.tma_k_blocks * self.ab_tma_bytes)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(work_mbar, nbytes)
+                cute.copy(a_tma, tAgA[(None, _global_k_block, tile_S, tile_B)],
+                          tAsA, tma_bar_ptr=_mbar_ptr)
+                if self.has_a_scale:
+                    cute.copy(a_scale_tma,
+                              tScaleG[(None, _global_k_block, tile_S, tile_B)],
+                              tScaleS, tma_bar_ptr=_mbar_ptr)
+                cute.copy(b_tma, tBgB[(None, _global_k_block, tile_N)], tBsB,
+                          tma_bar_ptr=_mbar_ptr)
+
+            if _k_block >= Int32(2):
+                _kr_ptr = cute.make_ptr(
+                    cutlass.Int64, _kr_0, cute.AddressSpace.smem)
+                if _buf_idx == Int32(0):
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _kr_0, Int32(self.ab_tma_bytes))
+                if _buf_idx == Int32(1):
+                    _kr_ptr = cute.make_ptr(
+                        cutlass.Int64, _kr_1, cute.AddressSpace.smem)
+                    with cute.arch.elect_one():
+                        mbarrier_arrive_expect_tx(
+                            _kr_1, Int32(self.ab_tma_bytes))
+
+                cute.copy(a_tma, tAgA[(None, _global_k_block, tile_S, tile_B)],
+                          tAsA, tma_bar_ptr=_kr_ptr)
+                if self.has_a_scale:
+                    cute.copy(a_scale_tma,
+                              tScaleG[(None, _global_k_block, tile_S, tile_B)],
+                              tScaleS, tma_bar_ptr=_kr_ptr)
+                cute.copy(b_tma, tBgB[(None, _global_k_block, tile_N)], tBsB,
+                          tma_bar_ptr=_kr_ptr)
+
+            _k_block = _k_block + Int32(1)
+
+    @classmethod
+    def schedule(cls, *, reduce_tile_n=1024, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        import torch
+
+        if "a_scale" not in tensors:
+            tensors["a_scale"] = tensors["a"]
+        k_extent = int(tensors["a"].shape[-1])
+        if reduce_tile_n <= 0:
+            raise ValueError("reduce_tile_n must be positive")
+        reduce_tile_n = min(int(reduce_tile_n), k_extent)
+        if k_extent % reduce_tile_n != 0:
+            raise ValueError(
+                f"ProjectionDaReduceGemmOp requires K ({k_extent}) to be divisible "
+                f"by reduce_tile_n ({reduce_tile_n})"
+            )
+
+        ts = dict(tile_sizes or {})
+        ts.setdefault("B", 1)
+        ts.setdefault("S", 128)
+        ts.setdefault("N", 64)
+        ts.setdefault("R", 1)
+        ts.setdefault("K", 32)
+        tile_K = ts.pop("K")
+        num_chunks = k_extent // reduce_tile_n
+        tensors["_chunk"] = torch.empty(num_chunks, dtype=torch.int32, device=tensors["a"].device)
+        scheduled = cls._schedule_single(tile_sizes=ts, **tensors)
+        scheduled.static_dims["tile_K"] = tile_K
+        scheduled.static_dims["page_size"] = page_size
+        scheduled.static_dims["has_a_scale"] = 0
+        scheduled.static_dims["reduce_tile_n"] = reduce_tile_n
+        scheduled.static_dims["reduce_k_block_offset"] = 0
+        return [scheduled]

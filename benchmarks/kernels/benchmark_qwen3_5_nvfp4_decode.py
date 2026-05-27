@@ -12,11 +12,16 @@ HF weights and quantize them into Machete's NVFP4 row layout before timing.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import time
 
 import torch
 
-from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
+from machete.megakernel import (
+    Megakernel,
+    MegakernelConfig,
+    OverlapTileScheduler,
+)
 from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
 from machete.kernels.qwen_3_5 import (
     QWEN3_5_NVFP4_DN_CONV_CHANNELS,
@@ -24,6 +29,7 @@ from machete.kernels.qwen_3_5 import (
     QWEN3_5_NVFP4_DN_NUM_HEADS,
     QWEN3_5_NVFP4_DN_VALUE_DIM,
     QWEN3_5_NVFP4_DN_V_SIZE,
+    QWEN3_5_NVFP4_GATE_UP_BLOCK,
     QWEN3_5_NVFP4_HEAD_DIM,
     QWEN3_5_NVFP4_HIDDEN,
     QWEN3_5_NVFP4_INTERMEDIATE,
@@ -55,6 +61,14 @@ def _qwen_rms_weight(weight: torch.Tensor) -> torch.Tensor:
     return (weight.float() + 1.0).to(weight.dtype).contiguous()
 
 
+def _qwen_rope_tables(context_len: int, device: torch.device | str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    positions = torch.arange(context_len + 1, device=device, dtype=torch.float32)
+    dims = torch.arange(QWEN3_5_NVFP4_ROTARY_D2, device=device, dtype=torch.float32)
+    inv_freq = torch.pow(torch.tensor(10000000.0, device=device, dtype=torch.float32), -dims / QWEN3_5_NVFP4_ROTARY_D2)
+    angles = positions[:, None] * inv_freq[None, :]
+    return torch.cos(angles).contiguous(), torch.sin(angles).contiguous()
+
+
 def _make_dummy_weights(context_len: int, dtype: torch.dtype, group_size: int) -> dict:
     weights = {
         "cos": torch.ones(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
@@ -79,8 +93,13 @@ def _make_dummy_weights(context_len: int, dtype: torch.dtype, group_size: int) -
             weights[f"{pfx}.linear_norm"] = torch.ones(QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda", dtype=dtype)
             weights[f"{pfx}.W_qkv_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_CONV_CHANNELS, QWEN3_5_NVFP4_HIDDEN, group_size)
             weights[f"{pfx}.W_z_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_V_SIZE, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_beta_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_beta"] = torch.zeros(
+                QWEN3_5_NVFP4_DN_NUM_HEADS,
+                QWEN3_5_NVFP4_HIDDEN,
+                device="cuda",
+                dtype=dtype,
+            )
+            weights[f"{pfx}.W_alpha"] = torch.zeros_like(weights[f"{pfx}.W_beta"])
             weights[f"{pfx}.conv_weight"] = torch.zeros(
                 QWEN3_5_NVFP4_DN_CONV_CHANNELS,
                 QWEN3_5_NVFP4_DN_CONV_KERNEL,
@@ -106,9 +125,10 @@ def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_s
         device_map="cuda",
     ).eval()
     state = model.state_dict()
+    cos, sin = _qwen_rope_tables(context_len, device="cuda")
     weights = {
-        "cos": torch.ones(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
-        "sin": torch.zeros(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "cos": cos,
+        "sin": sin,
         "final_norm": _qwen_rms_weight(state["model.norm.weight"]),
     }
     for layer_idx, layer_type in enumerate(QWEN3_5_LAYER_TYPES):
@@ -130,8 +150,8 @@ def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_s
             weights[f"{pfx}.linear_norm"] = state[f"{hf}.linear_attn.norm.weight"].contiguous()
             weights[f"{pfx}.W_qkv_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_qkv.weight"], group_size)
             weights[f"{pfx}.W_z_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_z.weight"], group_size)
-            weights[f"{pfx}.W_beta_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_b.weight"], group_size)
-            weights[f"{pfx}.W_alpha_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_a.weight"], group_size)
+            weights[f"{pfx}.W_beta"] = state[f"{hf}.linear_attn.in_proj_b.weight"].contiguous()
+            weights[f"{pfx}.W_alpha"] = state[f"{hf}.linear_attn.in_proj_a.weight"].contiguous()
             weights[f"{pfx}.conv_weight"] = state[f"{hf}.linear_attn.conv1d.weight"].squeeze(1).contiguous()
             weights[f"{pfx}.a_log"] = state[f"{hf}.linear_attn.A_log"].contiguous()
             weights[f"{pfx}.dt_bias"] = state[f"{hf}.linear_attn.dt_bias"].contiguous()
@@ -143,7 +163,7 @@ def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_s
     return weights
 
 
-def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
+def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int, atomic_final: bool = False):
     batch = 1
     seq_len = 1
     x = [torch.zeros(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS + 1)]
@@ -153,18 +173,19 @@ def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
         for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)
     ]
     v_cache = [torch.zeros_like(k) for k in k_cache]
-    q_raw = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_RAW_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_NVFP4_KV_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    q_gate = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    q_buf = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    scratch_dtype = torch.float32
+    q_raw = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_RAW_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_NVFP4_KV_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    q_gate = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    q_buf = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
     attn_out = [torch.empty_like(q) for q in q_buf]
     norm = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    qkv = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_CONV_CHANNELS, device="cuda", dtype=dtype) for _ in range(18)]
-    z = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_V_SIZE, device="cuda", dtype=dtype) for _ in range(18)]
-    beta = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype) for _ in range(18)]
+    qkv = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_CONV_CHANNELS, device="cuda", dtype=scratch_dtype) for _ in range(18)]
+    z = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_V_SIZE, device="cuda", dtype=scratch_dtype) for _ in range(18)]
+    beta = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=torch.float32) for _ in range(18)]
     alpha = [torch.empty_like(b) for b in beta]
     dn_out = [torch.empty_like(v) for v in z]
-    mlp = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_INTERMEDIATE, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    mlp = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_INTERMEDIATE, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
     dn_state = [
         torch.zeros(batch, QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_DN_KEY_DIM, QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda")
         for _ in range(18)
@@ -177,7 +198,12 @@ def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
     top_indices = torch.empty(batch, seq_len, device="cuda", dtype=torch.int32)
     top_partial_values = None
     top_partial_indices = None
-    if top_partitions > 0:
+    top_atomic_winner = None
+    top_atomic_counter = None
+    if top_partitions > 0 and atomic_final:
+        top_atomic_winner = torch.zeros(batch, seq_len, top_partitions, device="cuda", dtype=torch.int64)
+        top_atomic_counter = torch.zeros(batch, seq_len, top_partitions, device="cuda", dtype=torch.int32)
+    elif top_partitions > 0:
         top_partial_values = torch.empty(batch, seq_len, top_partitions, device="cuda", dtype=torch.float32)
         top_partial_indices = torch.empty(batch, seq_len, top_partitions, device="cuda", dtype=torch.int32)
     return (
@@ -203,6 +229,8 @@ def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int):
         top_indices,
         top_partial_values,
         top_partial_indices,
+        top_atomic_winner,
+        top_atomic_counter,
     )
 
 
@@ -230,6 +258,8 @@ def _schedule_body(args, weights, buffers):
         top_indices,
         top_partial_values,
         top_partial_indices,
+        top_atomic_winner,
+        top_atomic_counter,
     ) = buffers
     schedule = schedule_qwen3_5_nvfp4_decode_sm120(
         batch=1,
@@ -260,12 +290,19 @@ def _schedule_body(args, weights, buffers):
         top_indices=top_indices,
         top_partial_values=top_partial_values,
         top_partial_indices=top_partial_indices,
+        top_atomic_winner=top_atomic_winner,
+        top_atomic_counter=top_atomic_counter,
+        top_atomic_partitions=getattr(args, "top_partitions_resolved", None),
+        top_atomic_skip_init=getattr(args, "atomic_final_skip_init", False),
         page_size=args.page_size,
         group_size=args.group_size,
         fa_num_splits=args.fa_num_splits,
         use_flash_attention=args.use_flash_attention,
         matvec_block=args.matvec_block,
+        gate_up_block=getattr(args, "gate_up_block", None),
         prefetch_gate_up=args.prefetch_gate_up,
+        max_layers=getattr(args, "max_layers", None),
+        fuse_down_next_norm=getattr(args, "fuse_down_next_norm", False),
     )
     return schedule
 
@@ -288,6 +325,7 @@ def _make_replay_kernel(args, ops, keep_alive):
             page_size=args.page_size,
             threads_per_block=args.threads,
             mma_reg_count=args.mma_reg_count,
+            tracing=bool(args.trace or args.trace_perfetto),
         ),
         scheduler=scheduler,
     )
@@ -298,15 +336,18 @@ def _make_replay_kernel(args, ops, keep_alive):
 def build_kernel(args):
     dtype = torch.bfloat16
     top_partitions = args.top_partitions
-    if top_partitions <= 0:
+    if getattr(args, "single_final", False):
+        top_partitions = 0
+    elif top_partitions <= 0:
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        top_partitions = sm_count
+        top_partitions = 3 * sm_count
+    args.top_partitions_resolved = top_partitions
     weights = (
         _make_dummy_weights(args.context_len, dtype, args.group_size)
         if args.dummy_weights
         else _load_weights(args.model, args.context_len, dtype, args.group_size)
     )
-    buffers = _make_buffers(args.context_len, dtype, top_partitions)
+    buffers = _make_buffers(args.context_len, dtype, top_partitions, getattr(args, "atomic_final", False))
     (
         x,
         residual,
@@ -330,6 +371,8 @@ def build_kernel(args):
         top_indices,
         top_partial_values,
         top_partial_indices,
+        top_atomic_winner,
+        top_atomic_counter,
     ) = buffers
     if args.final_only:
         schedule_ops = schedule_qwen3_5_final_nvfp4_sm120(
@@ -342,6 +385,10 @@ def build_kernel(args):
             top_indices=top_indices,
             top_partial_values=top_partial_values,
             top_partial_indices=top_partial_indices,
+            top_atomic_winner=top_atomic_winner,
+            top_atomic_counter=top_atomic_counter,
+            top_atomic_partitions=top_partitions if getattr(args, "atomic_final", False) else None,
+            top_atomic_skip_init=getattr(args, "atomic_final_skip_init", False),
             seq_len=1,
             page_size=args.page_size,
             group_size=args.group_size,
@@ -383,6 +430,7 @@ def main():
         help="Registers requested for compute warps; NVFP4 decode is compute-only and does not need the GEMM default.",
     )
     parser.add_argument("--matvec-block", type=int, default=16)
+    parser.add_argument("--gate-up-block", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rep", type=int, default=5)
@@ -392,7 +440,7 @@ def main():
     parser.add_argument(
         "--prefetch-gate-up",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--scheduler",
@@ -403,6 +451,12 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-final", action="store_true")
     parser.add_argument("--final-only", action="store_true")
+    parser.add_argument("--single-final", action="store_true", help="Use the single-op final top-1 head instead of partitioned partial+reduce")
+    parser.add_argument("--atomic-final", action="store_true", help="Use partitioned final top-1 with an atomic global winner instead of partial+reduce")
+    parser.add_argument("--atomic-final-skip-init", action="store_true", help="Skip atomic final scratch init op; scratch is zeroed once and reset by the final op")
+    parser.add_argument("--fuse-down-next-norm", action="store_true", help="Pre-add MLP down projection into the next residual and start following layers with copy+RMSNorm")
+    parser.add_argument("--trace", type=Path, default=None, help="Write a cutedsl nanotrace after one launch")
+    parser.add_argument("--trace-perfetto", type=Path, default=None, help="Write a Perfetto JSON trace after one launch")
     args = parser.parse_args()
 
     props = torch.cuda.get_device_properties(0)
@@ -411,9 +465,14 @@ def main():
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
         f"threads={args.threads}, mma_reg_count={args.mma_reg_count}, "
-        f"top_partitions={'sms' if args.top_partitions <= 0 else args.top_partitions}, "
+        f"matvec_block={args.matvec_block}, gate_up_block={args.gate_up_block or QWEN3_5_NVFP4_GATE_UP_BLOCK}, "
+        f"top_partitions={'3*sms' if args.top_partitions <= 0 else args.top_partitions}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
+        f"single_final={args.single_final}, "
+        f"atomic_final={args.atomic_final}, "
+        f"atomic_final_skip_init={args.atomic_final_skip_init}, "
+        f"fuse_down_next_norm={args.fuse_down_next_norm}, "
         f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}, "
         f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}",
         flush=True,
@@ -432,6 +491,17 @@ def main():
         return
     print("timing hot launches...", flush=True)
     ms = time_kernel(kernel, args.warmup, args.rep)
+    if args.trace or args.trace_perfetto:
+        kernel.run(validate=False)
+        torch.cuda.synchronize()
+        if args.trace:
+            args.trace.parent.mkdir(parents=True, exist_ok=True)
+            kernel.write_trace(str(args.trace))
+            print(f"trace={args.trace}", flush=True)
+        if args.trace_perfetto:
+            args.trace_perfetto.parent.mkdir(parents=True, exist_ok=True)
+            kernel.write_trace_perfetto(str(args.trace_perfetto))
+            print(f"trace_perfetto={args.trace_perfetto}", flush=True)
     print(
         f"machete_qwen_nvfp4_decode: {ms:.3f} ms/token, "
         f"{1000.0 / ms:.1f} tok/s, ops={len(kernel.ops)}, "

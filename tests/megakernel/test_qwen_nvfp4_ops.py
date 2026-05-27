@@ -98,13 +98,13 @@ def test_qwen_full_attention_nvfp4_schedule_uses_native_ops():
 
     op_classes = [op.op_cls for op in layer.ops]
     assert op_classes[0] is RmsAddNormSm120Op
-    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 0
-    assert op_classes.count(MatvecNvfp4Sm120Op) >= 4
+    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 1
+    assert op_classes.count(MatvecNvfp4Sm120Op) >= 2
     assert Qwen3_5QGateRopeCacheSm120Op in op_classes
     assert Qwen3_5GatedSingleTokenAttentionSm120Op in op_classes
     assert MatvecResidualNvfp4Sm120Op in op_classes
     assert RmsGateUpSiluNvfp4Sm120Op in op_classes
-    post = layer.ops[4]
+    post = layer.ops[3]
     assert post.op_cls is Qwen3_5QGateRopeCacheSm120Op
     assert post.static_dims["head_dim"] == QWEN3_5_NVFP4_HEAD_DIM
 
@@ -328,6 +328,94 @@ def test_qwen_gated_single_token_attention_matches_reference():
     torch.testing.assert_close(o.float(), ref, rtol=2e-2, atol=2e-2)
 
 
+def test_qwen_grouped_gated_single_token_attention_matches_reference():
+    from machete.kernels.qwen_3_5 import Qwen3_5GatedGroupedSingleTokenAttentionSm120Op
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    torch.manual_seed(43)
+    dtype = torch.bfloat16
+    batch, seq, q_heads, kv_heads, head_dim, context = 1, 1, 8, 2, 256, 128
+    kv_group_size = q_heads // kv_heads
+    q = torch.randn(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch, context, kv_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    gate = torch.randn(batch, seq, q_heads * head_dim, device="cuda", dtype=dtype)
+    o = torch.empty(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+
+    kernel = Megakernel(
+        Qwen3_5GatedGroupedSingleTokenAttentionSm120Op.schedule(
+            q=q,
+            k=k,
+            v=v,
+            gate=gate,
+            o=o,
+            kv_group_size=kv_group_size,
+            page_size=32768,
+        ),
+        config=MegakernelConfig(num_sms=4, page_size=32768, threads_per_block=512, mma_reg_count=96),
+    )
+    kernel.run()
+    torch.cuda.synchronize()
+
+    ref = torch.empty_like(o, dtype=torch.float32)
+    for qh in range(q_heads):
+        kvh = qh // kv_group_size
+        scores = torch.einsum(
+            "d,td->t",
+            q[0, 0, qh].float(),
+            k[0, :, kvh].float(),
+        ) * 0.0625
+        probs = torch.softmax(scores, dim=0)
+        attn = torch.einsum("t,td->d", probs, v[0, :, kvh].float())
+        ref[0, 0, qh] = attn * torch.sigmoid(gate[0, 0, qh * head_dim : (qh + 1) * head_dim].float())
+
+    torch.testing.assert_close(o.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_qwen_narrow_gated_single_token_attention_matches_reference():
+    from machete.kernels.qwen_3_5 import Qwen3_5GatedNarrowSingleTokenAttentionSm120Op
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    torch.manual_seed(47)
+    dtype = torch.bfloat16
+    batch, seq, q_heads, kv_heads, head_dim, context = 1, 1, 8, 2, 256, 128
+    kv_group_size = q_heads // kv_heads
+    q = torch.randn(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch, context, kv_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    gate = torch.randn(batch, seq, q_heads * head_dim, device="cuda", dtype=dtype)
+    o = torch.empty(batch, seq, q_heads, head_dim, device="cuda", dtype=dtype)
+
+    kernel = Megakernel(
+        Qwen3_5GatedNarrowSingleTokenAttentionSm120Op.schedule(
+            q=q,
+            k=k,
+            v=v,
+            gate=gate,
+            o=o,
+            kv_group_size=kv_group_size,
+            page_size=32768,
+        ),
+        config=MegakernelConfig(num_sms=4, page_size=32768, threads_per_block=512, mma_reg_count=96),
+    )
+    kernel.run()
+    torch.cuda.synchronize()
+
+    ref = torch.empty_like(o, dtype=torch.float32)
+    for qh in range(q_heads):
+        kvh = qh // kv_group_size
+        scores = torch.einsum(
+            "d,td->t",
+            q[0, 0, qh].float(),
+            k[0, :, kvh].float(),
+        ) * 0.0625
+        probs = torch.softmax(scores, dim=0)
+        attn = torch.einsum("t,td->d", probs, v[0, :, kvh].float())
+        ref[0, 0, qh] = attn * torch.sigmoid(gate[0, 0, qh * head_dim : (qh + 1) * head_dim].float())
+
+    torch.testing.assert_close(o.float(), ref, rtol=2e-2, atol=2e-2)
+
+
 def test_qwen_flash_decode_attention_matches_reference():
     from machete.kernels.qwen_3_5 import schedule_qwen3_5_flash_decode_attention_sm120
     from machete.megakernel import Megakernel, MegakernelConfig
@@ -377,6 +465,7 @@ def test_qwen_deltanet_nvfp4_schedule_uses_native_ops():
         MatvecPairNvfp4Sm120Op,
         MatvecQuadNvfp4Sm120Op,
         MatvecResidualNvfp4Sm120Op,
+        MatvecSm120Op,
         RmsAddNormSm120Op,
         RmsGateUpSiluNvfp4Sm120Op,
         RmsMatvecNvfp4Sm120Op,
@@ -409,6 +498,8 @@ def test_qwen_deltanet_nvfp4_schedule_uses_native_ops():
         f"{pfx}.W_z_nvfp4": _qweight(v_size, QWEN3_5_NVFP4_HIDDEN),
         f"{pfx}.W_beta_nvfp4": _qweight(16, QWEN3_5_NVFP4_HIDDEN),
         f"{pfx}.W_alpha_nvfp4": _qweight(16, QWEN3_5_NVFP4_HIDDEN),
+        f"{pfx}.W_beta": torch.empty(16, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype),
+        f"{pfx}.W_alpha": torch.empty(16, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype),
         f"{pfx}.conv_weight": torch.empty(conv_channels, 4, device="cuda", dtype=dtype),
         f"{pfx}.a_log": torch.empty(16, device="cuda", dtype=dtype),
         f"{pfx}.dt_bias": torch.empty(16, device="cuda", dtype=dtype),
@@ -456,20 +547,21 @@ def test_qwen_deltanet_nvfp4_schedule_uses_native_ops():
     assert op_classes.count(RmsMatvecNvfp4Sm120Op) == 0
     assert op_classes.count(RmsReadMatvecNvfp4Sm120Op) == 0
     assert op_classes.count(MatvecQuadNvfp4Sm120Op) == 1
-    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 1
+    assert op_classes.count(MatvecPairNvfp4Sm120Op) == 0
     assert op_classes.count(MatvecNvfp4Sm120Op) >= 1
+    assert op_classes.count(MatvecSm120Op) == 2
     assert Qwen3_5DeltaNetCoreSm120Op in op_classes
     assert MatvecResidualNvfp4Sm120Op in op_classes
     assert RmsGateUpSiluNvfp4Sm120Op in op_classes
     assert op_classes[-1] is MatvecNvfp4Sm120Op
-    assert layer.ops[3].op_cls is Qwen3_5DeltaNetCoreSm120Op
+    assert layer.ops[4].op_cls is Qwen3_5DeltaNetCoreSm120Op
 
     builder = InstructionStreamBuilder()
     for op in layer.ops:
         builder.add_op(op)
     formulas = builder.get_op_barrier_formulas()
-    deltanet_signal = formulas[3][1][0]
-    residual_wait = next(wait for wait in formulas[4][0] if wait.base == deltanet_signal.base)
+    deltanet_signal = formulas[4][1][0]
+    residual_wait = next(wait for wait in formulas[5][0] if wait.base == deltanet_signal.base)
     assert residual_wait.expected == QWEN3_5_NVFP4_DN_NUM_HEADS
 
 

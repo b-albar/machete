@@ -13,6 +13,7 @@ from .interpreter import (
     global_barrier_signal_gpu,
     global_barrier_wait,
     global_barrier_wait_relaxed,
+    global_memory_fence_gpu,
     ld_global_i32,
 )
 from .paged_memory import (
@@ -82,7 +83,7 @@ def build_kernel_static_config(
         "tracing": kernel.config.tracing,
         "num_pages": layout.num_pages,
         "num_slots": layout.num_slots,
-        "has_page_free_ops": kernel._use_physical_page_ring and not use_compute_only_replay,
+        "has_page_free_ops": kernel._has_page_free_ops and not use_compute_only_replay,
         "iq_offset": layout.iq_offset,
         "flags_offset": layout.flags_offset,
         "ring_state_offset": layout.ring_state_offset,
@@ -366,6 +367,7 @@ def build_kernel_extra_exec_globals(
         "max_signal_formulas": kernel._max_signal_formulas,
         "global_barrier_wait": global_barrier_wait,
         "global_barrier_wait_relaxed": global_barrier_wait_relaxed,
+        "global_memory_fence_gpu": global_memory_fence_gpu,
         "relaxed_global_barriers": kernel.config.relaxed_global_barriers,
         "global_barrier_sleep_ns": int(kernel.config.global_barrier_sleep_ns),
         "ld_global_i32": ld_global_i32,

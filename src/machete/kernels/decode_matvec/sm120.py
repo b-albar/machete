@@ -24,11 +24,11 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from machete.megakernel.interpreter import mbarrier_arrive_expect_tx, named_barrier_sync
+from machete.megakernel.interpreter import named_barrier_sync
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec
 
 
@@ -48,11 +48,31 @@ SM120_DECODE_KV_GROUP_SIZE_DEFAULT = SM120_DECODE_NUM_Q_HEADS_DEFAULT // SM120_D
 SM120_OUTPUT_RANGE_PIPELINE = PipelineSpec(page_count=1)
 
 
+def _tile_sizes_with_defaults(tile_sizes, **defaults):
+    resolved = dict(tile_sizes or {})
+    for dim, size in defaults.items():
+        resolved.setdefault(dim, size)
+    return resolved
+
+
+def _finalize_decode_schedule(op, *, page_size=DEFAULT_PAGE_SIZE, **static_dims):
+    op.static_dims["page_size"] = page_size
+    op.static_dims.update(static_dims)
+    return [op]
+
+
 def _finalize_nvfp4_matvec_schedule(op, *, page_size, group_size, k_dim):
     op.static_dims["page_size"] = page_size
     op.static_dims["group_size"] = group_size
     op.static_dims["reduction_tile_K"] = min(SM120_DECODE_REDUCTION_DIM_PER_WARP, k_dim)
     return [op]
+
+
+def _validate_nvfp4_projection(input_k, packed, scales, group_size, *, prefix="weight"):
+    if packed.shape[1] * 2 != input_k:
+        raise ValueError(f"{prefix} K2 must equal input.K / 2")
+    if scales.shape[1] != input_k // group_size:
+        raise ValueError(f"{prefix} scales G must equal input.K / group_size")
 
 
 @cute.jit
@@ -70,6 +90,143 @@ def _fp4_e2m1_value(code):
     out = out + cute.arch.fmax((mag - Int32(6)).to(Float32), Float32(0.0))
     sign = Float32(1.0) - (code >> Int32(3)).to(Float32) * Float32(2.0)
     return out * sign
+
+
+@dsl_user_op
+def _top1_pack_score(score: Float32, idx: Int32, *, loc=None, ip=None) -> Int64:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(64),
+        [Float32(score).ir_value(loc=loc, ip=ip), Int32(idx).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        ".reg .pred p;\n"
+        ".reg .u32 bits, sign, mask, ordered, tie;\n"
+        ".reg .u64 hi, lo;\n"
+        "mov.b32 bits, $1;\n"
+        "shr.u32 sign, bits, 31;\n"
+        "setp.ne.u32 p, sign, 0;\n"
+        "selp.u32 mask, 0xffffffff, 0x80000000, p;\n"
+        "xor.b32 ordered, bits, mask;\n"
+        "not.b32 tie, $2;\n"
+        "cvt.u64.u32 hi, ordered;\n"
+        "shl.b64 hi, hi, 32;\n"
+        "cvt.u64.u32 lo, tie;\n"
+        "or.b64 $0, hi, lo;\n"
+        "}\n",
+        "=l,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def _top1_atomic_max_u64(ptr, packed: Int64, *, loc=None, ip=None) -> Int64:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(64),
+        [ptr.llvm_ptr, Int64(packed).ir_value(loc=loc, ip=ip)],
+        "atom.max.gpu.global.u64 $0, [$1], $2;",
+        "=l,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def _top1_atomic_inc_u32(ptr, *, loc=None, ip=None) -> Int32:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [ptr.llvm_ptr],
+        "atom.add.acq_rel.gpu.global.u32 $0, [$1], 1;",
+        "=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
+
+
+@dsl_user_op
+def _top1_load_volatile_u64(ptr, *, loc=None, ip=None) -> Int64:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(64),
+        [ptr.llvm_ptr],
+        "ld.volatile.global.u64 $0, [$1];",
+        "=l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def _top1_unpack_value(packed: Int64, *, loc=None, ip=None) -> Float32:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.F32Type.get(),
+        [Int64(packed).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        ".reg .u64 hi64;\n"
+        ".reg .u32 ordered, sign, mask, bits;\n"
+        "shr.u64 hi64, $1, 32;\n"
+        "cvt.u32.u64 ordered, hi64;\n"
+        "shr.u32 sign, ordered, 31;\n"
+        ".reg .pred p;\n"
+        "setp.ne.u32 p, sign, 0;\n"
+        "selp.u32 mask, 0x80000000, 0xffffffff, p;\n"
+        "xor.b32 bits, ordered, mask;\n"
+        "mov.b32 $0, bits;\n"
+        "}\n",
+        "=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(result)
+
+
+@dsl_user_op
+def _top1_unpack_index(packed: Int64, *, loc=None, ip=None) -> Int32:
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.IntegerType.get_signless(32),
+        [Int64(packed).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        ".reg .u32 lo;\n"
+        "cvt.u32.u64 lo, $1;\n"
+        "not.b32 $0, lo;\n"
+        "}\n",
+        "=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(result)
 
 
 @dsl_user_op
@@ -374,20 +531,28 @@ class _RmsProjectionSm120Base(_DecodeMatvecSm120Base):
         assert self.tile_size_O == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, cache_pos=0, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["cache_pos"] = cache_pos
-        op.static_dims["head_dim"] = tensors["cos"].shape[1] * 2
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        cache_pos=0,
+        dim_windows=None,
+        **tensors,
+    ):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
         )
-        return [op]
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            cache_pos=cache_pos,
+            head_dim=tensors["cos"].shape[1] * 2,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]),
+        )
 
     @cute.jit
     def _row_rstd(self, tile_B, row_idx, x, residual_in):
@@ -621,26 +786,39 @@ class _RmsProjectionNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         assert self.tile_size_O == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 cache_pos=0, group_size=32, head_dim=None, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal x.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["x"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["cache_pos"] = cache_pos
-        op.static_dims["head_dim"] = int(head_dim or tensors["cos"].shape[1] * 2)
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        cache_pos=0,
+        group_size=32,
+        head_dim=None,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
         )
-        return [op]
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            cache_pos=cache_pos,
+            head_dim=int(head_dim or tensors["cos"].shape[1] * 2),
+            group_size=group_size,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
 
     @cute.jit
     def _row_rstd(self, tile_B, row_idx, x, residual_in):
@@ -865,26 +1043,37 @@ class RmsMatvecNvfp4Sm120Op(_RmsProjectionNvfp4Sm120Base):
     }
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal x.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["x"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["cache_pos"] = 0
-        op.static_dims["head_dim"] = tensors["x"].shape[-1]
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
         )
-        return [op]
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            cache_pos=0,
+            head_dim=input_k,
+            group_size=group_size,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_O, x, residual_in, norm_weight,
@@ -954,14 +1143,13 @@ class MatvecResidualSm120Op(_DecodeMatvecSm120Base):
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        return [op]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight, residual_in, residual_out):
@@ -1012,14 +1200,13 @@ class MatvecSm120Op(_DecodeMatvecSm120Base):
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        return [op]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight, y):
@@ -1073,22 +1260,27 @@ class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
+        dim_windows=None,
         **tensors,
     ):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["a"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal a.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        input_k = tensors["a"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
+        )
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
             group_size=group_size,
-            k_dim=tensors["a"].shape[-1],
+            k_dim=input_k,
         )
 
     @cute.jit
@@ -1152,26 +1344,31 @@ class MatvecPairNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
+        dim_windows=None,
         **tensors,
     ):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
         if tensors["weight0_packed"].shape != tensors["weight1_packed"].shape:
             raise ValueError("paired NVFP4 projections must have matching packed shapes")
         if tensors["weight0_scales"].shape != tensors["weight1_scales"].shape:
             raise ValueError("paired NVFP4 projections must have matching scale shapes")
-        if tensors["weight0_packed"].shape[1] * 2 != tensors["a"].shape[-1]:
-            raise ValueError("weight K2 must equal a.K / 2")
-        if tensors["weight0_scales"].shape[1] != tensors["a"].shape[-1] // group_size:
-            raise ValueError("weight scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        input_k = tensors["a"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight0_packed"],
+            tensors["weight0_scales"],
+            group_size,
+            prefix="weight",
+        )
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
             group_size=group_size,
-            k_dim=tensors["a"].shape[-1],
+            k_dim=input_k,
         )
 
     @cute.jit
@@ -1277,12 +1474,9 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         tile_sizes=None,
         page_size=DEFAULT_PAGE_SIZE,
         group_size=32,
+        dim_windows=None,
         **tensors,
     ):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("O", 16)
         packed_shape = tensors["weight0_packed"].shape
         scale_shape = tensors["weight0_scales"].shape
         for idx in range(1, 4):
@@ -1290,16 +1484,24 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                 raise ValueError("quad NVFP4 projections must have matching packed shapes")
             if tensors[f"weight{idx}_scales"].shape != scale_shape:
                 raise ValueError("quad NVFP4 projections must have matching scale shapes")
-        if packed_shape[1] * 2 != tensors["a"].shape[-1]:
-            raise ValueError("weight K2 must equal a.K / 2")
-        if scale_shape[1] != tensors["a"].shape[-1] // group_size:
-            raise ValueError("weight scales G must equal a.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        input_k = tensors["a"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight0_packed"],
+            tensors["weight0_scales"],
+            group_size,
+            prefix="weight",
+        )
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
             group_size=group_size,
-            k_dim=tensors["a"].shape[-1],
+            k_dim=input_k,
         )
 
     @cute.jit
@@ -1423,14 +1625,13 @@ class ResidualAddSm120Op(_DecodeMatvecSm120Base):
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("K", 256)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        return [op]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, K=256),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_K, x, residual_in, residual_out):
@@ -1475,14 +1676,13 @@ class RmsAddNormSm120Op(_DecodeMatvecSm120Base):
         self.eps = getattr(self, "eps", 1e-5)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        return [op]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size, eps=eps)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_2, x, residual_in, norm_weight, residual_out, y):
@@ -1520,6 +1720,67 @@ class RmsAddNormSm120Op(_DecodeMatvecSm120Base):
                     k2 = k2 + Int32(32)
 
 
+class RmsCopyNormSm120Op(_DecodeMatvecSm120Base):
+    """RMSNorm an already-added residual stream and copy it to the next residual buffer."""
+
+    reads = {
+        "x": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+    }
+    writes = {
+        "residual_out": (None, ("B", "S", "K")),
+        "y": (None, ("B", "S", "K")),
+    }
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.eps = getattr(self, "eps", 1e-5)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size, eps=eps)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_2, x, norm_weight, residual_out, y):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        for local_row in range(warp_idx, self.tile_size_S, num_warps):
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+                out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+                out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.K))
+                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.K))
+                norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+
+                sum_sq = Float32(0.0)
+                k = lane_idx
+                while k < Int32(self.K):
+                    val = x_row[k].to(Float32)
+                    sum_sq = sum_sq + val * val
+                    k = k + Int32(32)
+                total = cute.arch.warp_reduction(sum_sq, operator.add)
+                rstd = cute.math.rsqrt(total * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
+
+                k2 = lane_idx
+                while k2 < Int32(self.K):
+                    val = x_row[k2].to(Float32)
+                    out_row[k2] = val.to(self.residual_out_dtype)
+                    y_row[k2] = (val * rstd * norm_row[k2].to(Float32)).to(self.y_dtype)
+                    k2 = k2 + Int32(32)
+
+
 class RmsGateUpSiluSm120Op(_DecodeMatvecSm120Base):
     """Fused RMS + gate/up matvec + SiLU, producing the MLP hidden vector."""
 
@@ -1540,18 +1801,18 @@ class RmsGateUpSiluSm120Op(_DecodeMatvecSm120Base):
         assert self.tile_size_D == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("D", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, D=16),
+            dim_windows=dim_windows,
+            **tensors,
         )
-        return [op]
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_D, x, norm_weight, gate_weight, up_weight, y):
@@ -1638,27 +1899,34 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         eps=1e-5,
         group_size=32,
         prefetch_nvfp4=True,
+        dim_windows=None,
         **tensors,
     ):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("D", 16)
-        if tensors["gate_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("gate_packed K2 must equal x.K / 2")
-        if tensors["up_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["gate_packed"],
+            tensors["gate_scales"],
+            group_size,
+            prefix="gate_packed",
+        )
+        if tensors["up_packed"].shape[1] * 2 != input_k:
             raise ValueError("up_packed K2 must equal x.K / 2")
-        expected_g = tensors["x"].shape[-1] // group_size
+        expected_g = input_k // group_size
         if tensors["gate_scales"].shape[1] != expected_g or tensors["up_scales"].shape[1] != expected_g:
             raise ValueError("gate/up scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, D=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
         op.static_dims["eps"] = eps
         op.static_dims["prefetch_nvfp4"] = bool(prefetch_nvfp4)
         return _finalize_nvfp4_matvec_schedule(
             op,
             page_size=page_size,
             group_size=group_size,
-            k_dim=tensors["x"].shape[-1],
+            k_dim=input_k,
         )
 
     @cute.jit
@@ -1778,18 +2046,18 @@ class FinalRmsLmHeadSm120Op(RmsGateUpSiluSm120Op):
         assert self.tile_size_V == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("V", 16)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, V=16),
+            dim_windows=dim_windows,
+            **tensors,
         )
-        return [op]
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_V, x, norm_weight, weight, logits):
@@ -1861,24 +2129,35 @@ class FinalRmsLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         assert self.tile_size_V == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("V", 16)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal x.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["x"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
         )
-        return [op]
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, V=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            group_size=group_size,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_V, x, norm_weight,
@@ -2004,24 +2283,35 @@ class FinalRmsTop1LmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
         assert self.tile_size_V == 16
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
-        tile_sizes.setdefault("V", 16)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal x.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["x"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal x.K / group_size")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["group_size"] = group_size
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
         )
-        return [op]
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, V=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            group_size=group_size,
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_V, tile_3, x, norm_weight,
@@ -2111,27 +2401,38 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
         self.partitions = getattr(self, "partitions", self.P)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5,
-                 group_size=32, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 1)
-        tile_sizes.setdefault("P", 1)
-        if tensors["weight_packed"].shape[1] * 2 != tensors["x"].shape[-1]:
-            raise ValueError("weight_packed K2 must equal x.K / 2")
-        if tensors["weight_scales"].shape[1] != tensors["x"].shape[-1] // group_size:
-            raise ValueError("weight_scales G must equal x.K / group_size")
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
+        )
         if tensors["partial_values"].shape != tensors["partial_indices"].shape:
             raise ValueError("partial_values and partial_indices must have the same shape")
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        op.static_dims["eps"] = eps
-        op.static_dims["group_size"] = group_size
-        op.static_dims["partitions"] = int(tensors["partial_values"].shape[-1])
-        op.static_dims["reduction_tile_K"] = min(
-            SM120_DECODE_REDUCTION_DIM_PER_WARP, tensors["x"].shape[-1]
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=1, P=1),
+            dim_windows=dim_windows,
+            **tensors,
         )
-        return [op]
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            group_size=group_size,
+            partitions=int(tensors["partial_values"].shape[-1]),
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, tile_P, x, norm_weight,
@@ -2410,6 +2711,264 @@ class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm1
             idx_row[partition] = part_idx
 
 
+class FinalTop1AtomicInitSm120Op(_DecodeMatvecSm120Base):
+    """Initialize one-token atomic top-1 scratch for partitioned final heads."""
+
+    reads = {}
+    writes = {
+        "atomic_winner": (cutlass.Int64, ("B", "S", "P")),
+        "atomic_counter": (cutlass.Int32, ("B", "S", "P")),
+    }
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        if tensors["atomic_winner"].shape != tensors["atomic_counter"].shape:
+            raise ValueError("atomic_winner and atomic_counter must have the same shape")
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=1),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, atomic_winner, atomic_counter):
+        tidx = cute.arch.thread_idx()[0]
+        row_idx = tile_S * Int32(self.tile_size_S)
+        if tidx == Int32(0) and row_idx < Int32(self.S):
+            base_w = tile_B * Int32(self.atomic_winner_stride_B) + row_idx * Int32(self.atomic_winner_stride_S)
+            base_c = tile_B * Int32(self.atomic_counter_stride_B) + row_idx * Int32(self.atomic_counter_stride_S)
+            winner_row = cute.make_tensor(atomic_winner.iterator + base_w, cute.make_layout(1))
+            counter_row = cute.make_tensor(atomic_counter.iterator + base_c, cute.make_layout(1))
+            winner_row[Int32(0)] = Int64(0)
+            counter_row[Int32(0)] = Int32(0)
+
+
+class FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm120Op):
+    """Partitioned final residual add + RMS + NVFP4 top-1 with one atomic winner."""
+
+    reads = {
+        "x": (None, ("B", "S", "K")),
+        "residual_in": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+        "weight_packed": (cutlass.Uint8, ("V", "K2")),
+        "weight_scales": (cutlass.Float16, ("V", "G")),
+        "atomic_winner": (cutlass.Int64, ("B", "S", "P")),
+        "atomic_counter": (cutlass.Int32, ("B", "S", "P")),
+    }
+    writes = {
+        "atomic_winner": (cutlass.Int64, ("B", "S", "P")),
+        "atomic_counter": (cutlass.Int32, ("B", "S", "P")),
+        "top_values": (cutlass.Float32, ("B", "S")),
+        "top_indices": (cutlass.Int32, ("B", "S")),
+    }
+
+    @classmethod
+    def schedule(
+        cls,
+        tile_sizes=None,
+        page_size=DEFAULT_PAGE_SIZE,
+        eps=1e-5,
+        group_size=32,
+        partitions=None,
+        reset_scratch=True,
+        dim_windows=None,
+        **tensors,
+    ):
+        input_k = tensors["x"].shape[-1]
+        _validate_nvfp4_projection(
+            input_k,
+            tensors["weight_packed"],
+            tensors["weight_scales"],
+            group_size,
+            prefix="weight_packed",
+        )
+        if tensors["residual_in"].shape != tensors["x"].shape:
+            raise ValueError("residual_in must have the same shape as x")
+        if tensors["atomic_winner"].shape != tensors["atomic_counter"].shape:
+            raise ValueError("atomic_winner and atomic_counter must have the same shape")
+        if tensors["top_values"].shape != tensors["atomic_winner"].shape[:2]:
+            raise ValueError("top_values must have shape (B, S)")
+        if tensors["top_indices"].shape != tensors["atomic_winner"].shape[:2]:
+            raise ValueError("top_indices must have shape (B, S)")
+        partitions = int(partitions or tensors["atomic_winner"].shape[-1])
+        if partitions < 1:
+            raise ValueError("partitions must be positive")
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=1, P=1),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(
+            op,
+            page_size=page_size,
+            eps=eps,
+            group_size=group_size,
+            partitions=partitions,
+            reset_scratch=int(bool(reset_scratch)),
+            reduction_tile_K=min(SM120_DECODE_REDUCTION_DIM_PER_WARP, input_k),
+        )
+
+    @cute.jit
+    def compute(
+        self,
+        page_ptr,
+        tile_B,
+        tile_S,
+        tile_P,
+        x,
+        residual_in,
+        norm_weight,
+        weight_packed,
+        weight_scales,
+        atomic_winner,
+        atomic_counter,
+        top_values,
+        top_indices,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_idx = tile_S * Int32(self.tile_size_S)
+        partition = tile_P
+
+        value_smem = cute.make_tensor(
+            cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout(self.threads_per_row),
+        )
+        index_smem = cute.make_tensor(
+            cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
+            cute.make_layout(self.threads_per_row),
+        )
+        norm_smem = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.threads_per_row * 8),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout(self.K),
+        )
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions):
+            x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+            residual_base = (
+                tile_B * Int32(self.residual_in_stride_B)
+                + row_idx * Int32(self.residual_in_stride_S)
+            )
+            x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+            residual_row = cute.make_tensor(residual_in.iterator + residual_base, cute.make_layout(self.K))
+            sum_sq = Float32(0.0)
+            k = lane_idx
+            while k < Int32(self.K):
+                xv = x_row[k].to(Float32) + residual_row[k].to(Float32)
+                sum_sq = sum_sq + xv * xv
+                k = k + Int32(32)
+            total_sq = cute.arch.warp_reduction(sum_sq, operator.add)
+            rstd = cute.math.rsqrt(total_sq * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
+            norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+            nk = tidx
+            while nk < Int32(self.K):
+                xv = x_row[nk].to(Float32) + residual_row[nk].to(Float32)
+                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
+                nk = nk + Int32(self.threads_per_row)
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions):
+            vocab_start = (Int32(self.V) * partition) // Int32(self.partitions)
+            vocab_end = (Int32(self.V) * (partition + Int32(1))) // Int32(self.partitions)
+            best_val = Float32(-3.4028234663852886e38)
+            best_idx = Int32(-1)
+            v = vocab_start + warp_idx
+            while v < vocab_end:
+                packed_row = cute.make_tensor(
+                    weight_packed.iterator + v * Int32(self.weight_packed_stride_V),
+                    cute.make_layout(self.K2),
+                )
+                scale_row = cute.make_tensor(
+                    weight_scales.iterator + v * Int32(self.weight_scales_stride_V),
+                    cute.make_layout(self.G),
+                )
+                acc = Float32(0.0)
+                full_k = Int32((self.K // 16) * 16)
+                k2 = lane_idx * Int32(16)
+                while k2 < full_k:
+                    v0 = norm_smem[k2].to(Float32)
+                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
+                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
+                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
+                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
+                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
+                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
+                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
+                    v8 = norm_smem[k2 + Int32(8)].to(Float32)
+                    v9 = norm_smem[k2 + Int32(9)].to(Float32)
+                    v10 = norm_smem[k2 + Int32(10)].to(Float32)
+                    v11 = norm_smem[k2 + Int32(11)].to(Float32)
+                    v12 = norm_smem[k2 + Int32(12)].to(Float32)
+                    v13 = norm_smem[k2 + Int32(13)].to(Float32)
+                    v14 = norm_smem[k2 + Int32(14)].to(Float32)
+                    v15 = norm_smem[k2 + Int32(15)].to(Float32)
+                    acc = acc + self._dot16_nvfp4_values(
+                        packed_row, scale_row, k2,
+                        v0, v1, v2, v3, v4, v5, v6, v7,
+                        v8, v9, v10, v11, v12, v13, v14, v15,
+                    )
+                    k2 = k2 + Int32(512)
+                k2 = full_k + lane_idx
+                while k2 < Int32(self.K):
+                    acc = acc + norm_smem[k2].to(Float32) * self._nvfp4_weight_value(packed_row, scale_row, k2)
+                    k2 = k2 + Int32(32)
+                total = cute.arch.warp_reduction(acc, operator.add)
+                if total > best_val:
+                    best_val = total
+                    best_idx = v
+                v = v + num_warps
+
+            if lane_idx == Int32(0):
+                value_smem[warp_idx] = best_val
+                index_smem[warp_idx] = best_idx
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
+
+        if row_idx < Int32(self.S) and partition < Int32(self.partitions) and tidx == Int32(0):
+            part_val = Float32(-3.4028234663852886e38)
+            part_idx = Int32(-1)
+            wi = Int32(0)
+            while wi < num_warps:
+                other_val = value_smem[wi]
+                other_idx = index_smem[wi]
+                if other_val > part_val:
+                    part_val = other_val
+                    part_idx = other_idx
+                wi = wi + Int32(1)
+
+            scratch_base = tile_B * Int32(self.atomic_winner_stride_B) + row_idx * Int32(self.atomic_winner_stride_S)
+            winner_row = cute.make_tensor(atomic_winner.iterator + scratch_base, cute.make_layout(1))
+            counter_row = cute.make_tensor(
+                atomic_counter.iterator
+                + tile_B * Int32(self.atomic_counter_stride_B)
+                + row_idx * Int32(self.atomic_counter_stride_S),
+                cute.make_layout(1),
+            )
+            _top1_atomic_max_u64(winner_row.iterator, _top1_pack_score(part_val, part_idx))
+            old = _top1_atomic_inc_u32(counter_row.iterator)
+            if old == Int32(self.partitions - 1):
+                packed = _top1_load_volatile_u64(winner_row.iterator)
+                out_base = tile_B * Int32(self.top_values_stride_B) + row_idx
+                val_row = cute.make_tensor(top_values.iterator + out_base, cute.make_layout(1))
+                idx_row = cute.make_tensor(
+                    top_indices.iterator + tile_B * Int32(self.top_indices_stride_B) + row_idx,
+                    cute.make_layout(1),
+                )
+                val_row[Int32(0)] = _top1_unpack_value(packed).to(self.top_values_dtype)
+                idx_row[Int32(0)] = _top1_unpack_index(packed)
+                if const_expr(self.reset_scratch):
+                    winner_row[Int32(0)] = Int64(0)
+                    counter_row[Int32(0)] = Int32(0)
+
+
 class ReduceTop1PartialsSm120Op(_DecodeMatvecSm120Base):
     """Reduce per-partition top-1 values to one token result."""
 
@@ -2425,13 +2984,13 @@ class ReduceTop1PartialsSm120Op(_DecodeMatvecSm120Base):
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 1)
-        op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
-        op.static_dims["page_size"] = page_size
-        return [op]
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=1),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
 
     @cute.jit
     def compute(self, page_ptr, tile_B, tile_S, partial_values, partial_indices, top_values, top_indices):
@@ -2846,6 +3405,10 @@ def schedule_final_nvfp4_sm120(
     top_indices=None,
     top_partial_values=None,
     top_partial_indices=None,
+    top_atomic_winner=None,
+    top_atomic_counter=None,
+    top_atomic_partitions=None,
+    top_atomic_skip_init=False,
     seq_len,
     page_size=DEFAULT_PAGE_SIZE,
     eps=1e-5,
@@ -2857,7 +3420,36 @@ def schedule_final_nvfp4_sm120(
         if top_values is not None or top_indices is not None:
             if top_values is None or top_indices is None:
                 raise ValueError("top_values and top_indices must be provided together")
-            if top_partial_values is not None or top_partial_indices is not None:
+            if top_atomic_winner is not None or top_atomic_counter is not None:
+                if top_atomic_winner is None or top_atomic_counter is None:
+                    raise ValueError("top_atomic_winner and top_atomic_counter must be provided together")
+                if top_atomic_partitions is None:
+                    raise ValueError("top_atomic_partitions must be provided for atomic top-1")
+                if not top_atomic_skip_init:
+                    ops += FinalTop1AtomicInitSm120Op.schedule(
+                        atomic_winner=top_atomic_winner,
+                        atomic_counter=top_atomic_counter,
+                        tile_sizes={"S": seq_len},
+                        page_size=page_size,
+                    )
+                ops += FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op.schedule(
+                    x=x,
+                    residual_in=residual_in,
+                    norm_weight=final_norm,
+                    weight_packed=lm_head_nvfp4.packed,
+                    weight_scales=lm_head_nvfp4.scales,
+                    atomic_winner=top_atomic_winner,
+                    atomic_counter=top_atomic_counter,
+                    top_values=top_values,
+                    top_indices=top_indices,
+                    tile_sizes={"S": seq_len, "P": 1},
+                    page_size=page_size,
+                    eps=eps,
+                    group_size=group_size,
+                    partitions=top_atomic_partitions,
+                    reset_scratch=top_atomic_skip_init,
+                )
+            elif top_partial_values is not None or top_partial_indices is not None:
                 if top_partial_values is None or top_partial_indices is None:
                     raise ValueError("top_partial_values and top_partial_indices must be provided together")
                 ops += FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op.schedule(
@@ -2938,9 +3530,11 @@ def schedule_final_nvfp4_sm120(
 __all__ = [
     "FinalRmsLmHeadSm120Op",
     "FinalRmsLmHeadNvfp4Sm120Op",
+    "FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op",
     "FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1LmHeadNvfp4Sm120Op",
+    "FinalTop1AtomicInitSm120Op",
     "MatvecPairNvfp4Sm120Op",
     "MatvecQuadNvfp4Sm120Op",
     "MatvecResidualSm120Op",
@@ -2949,6 +3543,7 @@ __all__ = [
     "MatvecNvfp4Sm120Op",
     "ResidualAddSm120Op",
     "RmsAddNormSm120Op",
+    "RmsCopyNormSm120Op",
     "RmsGateUpSiluSm120Op",
     "RmsGateUpSiluNvfp4Sm120Op",
     "RmsMatvecNvfp4Sm120Op",

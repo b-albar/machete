@@ -186,6 +186,51 @@ class TestSmemPipelinedOps:
         Megakernel(ops).run()
         torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
 
+    def test_dim_window_single_op_dispatches_physical_tile(self):
+        x = torch.arange(4 * TILE_ELEMS, dtype=torch.float16, device="cuda")
+        y = torch.full_like(x, -1)
+
+        ops = MulTwoOp.schedule(
+            x=x,
+            y=y,
+            tile_sizes={"M": TILE_ELEMS},
+            dim_windows={"M": (2 * TILE_ELEMS, TILE_ELEMS)},
+        )
+        Megakernel(ops).run()
+
+        torch.testing.assert_close(y[: 2 * TILE_ELEMS], torch.full_like(y[: 2 * TILE_ELEMS], -1))
+        torch.testing.assert_close(
+            y[2 * TILE_ELEMS : 3 * TILE_ELEMS],
+            x[2 * TILE_ELEMS : 3 * TILE_ELEMS] * 2,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        torch.testing.assert_close(y[3 * TILE_ELEMS :], torch.full_like(y[3 * TILE_ELEMS :], -1))
+
+    def test_dim_windowed_producers_feed_full_consumer(self):
+        x = torch.arange(2 * TILE_ELEMS, dtype=torch.float16, device="cuda")
+        y = torch.empty_like(x)
+        z = torch.empty_like(x)
+
+        ops = (
+            MulTwoOp.schedule(
+                x=x,
+                y=y,
+                tile_sizes={"M": TILE_ELEMS},
+                dim_windows={"M": (0, TILE_ELEMS)},
+            )
+            + MulTwoOp.schedule(
+                x=x,
+                y=y,
+                tile_sizes={"M": TILE_ELEMS},
+                dim_windows={"M": (TILE_ELEMS, TILE_ELEMS)},
+            )
+            + AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})
+        )
+        Megakernel(ops).run()
+
+        torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_mul_then_add_dtypes(self, dtype):
         x = torch.randn(1024, dtype=dtype, device="cuda")

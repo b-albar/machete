@@ -25,6 +25,10 @@ Smem page layout (all regions coexist, page_size >= 48KB):
     [P_buf: m_block×tile_N] [dS_buf: m_block×tile_N]
     K/V stay in smem throughout compute. Q_buf/dO_buf refreshed each M-block.
     Epilogue: dK/dV overwrite K/V areas for TMA store.
+
+    For the minimum D=256,tile_N=16 shape, the op uses a compact 32KB layout:
+    Q/dO rows are unpadded and P/dS scratch reuses the V smem region after the
+    dP GEMM, when V is no longer needed.
 """
 
 import cutlass
@@ -167,16 +171,22 @@ class FlashAttentionSm120BwdOp(Op):
 
         # 4 warps in (2,2,1) layout: 2 warps M × 2 warps N × 1 warp K
         # Reduces per-thread accumulator regs from 128 to 64 for dK/dV/dQ
-        # (peak: 64+64+8+8+64 = 208 regs vs 416 with 2 warps)
+        # (peak: 64+64+8+8+64 = 208 regs vs 416 with 2 warps).
+        # The compact 32KB path switches to one M warp below; a 2-M warp
+        # LdMatrix source extent can read beyond the compact Q/dO buffers.
         self.num_mma_warps = 4
-        self.num_mma_threads = self.num_mma_warps * 32
+        self.mma_layout_m = 2
+        self.mma_layout_n = 2
+        self.mma_perm_m = 32
 
         self.num_m_blocks = (self.M + self.m_block - 1) // self.m_block
 
-        # Row padding for non-TMA buffers (eliminates swizzle register overhead)
+        # Row padding for non-TMA buffers (eliminates swizzle register overhead
+        # unless the compact 32KB D=256 path is required).
         self.smem_pad = self.SMEM_PAD
-        self.q_stride = self.D + self.smem_pad  # padded D-stride for Q/dO
-        self.p_stride = self.tile_size_N + self.smem_pad  # padded tile_N-stride for P/dS
+        self.q_stride = self.D + self.smem_pad
+        self.p_stride = self.tile_size_N + self.smem_pad
+        self.compact_32kb = 0
 
         # Smem layout: K/V (TMA swizzle, no pad), Q/dO/P/dS (row padded)
         self.kv_tile_bytes = self.tile_size_N * self.D * self.elem_bytes
@@ -192,6 +202,34 @@ class FlashAttentionSm120BwdOp(Op):
         self.ds_buf_offset = self.p_buf_offset + self.p_buf_bytes
 
         total_smem = self.ds_buf_offset + self.ds_buf_bytes
+        if total_smem > self.page_size:
+            compact_q_stride = self.D
+            compact_p_stride = self.tile_size_N
+            compact_q_buf_bytes = self.m_block * compact_q_stride * self.elem_bytes
+            compact_do_buf_bytes = self.m_block * compact_q_stride * self.elem_bytes
+            compact_p_buf_bytes = self.m_block * compact_p_stride * self.elem_bytes
+            compact_ds_buf_bytes = self.m_block * compact_p_stride * self.elem_bytes
+            compact_total = 2 * self.kv_tile_bytes + compact_q_buf_bytes + compact_do_buf_bytes
+            if compact_total <= self.page_size and compact_p_buf_bytes + compact_ds_buf_bytes <= self.kv_tile_bytes:
+                self.compact_32kb = 1
+                self.num_mma_warps = 2
+                self.mma_layout_m = 1
+                self.mma_layout_n = 2
+                self.mma_perm_m = 16
+                self.smem_pad = 0
+                self.q_stride = compact_q_stride
+                self.p_stride = compact_p_stride
+                self.q_buf_bytes = compact_q_buf_bytes
+                self.do_buf_bytes = compact_do_buf_bytes
+                self.p_buf_bytes = compact_p_buf_bytes
+                self.ds_buf_bytes = compact_ds_buf_bytes
+                self.q_buf_offset = 2 * self.kv_tile_bytes
+                self.do_buf_offset = self.q_buf_offset + self.q_buf_bytes
+                # P/dS reuse V smem after dP has consumed V.
+                self.p_buf_offset = self.kv_tile_bytes
+                self.ds_buf_offset = self.p_buf_offset + self.p_buf_bytes
+                total_smem = compact_total
+        self.num_mma_threads = self.num_mma_warps * 32
         assert total_smem <= self.page_size, (
             f"Total smem ({total_smem}B) exceeds page_size ({self.page_size}B). "
             f"tile_N={self.tile_size_N}, D={self.D}"
@@ -228,15 +266,20 @@ class FlashAttentionSm120BwdOp(Op):
         Layout: K + V (TMA swizzle, no pad) + Q_buf + dO_buf + P_buf + dS_buf (row padded)
         """
         pad = cls.SMEM_PAD
-        return (
+        regular = (
             2 * tile_N * D  # K + V: TMA swizzle, no padding
             + 2 * tile_N * (D + pad)  # Q_buf + dO_buf: row padded
             + 2 * tile_N * (tile_N + pad)  # P_buf + dS_buf: row padded
         ) * elem_bytes
+        compact = (2 * tile_N * D + 2 * tile_N * D) * elem_bytes
+        pds = 2 * tile_N * tile_N * elem_bytes
+        if pds <= tile_N * D * elem_bytes:
+            return min(regular, compact)
+        return regular
 
     @classmethod
     def schedule(cls, tile_sizes=None, causal=False, page_size=None,
-                          kv_group_size=1, **tensors):
+                          kv_group_size=1, dim_windows=None, **tensors):
         """Schedule backward pass.
 
         If page_size is None, auto-detects optimal page_size from GPU shared
@@ -296,7 +339,7 @@ class FlashAttentionSm120BwdOp(Op):
         if page_size is None:
             page_size = DEFAULT_PAGE_SIZE
 
-        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, dim_windows=dim_windows, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         if q is not None:
             ops[0].static_dims["M"] = q.shape[1]
@@ -423,8 +466,8 @@ class FlashAttentionSm120BwdOp(Op):
             mma_op = warp.MmaF16BF16Op(self.dtype, Float32, (16, 8, 16))
             tiled_mma = cute.make_tiled_mma(
                 mma_op,
-                cute.make_layout((2, 2, 1)),
-                permutation_mnk=(32, 16, 16),
+                cute.make_layout((self.mma_layout_m, self.mma_layout_n, 1)),
+                permutation_mnk=(self.mma_perm_m, 16, 16),
             )
             thr_mma = tiled_mma.get_slice(tidx)
 

@@ -77,20 +77,20 @@ def mk_qknorm_rope(q, norm_weight, cos, sin):
 
 def mk_qknorm_rope_bwd(q, norm_weight, cos, sin, dout):
     """Megakernel QKNorm+RoPE backward returning dq only."""
-    q_flat = q.float().view(q.shape[0] * q.shape[1], q.shape[2], q.shape[3]).contiguous()
-    dout_flat = dout.float().view_as(q_flat).contiguous()
-    dq_flat = torch.empty_like(q_flat)
+    q_4d = q.float().contiguous()
+    dout_4d = dout.float().contiguous()
+    dq_4d = torch.empty_like(q_4d)
     ops = QKNormRopeBwdOp.schedule(
-        q=q_flat,
-        dout=dout_flat,
-        dq=dq_flat,
+        q=q_4d,
+        dout=dout_4d,
+        dq=dq_4d,
         norm_weight=norm_weight.float().contiguous(),
         cos=cos.float().contiguous(),
         sin=sin.float().contiguous(),
     )
     kernel = Megakernel(ops, config=MegakernelConfig(num_sms=2))
     kernel.run()
-    return dq_flat.view_as(q)
+    return dq_4d
 
 
 def build_qknorm_rope_kernel(q, norm_weight, cos, sin, eps=1e-6, num_sms=2):

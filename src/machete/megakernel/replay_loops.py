@@ -386,10 +386,15 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _dl_1 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_1))
                         _dl_2 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_2))
                         _dl_3 = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_TILE_3))
+                        _dl_0 = _dl_0 + _op_meta_i32_base(op_meta_ptr, _dl_meta_base, Int32(_OP_META_ORIGIN_0))
+                        _dl_1 = _dl_1 + _op_meta_i32_base(op_meta_ptr, _dl_meta_base, Int32(_OP_META_ORIGIN_1))
+                        _dl_2 = _dl_2 + _op_meta_i32_base(op_meta_ptr, _dl_meta_base, Int32(_OP_META_ORIGIN_2))
+                        _dl_3 = _dl_3 + _op_meta_i32_base(op_meta_ptr, _dl_meta_base, Int32(_OP_META_ORIGIN_3))
                         _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
                         if const_expr(tracing):
                             _tl = trace_start()
+                        _dl_page = _dl_slot
                         if const_expr(has_page_free_ops):
                             _dl_page = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_PAGE_ID))
                             _dl_pp = _get_page_ptr(smem_base, _dl_page)
@@ -419,13 +424,14 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                                 _dl_mbar,
                             )
                         if const_expr(tracing):
-                            _dma_lane = end_event_dynamic_raw_1(
+                            _dma_lane = end_event_dynamic_raw_2(
                                 _tl,
                                 _trace_buf,
                                 Int32(trace_row_stride),
                                 _dma_lane,
                                 ld_global_i32(trace_load_fmt_ptr, _dl_op),
                                 _dl_op,
+                                _dl_page,
                             )
                     _ldr_idx = _ldr_idx + Int32(1)
                 else:
@@ -481,6 +487,10 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                     _ds_1 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_1))
                     _ds_2 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_2))
                     _ds_3 = ld_shared_i32(_ds_ti + Int32(4 * _TILE_INFO_TILE_3))
+                    _ds_0 = _ds_0 + _op_meta_i32_base(op_meta_ptr, _ds_meta_base, Int32(_OP_META_ORIGIN_0))
+                    _ds_1 = _ds_1 + _op_meta_i32_base(op_meta_ptr, _ds_meta_base, Int32(_OP_META_ORIGIN_1))
+                    _ds_2 = _ds_2 + _op_meta_i32_base(op_meta_ptr, _ds_meta_base, Int32(_OP_META_ORIGIN_2))
+                    _ds_3 = _ds_3 + _op_meta_i32_base(op_meta_ptr, _ds_meta_base, Int32(_OP_META_ORIGIN_3))
                     _ds_instruction_idx = ld_shared_i32(
                         _ds_ti + Int32(4 * _TILE_INFO_INSTRUCTION_IDX)
                     )
@@ -555,13 +565,14 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                     if const_expr(tracing):
-                        _store_lane = end_event_dynamic_raw_1(
+                        _store_lane = end_event_dynamic_raw_2(
                             _tss,
                             _trace_buf,
                             Int32(trace_row_stride),
                             _store_lane,
                             ld_global_i32(trace_store_fmt_ptr, _ds_op),
                             _ds_op,
+                            _ds_page,
                         )
 
                     with cute.arch.elect_one():
@@ -672,6 +683,10 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                     tile_2 = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_TILE_2))
                     tile_3 = ld_shared_i32(tile_info_ptr + Int32(4 * _TILE_INFO_TILE_3))
                     _op_meta_base_cached = _op_meta_base(op_idx)
+                    tile_0 = tile_0 + _op_meta_i32_base(op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_ORIGIN_0))
+                    tile_1 = tile_1 + _op_meta_i32_base(op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_ORIGIN_1))
+                    tile_2 = tile_2 + _op_meta_i32_base(op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_ORIGIN_2))
+                    tile_3 = tile_3 + _op_meta_i32_base(op_meta_ptr, _op_meta_base_cached, Int32(_OP_META_ORIGIN_3))
                     _handler_idx = ld_shared_i32(
                         tile_info_ptr + Int32(4 * _TILE_INFO_HANDLER_IDX)
                     )
@@ -806,13 +821,14 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
                     if const_expr(tracing):
-                        _mma_lane = end_event_dynamic_raw_1(
+                        _mma_lane = end_event_dynamic_raw_2(
                             _tc,
                             _trace_buf,
                             Int32(trace_row_stride),
                             _mma_lane,
                             ld_global_i32(trace_compute_fmt_ptr, op_idx),
                             op_idx,
+                            _page_id,
                         )
 
                     with cute.arch.elect_one():
@@ -832,6 +848,7 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
     dispatch_compute = runtime["dispatch_compute"]
     signal_barriers = runtime["signal_barriers"]
     max_waits = runtime["max_waits"]
+    max_compute_waits = runtime["max_compute_waits"]
     max_signal_formulas = kernel._max_signal_formulas
     num_mma_warps = kernel_cfg["num_mma_warps"]
     num_compute_threads = kernel_cfg["num_compute_threads"]
@@ -882,8 +899,11 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
         _cached_wait_count = Int32(0)
         _cached_wait_acquire = Int32(0)
         _cached_signal_count = Int32(0)
+        _cached_compute_wait_count = Int32(0)
         _cached_wait_barrier = Int32(-2)
         _cached_wait_expected = Int32(-1)
+        _cached_compute_wait_barrier = Int32(-2)
+        _cached_compute_wait_expected = Int32(-1)
         _running = Int32(1)
         _cached_op_idx = Int32(TileInstruction.END_MARKER)
         _cached_handler = Int32(0)
@@ -930,6 +950,9 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                     _cached_phase_mask = _op_meta_i32_base(
                         op_meta_ptr, _meta_base, Int32(_OP_META_PHASE_MASK)
                     )
+                    _cached_signal_count = _op_meta_i32_base(
+                        op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
+                    )
                     _cached_op_idx = op_idx
                 _handler = _cached_handler
                 _barrier_meta_idx = ld_shared_i32(iq_base + Int32(4 * _INSTR_BARRIER_META_IDX))
@@ -947,12 +970,15 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                         _cached_wait_count = _op_meta_i32_base(
                             op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_COUNT)
                         )
-                        _cached_signal_count = _op_meta_i32_base(
-                            op_meta_ptr, _meta_base, Int32(_OP_META_SIGNAL_COUNT)
-                        )
                         _cached_wait_acquire = _op_meta_i32_base(
                             op_meta_ptr, _meta_base, Int32(_OP_META_WAIT_ACQUIRE)
                         )
+                        if const_expr(max_compute_waits > 0):
+                            _cached_compute_wait_count = _op_meta_i32_base(
+                                op_meta_ptr,
+                                _meta_base,
+                                Int32(_OP_META_COMPUTE_WAIT_COUNT),
+                            )
 
                     if _cached_wait_count > Int32(0):
                         _done_waits = Int32(0)
@@ -988,6 +1014,41 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                                         _done_waits = Int32(1)
                                 else:
                                     _done_waits = Int32(1)
+                    if const_expr(max_compute_waits > 0):
+                        if _cached_compute_wait_count > Int32(0):
+                            _done_compute_waits = Int32(0)
+                            for _cw in range_constexpr(max_compute_waits):
+                                if _done_compute_waits == Int32(0):
+                                    if _cw < _cached_compute_wait_count:
+                                        _cwi_off = (
+                                            _barrier_meta_idx * Int32(max_compute_waits * 2)
+                                            + Int32(_cw * 2)
+                                        )
+                                        _cbar_idx = ld_global_i32(compute_wait_info_ptr, _cwi_off)
+                                        if _cbar_idx >= Int32(0):
+                                            _cbar_exp = ld_global_i32(compute_wait_info_ptr, _cwi_off + Int32(1))
+                                            if (
+                                                _cbar_idx != _cached_compute_wait_barrier
+                                                or _cbar_exp != _cached_compute_wait_expected
+                                            ):
+                                                if const_expr(relaxed_global_barriers):
+                                                    if _cached_wait_acquire != Int32(0):
+                                                        global_barrier_wait(barriers_ptr, _cbar_idx, _cbar_exp)
+                                                    else:
+                                                        global_barrier_wait_relaxed(
+                                                            barriers_ptr,
+                                                            _cbar_idx,
+                                                            _cbar_exp,
+                                                            Int32(global_barrier_sleep_ns),
+                                                        )
+                                                else:
+                                                    global_barrier_wait(barriers_ptr, _cbar_idx, _cbar_exp)
+                                                _cached_compute_wait_barrier = _cbar_idx
+                                                _cached_compute_wait_expected = _cbar_exp
+                                        else:
+                                            _done_compute_waits = Int32(1)
+                                    else:
+                                        _done_compute_waits = Int32(1)
 
                 named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
@@ -997,6 +1058,10 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                 tile_1 = (_tile_01 >> Int32(16)) & Int32(65535)
                 tile_2 = _tile_23 & Int32(65535)
                 tile_3 = (_tile_23 >> Int32(16)) & Int32(65535)
+                origin_0 = _op_meta_i32_base(op_meta_ptr, _meta_base, Int32(_OP_META_ORIGIN_0))
+                origin_1 = _op_meta_i32_base(op_meta_ptr, _meta_base, Int32(_OP_META_ORIGIN_1))
+                origin_2 = _op_meta_i32_base(op_meta_ptr, _meta_base, Int32(_OP_META_ORIGIN_2))
+                origin_3 = _op_meta_i32_base(op_meta_ptr, _meta_base, Int32(_OP_META_ORIGIN_3))
                 page_ptr = _get_page_ptr(smem_base, Int32(0))
                 _phase_mask = _cached_phase_mask
                 _range_pos = Int32(0)
@@ -1064,6 +1129,48 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                                             _done_waits = Int32(1)
                                     else:
                                         _done_waits = Int32(1)
+                                else:
+                                    _done_waits = Int32(1)
+                    if (
+                        const_expr(max_compute_waits > 0)
+                        and _range_axis >= Int32(0)
+                        and warp_id == Int32(0)
+                        and lane_id == Int32(0)
+                    ):
+                        if _cached_compute_wait_count > Int32(0):
+                            _done_compute_waits = Int32(0)
+                            for _cw in range_constexpr(max_compute_waits):
+                                if _done_compute_waits == Int32(0):
+                                    if _cw < _cached_compute_wait_count:
+                                        _cwi_off = (
+                                            _current_meta_idx * Int32(max_compute_waits * 2)
+                                            + Int32(_cw * 2)
+                                        )
+                                        _cbar_idx = ld_global_i32(compute_wait_info_ptr, _cwi_off)
+                                        if _cbar_idx >= Int32(0):
+                                            _cbar_exp = ld_global_i32(compute_wait_info_ptr, _cwi_off + Int32(1))
+                                            if (
+                                                _cbar_idx != _cached_compute_wait_barrier
+                                                or _cbar_exp != _cached_compute_wait_expected
+                                            ):
+                                                if const_expr(relaxed_global_barriers):
+                                                    if _cached_wait_acquire != Int32(0):
+                                                        global_barrier_wait(barriers_ptr, _cbar_idx, _cbar_exp)
+                                                    else:
+                                                        global_barrier_wait_relaxed(
+                                                            barriers_ptr,
+                                                            _cbar_idx,
+                                                            _cbar_exp,
+                                                            Int32(global_barrier_sleep_ns),
+                                                        )
+                                                else:
+                                                    global_barrier_wait(barriers_ptr, _cbar_idx, _cbar_exp)
+                                                _cached_compute_wait_barrier = _cbar_idx
+                                                _cached_compute_wait_expected = _cbar_exp
+                                        else:
+                                            _done_compute_waits = Int32(1)
+                                    else:
+                                        _done_compute_waits = Int32(1)
                     if _range_axis >= Int32(0):
                         named_barrier_sync(Int32(1), Int32(num_compute_threads))
 
@@ -1075,6 +1182,10 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                         tile_2 = _range_pos
                     if _range_axis == Int32(3):
                         tile_3 = _range_pos
+                    dispatch_tile_0 = tile_0 + origin_0
+                    dispatch_tile_1 = tile_1 + origin_1
+                    dispatch_tile_2 = tile_2 + origin_2
+                    dispatch_tile_3 = tile_3 + origin_3
                     if const_expr(dispatch_compute_uses_handler_local_idx):
                         if const_expr(tracing):
                             _tc = trace_start()
@@ -1082,10 +1193,10 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                             _handler,
                             _compute_local,
                             page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
+                            dispatch_tile_0,
+                            dispatch_tile_1,
+                            dispatch_tile_2,
+                            dispatch_tile_3,
                             _config,
                         )
                         if const_expr(tracing):
@@ -1103,10 +1214,10 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                         dispatch_compute(
                             _handler,
                             page_ptr,
-                            tile_0,
-                            tile_1,
-                            tile_2,
-                            tile_3,
+                            dispatch_tile_0,
+                            dispatch_tile_1,
+                            dispatch_tile_2,
+                            dispatch_tile_3,
                             _config,
                         )
                         if const_expr(tracing):
@@ -1118,26 +1229,26 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                                 ld_global_i32(trace_compute_fmt_ptr, op_idx),
                                 op_idx,
                             )
-                    if (
-                        _range_axis >= Int32(0)
-                        and warp_id == Int32(0)
-                        and lane_id == Int32(0)
-                    ):
+                    named_barrier_sync(Int32(1), Int32(num_compute_threads))
+                    if _range_axis >= Int32(0):
                         if _cached_signal_count > Int32(0):
-                            if _cached_signal_count == Int32(1):
-                                _sig_barrier = ld_global_i32(
-                                    signal_meta_ptr,
-                                    _current_meta_idx * Int32(max_signal_formulas),
-                                )
-                                if _sig_barrier >= Int32(0):
-                                    global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
-                            else:
-                                signal_barriers(
-                                    signal_meta_ptr,
-                                    _current_meta_idx,
-                                    _cached_signal_count,
-                                    barriers_ptr,
-                                )
+                            global_memory_fence_gpu()
+                            named_barrier_sync(Int32(1), Int32(num_compute_threads))
+                            if warp_id == Int32(0) and lane_id == Int32(0):
+                                if _cached_signal_count == Int32(1):
+                                    _sig_barrier = ld_global_i32(
+                                        signal_meta_ptr,
+                                        _current_meta_idx * Int32(max_signal_formulas),
+                                    )
+                                    if _sig_barrier >= Int32(0):
+                                        global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
+                                else:
+                                    signal_barriers(
+                                        signal_meta_ptr,
+                                        _current_meta_idx,
+                                        _cached_signal_count,
+                                        barriers_ptr,
+                                    )
                     _range_offset = _range_offset + Int32(1)
                     _range_pos = _range_pos + _range_stride
 
@@ -1150,34 +1261,33 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                 if _range_axis == Int32(3):
                     tile_3 = (_tile_23 >> Int32(16)) & Int32(65535)
 
-                if const_expr(sync_compute_warps_after_tile):
+                if _range_axis < Int32(0):
                     named_barrier_sync(
                         Int32(1),
                         Int32(num_compute_threads),
                     )
-
-                if (
-                    _range_axis < Int32(0)
-                    and warp_id == Int32(0)
-                    and lane_id == Int32(0)
-                ):
                     if _cached_signal_count > Int32(0):
-                        if _cached_signal_count == Int32(1):
-                            _sig_barrier = ld_global_i32(
-                                signal_meta_ptr,
-                                _barrier_meta_idx * Int32(max_signal_formulas),
-                            )
-                            if _sig_barrier >= Int32(0):
-                                global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
-                        else:
-                            signal_barriers(
-                                signal_meta_ptr,
-                                _barrier_meta_idx,
-                                _cached_signal_count,
-                                barriers_ptr,
-                            )
+                        global_memory_fence_gpu()
+                        named_barrier_sync(
+                            Int32(1),
+                            Int32(num_compute_threads),
+                        )
+                        if warp_id == Int32(0) and lane_id == Int32(0):
+                            if _cached_signal_count == Int32(1):
+                                _sig_barrier = ld_global_i32(
+                                    signal_meta_ptr,
+                                    _barrier_meta_idx * Int32(max_signal_formulas),
+                                )
+                                if _sig_barrier >= Int32(0):
+                                    global_barrier_signal_gpu(barriers_ptr, _sig_barrier)
+                            else:
+                                signal_barriers(
+                                    signal_meta_ptr,
+                                    _barrier_meta_idx,
+                                    _cached_signal_count,
+                                    barriers_ptr,
+                                )
             named_barrier_sync(Int32(1), Int32(num_compute_threads))
-
         if const_expr(tracing):
             finish_lane_dynamic_raw(_trace_buf, _mma_lane)
 

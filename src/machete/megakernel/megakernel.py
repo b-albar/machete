@@ -16,6 +16,7 @@ import ctypes
 from dataclasses import dataclass
 import inspect
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 
@@ -65,6 +66,7 @@ from .interpreter import (
     global_barrier_signal_gpu,
     global_barrier_wait,
     global_barrier_wait_relaxed,
+    global_memory_fence_gpu,
     load_instruction_to_smem,
     prefetch_instruction,
     ld_global_i32,
@@ -78,7 +80,6 @@ from .interpreter import (
     nanosleep,
 )
 from .paged_memory import (
-    MAX_PAGES,
     NPageLayout,
     PipelinePageLayout,
     st_shared_i32,
@@ -145,17 +146,21 @@ _OP_META_COUNT_0 = 5
 _OP_META_COUNT_1 = 6
 _OP_META_COUNT_2 = 7
 _OP_META_COUNT_3 = 8
-_OP_META_HANDLER_IDX = 9
-_OP_META_LOAD_LOCAL_IDX = 10
-_OP_META_COMPUTE_LOCAL_IDX = 11
-_OP_META_STORE_LOCAL_IDX = 12
-_OP_META_COMM_LOCAL_IDX = 13
-_OP_META_WAIT_COUNT = 14
-_OP_META_COMPUTE_WAIT_COUNT = 15
-_OP_META_SIGNAL_COUNT = 16
-_OP_META_WAIT_ACQUIRE = 17
-_OP_META_PHASE_MASK = 18
-_OP_META_STRIDE = 19
+_OP_META_ORIGIN_0 = 9
+_OP_META_ORIGIN_1 = 10
+_OP_META_ORIGIN_2 = 11
+_OP_META_ORIGIN_3 = 12
+_OP_META_HANDLER_IDX = 13
+_OP_META_LOAD_LOCAL_IDX = 14
+_OP_META_COMPUTE_LOCAL_IDX = 15
+_OP_META_STORE_LOCAL_IDX = 16
+_OP_META_COMM_LOCAL_IDX = 17
+_OP_META_WAIT_COUNT = 18
+_OP_META_COMPUTE_WAIT_COUNT = 19
+_OP_META_SIGNAL_COUNT = 20
+_OP_META_WAIT_ACQUIRE = 21
+_OP_META_PHASE_MASK = 22
+_OP_META_STRIDE = 23
 
 _OP_PHASE_LOAD = 1
 _OP_PHASE_COMPUTE = 2
@@ -508,9 +513,10 @@ class Megakernel:
             os.environ.get("MACHETE_ENABLE_PAGE_FREE_OPS", "0") == "1"
             and any(not bool(getattr(op.op_cls, "uses_smem_page", True)) for op in ops)
         )
-        # Keep instruction slots separate from physical shared-memory pages for
-        # multi-page kernels. This prevents slot metadata/mbarrier phase reuse
-        # from being coupled to page reuse.
+        # Page-using ring replay keeps a simple ownership rule: one live slot
+        # owns one physical page. Compute-only replay does not consume these
+        # pages, so deeper compute prefetching should be handled in that replay
+        # path rather than by aliasing page-backed slots.
         self._use_physical_page_ring = self._has_page_free_ops
 
         # Detect resident block count if not specified.
@@ -532,13 +538,9 @@ class Megakernel:
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
-            num_slots = self.config.num_pages
-            if self.config.num_pages > 1 or self._has_page_free_ops:
-                num_slots = min(MAX_PAGES, self.config.num_pages + 2)
-                self._use_physical_page_ring = True
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
-                num_slots=num_slots,
+                num_slots=self.config.num_pages,
                 page_size=self.config.page_size,
             )
         else:
@@ -555,15 +557,14 @@ class Megakernel:
                 else:
                     max_smem = 228 * 1024
                 for n in range(self._layout.num_pages, 0, -1):
-                    num_slots = min(MAX_PAGES, n + 2) if n > 1 or self._has_page_free_ops else n
                     candidate = NPageLayout(
                         num_pages=n,
-                        num_slots=num_slots,
+                        num_slots=n,
                         page_size=self.config.page_size,
                     )
                     if candidate.total_size <= max_smem:
                         self._layout = candidate
-                        self._use_physical_page_ring = n > 1 or self._has_page_free_ops
+                        self._use_physical_page_ring = self._has_page_free_ops
                         break
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
@@ -895,6 +896,7 @@ class Megakernel:
                     num_warps,
                     *tile_strides,
                     *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
+                    *(op.tile_origin_for_axis(axis) for axis in range(MAX_TILE_DIMS)),
                     handler_idx,
                     *self._phase_local_indices_for_op(op_phase_local_indices, op_idx),
                     wait_count,
@@ -1187,6 +1189,12 @@ class Megakernel:
 
         write_trace_perfetto(self._tracing_state, filename)
 
+    def write_dependency_graph_csv(self, op_csv: str, tile_csv: str) -> None:
+        """Write static op and tile dependency graphs as CSV files."""
+        Path(op_csv).parent.mkdir(parents=True, exist_ok=True)
+        Path(tile_csv).parent.mkdir(parents=True, exist_ok=True)
+        self._builder.export_dependency_graph_csv(op_csv, tile_csv)
+
     def _build_pipelined_dispatch_fns(self):
         """Build dispatch functions for pipelined execution phases.
 
@@ -1298,6 +1306,10 @@ class Megakernel:
             "_OP_META_COUNT_1": _OP_META_COUNT_1,
             "_OP_META_COUNT_2": _OP_META_COUNT_2,
             "_OP_META_COUNT_3": _OP_META_COUNT_3,
+            "_OP_META_ORIGIN_0": _OP_META_ORIGIN_0,
+            "_OP_META_ORIGIN_1": _OP_META_ORIGIN_1,
+            "_OP_META_ORIGIN_2": _OP_META_ORIGIN_2,
+            "_OP_META_ORIGIN_3": _OP_META_ORIGIN_3,
             "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
             "_OP_META_LOAD_LOCAL_IDX": _OP_META_LOAD_LOCAL_IDX,
             "_OP_META_COMPUTE_LOCAL_IDX": _OP_META_COMPUTE_LOCAL_IDX,
@@ -1793,9 +1805,10 @@ class Megakernel:
         schedule() was called.
         """
         for op in self.ops:
-            if not op.tensor_metas:
+            validation_metas = op.tensor_validation_metas or op.tensor_metas
+            if not validation_metas:
                 continue
-            for name, meta in op.tensor_metas.items():
+            for name, meta in validation_metas.items():
                 ref = op.tensor_refs.get(name)
                 if ref is None:
                     continue

@@ -285,6 +285,22 @@ def global_barrier_signal_gpu(
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
+
+@dsl_user_op
+def global_memory_fence_gpu(*, loc=None, ip=None) -> None:
+    """Make this thread's global writes visible before a dependency signal."""
+    llvm.inline_asm(
+        None,
+        [],
+        "membar.gl;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
 # =============================================================================
 # Instruction Stream Access
 # =============================================================================
@@ -838,6 +854,7 @@ __all__ = [
     "global_barrier_wait_relaxed",
     "global_barrier_signal",
     "global_barrier_signal_gpu",
+    "global_memory_fence_gpu",
     "check_barrier_ready",
     "check_barrier_ready_gpu",
     "load_instruction_to_smem",

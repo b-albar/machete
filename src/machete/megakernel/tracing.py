@@ -45,7 +45,7 @@ def _max_events_per_lane(total_tiles: int, num_sms: int) -> int:
     lane rows and the host parser later sees bogus dynamic format IDs.
     """
     tiles_per_sm = math.ceil(max(1, int(total_tiles)) / max(1, int(num_sms)))
-    return max(1024, tiles_per_sm * 64 + 512)
+    return max(4096, tiles_per_sm * 256 + 2048)
 
 
 def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
@@ -75,8 +75,8 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
                 tt = TraceType(
                     name=key,
                     label_string=f"{cls_name} {phase}",
-                    tooltip_string=f"{cls_name} {phase} op={{0}}",
-                    param_count=1,
+                    tooltip_string=f"{cls_name} {phase} op={{0}} page={{1}}",
+                    param_count=2,
                     lane_type=LaneType.DYNAMIC,
                 )
                 seen_classes[cls_name][phase] = tt
@@ -108,23 +108,23 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
 
     load_track = TrackType(
         name="Load",
-        label_string="SM {lane} Load",
-        tooltip_string="Load warp on SM {lane}",
+        label_string="Lane {lane} Load",
+        tooltip_string="Load warp lane {lane}",
     )
     mma_track = TrackType(
         name="MMA",
-        label_string="SM {lane} MMA",
-        tooltip_string="MMA warp 0 on SM {lane}",
+        label_string="Lane {lane} MMA",
+        tooltip_string="MMA warp 0 lane {lane}",
     )
     store_track = TrackType(
         name="Store",
-        label_string="SM {lane} Store",
-        tooltip_string="Store warp on SM {lane}",
+        label_string="Lane {lane} Store",
+        tooltip_string="Store warp lane {lane}",
     )
     controller_track = TrackType(
         name="Controller",
-        label_string="SM {lane} Controller",
-        tooltip_string="Controller warp on SM {lane}",
+        label_string="Lane {lane} Controller",
+        tooltip_string="Controller warp lane {lane}",
     )
 
     # 4 lanes: load, MMA, store, controller. Wait-heavy backward overlap traces
@@ -264,12 +264,14 @@ def get_trace_exec_globals(state: TracingState) -> dict:
             start as trace_start,
             begin_lane_dynamic_raw,
             end_event_dynamic_raw_1,
+            end_event_dynamic_raw_2,
             finish_lane_dynamic_raw,
         )
         return {
             "trace_start": trace_start,
             "begin_lane_dynamic_raw": begin_lane_dynamic_raw,
             "end_event_dynamic_raw_1": end_event_dynamic_raw_1,
+            "end_event_dynamic_raw_2": end_event_dynamic_raw_2,
             "finish_lane_dynamic_raw": finish_lane_dynamic_raw,
             "trace_row_stride": state.builder.row_stride_bytes,
             "trace_load_fmt_ptr": Int64(state.load_fmts_tensor.data_ptr()),
