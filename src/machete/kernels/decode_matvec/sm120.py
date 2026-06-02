@@ -263,46 +263,185 @@ def _nvfp4_ptr_dot8(
             Float32(v7).ir_value(loc=loc, ip=ip),
             Float32(scale).ir_value(loc=loc, ip=ip),
         ],
+        # Packed-half dot: dequant fp4->f16x2, pack the two f32 activations into
+        # an f16x2, and MAC with a single fma.f16x2 per byte (2 weights). Each
+        # f16x2 lane accumulates 4 terms, then we promote to f32 and apply the
+        # group scale. Fewer instructions than the scalar f32 path; f16
+        # accumulation over 4 terms is well within inference tolerance.
         "{\n"
         ".reg .u64 addr;\n"
         ".reg .b8 byte0, byte1, byte2, byte3;\n"
-        ".reg .f16x2 fp4_f16x2;\n"
-        ".reg .f16 weight0_f16, weight1_f16;\n"
-        ".reg .f32 weight0, weight1, acc;\n"
+        ".reg .b32 w_f16x2, a_f16x2, acc_f16x2;\n"
+        ".reg .f16 acc_lo, acc_hi;\n"
+        ".reg .f32 acc_lo_f, acc_hi_f, total;\n"
         "cvt.u64.u32 addr, $2;\n"
         "add.u64 addr, addr, $1;\n"
         "ld.global.u8 byte0, [addr];\n"
         "ld.global.u8 byte1, [addr+1];\n"
         "ld.global.u8 byte2, [addr+2];\n"
         "ld.global.u8 byte3, [addr+3];\n"
-        "mov.f32 acc, 0f00000000;\n"
-        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte0;\n"
-        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
-        "cvt.f32.f16 weight0, weight0_f16;\n"
-        "cvt.f32.f16 weight1, weight1_f16;\n"
-        "fma.rn.f32 acc, weight0, $3, acc;\n"
-        "fma.rn.f32 acc, weight1, $4, acc;\n"
-        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte1;\n"
-        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
-        "cvt.f32.f16 weight0, weight0_f16;\n"
-        "cvt.f32.f16 weight1, weight1_f16;\n"
-        "fma.rn.f32 acc, weight0, $5, acc;\n"
-        "fma.rn.f32 acc, weight1, $6, acc;\n"
-        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte2;\n"
-        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
-        "cvt.f32.f16 weight0, weight0_f16;\n"
-        "cvt.f32.f16 weight1, weight1_f16;\n"
-        "fma.rn.f32 acc, weight0, $7, acc;\n"
-        "fma.rn.f32 acc, weight1, $8, acc;\n"
-        "cvt.rn.f16x2.e2m1x2 fp4_f16x2, byte3;\n"
-        "mov.b32 {weight0_f16, weight1_f16}, fp4_f16x2;\n"
-        "cvt.f32.f16 weight0, weight0_f16;\n"
-        "cvt.f32.f16 weight1, weight1_f16;\n"
-        "fma.rn.f32 acc, weight0, $9, acc;\n"
-        "fma.rn.f32 acc, weight1, $10, acc;\n"
-        "mul.rn.f32 $0, acc, $11;\n"
+        "mov.b32 acc_f16x2, 0;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte0;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $4, $3;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte1;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $6, $5;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte2;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $8, $7;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte3;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $10, $9;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "mov.b32 {acc_lo, acc_hi}, acc_f16x2;\n"
+        "cvt.f32.f16 acc_lo_f, acc_lo;\n"
+        "cvt.f32.f16 acc_hi_f, acc_hi;\n"
+        "add.f32 total, acc_lo_f, acc_hi_f;\n"
+        "mul.rn.f32 $0, total, $11;\n"
         "}\n",
         "=f,l,r,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(result)
+
+
+@dsl_user_op
+def _nvfp4_reg_dot8(
+    packed: Int32,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Dot-8 of nvfp4 weights with the weight bytes supplied as a packed u32
+    REGISTER (read via cute outside the asm). Hoisting the global loads out of
+    the asm lets the compiler pipeline them across K-loop iterations, hiding the
+    weight-load latency the in-asm ``ld.global`` could not."""
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.F32Type.get(),
+        [
+            Int32(packed).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(v4).ir_value(loc=loc, ip=ip),
+            Float32(v5).ir_value(loc=loc, ip=ip),
+            Float32(v6).ir_value(loc=loc, ip=ip),
+            Float32(v7).ir_value(loc=loc, ip=ip),
+            Float32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .b32 packed, sh1, sh2, sh3;\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        ".reg .b32 w_f16x2, a_f16x2, acc_f16x2;\n"
+        ".reg .f16 acc_lo, acc_hi;\n"
+        ".reg .f32 acc_lo_f, acc_hi_f, total;\n"
+        "mov.b32 packed, $1;\n"
+        "shr.u32 sh1, packed, 8;\n"
+        "shr.u32 sh2, packed, 16;\n"
+        "shr.u32 sh3, packed, 24;\n"
+        "cvt.u8.u32 byte0, packed;\n"
+        "cvt.u8.u32 byte1, sh1;\n"
+        "cvt.u8.u32 byte2, sh2;\n"
+        "cvt.u8.u32 byte3, sh3;\n"
+        "mov.b32 acc_f16x2, 0;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte0;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $3, $2;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte1;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $5, $4;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte2;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $7, $6;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte3;\n"
+        "cvt.rn.f16x2.f32 a_f16x2, $9, $8;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, a_f16x2, acc_f16x2;\n"
+        "mov.b32 {acc_lo, acc_hi}, acc_f16x2;\n"
+        "cvt.f32.f16 acc_lo_f, acc_lo;\n"
+        "cvt.f32.f16 acc_hi_f, acc_hi;\n"
+        "add.f32 total, acc_lo_f, acc_hi_f;\n"
+        "mul.rn.f32 $0, total, $10;\n"
+        "}\n",
+        "=f,r,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(result)
+
+
+def _nvfp4_reg_dot8_f16a(
+    packed: Int32,
+    a01: Int32,
+    a23: Int32,
+    a45: Int32,
+    a67: Int32,
+    scale: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Dot-8 of nvfp4 weights against an activation supplied as 4 packed f16x2
+    REGISTERS (``a01``=elems 0,1 …). Unlike :func:`_nvfp4_reg_dot8` this skips the
+    per-call ``cvt.f16x2.f32`` of the activation — the activation is pre-converted
+    to f16 once (it is reused across every output), so the dot just ``fma``s the
+    f16x2 directly. Removes 4 instructions / 8 MACs vs the f32-activation dot."""
+    from cutlass._mlir import ir
+
+    result = llvm.inline_asm(
+        ir.F32Type.get(),
+        [
+            Int32(packed).ir_value(loc=loc, ip=ip),
+            Int32(a01).ir_value(loc=loc, ip=ip),
+            Int32(a23).ir_value(loc=loc, ip=ip),
+            Int32(a45).ir_value(loc=loc, ip=ip),
+            Int32(a67).ir_value(loc=loc, ip=ip),
+            Float32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n"
+        ".reg .b32 packed, sh1, sh2, sh3;\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        ".reg .b32 w_f16x2, acc_f16x2;\n"
+        ".reg .f16 acc_lo, acc_hi;\n"
+        ".reg .f32 acc_lo_f, acc_hi_f, total;\n"
+        "mov.b32 packed, $1;\n"
+        "shr.u32 sh1, packed, 8;\n"
+        "shr.u32 sh2, packed, 16;\n"
+        "shr.u32 sh3, packed, 24;\n"
+        "cvt.u8.u32 byte0, packed;\n"
+        "cvt.u8.u32 byte1, sh1;\n"
+        "cvt.u8.u32 byte2, sh2;\n"
+        "cvt.u8.u32 byte3, sh3;\n"
+        "mov.b32 acc_f16x2, 0;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte0;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, $2, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte1;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, $3, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte2;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, $4, acc_f16x2;\n"
+        "cvt.rn.f16x2.e2m1x2 w_f16x2, byte3;\n"
+        "fma.rn.f16x2 acc_f16x2, w_f16x2, $5, acc_f16x2;\n"
+        "mov.b32 {acc_lo, acc_hi}, acc_f16x2;\n"
+        "cvt.f32.f16 acc_lo_f, acc_lo;\n"
+        "cvt.f32.f16 acc_hi_f, acc_hi;\n"
+        "add.f32 total, acc_lo_f, acc_hi_f;\n"
+        "mul.rn.f32 $0, total, $6;\n"
+        "}\n",
+        "=f,r,r,r,r,r,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -329,6 +468,16 @@ def _prefetch_ptr_l2(ptr, byte_offset: Int32, *, loc=None, ip=None) -> None:
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def _read_packed_u32(packed_row, byte_idx):
+    """Read 4 consecutive packed-fp4 bytes (at 4-aligned byte_idx) as ONE u32 via a
+    recast view — 1 LDG.U32 instead of 4 LDG.U8. byte_idx must be 4-aligned (true for
+    dot-8: 8 fp4 = 4 bytes, k is always 8-aligned)."""
+    u32 = cute.make_tensor(cute.recast_ptr(packed_row.iterator, dtype=Int32),
+                           cute.make_layout(cute.size(packed_row) // 4))
+    return u32[byte_idx >> Int32(2)].to(Int32)
 
 
 class _DecodeMatvecSm120Base(Op):
@@ -365,6 +514,12 @@ class _Nvfp4WeightMixin:
         )
 
     @cute.jit
+    def _decode_scale(self, scale_row, scale_idx):
+        """Per-group weight scale. Default = FP16 group scale (machete 'nvfp4').
+        MXFP4 overrides this to decode an E8M0 byte (2**(byte-127))."""
+        return scale_row[scale_idx].to(Float32)
+
+    @cute.jit
     def _nvfp4_weight_value(self, packed_row, scale_row, k):
         byte = packed_row[k >> Int32(1)].to(Int32) & Int32(255)
         code = byte & Int32(15)
@@ -374,7 +529,7 @@ class _Nvfp4WeightMixin:
             scale_idx = k >> Int32(5)
         else:
             scale_idx = k // Int32(self.group_size)
-        scale = scale_row[scale_idx].to(Float32)
+        scale = self._decode_scale(scale_row, scale_idx)
         return _fp4_e2m1_value(code) * scale
 
     @cute.jit
@@ -384,18 +539,32 @@ class _Nvfp4WeightMixin:
             scale_idx = k >> Int32(5)
         else:
             scale_idx = k // Int32(self.group_size)
-        scale = scale_row[scale_idx].to(Float32)
-        return _nvfp4_ptr_dot8(
-            packed_row.iterator,
-            byte_idx,
-            v0,
-            v1,
-            v2,
-            v3,
-            v4,
-            v5,
-            v6,
-            v7,
+        scale = self._decode_scale(scale_row, scale_idx)
+        # 8 fp4 = 4 packed bytes at byte_idx (4-aligned since k is 8-aligned). Read
+        # them as ONE u32 (recast view) instead of 4 byte-loads — 4x fewer LDG, far
+        # better weight-read bandwidth for the (memory-bound) decode matvec/LM head.
+        packed = _read_packed_u32(packed_row, byte_idx)
+        return _nvfp4_reg_dot8(packed, v0, v1, v2, v3, v4, v5, v6, v7, scale)
+
+    @cute.jit
+    def _dot8_nvfp4_f16a(self, packed_row, na_u32, scale_row, k):
+        """Dot-8 with the activation read as packed f16x2 from a u32 smem view
+        (``na_u32``), avoiding the per-output f32→f16 activation conversion. The
+        activation must be pre-staged to f16; ``na_u32[i]`` holds elements 2i,2i+1."""
+        byte_idx = k >> Int32(1)
+        if const_expr(self.group_size == 32):
+            scale_idx = k >> Int32(5)
+        else:
+            scale_idx = k // Int32(self.group_size)
+        scale = self._decode_scale(scale_row, scale_idx)
+        packed = _read_packed_u32(packed_row, byte_idx)
+        ki = k >> Int32(1)
+        return _nvfp4_reg_dot8_f16a(
+            packed,
+            na_u32[ki],
+            na_u32[ki + Int32(1)],
+            na_u32[ki + Int32(2)],
+            na_u32[ki + Int32(3)],
             scale,
         )
 
@@ -432,37 +601,15 @@ class _Nvfp4WeightMixin:
         v14,
         v15,
     ):
-        byte_idx = k >> Int32(1)
-        if const_expr(self.group_size == 32):
-            scale_idx = k >> Int32(5)
-        else:
-            scale_idx = k // Int32(self.group_size)
-        scale = scale_row[scale_idx].to(Float32)
-        acc = _nvfp4_ptr_dot8(
-            packed_row.iterator,
-            byte_idx,
-            v0,
-            v1,
-            v2,
-            v3,
-            v4,
-            v5,
-            v6,
-            v7,
-            scale,
+        # Two load-hoisted dot-8s (weight bytes read via cute, outside the asm,
+        # so the compiler pipelines them — same fix the other matvecs got). k and
+        # k+8 are always in the same group-32 (k is 16-aligned), so one scale
+        # lookup per dot-8 stays correct.
+        acc = self._dot8_nvfp4_values(
+            packed_row, scale_row, k, v0, v1, v2, v3, v4, v5, v6, v7
         )
-        acc = acc + _nvfp4_ptr_dot8(
-            packed_row.iterator,
-            byte_idx + Int32(4),
-            v8,
-            v9,
-            v10,
-            v11,
-            v12,
-            v13,
-            v14,
-            v15,
-            scale,
+        acc = acc + self._dot8_nvfp4_values(
+            packed_row, scale_row, k + Int32(8), v8, v9, v10, v11, v12, v13, v14, v15
         )
         return acc
 
@@ -1215,31 +1362,114 @@ class MatvecSm120Op(_DecodeMatvecSm120Base):
         num_warps = self.threads_per_row // 32
         row_start = tile_S * Int32(self.tile_size_S)
         out_start = tile_O * Int32(self.tile_size_O)
-        for local_row in range(warp_idx, self.tile_size_S, num_warps):
+        # Distribute the flattened (row, output) work across warps. Parallelizing
+        # over S alone leaves all-but-one warp idle in decode (S=1); flattening
+        # S*O keeps every warp busy (e.g. one output per warp at S=1).
+        total_work = self.tile_size_S * self.tile_size_O
+        for work in range(warp_idx, total_work, num_warps):
+            local_row = work // self.tile_size_O
+            local_o = work % self.tile_size_O
             row_idx = row_start + Int32(local_row)
-            if row_idx < Int32(self.S):
+            out_idx = out_start + Int32(local_o)
+            if row_idx < Int32(self.S) and out_idx < Int32(self.O):
                 a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
-                for local_o in range(self.tile_size_O):
-                    out_idx = out_start + Int32(local_o)
-                    if out_idx < Int32(self.O):
-                        acc = Float32(0.0)
-                        w_base = out_idx * Int32(self.weight_stride_O)
-                        k_base = Int32(0)
-                        while k_base < Int32(self.K):
-                            a_row = cute.make_tensor(a.iterator + a_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                            weight_row = cute.make_tensor(weight.iterator + w_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
-                            elem = lane_idx
-                            while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
-                                k = k_base + elem
-                                if k < Int32(self.K):
-                                    acc = acc + a_row[elem].to(Float32) * weight_row[elem].to(Float32)
-                                elem = elem + Int32(32)
-                            k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
-                        total = cute.arch.warp_reduction(acc, operator.add)
-                        if lane_idx == Int32(0):
-                            y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
-                            y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
-                            y_tile[local_o] = total.to(self.y_dtype)
+                acc = Float32(0.0)
+                w_base = out_idx * Int32(self.weight_stride_O)
+                k_base = Int32(0)
+                while k_base < Int32(self.K):
+                    a_row = cute.make_tensor(a.iterator + a_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
+                    weight_row = cute.make_tensor(weight.iterator + w_base + k_base, cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP))
+                    elem = lane_idx
+                    while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
+                        k = k_base + elem
+                        if k < Int32(self.K):
+                            acc = acc + a_row[elem].to(Float32) * weight_row[elem].to(Float32)
+                        elem = elem + Int32(32)
+                    k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
+                total = cute.arch.warp_reduction(acc, operator.add)
+                if lane_idx == Int32(0):
+                    y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                    y_tile = cute.make_tensor(y.iterator + y_base + out_start, cute.make_layout(self.tile_size_O))
+                    y_tile[local_o] = total.to(self.y_dtype)
+
+
+class MatvecPairSm120Op(_DecodeMatvecSm120Base):
+    """BF16/FP matvec for two same-sized projections sharing one input."""
+
+    reads = {
+        "a": (None, ("B", "S", "K")),
+        "weight0": (None, ("O", "K")),
+        "weight1": (None, ("O", "K")),
+    }
+    writes = {
+        "y0": (None, ("B", "S", "O")),
+        "y1": (None, ("B", "S", "O")),
+    }
+    tile = ("B", "S", "O")
+    dynamic_dims = ("B",)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
+        if tensors["weight0"].shape != tensors["weight1"].shape:
+            raise ValueError("paired projections must have matching weight shapes")
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16, O=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_O, a, weight0, weight1, y0, y1):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        out_start = tile_O * Int32(self.tile_size_O)
+        total_work = self.tile_size_S * self.tile_size_O
+        for work in range(warp_idx, total_work, num_warps):
+            local_row = work // self.tile_size_O
+            local_o = work % self.tile_size_O
+            row_idx = row_start + Int32(local_row)
+            out_idx = out_start + Int32(local_o)
+            if row_idx < Int32(self.S) and out_idx < Int32(self.O):
+                a_base = tile_B * Int32(self.a_stride_B) + row_idx * Int32(self.a_stride_S)
+                w0_base = out_idx * Int32(self.weight0_stride_O)
+                w1_base = out_idx * Int32(self.weight1_stride_O)
+                acc0 = Float32(0.0)
+                acc1 = Float32(0.0)
+                k_base = Int32(0)
+                while k_base < Int32(self.K):
+                    a_row = cute.make_tensor(
+                        a.iterator + a_base + k_base,
+                        cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP),
+                    )
+                    w0_row = cute.make_tensor(
+                        weight0.iterator + w0_base + k_base,
+                        cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP),
+                    )
+                    w1_row = cute.make_tensor(
+                        weight1.iterator + w1_base + k_base,
+                        cute.make_layout(SM120_DECODE_REDUCTION_DIM_PER_WARP),
+                    )
+                    elem = lane_idx
+                    while elem < Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP):
+                        k = k_base + elem
+                        if k < Int32(self.K):
+                            av = a_row[elem].to(Float32)
+                            acc0 = acc0 + av * w0_row[elem].to(Float32)
+                            acc1 = acc1 + av * w1_row[elem].to(Float32)
+                        elem = elem + Int32(32)
+                    k_base = k_base + Int32(SM120_DECODE_REDUCTION_DIM_PER_WARP)
+                total0 = cute.arch.warp_reduction(acc0, operator.add)
+                total1 = cute.arch.warp_reduction(acc1, operator.add)
+                if lane_idx == Int32(0):
+                    y0_base = tile_B * Int32(self.y0_stride_B) + row_idx * Int32(self.y0_stride_S)
+                    y1_base = tile_B * Int32(self.y1_stride_B) + row_idx * Int32(self.y1_stride_S)
+                    y0_tile = cute.make_tensor(y0.iterator + y0_base + out_start, cute.make_layout(self.tile_size_O))
+                    y1_tile = cute.make_tensor(y1.iterator + y1_base + out_start, cute.make_layout(self.tile_size_O))
+                    y0_tile[local_o] = total0.to(self.y0_dtype)
+                    y1_tile[local_o] = total1.to(self.y1_dtype)
 
 
 class _MatvecNvfp4Sm120Base(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
@@ -1690,7 +1920,9 @@ class RmsAddNormSm120Op(_DecodeMatvecSm120Base):
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
         row_start = tile_S * Int32(self.tile_size_S)
-        for local_row in range(warp_idx, self.tile_size_S, num_warps):
+        # All warps cooperate on each row (decode has S=1). Each warp reduces the
+        # full row for rstd (redundant reads hit L2); warps split the K-wide write.
+        for local_row in range(self.tile_size_S):
             row_idx = row_start + Int32(local_row)
             if row_idx < Int32(self.S):
                 x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
@@ -1712,12 +1944,12 @@ class RmsAddNormSm120Op(_DecodeMatvecSm120Base):
                 total = cute.arch.warp_reduction(sum_sq, operator.add)
                 rstd = cute.math.rsqrt(total * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
 
-                k2 = lane_idx
+                k2 = warp_idx * Int32(32) + lane_idx
                 while k2 < Int32(self.K):
                     val = x_row[k2].to(Float32) + res_row[k2].to(Float32)
                     out_row[k2] = val.to(self.residual_out_dtype)
                     y_row[k2] = (val * rstd * norm_row[k2].to(Float32)).to(self.y_dtype)
-                    k2 = k2 + Int32(32)
+                    k2 = k2 + num_warps * Int32(32)
 
 
 class RmsCopyNormSm120Op(_DecodeMatvecSm120Base):
@@ -1753,7 +1985,10 @@ class RmsCopyNormSm120Op(_DecodeMatvecSm120Base):
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
         row_start = tile_S * Int32(self.tile_size_S)
-        for local_row in range(warp_idx, self.tile_size_S, num_warps):
+        # All warps cooperate on each row (decode has S=1, so row-parallelism
+        # would leave 15/16 warps idle). Each warp reduces the full row for rstd
+        # (redundant reads hit L2), then warps split the K-wide write.
+        for local_row in range(self.tile_size_S):
             row_idx = row_start + Int32(local_row)
             if row_idx < Int32(self.S):
                 x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
@@ -1773,12 +2008,206 @@ class RmsCopyNormSm120Op(_DecodeMatvecSm120Base):
                 total = cute.arch.warp_reduction(sum_sq, operator.add)
                 rstd = cute.math.rsqrt(total * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
 
-                k2 = lane_idx
+                k2 = warp_idx * Int32(32) + lane_idx
                 while k2 < Int32(self.K):
                     val = x_row[k2].to(Float32)
                     out_row[k2] = val.to(self.residual_out_dtype)
                     y_row[k2] = (val * rstd * norm_row[k2].to(Float32)).to(self.y_dtype)
-                    k2 = k2 + Int32(32)
+                    k2 = k2 + num_warps * Int32(32)
+
+
+class RmsAddNormPairMatvecSm120Op(_DecodeMatvecSm120Base):
+    """Fused residual add + RMSNorm + two small dense projections."""
+
+    reads = {
+        "x": (None, ("B", "S", "K")),
+        "residual_in": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+        "weight0": (None, ("O", "K")),
+        "weight1": (None, ("O", "K")),
+    }
+    writes = {
+        "residual_out": (None, ("B", "S", "K")),
+        "y": (None, ("B", "S", "K")),
+        "y0": (None, ("B", "S", "O")),
+        "y1": (None, ("B", "S", "O")),
+    }
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.eps = getattr(self, "eps", 1e-5)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        if tensors["weight0"].shape != tensors["weight1"].shape:
+            raise ValueError("paired projections must have matching weight shapes")
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size, eps=eps)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_2, x, residual_in, norm_weight,
+                weight0, weight1, residual_out, y, y0, y1):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        for local_row in range(self.tile_size_S):
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+                res_base = tile_B * Int32(self.residual_in_stride_B) + row_idx * Int32(self.residual_in_stride_S)
+                out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+                res_row = cute.make_tensor(residual_in.iterator + res_base, cute.make_layout(self.K))
+                out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.K))
+                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.K))
+                norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+
+                sum_sq = Float32(0.0)
+                k = lane_idx
+                while k < Int32(self.K):
+                    val = x_row[k].to(Float32) + res_row[k].to(Float32)
+                    sum_sq = sum_sq + val * val
+                    k = k + Int32(32)
+                total = cute.arch.warp_reduction(sum_sq, operator.add)
+                rstd = cute.math.rsqrt(total * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
+
+                k2 = warp_idx * Int32(32) + lane_idx
+                while k2 < Int32(self.K):
+                    val = x_row[k2].to(Float32) + res_row[k2].to(Float32)
+                    out_row[k2] = val.to(self.residual_out_dtype)
+                    y_row[k2] = (val * rstd * norm_row[k2].to(Float32)).to(self.y_dtype)
+                    k2 = k2 + num_warps * Int32(32)
+
+                if warp_idx < Int32(self.O):
+                    w0_row = cute.make_tensor(
+                        weight0.iterator + warp_idx * Int32(self.weight0_stride_O),
+                        cute.make_layout(self.K),
+                    )
+                    w1_row = cute.make_tensor(
+                        weight1.iterator + warp_idx * Int32(self.weight1_stride_O),
+                        cute.make_layout(self.K),
+                    )
+                    acc0 = Float32(0.0)
+                    acc1 = Float32(0.0)
+                    kk = lane_idx
+                    while kk < Int32(self.K):
+                        val = x_row[kk].to(Float32) + res_row[kk].to(Float32)
+                        nv = val * rstd * norm_row[kk].to(Float32)
+                        acc0 = acc0 + nv * w0_row[kk].to(Float32)
+                        acc1 = acc1 + nv * w1_row[kk].to(Float32)
+                        kk = kk + Int32(32)
+                    total0 = cute.arch.warp_reduction(acc0, operator.add)
+                    total1 = cute.arch.warp_reduction(acc1, operator.add)
+                    if lane_idx == Int32(0):
+                        y0_base = tile_B * Int32(self.y0_stride_B) + row_idx * Int32(self.y0_stride_S)
+                        y1_base = tile_B * Int32(self.y1_stride_B) + row_idx * Int32(self.y1_stride_S)
+                        y0_row = cute.make_tensor(y0.iterator + y0_base, cute.make_layout(self.O))
+                        y1_row = cute.make_tensor(y1.iterator + y1_base, cute.make_layout(self.O))
+                        y0_row[warp_idx] = total0.to(self.y0_dtype)
+                        y1_row[warp_idx] = total1.to(self.y1_dtype)
+
+
+class RmsCopyNormPairMatvecSm120Op(_DecodeMatvecSm120Base):
+    """Fused RMSNorm/copy + two small dense projections."""
+
+    reads = {
+        "x": (None, ("B", "S", "K")),
+        "norm_weight": (None, ("K",)),
+        "weight0": (None, ("O", "K")),
+        "weight1": (None, ("O", "K")),
+    }
+    writes = {
+        "residual_out": (None, ("B", "S", "K")),
+        "y": (None, ("B", "S", "K")),
+        "y0": (None, ("B", "S", "O")),
+        "y1": (None, ("B", "S", "O")),
+    }
+    tile = ("B", "S")
+    dynamic_dims = ("B",)
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.eps = getattr(self, "eps", 1e-5)
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-5, dim_windows=None, **tensors):
+        if tensors["weight0"].shape != tensors["weight1"].shape:
+            raise ValueError("paired projections must have matching weight shapes")
+        op = cls._schedule_single(
+            tile_sizes=_tile_sizes_with_defaults(tile_sizes, B=1, S=16),
+            dim_windows=dim_windows,
+            **tensors,
+        )
+        return _finalize_decode_schedule(op, page_size=page_size, eps=eps)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_2, x, norm_weight,
+                weight0, weight1, residual_out, y, y0, y1):
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        num_warps = self.threads_per_row // 32
+        row_start = tile_S * Int32(self.tile_size_S)
+        for local_row in range(self.tile_size_S):
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+                out_base = tile_B * Int32(self.residual_out_stride_B) + row_idx * Int32(self.residual_out_stride_S)
+                y_base = tile_B * Int32(self.y_stride_B) + row_idx * Int32(self.y_stride_S)
+                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+                out_row = cute.make_tensor(residual_out.iterator + out_base, cute.make_layout(self.K))
+                y_row = cute.make_tensor(y.iterator + y_base, cute.make_layout(self.K))
+                norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
+
+                sum_sq = Float32(0.0)
+                k = lane_idx
+                while k < Int32(self.K):
+                    val = x_row[k].to(Float32)
+                    sum_sq = sum_sq + val * val
+                    k = k + Int32(32)
+                total = cute.arch.warp_reduction(sum_sq, operator.add)
+                rstd = cute.math.rsqrt(total * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
+
+                k2 = warp_idx * Int32(32) + lane_idx
+                while k2 < Int32(self.K):
+                    val = x_row[k2].to(Float32)
+                    out_row[k2] = val.to(self.residual_out_dtype)
+                    y_row[k2] = (val * rstd * norm_row[k2].to(Float32)).to(self.y_dtype)
+                    k2 = k2 + num_warps * Int32(32)
+
+                if warp_idx < Int32(self.O):
+                    w0_row = cute.make_tensor(
+                        weight0.iterator + warp_idx * Int32(self.weight0_stride_O),
+                        cute.make_layout(self.K),
+                    )
+                    w1_row = cute.make_tensor(
+                        weight1.iterator + warp_idx * Int32(self.weight1_stride_O),
+                        cute.make_layout(self.K),
+                    )
+                    acc0 = Float32(0.0)
+                    acc1 = Float32(0.0)
+                    kk = lane_idx
+                    while kk < Int32(self.K):
+                        nv = x_row[kk].to(Float32) * rstd * norm_row[kk].to(Float32)
+                        acc0 = acc0 + nv * w0_row[kk].to(Float32)
+                        acc1 = acc1 + nv * w1_row[kk].to(Float32)
+                        kk = kk + Int32(32)
+                    total0 = cute.arch.warp_reduction(acc0, operator.add)
+                    total1 = cute.arch.warp_reduction(acc1, operator.add)
+                    if lane_idx == Int32(0):
+                        y0_base = tile_B * Int32(self.y0_stride_B) + row_idx * Int32(self.y0_stride_S)
+                        y1_base = tile_B * Int32(self.y1_stride_B) + row_idx * Int32(self.y1_stride_S)
+                        y0_row = cute.make_tensor(y0.iterator + y0_base, cute.make_layout(self.O))
+                        y1_row = cute.make_tensor(y1.iterator + y1_base, cute.make_layout(self.O))
+                        y0_row[warp_idx] = total0.to(self.y0_dtype)
+                        y1_row[warp_idx] = total1.to(self.y1_dtype)
 
 
 class RmsGateUpSiluSm120Op(_DecodeMatvecSm120Base):
@@ -1934,12 +2363,24 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                 gate_packed, gate_scales, up_packed, up_scales, y):
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
+        tidx = cute.arch.thread_idx()[0]
         num_warps = self.threads_per_row // 32
         row_start = tile_S * Int32(self.tile_size_S)
         rstd_smem = cute.make_tensor(
             cute.make_ptr(cutlass.Float32, page_ptr, cute.AddressSpace.smem),
             cute.make_layout(self.tile_size_S),
         )
+        # Normed activation staged once as f16 (reused by both gate and up dots
+        # across every output) → no per-output RMSNorm recompute, no f32→f16 cvt.
+        norm_smem = cute.make_tensor(
+            cute.make_ptr(cutlass.Float16, page_ptr + Int32(self.tile_size_S * 4), cute.AddressSpace.smem),
+            cute.make_layout(self.tile_size_S * self.K),
+        )
+        norm_u32 = cute.make_tensor(
+            cute.make_ptr(Int32, page_ptr + Int32(self.tile_size_S * 4), cute.AddressSpace.smem),
+            cute.make_layout(self.tile_size_S * (self.K // 2)),
+        )
+        norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
         for local_row in range(warp_idx, self.tile_size_S, num_warps):
             row_idx = row_start + Int32(local_row)
             if row_idx < Int32(self.S):
@@ -1955,7 +2396,20 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                 rstd = cute.math.rsqrt(total_sq * Float32(1.0 / self.K) + Float32(self.eps), fastmath=True)
                 if lane_idx == Int32(0):
                     rstd_smem[local_row] = rstd
+        named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+        for local_row in range(self.tile_size_S):
+            row_idx = row_start + Int32(local_row)
+            if row_idx < Int32(self.S):
+                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
+                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
+                rstd = rstd_smem[local_row]
+                nk = tidx
+                while nk < Int32(self.K):
+                    norm_smem[Int32(local_row * self.K) + nk] = (
+                        x_row[nk].to(Float32) * rstd * norm_row[nk].to(Float32)
+                    ).to(cutlass.Float16)
+                    nk = nk + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
         d_start = tile_D * Int32(self.tile_size_D)
@@ -1964,11 +2418,13 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
             local_d = local_work - local_row * self.tile_size_D
             row_idx = row_start + Int32(local_row)
             if row_idx < Int32(self.S):
-                x_base = tile_B * Int32(self.x_stride_B) + row_idx * Int32(self.x_stride_S)
-                x_row = cute.make_tensor(x.iterator + x_base, cute.make_layout(self.K))
                 d = d_start + Int32(local_d)
                 if d < Int32(self.D):
-                    rstd = rstd_smem[local_row]
+                    na_u32 = cute.make_tensor(
+                        norm_u32.iterator + Int32(local_row) * Int32(self.K // 2),
+                        cute.make_layout(self.K // 2),
+                    )
+                    norm_base = Int32(local_row) * Int32(self.K)
                     gate_packed_row = cute.make_tensor(
                         gate_packed.iterator + d * Int32(self.gate_packed_stride_D),
                         cute.make_layout(self.K2),
@@ -1985,7 +2441,6 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                         up_scales.iterator + d * Int32(self.up_scales_stride_D),
                         cute.make_layout(self.G),
                     )
-                    norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
                     gate_acc = Float32(0.0)
                     up_acc = Float32(0.0)
                     full_k = Int32((self.K // 8) * 8)
@@ -1996,26 +2451,16 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                             if next_k < full_k:
                                 self._prefetch_dot8_nvfp4_values(gate_packed_row, gate_scale_row, next_k)
                                 self._prefetch_dot8_nvfp4_values(up_packed_row, up_scale_row, next_k)
-                        v0 = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
-                        v1 = x_row[k2 + Int32(1)].to(Float32) * rstd * norm_row[k2 + Int32(1)].to(Float32)
-                        v2 = x_row[k2 + Int32(2)].to(Float32) * rstd * norm_row[k2 + Int32(2)].to(Float32)
-                        v3 = x_row[k2 + Int32(3)].to(Float32) * rstd * norm_row[k2 + Int32(3)].to(Float32)
-                        v4 = x_row[k2 + Int32(4)].to(Float32) * rstd * norm_row[k2 + Int32(4)].to(Float32)
-                        v5 = x_row[k2 + Int32(5)].to(Float32) * rstd * norm_row[k2 + Int32(5)].to(Float32)
-                        v6 = x_row[k2 + Int32(6)].to(Float32) * rstd * norm_row[k2 + Int32(6)].to(Float32)
-                        v7 = x_row[k2 + Int32(7)].to(Float32) * rstd * norm_row[k2 + Int32(7)].to(Float32)
-                        gate_acc = gate_acc + self._dot8_nvfp4_values(
-                            gate_packed_row, gate_scale_row, k2,
-                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        gate_acc = gate_acc + self._dot8_nvfp4_f16a(
+                            gate_packed_row, na_u32, gate_scale_row, k2
                         )
-                        up_acc = up_acc + self._dot8_nvfp4_values(
-                            up_packed_row, up_scale_row, k2,
-                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        up_acc = up_acc + self._dot8_nvfp4_f16a(
+                            up_packed_row, na_u32, up_scale_row, k2
                         )
                         k2 = k2 + Int32(256)
                     k2 = full_k + lane_idx
                     while k2 < Int32(self.K):
-                        nv = x_row[k2].to(Float32) * rstd * norm_row[k2].to(Float32)
+                        nv = norm_smem[norm_base + k2].to(Float32)
                         gate_acc = gate_acc + nv * self._nvfp4_weight_value(gate_packed_row, gate_scale_row, k2)
                         up_acc = up_acc + nv * self._nvfp4_weight_value(up_packed_row, up_scale_row, k2)
                         k2 = k2 + Int32(32)
@@ -2452,13 +2897,23 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
             cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
             cute.make_layout(self.threads_per_row),
         )
+        # Stage the normalised activation as f16 (reused across every vocab
+        # output), so the dot reads it as packed f16x2 with no per-output cvt.
         norm_smem = cute.make_tensor(
             cute.make_ptr(
-                self.x_dtype,
+                cutlass.Float16,
                 page_ptr + Int32(self.threads_per_row * 8),
                 cute.AddressSpace.smem,
             ),
             cute.make_layout(self.K),
+        )
+        norm_u32 = cute.make_tensor(
+            cute.make_ptr(
+                Int32,
+                page_ptr + Int32(self.threads_per_row * 8),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout(self.K // 2),
         )
 
         if row_idx < Int32(self.S) and partition < Int32(self.partitions):
@@ -2475,7 +2930,7 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
             norm_row = cute.make_tensor(norm_weight.iterator, cute.make_layout(self.K))
             nk = tidx
             while nk < Int32(self.K):
-                norm_smem[nk] = (x_row[nk].to(Float32) * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
+                norm_smem[nk] = (x_row[nk].to(Float32) * rstd * norm_row[nk].to(Float32)).to(cutlass.Float16)
                 nk = nk + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
@@ -2498,26 +2953,9 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
                 full_k = Int32((self.K // 16) * 16)
                 k2 = lane_idx * Int32(16)
                 while k2 < full_k:
-                    v0 = norm_smem[k2].to(Float32)
-                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
-                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
-                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
-                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
-                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
-                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
-                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
-                    v8 = norm_smem[k2 + Int32(8)].to(Float32)
-                    v9 = norm_smem[k2 + Int32(9)].to(Float32)
-                    v10 = norm_smem[k2 + Int32(10)].to(Float32)
-                    v11 = norm_smem[k2 + Int32(11)].to(Float32)
-                    v12 = norm_smem[k2 + Int32(12)].to(Float32)
-                    v13 = norm_smem[k2 + Int32(13)].to(Float32)
-                    v14 = norm_smem[k2 + Int32(14)].to(Float32)
-                    v15 = norm_smem[k2 + Int32(15)].to(Float32)
-                    acc = acc + self._dot16_nvfp4_values(
-                        packed_row, scale_row, k2,
-                        v0, v1, v2, v3, v4, v5, v6, v7,
-                        v8, v9, v10, v11, v12, v13, v14, v15,
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(
+                        packed_row, norm_u32, scale_row, k2 + Int32(8)
                     )
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
@@ -2593,13 +3031,23 @@ class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm1
             cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
             cute.make_layout(self.threads_per_row),
         )
+        # Stage the normalised activation as f16 (it is reused across every vocab
+        # output), so the dot reads it as packed f16x2 with no per-output cvt.
         norm_smem = cute.make_tensor(
             cute.make_ptr(
-                self.x_dtype,
+                cutlass.Float16,
                 page_ptr + Int32(self.threads_per_row * 8),
                 cute.AddressSpace.smem,
             ),
             cute.make_layout(self.K),
+        )
+        norm_u32 = cute.make_tensor(
+            cute.make_ptr(
+                Int32,
+                page_ptr + Int32(self.threads_per_row * 8),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout(self.K // 2),
         )
 
         if row_idx < Int32(self.S) and partition < Int32(self.partitions):
@@ -2622,7 +3070,7 @@ class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm1
             nk = tidx
             while nk < Int32(self.K):
                 xv = x_row[nk].to(Float32) + residual_row[nk].to(Float32)
-                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
+                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(cutlass.Float16)
                 nk = nk + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
@@ -2645,26 +3093,9 @@ class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm1
                 full_k = Int32((self.K // 16) * 16)
                 k2 = lane_idx * Int32(16)
                 while k2 < full_k:
-                    v0 = norm_smem[k2].to(Float32)
-                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
-                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
-                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
-                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
-                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
-                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
-                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
-                    v8 = norm_smem[k2 + Int32(8)].to(Float32)
-                    v9 = norm_smem[k2 + Int32(9)].to(Float32)
-                    v10 = norm_smem[k2 + Int32(10)].to(Float32)
-                    v11 = norm_smem[k2 + Int32(11)].to(Float32)
-                    v12 = norm_smem[k2 + Int32(12)].to(Float32)
-                    v13 = norm_smem[k2 + Int32(13)].to(Float32)
-                    v14 = norm_smem[k2 + Int32(14)].to(Float32)
-                    v15 = norm_smem[k2 + Int32(15)].to(Float32)
-                    acc = acc + self._dot16_nvfp4_values(
-                        packed_row, scale_row, k2,
-                        v0, v1, v2, v3, v4, v5, v6, v7,
-                        v8, v9, v10, v11, v12, v13, v14, v15,
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(
+                        packed_row, norm_u32, scale_row, k2 + Int32(8)
                     )
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
@@ -2843,13 +3274,23 @@ class FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm12
             cute.make_ptr(cutlass.Int32, page_ptr + Int32(self.threads_per_row * 4), cute.AddressSpace.smem),
             cute.make_layout(self.threads_per_row),
         )
+        # Stage the normalised activation as f16 (it is reused across every vocab
+        # output), so the dot reads it as packed f16x2 with no per-output cvt.
         norm_smem = cute.make_tensor(
             cute.make_ptr(
-                self.x_dtype,
+                cutlass.Float16,
                 page_ptr + Int32(self.threads_per_row * 8),
                 cute.AddressSpace.smem,
             ),
             cute.make_layout(self.K),
+        )
+        norm_u32 = cute.make_tensor(
+            cute.make_ptr(
+                Int32,
+                page_ptr + Int32(self.threads_per_row * 8),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout(self.K // 2),
         )
 
         if row_idx < Int32(self.S) and partition < Int32(self.partitions):
@@ -2872,7 +3313,7 @@ class FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm12
             nk = tidx
             while nk < Int32(self.K):
                 xv = x_row[nk].to(Float32) + residual_row[nk].to(Float32)
-                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(self.x_dtype)
+                norm_smem[nk] = (xv * rstd * norm_row[nk].to(Float32)).to(cutlass.Float16)
                 nk = nk + Int32(self.threads_per_row)
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
@@ -2895,26 +3336,9 @@ class FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm12
                 full_k = Int32((self.K // 16) * 16)
                 k2 = lane_idx * Int32(16)
                 while k2 < full_k:
-                    v0 = norm_smem[k2].to(Float32)
-                    v1 = norm_smem[k2 + Int32(1)].to(Float32)
-                    v2 = norm_smem[k2 + Int32(2)].to(Float32)
-                    v3 = norm_smem[k2 + Int32(3)].to(Float32)
-                    v4 = norm_smem[k2 + Int32(4)].to(Float32)
-                    v5 = norm_smem[k2 + Int32(5)].to(Float32)
-                    v6 = norm_smem[k2 + Int32(6)].to(Float32)
-                    v7 = norm_smem[k2 + Int32(7)].to(Float32)
-                    v8 = norm_smem[k2 + Int32(8)].to(Float32)
-                    v9 = norm_smem[k2 + Int32(9)].to(Float32)
-                    v10 = norm_smem[k2 + Int32(10)].to(Float32)
-                    v11 = norm_smem[k2 + Int32(11)].to(Float32)
-                    v12 = norm_smem[k2 + Int32(12)].to(Float32)
-                    v13 = norm_smem[k2 + Int32(13)].to(Float32)
-                    v14 = norm_smem[k2 + Int32(14)].to(Float32)
-                    v15 = norm_smem[k2 + Int32(15)].to(Float32)
-                    acc = acc + self._dot16_nvfp4_values(
-                        packed_row, scale_row, k2,
-                        v0, v1, v2, v3, v4, v5, v6, v7,
-                        v8, v9, v10, v11, v12, v13, v14, v15,
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(
+                        packed_row, norm_u32, scale_row, k2 + Int32(8)
                     )
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
@@ -3535,6 +3959,7 @@ __all__ = [
     "FinalRmsTop1PartialLmHeadNvfp4Sm120Op",
     "FinalRmsTop1LmHeadNvfp4Sm120Op",
     "FinalTop1AtomicInitSm120Op",
+    "MatvecPairSm120Op",
     "MatvecPairNvfp4Sm120Op",
     "MatvecQuadNvfp4Sm120Op",
     "MatvecResidualSm120Op",
@@ -3543,7 +3968,9 @@ __all__ = [
     "MatvecNvfp4Sm120Op",
     "ResidualAddSm120Op",
     "RmsAddNormSm120Op",
+    "RmsAddNormPairMatvecSm120Op",
     "RmsCopyNormSm120Op",
+    "RmsCopyNormPairMatvecSm120Op",
     "RmsGateUpSiluSm120Op",
     "RmsGateUpSiluNvfp4Sm120Op",
     "RmsMatvecNvfp4Sm120Op",

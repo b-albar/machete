@@ -21,7 +21,7 @@ if importlib.util.find_spec("cutlass") is None:
     pytest.skip("Requires CUTLASS", allow_module_level=True)
 
 from machete.megakernel import Megakernel, MegakernelConfig
-from machete.kernels.qknorm_rope import QKNormRopeBwdOp, QKNormRopeOp
+from machete.kernels.qknorm_rope import PackedQKNormRopeOp, QKNormRopeBwdOp, QKNormRopeOp
 from machete.kernels.qknorm_rope.ref import (
     qknorm_rope_backward_pytorch,
     qknorm_rope_pytorch,
@@ -73,6 +73,26 @@ def mk_qknorm_rope(q, norm_weight, cos, sin):
     q_out = q.clone()
     run_qknorm_rope(q_out, norm_weight, cos, sin)
     return q_out
+
+
+def mk_packed_qknorm_rope(q, k, q_norm_weight, k_norm_weight, cos, sin):
+    """Megakernel packed Q/K norm+RoPE returning separate Q and K tensors."""
+    b, s, hq, d = q.shape
+    hk = k.shape[2]
+    qk = torch.cat((q, k), dim=2).float().view(b * s, hq + hk, d).contiguous()
+    ops = PackedQKNormRopeOp.schedule(
+        qk=qk,
+        q_norm_weight=q_norm_weight.float().contiguous(),
+        k_norm_weight=k_norm_weight.float().contiguous(),
+        cos=cos.float().contiguous(),
+        sin=sin.float().contiguous(),
+        num_q_heads=hq,
+        num_k_heads=hk,
+    )
+    kernel = Megakernel(ops, config=MegakernelConfig(num_sms=2))
+    kernel.run()
+    out = qk.view(b, s, hq + hk, d).to(q.dtype)
+    return out[:, :, :hq].contiguous(), out[:, :, hq:].contiguous()
 
 
 def mk_qknorm_rope_bwd(q, norm_weight, cos, sin, dout):
@@ -181,6 +201,28 @@ class TestQKNormRopeGPU:
             atol=atol,
             check_grad=False,
         )
+
+    def test_packed_qk_forward_matches_separate_reference(self):
+        """Packed Q/K op matches two independent QKNormRope references."""
+        b, s, hq, hk, d, d2 = 2, 16, 8, 2, 256, 32
+        torch.manual_seed(2026)
+        q = torch.randn(b, s, hq, d, dtype=torch.float32, device="cuda")
+        k = torch.randn(b, s, hk, d, dtype=torch.float32, device="cuda")
+        q_norm_weight = torch.randn(d, dtype=torch.float32, device="cuda")
+        k_norm_weight = torch.randn(d, dtype=torch.float32, device="cuda")
+        cos = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+        sin = torch.randn(s, d2, dtype=torch.float32, device="cuda")
+
+        q_out, k_out = mk_packed_qknorm_rope(
+            q, k, q_norm_weight, k_norm_weight, cos, sin
+        )
+        q_ref = qknorm_rope_pytorch(q, q_norm_weight, cos, sin)
+        k_ref = qknorm_rope_pytorch(k, k_norm_weight, cos, sin)
+
+        q_atol = ref_atol(q, q_norm_weight, cos, sin)
+        k_atol = ref_atol(k, k_norm_weight, cos, sin)
+        assert torch.allclose(q_out.float(), q_ref.float(), atol=q_atol, rtol=1e-4)
+        assert torch.allclose(k_out.float(), k_ref.float(), atol=k_atol, rtol=1e-4)
 
     def test_passthrough_dims_unchanged(self):
         """Dimensions beyond 2*D2 should only be RMSNorm'd, not rotated."""

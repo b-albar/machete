@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Benchmark the composable Machete Qwen3.5 NVFP4 decode graph.
+"""Full 24-layer Qwen3.5 MXFP4 SIMT decode benchmark.
 
 This benchmark targets the same model shape as Luce's Qwen/Qwen3.5-0.8B path:
 24 hybrid layers, 18 DeltaNet layers, 6 full-attention layers, hidden=1024,
-and vocab=248320.  It measures one composed Machete megakernel decode step.
+and vocab=248320. It measures one composed Machete megakernel decode step.
 
-Use ``--dummy-weights`` for fast framework/runtime iteration.  Omit it to load
-HF weights and quantize them into Machete's NVFP4 row layout before timing.
+Use ``--dummy-weights`` for fast framework/runtime iteration. Omit it or pass
+``--no-dummy-weights`` to load HF weights and quantize them to MXFP4.
 """
 
 from __future__ import annotations
@@ -22,39 +22,44 @@ from machete.megakernel import (
     MegakernelConfig,
     OverlapTileScheduler,
 )
-from machete.quantization import NVFP4Tensor, quantize_nvfp4_weight
-from machete.kernels.qwen_3_5 import (
-    QWEN3_5_NVFP4_DN_CONV_CHANNELS,
-    QWEN3_5_NVFP4_DN_CONV_KERNEL,
-    QWEN3_5_NVFP4_DN_NUM_HEADS,
-    QWEN3_5_NVFP4_DN_VALUE_DIM,
-    QWEN3_5_NVFP4_DN_V_SIZE,
-    QWEN3_5_NVFP4_GATE_UP_BLOCK,
-    QWEN3_5_NVFP4_HEAD_DIM,
-    QWEN3_5_NVFP4_HIDDEN,
-    QWEN3_5_NVFP4_INTERMEDIATE,
-    QWEN3_5_NVFP4_KV_DIM,
-    QWEN3_5_LAYER_TYPES,
-    QWEN3_5_NVFP4_NUM_KV_HEADS,
-    QWEN3_5_NVFP4_NUM_LAYERS,
-    QWEN3_5_NVFP4_Q_DIM,
-    QWEN3_5_NVFP4_Q_RAW_DIM,
-    QWEN3_5_NVFP4_ROTARY_D2,
-    QWEN3_5_NVFP4_VOCAB,
-    schedule_qwen3_5_final_nvfp4_sm120,
-    schedule_qwen3_5_nvfp4_decode_sm120,
+from machete.kernels.qwen_3_5.mxfp4_ops import (
+    MXFP4SimtWeight,
+    QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK,
+    empty_mxfp4_simt_weight,
+    quantize_mxfp4_simt_weight,
 )
-from machete.kernels.qwen_3_5.nvfp4_ops import QWEN3_5_NVFP4_DN_KEY_DIM
+from machete.kernels.qwen_3_5 import (
+    QWEN3_5_MXFP4_DN_CONV_CHANNELS,
+    QWEN3_5_MXFP4_DN_CONV_KERNEL,
+    QWEN3_5_MXFP4_DN_NUM_HEADS,
+    QWEN3_5_MXFP4_DN_VALUE_DIM,
+    QWEN3_5_MXFP4_DN_V_SIZE,
+    QWEN3_5_MXFP4_GATE_UP_BLOCK,
+    QWEN3_5_MXFP4_HEAD_DIM,
+    QWEN3_5_MXFP4_HIDDEN,
+    QWEN3_5_MXFP4_INTERMEDIATE,
+    QWEN3_5_MXFP4_KV_DIM,
+    QWEN3_5_LAYER_TYPES,
+    QWEN3_5_MXFP4_NUM_KV_HEADS,
+    QWEN3_5_MXFP4_NUM_LAYERS,
+    QWEN3_5_MXFP4_Q_DIM,
+    QWEN3_5_MXFP4_Q_RAW_DIM,
+    QWEN3_5_MXFP4_ROTARY_D2,
+    QWEN3_5_MXFP4_VOCAB,
+)
+from machete.kernels.qwen_3_5.mxfp4_ops import (
+    schedule_qwen3_5_final_mxfp4_sm120,
+    schedule_qwen3_5_mxfp4_decode_sm120,
+)
+from machete.kernels.qwen_3_5.mxfp4_ops import QWEN3_5_MXFP4_DN_KEY_DIM
 
 
-def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> NVFP4Tensor:
-    packed = torch.empty(rows, cols // 2, device="cuda", dtype=torch.uint8)
-    scales = torch.empty(rows, cols // group_size, device="cuda", dtype=torch.float16)
-    return NVFP4Tensor(packed, scales, group_size=group_size, rows=rows, cols=cols)
+def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> MXFP4SimtWeight:
+    return empty_mxfp4_simt_weight(rows, cols, group_size)
 
 
-def _qweight(weight: torch.Tensor, group_size: int = 32) -> NVFP4Tensor:
-    return quantize_nvfp4_weight(weight.contiguous(), group_size=group_size)
+def _qweight(weight: torch.Tensor, group_size: int = 32) -> MXFP4SimtWeight:
+    return quantize_mxfp4_simt_weight(weight.contiguous(), group_size=group_size)
 
 
 def _qwen_rms_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -63,53 +68,53 @@ def _qwen_rms_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _qwen_rope_tables(context_len: int, device: torch.device | str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
     positions = torch.arange(context_len + 1, device=device, dtype=torch.float32)
-    dims = torch.arange(QWEN3_5_NVFP4_ROTARY_D2, device=device, dtype=torch.float32)
-    inv_freq = torch.pow(torch.tensor(10000000.0, device=device, dtype=torch.float32), -dims / QWEN3_5_NVFP4_ROTARY_D2)
+    dims = torch.arange(QWEN3_5_MXFP4_ROTARY_D2, device=device, dtype=torch.float32)
+    inv_freq = torch.pow(torch.tensor(10000000.0, device=device, dtype=torch.float32), -dims / QWEN3_5_MXFP4_ROTARY_D2)
     angles = positions[:, None] * inv_freq[None, :]
     return torch.cos(angles).contiguous(), torch.sin(angles).contiguous()
 
 
 def _make_dummy_weights(context_len: int, dtype: torch.dtype, group_size: int) -> dict:
     weights = {
-        "cos": torch.ones(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
-        "sin": torch.zeros(context_len + 1, QWEN3_5_NVFP4_ROTARY_D2, device="cuda", dtype=dtype),
-        "final_norm": torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype),
+        "cos": torch.ones(context_len + 1, QWEN3_5_MXFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "sin": torch.zeros(context_len + 1, QWEN3_5_MXFP4_ROTARY_D2, device="cuda", dtype=dtype),
+        "final_norm": torch.ones(QWEN3_5_MXFP4_HIDDEN, device="cuda", dtype=dtype),
     }
     for layer_idx, layer_type in enumerate(QWEN3_5_LAYER_TYPES):
         pfx = f"layer.{layer_idx}"
-        weights[f"{pfx}.attn_norm"] = torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype)
-        weights[f"{pfx}.mlp_norm"] = torch.ones(QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype)
-        weights[f"{pfx}.W_gate_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_INTERMEDIATE, QWEN3_5_NVFP4_HIDDEN, group_size)
-        weights[f"{pfx}.W_up_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_INTERMEDIATE, QWEN3_5_NVFP4_HIDDEN, group_size)
-        weights[f"{pfx}.W_down_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_INTERMEDIATE, group_size)
+        weights[f"{pfx}.attn_norm"] = torch.ones(QWEN3_5_MXFP4_HIDDEN, device="cuda", dtype=dtype)
+        weights[f"{pfx}.mlp_norm"] = torch.ones(QWEN3_5_MXFP4_HIDDEN, device="cuda", dtype=dtype)
+        weights[f"{pfx}.W_gate_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_INTERMEDIATE, QWEN3_5_MXFP4_HIDDEN, group_size)
+        weights[f"{pfx}.W_up_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_INTERMEDIATE, QWEN3_5_MXFP4_HIDDEN, group_size)
+        weights[f"{pfx}.W_down_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_HIDDEN, QWEN3_5_MXFP4_INTERMEDIATE, group_size)
         if layer_type == "full_attention":
-            weights[f"{pfx}.q_norm"] = torch.ones(QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.k_norm"] = torch.ones(QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_q_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_Q_RAW_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_k_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_KV_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_v_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_KV_DIM, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_o_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_Q_DIM, group_size)
+            weights[f"{pfx}.q_norm"] = torch.ones(QWEN3_5_MXFP4_HEAD_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.k_norm"] = torch.ones(QWEN3_5_MXFP4_HEAD_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_q_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_Q_RAW_DIM, QWEN3_5_MXFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_k_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_KV_DIM, QWEN3_5_MXFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_v_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_KV_DIM, QWEN3_5_MXFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_o_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_HIDDEN, QWEN3_5_MXFP4_Q_DIM, group_size)
         else:
-            weights[f"{pfx}.linear_norm"] = torch.ones(QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_CONV_CHANNELS, QWEN3_5_NVFP4_HIDDEN, group_size)
-            weights[f"{pfx}.W_z_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_DN_V_SIZE, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.linear_norm"] = torch.ones(QWEN3_5_MXFP4_DN_VALUE_DIM, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_qkv_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_DN_CONV_CHANNELS, QWEN3_5_MXFP4_HIDDEN, group_size)
+            weights[f"{pfx}.W_z_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_DN_V_SIZE, QWEN3_5_MXFP4_HIDDEN, group_size)
             weights[f"{pfx}.W_beta"] = torch.zeros(
-                QWEN3_5_NVFP4_DN_NUM_HEADS,
-                QWEN3_5_NVFP4_HIDDEN,
+                QWEN3_5_MXFP4_DN_NUM_HEADS,
+                QWEN3_5_MXFP4_HIDDEN,
                 device="cuda",
                 dtype=dtype,
             )
             weights[f"{pfx}.W_alpha"] = torch.zeros_like(weights[f"{pfx}.W_beta"])
             weights[f"{pfx}.conv_weight"] = torch.zeros(
-                QWEN3_5_NVFP4_DN_CONV_CHANNELS,
-                QWEN3_5_NVFP4_DN_CONV_KERNEL,
+                QWEN3_5_MXFP4_DN_CONV_CHANNELS,
+                QWEN3_5_MXFP4_DN_CONV_KERNEL,
                 device="cuda",
                 dtype=dtype,
             )
-            weights[f"{pfx}.a_log"] = torch.zeros(QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
-            weights[f"{pfx}.dt_bias"] = torch.zeros(QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
-            weights[f"{pfx}.W_out_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_HIDDEN, QWEN3_5_NVFP4_DN_V_SIZE, group_size)
-    weights["lm_head_nvfp4"] = _qweight_empty(QWEN3_5_NVFP4_VOCAB, QWEN3_5_NVFP4_HIDDEN, group_size)
+            weights[f"{pfx}.a_log"] = torch.zeros(QWEN3_5_MXFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
+            weights[f"{pfx}.dt_bias"] = torch.zeros(QWEN3_5_MXFP4_DN_NUM_HEADS, device="cuda", dtype=dtype)
+            weights[f"{pfx}.W_out_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_HIDDEN, QWEN3_5_MXFP4_DN_V_SIZE, group_size)
+    weights["lm_head_mxfp4"] = _qweight_empty(QWEN3_5_MXFP4_VOCAB, QWEN3_5_MXFP4_HIDDEN, group_size)
     return weights
 
 
@@ -136,28 +141,28 @@ def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_s
         hf = f"model.layers.{layer_idx}"
         weights[f"{pfx}.attn_norm"] = _qwen_rms_weight(state[f"{hf}.input_layernorm.weight"])
         weights[f"{pfx}.mlp_norm"] = _qwen_rms_weight(state[f"{hf}.post_attention_layernorm.weight"])
-        weights[f"{pfx}.W_gate_nvfp4"] = _qweight(state[f"{hf}.mlp.gate_proj.weight"], group_size)
-        weights[f"{pfx}.W_up_nvfp4"] = _qweight(state[f"{hf}.mlp.up_proj.weight"], group_size)
-        weights[f"{pfx}.W_down_nvfp4"] = _qweight(state[f"{hf}.mlp.down_proj.weight"], group_size)
+        weights[f"{pfx}.W_gate_mxfp4"] = _qweight(state[f"{hf}.mlp.gate_proj.weight"], group_size)
+        weights[f"{pfx}.W_up_mxfp4"] = _qweight(state[f"{hf}.mlp.up_proj.weight"], group_size)
+        weights[f"{pfx}.W_down_mxfp4"] = _qweight(state[f"{hf}.mlp.down_proj.weight"], group_size)
         if layer_type == "full_attention":
             weights[f"{pfx}.q_norm"] = _qwen_rms_weight(state[f"{hf}.self_attn.q_norm.weight"])
             weights[f"{pfx}.k_norm"] = _qwen_rms_weight(state[f"{hf}.self_attn.k_norm.weight"])
-            weights[f"{pfx}.W_q_nvfp4"] = _qweight(state[f"{hf}.self_attn.q_proj.weight"], group_size)
-            weights[f"{pfx}.W_k_nvfp4"] = _qweight(state[f"{hf}.self_attn.k_proj.weight"], group_size)
-            weights[f"{pfx}.W_v_nvfp4"] = _qweight(state[f"{hf}.self_attn.v_proj.weight"], group_size)
-            weights[f"{pfx}.W_o_nvfp4"] = _qweight(state[f"{hf}.self_attn.o_proj.weight"], group_size)
+            weights[f"{pfx}.W_q_mxfp4"] = _qweight(state[f"{hf}.self_attn.q_proj.weight"], group_size)
+            weights[f"{pfx}.W_k_mxfp4"] = _qweight(state[f"{hf}.self_attn.k_proj.weight"], group_size)
+            weights[f"{pfx}.W_v_mxfp4"] = _qweight(state[f"{hf}.self_attn.v_proj.weight"], group_size)
+            weights[f"{pfx}.W_o_mxfp4"] = _qweight(state[f"{hf}.self_attn.o_proj.weight"], group_size)
         else:
             weights[f"{pfx}.linear_norm"] = state[f"{hf}.linear_attn.norm.weight"].contiguous()
-            weights[f"{pfx}.W_qkv_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_qkv.weight"], group_size)
-            weights[f"{pfx}.W_z_nvfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_z.weight"], group_size)
+            weights[f"{pfx}.W_qkv_mxfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_qkv.weight"], group_size)
+            weights[f"{pfx}.W_z_mxfp4"] = _qweight(state[f"{hf}.linear_attn.in_proj_z.weight"], group_size)
             weights[f"{pfx}.W_beta"] = state[f"{hf}.linear_attn.in_proj_b.weight"].contiguous()
             weights[f"{pfx}.W_alpha"] = state[f"{hf}.linear_attn.in_proj_a.weight"].contiguous()
             weights[f"{pfx}.conv_weight"] = state[f"{hf}.linear_attn.conv1d.weight"].squeeze(1).contiguous()
             weights[f"{pfx}.a_log"] = state[f"{hf}.linear_attn.A_log"].contiguous()
             weights[f"{pfx}.dt_bias"] = state[f"{hf}.linear_attn.dt_bias"].contiguous()
-            weights[f"{pfx}.W_out_nvfp4"] = _qweight(state[f"{hf}.linear_attn.out_proj.weight"], group_size)
+            weights[f"{pfx}.W_out_mxfp4"] = _qweight(state[f"{hf}.linear_attn.out_proj.weight"], group_size)
     lm_head = state.get("lm_head.weight", state["model.embed_tokens.weight"]).contiguous()
-    weights["lm_head_nvfp4"] = _qweight(lm_head, group_size)
+    weights["lm_head_mxfp4"] = _qweight(lm_head, group_size)
     del model
     torch.cuda.empty_cache()
     return weights
@@ -166,32 +171,32 @@ def _load_weights(model_name: str, context_len: int, dtype: torch.dtype, group_s
 def _make_buffers(context_len: int, dtype: torch.dtype, top_partitions: int, atomic_final: bool = False):
     batch = 1
     seq_len = 1
-    x = [torch.zeros(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS + 1)]
-    residual = [torch.zeros_like(x[0]) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS + 1)]
+    x = [torch.zeros(batch, seq_len, QWEN3_5_MXFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS + 1)]
+    residual = [torch.zeros_like(x[0]) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS + 1)]
     k_cache = [
-        torch.zeros(batch, context_len + 1, QWEN3_5_NVFP4_NUM_KV_HEADS, QWEN3_5_NVFP4_HEAD_DIM, device="cuda", dtype=dtype)
-        for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)
+        torch.zeros(batch, context_len + 1, QWEN3_5_MXFP4_NUM_KV_HEADS, QWEN3_5_MXFP4_HEAD_DIM, device="cuda", dtype=dtype)
+        for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)
     ]
     v_cache = [torch.zeros_like(k) for k in k_cache]
     scratch_dtype = torch.float32
-    q_raw = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_RAW_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_NVFP4_KV_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    q_gate = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    q_buf = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    q_raw = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_Q_RAW_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
+    kv_raw = [torch.empty(batch, seq_len, 2 * QWEN3_5_MXFP4_KV_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
+    q_gate = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
+    q_buf = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_Q_DIM, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
     attn_out = [torch.empty_like(q) for q in q_buf]
-    norm = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
-    qkv = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_CONV_CHANNELS, device="cuda", dtype=scratch_dtype) for _ in range(18)]
-    z = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_V_SIZE, device="cuda", dtype=scratch_dtype) for _ in range(18)]
-    beta = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_DN_NUM_HEADS, device="cuda", dtype=torch.float32) for _ in range(18)]
+    norm = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_HIDDEN, device="cuda", dtype=dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
+    qkv = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_DN_CONV_CHANNELS, device="cuda", dtype=scratch_dtype) for _ in range(18)]
+    z = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_DN_V_SIZE, device="cuda", dtype=scratch_dtype) for _ in range(18)]
+    beta = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_DN_NUM_HEADS, device="cuda", dtype=torch.float32) for _ in range(18)]
     alpha = [torch.empty_like(b) for b in beta]
     dn_out = [torch.empty_like(v) for v in z]
-    mlp = [torch.empty(batch, seq_len, QWEN3_5_NVFP4_INTERMEDIATE, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_NVFP4_NUM_LAYERS)]
+    mlp = [torch.empty(batch, seq_len, QWEN3_5_MXFP4_INTERMEDIATE, device="cuda", dtype=scratch_dtype) for _ in range(QWEN3_5_MXFP4_NUM_LAYERS)]
     dn_state = [
-        torch.zeros(batch, QWEN3_5_NVFP4_DN_NUM_HEADS, QWEN3_5_NVFP4_DN_KEY_DIM, QWEN3_5_NVFP4_DN_VALUE_DIM, device="cuda")
+        torch.zeros(batch, QWEN3_5_MXFP4_DN_NUM_HEADS, QWEN3_5_MXFP4_DN_KEY_DIM, QWEN3_5_MXFP4_DN_VALUE_DIM, device="cuda")
         for _ in range(18)
     ]
     conv = [
-        torch.zeros(batch, QWEN3_5_NVFP4_DN_CONV_CHANNELS, QWEN3_5_NVFP4_DN_CONV_KERNEL, device="cuda")
+        torch.zeros(batch, QWEN3_5_MXFP4_DN_CONV_CHANNELS, QWEN3_5_MXFP4_DN_CONV_KERNEL, device="cuda")
         for _ in range(18)
     ]
     top_values = torch.empty(batch, seq_len, device="cuda", dtype=torch.float32)
@@ -261,7 +266,7 @@ def _schedule_body(args, weights, buffers):
         top_atomic_winner,
         top_atomic_counter,
     ) = buffers
-    schedule = schedule_qwen3_5_nvfp4_decode_sm120(
+    schedule = schedule_qwen3_5_mxfp4_decode_sm120(
         batch=1,
         seq_len=1,
         cache_pos=args.context_len,
@@ -285,7 +290,7 @@ def _schedule_body(args, weights, buffers):
         dn_state=dn_state,
         conv_buf=conv,
         final_norm=None if args.no_final else weights["final_norm"],
-        lm_head_nvfp4=None if args.no_final else weights["lm_head_nvfp4"],
+        lm_head_mxfp4=None if args.no_final else weights["lm_head_mxfp4"],
         top_values=top_values,
         top_indices=top_indices,
         top_partial_values=top_partial_values,
@@ -297,12 +302,12 @@ def _schedule_body(args, weights, buffers):
         page_size=args.page_size,
         group_size=args.group_size,
         fa_num_splits=args.fa_num_splits,
-        use_flash_attention=args.use_flash_attention,
         matvec_block=args.matvec_block,
         gate_up_block=getattr(args, "gate_up_block", None),
         prefetch_gate_up=args.prefetch_gate_up,
         max_layers=getattr(args, "max_layers", None),
         fuse_down_next_norm=getattr(args, "fuse_down_next_norm", False),
+        fp4_ops=getattr(args, "fp4_ops", None),
     )
     return schedule
 
@@ -311,12 +316,10 @@ def _make_replay_kernel(args, ops, keep_alive):
     scheduler = None
     if args.scheduler == "overlap":
         scheduler = OverlapTileScheduler(
-            use_controller_waits_for_readiness=True,
         )
     elif args.scheduler == "overlap-adaptive":
         scheduler = OverlapTileScheduler(
             adaptive_fetch_stride=True,
-            use_controller_waits_for_readiness=True,
         )
     kernel = Megakernel(
         ops,
@@ -336,9 +339,7 @@ def _make_replay_kernel(args, ops, keep_alive):
 def build_kernel(args):
     dtype = torch.bfloat16
     top_partitions = args.top_partitions
-    if getattr(args, "single_final", False):
-        top_partitions = 0
-    elif top_partitions <= 0:
+    if top_partitions <= 0:
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
         top_partitions = 3 * sm_count
     args.top_partitions_resolved = top_partitions
@@ -375,12 +376,12 @@ def build_kernel(args):
         top_atomic_counter,
     ) = buffers
     if args.final_only:
-        schedule_ops = schedule_qwen3_5_final_nvfp4_sm120(
+        schedule_ops = schedule_qwen3_5_final_mxfp4_sm120(
             x=x[-1],
             residual_in=residual[-1],
             residual_out=residual[-1],
             final_norm=weights["final_norm"],
-            lm_head_nvfp4=weights["lm_head_nvfp4"],
+            lm_head_mxfp4=weights["lm_head_mxfp4"],
             top_values=top_values,
             top_indices=top_indices,
             top_partial_values=top_partial_values,
@@ -392,6 +393,7 @@ def build_kernel(args):
             seq_len=1,
             page_size=args.page_size,
             group_size=args.group_size,
+            fp4_ops=getattr(args, "fp4_ops", None),
         )
         keep_alive = []
     else:
@@ -427,16 +429,15 @@ def main():
         "--mma-reg-count",
         type=int,
         default=96,
-        help="Registers requested for compute warps; NVFP4 decode is compute-only and does not need the GEMM default.",
+        help="Registers requested for compute warps; FP4 decode is compute-only and does not need the GEMM default.",
     )
-    parser.add_argument("--matvec-block", type=int, default=16)
+    parser.add_argument("--matvec-block", type=int, default=QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK)
     parser.add_argument("--gate-up-block", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=32)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--rep", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--rep", "--iters", dest="rep", type=int, default=100)
     parser.add_argument("--top-partitions", type=int, default=0)
     parser.add_argument("--fa-num-splits", type=int, default=0)
-    parser.add_argument("--use-flash-attention", action="store_true")
     parser.add_argument(
         "--prefetch-gate-up",
         action=argparse.BooleanOptionalAction,
@@ -447,14 +448,14 @@ def main():
         choices=("default", "overlap", "overlap-adaptive"),
         default="overlap",
     )
-    parser.add_argument("--dummy-weights", action="store_true")
+    parser.add_argument("--dummy-weights", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-final", action="store_true")
     parser.add_argument("--final-only", action="store_true")
-    parser.add_argument("--single-final", action="store_true", help="Use the single-op final top-1 head instead of partitioned partial+reduce")
     parser.add_argument("--atomic-final", action="store_true", help="Use partitioned final top-1 with an atomic global winner instead of partial+reduce")
     parser.add_argument("--atomic-final-skip-init", action="store_true", help="Skip atomic final scratch init op; scratch is zeroed once and reset by the final op")
     parser.add_argument("--fuse-down-next-norm", action="store_true", help="Pre-add MLP down projection into the next residual and start following layers with copy+RMSNorm")
+    parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--trace", type=Path, default=None, help="Write a cutedsl nanotrace after one launch")
     parser.add_argument("--trace-perfetto", type=Path, default=None, help="Write a Perfetto JSON trace after one launch")
     args = parser.parse_args()
@@ -465,15 +466,14 @@ def main():
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
         f"threads={args.threads}, mma_reg_count={args.mma_reg_count}, "
-        f"matvec_block={args.matvec_block}, gate_up_block={args.gate_up_block or QWEN3_5_NVFP4_GATE_UP_BLOCK}, "
+        f"matvec_block={args.matvec_block}, gate_up_block={args.gate_up_block or QWEN3_5_MXFP4_GATE_UP_BLOCK}, "
         f"top_partitions={'3*sms' if args.top_partitions <= 0 else args.top_partitions}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
-        f"single_final={args.single_final}, "
         f"atomic_final={args.atomic_final}, "
         f"atomic_final_skip_init={args.atomic_final_skip_init}, "
         f"fuse_down_next_norm={args.fuse_down_next_norm}, "
-        f"use_flash_attention={args.use_flash_attention}, fa_num_splits={args.fa_num_splits}, "
+        f"fa_num_splits={args.fa_num_splits}, "
         f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}",
         flush=True,
     )
@@ -503,7 +503,7 @@ def main():
             kernel.write_trace_perfetto(str(args.trace_perfetto))
             print(f"trace_perfetto={args.trace_perfetto}", flush=True)
     print(
-        f"machete_qwen_nvfp4_decode: {ms:.3f} ms/token, "
+        f"machete_qwen_mxfp4_SIMT_decode: {ms:.3f} ms/token, "
         f"{1000.0 / ms:.1f} tok/s, ops={len(kernel.ops)}, "
         f"tiles={kernel.total_tiles}, instructions={kernel._num_instructions}, "
         f"page_size={args.page_size}, num_pages={args.num_pages}"

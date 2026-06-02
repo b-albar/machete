@@ -711,7 +711,17 @@ def test_qwen_layer_qkv_projection_uses_staged_decode_gemm():
     assert first_qkv.tiles == (0, 0, 0, 0)
     assert first_qkv.range_end == layer.ops[0].tile_counts[2]
     qkv_signals = builder._build_signal_info_entry(first_qkv, formulas)
-    assert qkv_signals == [idx // 4 for idx in range(first_qkv.range_end)]
+    # The finalize op consumes only the qk_block (Q + KV chunks) — it applies
+    # q/k RMSNorm + RoPE, which V does not need — so the dependency-overlap guard
+    # restricts the qkv projection's signal to the Q+KV chunks within this 2-op
+    # subset. (The V chunks are signalled to the later attention op.)
+    tiles_per_chunk = first_qkv.range_end // (
+        qwen.QWEN3_5_NUM_Q_HEADS + 2 * qwen.QWEN3_5_NUM_KV_HEADS
+    )
+    qk_signal_tiles = (
+        qwen.QWEN3_5_NUM_Q_HEADS + qwen.QWEN3_5_NUM_KV_HEADS
+    ) * tiles_per_chunk
+    assert qkv_signals == [idx // tiles_per_chunk for idx in range(qk_signal_tiles)]
     assert builder._build_wait_info_entry(first_finalize, formulas) == [
         value
         for barrier_idx in range(first_finalize.range_end)

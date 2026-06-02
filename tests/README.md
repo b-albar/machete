@@ -67,7 +67,7 @@ Markers are attached automatically from `tests/conftest.py`, so file layout and 
 - Heavy framework integration:
   - `tests/megakernel/test_communicate.py`
   - `tests/megakernel/test_integration_gpu.py`
-  - `tests/megakernel/test_qwen_nvfp4_ops.py`
+  - `tests/megakernel/test_qwen_mxfp4_ops.py`
 - Fast kernel smoke:
   - `tests/kernels/test_activation.py`
   - `tests/kernels/test_glu.py`

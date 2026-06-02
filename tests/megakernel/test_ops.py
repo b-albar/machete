@@ -506,7 +506,6 @@ def test_controller_wait_readiness_keeps_compute_wait_dependencies_ordered():
     instructions = builder.build(
         scheduler=OverlapTileScheduler(
             fetch_stride=4,
-            use_controller_waits_for_readiness=True,
         )
     )
 
@@ -1540,32 +1539,6 @@ class TestSchedulerAPI:
             (0, 0), (0, 1),
         ]
 
-    def test_overlap_ready_consumer_priority_can_be_limited_by_op_name(self):
-        """Ready-consumer priority is opt-in for ops with reorder-safe semantics."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_ProducerOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_ConsumerOp, tile_counts=(4,))
-
-        unrestricted = builder.build(
-            scheduler=OverlapTileScheduler(
-                fetch_stride=1,
-                prefer_data_movement=False,
-                prefer_ready_consumers=True,
-            )
-        )[:-1]
-        restricted = builder.build(
-            scheduler=OverlapTileScheduler(
-                fetch_stride=1,
-                prefer_data_movement=False,
-                prefer_ready_consumers=True,
-                prefer_ready_consumer_op_names={"NoSuchOp"},
-            )
-        )[:-1]
-
-        assert [(i.op_idx, i.tiles[0]) for i in unrestricted[:2]] == [(0, 0), (2, 0)]
-        assert [(i.op_idx, i.tiles[0]) for i in restricted[:2]] == [(0, 0), (0, 1)]
-
     def test_overlap_dependency_slack_keeps_ready_consumer_behind_independent_work(self):
         """Slack gives strided CTA streams runway before consuming a newly-ready barrier."""
         builder = InstructionStreamBuilder()
@@ -1584,27 +1557,6 @@ class TestSchedulerAPI:
         assert [(i.op_idx, i.tiles[0]) for i in instructions[:8]] == [
             (0, 0), (0, 1), (0, 2), (0, 3),
             (1, 0), (1, 1), (1, 2), (1, 3),
-        ]
-
-    def test_overlap_dependency_slack_can_be_limited_by_op_name(self):
-        """Slack should be opt-in for graphs with ops that have hidden order constraints."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_ProducerOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_ConsumerOp, tile_counts=(4,))
-
-        instructions = builder.build(
-            scheduler=OverlapTileScheduler(
-                fetch_stride=4,
-                prefer_data_movement=False,
-                prefer_ready_consumers=True,
-                dependency_slack_waves=1,
-                dependency_slack_op_names={"NoSuchOp"},
-            )
-        )[:-1]
-
-        assert [(i.op_idx, i.tiles[0]) for i in instructions[4:8]] == [
-            (2, 0), (2, 1), (2, 2), (2, 3),
         ]
 
 

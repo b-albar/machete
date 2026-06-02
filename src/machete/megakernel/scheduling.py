@@ -38,6 +38,7 @@ from .ops import (
     last_dim_slice_region,
     tensor_meta_overlaps,
 )
+from .timing_profile import TimingProfile
 
 
 def _op_cls_phase_param_names(op_cls: Type[Op], phase_name: str) -> Tuple[str, ...]:
@@ -587,35 +588,19 @@ class OverlapTileScheduler(TileScheduler):
         adaptive_fetch_stride: bool = False,
         prefer_data_movement: bool = True,
         prefer_ready_consumers: bool = False,
-        prefer_ready_consumer_op_names: Optional[Set[str]] = None,
         dependency_slack_waves: int = 0,
-        dependency_slack_op_names: Optional[Set[str]] = None,
         dependency_slack_op_indices: Optional[Set[int]] = None,
-        dependency_slack_requires_full_op: bool = True,
-        use_controller_waits_for_readiness: bool = False,
     ):
         self.fetch_stride = fetch_stride
         self.adaptive_fetch_stride = bool(adaptive_fetch_stride)
         self.prefer_data_movement = prefer_data_movement
         self.prefer_ready_consumers = prefer_ready_consumers
-        self.prefer_ready_consumer_op_names = (
-            set(prefer_ready_consumer_op_names)
-            if prefer_ready_consumer_op_names is not None
-            else None
-        )
         self.dependency_slack_waves = max(0, int(dependency_slack_waves))
-        self.dependency_slack_op_names = (
-            set(dependency_slack_op_names)
-            if dependency_slack_op_names is not None
-            else None
-        )
         self.dependency_slack_op_indices = (
             {int(op_idx) for op_idx in dependency_slack_op_indices}
             if dependency_slack_op_indices is not None
             else None
         )
-        self.dependency_slack_requires_full_op = bool(dependency_slack_requires_full_op)
-        self.use_controller_waits_for_readiness = bool(use_controller_waits_for_readiness)
         self._bound_num_blocks: Optional[int] = None
 
     def bind_num_blocks(self, num_blocks: int) -> None:
@@ -682,10 +667,9 @@ class OverlapTileScheduler(TileScheduler):
         barrier_counts: Dict[int, int],
         barrier_ready_wave: Dict[int, int],
         current_wave: int,
-        op_name: str,
         op_idx: int,
     ) -> bool:
-        if not self._slack_applies(op_idx, op_name):
+        if not self._slack_applies(op_idx):
             return True
         for formula in wait_formulas:
             if formula.has_guard and not formula.is_guarded(instr.tiles):
@@ -698,14 +682,11 @@ class OverlapTileScheduler(TileScheduler):
                 return False
         return True
 
-    def _slack_applies(self, op_idx: int, op_name: str) -> bool:
+    def _slack_applies(self, op_idx: int) -> bool:
         if self.dependency_slack_waves <= 0:
             return False
         slack_indices = self.dependency_slack_op_indices
         if slack_indices is not None and op_idx not in slack_indices:
-            return False
-        slack_ops = self.dependency_slack_op_names
-        if slack_ops is not None and op_name not in slack_ops:
             return False
         return True
 
@@ -732,18 +713,14 @@ class OverlapTileScheduler(TileScheduler):
         *,
         op_idx: int,
         tile_idx: int,
-        pos: int,
         depths: List[int],
         resource_scores: List[int],
         has_waits: List[bool],
-        op_names: List[str],
     ) -> Tuple[int, int, int, int, int]:
         resource_score = resource_scores[op_idx] if self.prefer_data_movement else 0
-        allowed_consumers = self.prefer_ready_consumer_op_names
         consumer_score = 1 if (
             self.prefer_ready_consumers
             and has_waits[op_idx]
-            and (allowed_consumers is None or op_names[op_idx] in allowed_consumers)
         ) else 0
         return (
             consumer_score,
@@ -760,7 +737,6 @@ class OverlapTileScheduler(TileScheduler):
         depths: List[int],
         resource_scores: List[int],
         has_waits: List[bool],
-        op_names: List[str],
         fetch_stride: int,
     ) -> List[TileInstruction]:
         scheduled: List[TileInstruction] = []
@@ -785,11 +761,9 @@ class OverlapTileScheduler(TileScheduler):
                         *self._priority(
                             op_idx=op_idx,
                             tile_idx=tile_idx,
-                            pos=pos,
                             depths=depths,
                             resource_scores=resource_scores,
                             has_waits=has_waits,
-                            op_names=op_names,
                         ),
                         pos,
                     )
@@ -801,15 +775,16 @@ class OverlapTileScheduler(TileScheduler):
                         barrier_counts,
                         barrier_ready_wave,
                         current_wave,
-                        op_names[op_idx],
                         op_idx,
                     ):
                         slack_ready_by_op[op_idx] = slack_ready_by_op.get(op_idx, 0) + 1
 
             for entry, op_idx, instr, wait_formulas in base_ready_entries:
+                # Slack ops only dispatch once the whole op is ready, so a
+                # newly-signalled barrier does not pull a single consumer tile
+                # ahead of its independent siblings.
                 if (
-                    self.dependency_slack_requires_full_op
-                    and self._slack_applies(op_idx, op_names[op_idx])
+                    self._slack_applies(op_idx)
                     and (
                         base_ready_by_op.get(op_idx, 0) < pending_by_op.get(op_idx, 0)
                         or slack_ready_by_op.get(op_idx, 0) < pending_by_op.get(op_idx, 0)
@@ -822,7 +797,6 @@ class OverlapTileScheduler(TileScheduler):
                         barrier_counts,
                         barrier_ready_wave,
                         current_wave,
-                        op_names[op_idx],
                         op_idx,
                 ):
                     ready.append(entry)
@@ -874,7 +848,6 @@ class OverlapTileScheduler(TileScheduler):
         depths = _compute_op_depths(len(op_records), edges)
         resource_scores = [self._resource_score(rec.op) for rec in op_records]
         has_waits = [bool(formulas.get(rec.op_idx, ([], []))[0]) for rec in op_records]
-        op_names = [rec.op.op_cls.__name__ for rec in op_records]
         candidates: List[Tuple[int, int, TileInstruction]] = []
         for rec in op_records:
             for tile_idx, tile in enumerate(rec.tiles):
@@ -887,7 +860,6 @@ class OverlapTileScheduler(TileScheduler):
             depths,
             resource_scores,
             has_waits,
-            op_names,
             fetch_stride,
         )
 
@@ -903,6 +875,68 @@ class OverlapTileScheduler(TileScheduler):
         scheduler.  This method keeps the abstract interface complete.
         """
         return BackwardScheduler().schedule(op_records, consumer_deps, edges)
+
+
+class TimingAwareOverlapScheduler(OverlapTileScheduler):
+    """Overlap scheduler that biases ready-tile ordering with measured timings."""
+
+    def __init__(
+        self,
+        *,
+        timing_profile: TimingProfile,
+        timing_mode: str = "critical",
+        timing_position: str = "late",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.timing_profile = timing_profile
+        self.timing_mode = timing_mode
+        self.timing_position = timing_position
+
+    def _priority(
+        self,
+        *,
+        op_idx: int,
+        tile_idx: int,
+        depths: List[int],
+        resource_scores: List[int],
+        has_waits: List[bool],
+    ) -> Tuple[int, int, int, int, int, int]:
+        base = super()._priority(
+            op_idx=op_idx,
+            tile_idx=tile_idx,
+            depths=depths,
+            resource_scores=resource_scores,
+            has_waits=has_waits,
+        )
+        timing_score = self.timing_profile.score(op_idx, self.timing_mode)
+        consumer_score, depth, neg_op_idx, resource_score, neg_tile_idx = base
+        if self.timing_position == "before_op":
+            return (
+                consumer_score,
+                depth,
+                timing_score,
+                neg_op_idx,
+                resource_score,
+                neg_tile_idx,
+            )
+        if self.timing_position == "after_resource":
+            return (
+                consumer_score,
+                depth,
+                neg_op_idx,
+                resource_score,
+                neg_tile_idx,
+                timing_score,
+            )
+        return (
+            consumer_score,
+            depth,
+            neg_op_idx,
+            resource_score,
+            timing_score,
+            neg_tile_idx,
+        )
 
 
 # =============================================================================

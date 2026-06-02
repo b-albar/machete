@@ -83,7 +83,7 @@ class StreamingOp(Op):
 
 - Attention kernels for SM100/SM120.
 - GEMM, RMSNorm, RoPE, GLU, MoE, and cross entropy ops.
-- Decode-oriented Qwen 3.5 SM120/NVFP4 kernels.
+- Decode-oriented Qwen 3.5 SM120/MXFP4 kernels.
 - Autograd helpers for composing megakernel-backed modules.
 - Trace export helpers for profiling persistent-kernel replay.
 

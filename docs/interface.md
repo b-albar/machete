@@ -157,7 +157,7 @@ venvmachete/bin/python scripts/generate_qwen35_benchmark_graphics.py \
   --decode-context-len 128 256 512 1024 \
   --decode-page-size 32768 \
   --decode-num-pages 3 \
-  --machete-decode-bench nvfp4 \
+  --machete-decode-bench mxfp4 \
   --machete-scheduler overlap-adaptive \
   --no-machete-dummy-weights \
   --training-seq-len 128 256 512 1024 \
@@ -169,7 +169,7 @@ The training graphics intentionally require a source-backed full Qwen layer
 benchmark at `benchmarks/kernels/benchmark_qwen3_5_layer.py`. The old
 MLP-block benchmark is not used for these graphs.
 
-Machete decode should be run with `--machete-decode-bench nvfp4` and
+Machete decode should be run with `--machete-decode-bench mxfp4` and
 `--no-machete-dummy-weights` for published graphics. Token equivalence with the
 Luce/llama reference path is checked by
 `scripts/check_qwen35_machete_decode_equivalence.py`.

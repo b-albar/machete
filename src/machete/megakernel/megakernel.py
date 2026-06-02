@@ -80,6 +80,7 @@ from .interpreter import (
     nanosleep,
 )
 from .paged_memory import (
+    MAX_PAGES,
     NPageLayout,
     PipelinePageLayout,
     st_shared_i32,
@@ -210,6 +211,7 @@ class MegakernelConfig:
     num_sms: Optional[int] = None
     page_size: int = 49152
     num_pages: Optional[int] = None
+    page_free_extra_slots: int = 0
     tracing: bool = False
     dma_reg_count: int = 40
     mma_reg_count: int = 232
@@ -538,9 +540,10 @@ class Megakernel:
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
+            num_slots = self._num_slots_for_pages(self.config.num_pages)
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
-                num_slots=self.config.num_pages,
+                num_slots=num_slots,
                 page_size=self.config.page_size,
             )
         else:
@@ -557,9 +560,10 @@ class Megakernel:
                 else:
                     max_smem = 228 * 1024
                 for n in range(self._layout.num_pages, 0, -1):
+                    num_slots = self._num_slots_for_pages(n)
                     candidate = NPageLayout(
                         num_pages=n,
-                        num_slots=n,
+                        num_slots=num_slots,
                         page_size=self.config.page_size,
                     )
                     if candidate.total_size <= max_smem:
@@ -676,6 +680,12 @@ class Megakernel:
             self._tracing_state = setup_tracing(
                 self.ops, self.num_sms, self.total_tiles, device=self.device
             )
+
+    def _num_slots_for_pages(self, num_pages: int) -> int:
+        if not self._has_page_free_ops:
+            return num_pages
+        extra_slots = max(0, int(getattr(self.config, "page_free_extra_slots", 0)))
+        return min(MAX_PAGES, num_pages + extra_slots)
 
     @property
     def num_sms(self) -> int:
