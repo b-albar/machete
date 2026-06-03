@@ -591,8 +591,7 @@ class GLUOp(Op):
             cute.group_modes(sY, 0, 3),
             cute.group_modes(gY, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
+        cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
 class DirectGLUOp(Op):
@@ -970,22 +969,21 @@ class StagedDirectGLUOp(Op):
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_D,
               y_tma, y_tma_gmem):
-        with cute.arch.elect_one():
-            sY = cute.make_tensor(
-                cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
-                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
-            )
-            gY = cute.local_tile(
-                y_tma_gmem,
-                (self.tile_size_D, self.tile_size_S, 1),
-                (tile_D, tile_S, tile_B),
-            )
-            tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
-                y_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sY, 0, 3),
-                cute.group_modes(gY, 0, 3),
-            )
-            cute.copy(y_tma, tYsY, tYgY)
+        sY = cute.make_tensor(
+            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gY = cute.local_tile(
+            y_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
+            y_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sY, 0, 3),
+            cute.group_modes(gY, 0, 3),
+        )
+        cute.copy(y_tma, tYsY, tYgY)
 
 
 # =============================================================================
@@ -1308,39 +1306,38 @@ class GLUBwdOp(Op):
     def store(self, page_ptr, tile_B, tile_S, tile_D,
              dx_tma, dx_tma_gmem):
         """TMA store d_gate/d_up D chunks from smem to dx."""
-        with cute.arch.elect_one():
-            sDGate = cute.make_tensor(
-                cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
-            )
-            gDGate = cute.local_tile(
-                dx_tma_gmem,
-                (self.tile_size_D, self.tile_size_S, 1),
-                (tile_D, tile_S, tile_B),
-            )
-            tDGsDGate, tDGgDGate = cute.nvgpu.cpasync.tma_partition(
-                dx_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sDGate, 0, 3),
-                cute.group_modes(gDGate, 0, 3),
-            )
-            cute.copy(dx_tma, tDGsDGate, tDGgDGate)
+        sDGate = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gDGate = cute.local_tile(
+            dx_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tDGsDGate, tDGgDGate = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDGate, 0, 3),
+            cute.group_modes(gDGate, 0, 3),
+        )
+        cute.copy(dx_tma, tDGsDGate, tDGgDGate)
 
-            sDUp = cute.make_tensor(
-                cute.make_ptr(
-                    self.x_dtype,
-                    page_ptr + Int32(self.up_smem_offset),
-                    cute.AddressSpace.smem,
-                ),
-                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
-            )
-            gDUp = cute.local_tile(
-                dx_tma_gmem,
-                (self.tile_size_D, self.tile_size_S, 1),
-                (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
-            )
-            tDUsDUp, tDUgDUp = cute.nvgpu.cpasync.tma_partition(
-                dx_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sDUp, 0, 3),
-                cute.group_modes(gDUp, 0, 3),
-            )
-            cute.copy(dx_tma, tDUsDUp, tDUgDUp)
+        sDUp = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.up_smem_offset),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gDUp = cute.local_tile(
+            dx_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
+        )
+        tDUsDUp, tDUgDUp = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDUp, 0, 3),
+            cute.group_modes(gDUp, 0, 3),
+        )
+        cute.copy(dx_tma, tDUsDUp, tDUgDUp)

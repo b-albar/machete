@@ -519,27 +519,55 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _ds_pp = _get_page_ptr(smem_base, _ds_page)
                     else:
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
-                    if const_expr(dispatch_store_uses_handler_local_idx):
-                        dispatch_store(
-                            _ds_handler,
-                            _ds_handler_local,
-                            _ds_pp,
-                            _ds_0,
-                            _ds_1,
-                            _ds_2,
-                            _ds_3,
-                            _ds_config,
-                        )
+                    # Elect once at the dispatch boundary. Electing only inside
+                    # each op store lets PTXAS lose the single-lane proof in the
+                    # fused Qwen kernels and can reintroduce serialized UTMASTG
+                    # loops.
+                    if const_expr(elect_store_dispatch):
+                        with cute.arch.elect_one():
+                            if const_expr(dispatch_store_uses_handler_local_idx):
+                                dispatch_store(
+                                    _ds_handler,
+                                    _ds_handler_local,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_config,
+                                )
+                            else:
+                                dispatch_store(
+                                    _ds_handler,
+                                    _ds_pp,
+                                    _ds_0,
+                                    _ds_1,
+                                    _ds_2,
+                                    _ds_3,
+                                    _ds_config,
+                                )
                     else:
-                        dispatch_store(
-                            _ds_handler,
-                            _ds_pp,
-                            _ds_0,
-                            _ds_1,
-                            _ds_2,
-                            _ds_3,
-                            _ds_config,
-                        )
+                        if const_expr(dispatch_store_uses_handler_local_idx):
+                            dispatch_store(
+                                _ds_handler,
+                                _ds_handler_local,
+                                _ds_pp,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_config,
+                            )
+                        else:
+                            dispatch_store(
+                                _ds_handler,
+                                _ds_pp,
+                                _ds_0,
+                                _ds_1,
+                                _ds_2,
+                                _ds_3,
+                                _ds_config,
+                            )
                     if const_expr(has_communicate):
                         if const_expr(dispatch_communicate_uses_handler_local_idx):
                             dispatch_communicate(

@@ -75,6 +75,14 @@ def build_kernel_static_config(
     threads_per_block = kernel.config.threads_per_block
     active_dma_warps = 0 if use_compute_only_replay else num_dma_warps
     num_mma_warps = (threads_per_block // 32) - active_dma_warps
+    # Regular TMA stores are issued from a single elected lane in the store
+    # dispatcher. Reduce-style stores need all participating lanes, so leave
+    # their dispatch path un-elected.
+    has_tma_reduce_store = any(
+        bool(getattr(op.op_cls, "_TMA_REDUCE_STORES", set()))
+        or bool(getattr(op.op_cls, "_PEER_REDUCE_STORES", set()))
+        for op in kernel.ops
+    )
 
     return {
         "num_sms": kernel.config.num_sms,
@@ -97,6 +105,7 @@ def build_kernel_static_config(
         "dma_reg_count": kernel.config.dma_reg_count,
         "mma_reg_count": kernel.config.mma_reg_count,
         "actual_threads_per_block": threads_per_block,
+        "elect_store_dispatch": not has_tma_reduce_store,
         "mbarrier_stride": mbarrier_stride,
         "tile_info_bytes": tile_info_bytes,
         "peer_barriers_data_ptr": (
@@ -376,6 +385,7 @@ def build_kernel_extra_exec_globals(
         "sync_compute_warps_after_tile": sync_compute_warps_after_tile,
         "loader_idle_sleep_ns": int(kernel.config.loader_idle_sleep_ns),
         "has_page_free_ops": bool(kernel_cfg["has_page_free_ops"]),
+        "elect_store_dispatch": bool(kernel_cfg["elect_store_dispatch"]),
         "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
         "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
         "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],

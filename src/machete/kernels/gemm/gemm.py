@@ -908,8 +908,7 @@ class GemmOp(Op):
             cute.group_modes(gC, 0, 3),
         )
 
-        with cute.arch.elect_one():
-            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+        cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
