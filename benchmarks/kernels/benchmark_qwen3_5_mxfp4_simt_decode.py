@@ -12,6 +12,7 @@ Use ``--dummy-weights`` for fast framework/runtime iteration. Omit it or pass
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import time
 
@@ -25,6 +26,8 @@ from machete.megakernel import (
 from machete.kernels.qwen_3_5.mxfp4_ops import (
     MXFP4SimtWeight,
     QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK,
+    QWEN3_5_MXFP4_SIMT_Q_MATVEC_BLOCK,
+    QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK,
     empty_mxfp4_simt_weight,
     quantize_mxfp4_simt_weight,
 )
@@ -52,6 +55,24 @@ from machete.kernels.qwen_3_5.mxfp4_ops import (
     schedule_qwen3_5_mxfp4_decode_sm120,
 )
 from machete.kernels.qwen_3_5.mxfp4_ops import QWEN3_5_MXFP4_DN_KEY_DIM
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _resolve_auto_page_size(args) -> int:
+    """Smallest shared-memory page needed by this benchmark's Qwen decode ops."""
+    hidden = QWEN3_5_MXFP4_HIDDEN
+    seq_tile = 1
+    requirements = [
+        128,  # QGate/RoPE norm scratch.
+        3 * QWEN3_5_MXFP4_DN_VALUE_DIM * 4,  # DeltaNet q/k/v fp32 scratch.
+        seq_tile * 4 + seq_tile * hidden * 2,  # RMS+gate/up f16 normalized activation.
+    ]
+    if not args.no_final or args.final_only:
+        requirements.append(args.threads * 8 + hidden * 2)  # LM-head top1 reductions + f16 norm.
+    return _align_up(max(requirements), 128)
 
 
 def _qweight_empty(rows: int, cols: int, group_size: int = 32) -> MXFP4SimtWeight:
@@ -303,10 +324,12 @@ def _schedule_body(args, weights, buffers):
         group_size=args.group_size,
         fa_num_splits=args.fa_num_splits,
         matvec_block=args.matvec_block,
+        q_matvec_block=getattr(args, "q_matvec_block", None),
+        qkv_matvec_block=getattr(args, "qkv_matvec_block", None),
+        out_matvec_block=getattr(args, "out_matvec_block", None),
         gate_up_block=getattr(args, "gate_up_block", None),
         prefetch_gate_up=args.prefetch_gate_up,
         max_layers=getattr(args, "max_layers", None),
-        fuse_down_next_norm=getattr(args, "fuse_down_next_norm", False),
         fp4_ops=getattr(args, "fp4_ops", None),
     )
     return schedule
@@ -317,11 +340,13 @@ def _make_replay_kernel(args, ops, keep_alive):
     if args.scheduler == "overlap":
         scheduler = OverlapTileScheduler(
             fetch_stride=args.fetch_stride if args.fetch_stride > 0 else None,
+            prefer_ready_consumers=args.prefer_ready_consumers,
         )
     elif args.scheduler == "overlap-adaptive":
         scheduler = OverlapTileScheduler(
             fetch_stride=args.fetch_stride if args.fetch_stride > 0 else None,
             adaptive_fetch_stride=True,
+            prefer_ready_consumers=args.prefer_ready_consumers,
         )
     kernel = Megakernel(
         ops,
@@ -343,7 +368,7 @@ def build_kernel(args):
     top_partitions = args.top_partitions
     if top_partitions <= 0:
         sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        top_partitions = 3 * sm_count
+        top_partitions = sm_count
     args.top_partitions_resolved = top_partitions
     weights = (
         _make_dummy_weights(args.context_len, dtype, args.group_size)
@@ -410,6 +435,9 @@ def time_kernel(kernel: Megakernel, warmup: int, rep: int) -> float:
     for _ in range(warmup):
         kernel.run(validate=False)
     torch.cuda.synchronize()
+    use_profiler_range = os.environ.get("MACHETE_CUDA_PROFILER_RANGE") == "1"
+    if use_profiler_range:
+        torch.cuda.cudart().cudaProfilerStart()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -417,6 +445,8 @@ def time_kernel(kernel: Megakernel, warmup: int, rep: int) -> float:
         kernel.run(validate=False)
     end.record()
     torch.cuda.synchronize()
+    if use_profiler_range:
+        torch.cuda.cudart().cudaProfilerStop()
     return start.elapsed_time(end) / rep
 
 
@@ -424,7 +454,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--context-len", type=int, default=128)
-    parser.add_argument("--page-size", type=int, default=32768)
+    parser.add_argument("--page-size", type=int, default=16384, help="Shared-memory page bytes; 0 uses the minimum required for this Qwen decode op mix.")
     parser.add_argument("--num-pages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=512)
     parser.add_argument(
@@ -434,6 +464,9 @@ def main():
         help="Registers requested for compute warps; FP4 decode is compute-only and does not need the GEMM default.",
     )
     parser.add_argument("--matvec-block", type=int, default=QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK)
+    parser.add_argument("--q-matvec-block", type=int, default=QWEN3_5_MXFP4_SIMT_Q_MATVEC_BLOCK)
+    parser.add_argument("--qkv-matvec-block", type=int, default=QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK)
+    parser.add_argument("--out-matvec-block", type=int, default=None)
     parser.add_argument("--gate-up-block", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=20)
@@ -451,6 +484,12 @@ def main():
         default="overlap",
     )
     parser.add_argument(
+        "--prefer-ready-consumers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prioritize dependency-ready consumer tiles within each overlap scheduling wave.",
+    )
+    parser.add_argument(
         "--fetch-stride",
         type=int,
         default=0,
@@ -462,11 +501,13 @@ def main():
     parser.add_argument("--final-only", action="store_true")
     parser.add_argument("--atomic-final", action="store_true", help="Use partitioned final top-1 with an atomic global winner instead of partial+reduce")
     parser.add_argument("--atomic-final-skip-init", action="store_true", help="Skip atomic final scratch init op; scratch is zeroed once and reset by the final op")
-    parser.add_argument("--fuse-down-next-norm", action="store_true", help="Pre-add MLP down projection into the next residual and start following layers with copy+RMSNorm")
     parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--trace", type=Path, default=None, help="Write a cutedsl nanotrace after one launch")
     parser.add_argument("--trace-perfetto", type=Path, default=None, help="Write a Perfetto JSON trace after one launch")
     args = parser.parse_args()
+    requested_page_size = args.page_size
+    if args.page_size <= 0:
+        args.page_size = _resolve_auto_page_size(args)
 
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {props.name}, SMs={props.multi_processor_count}", flush=True)
@@ -474,15 +515,20 @@ def main():
         f"model={args.model}, ctx={args.context_len}, dummy={args.dummy_weights}, "
         f"group_size={args.group_size}, "
         f"threads={args.threads}, mma_reg_count={args.mma_reg_count}, "
-        f"matvec_block={args.matvec_block}, gate_up_block={args.gate_up_block or QWEN3_5_MXFP4_GATE_UP_BLOCK}, "
-        f"top_partitions={'3*sms' if args.top_partitions <= 0 else args.top_partitions}, "
+        f"matvec_block={args.matvec_block}, q_matvec_block={args.q_matvec_block or args.matvec_block}, "
+        f"qkv_matvec_block={args.qkv_matvec_block or args.matvec_block}, "
+        f"out_matvec_block={args.out_matvec_block or args.matvec_block}, "
+        f"gate_up_block={args.gate_up_block or QWEN3_5_MXFP4_GATE_UP_BLOCK}, "
+        f"top_partitions={'sms' if args.top_partitions <= 0 else args.top_partitions}, "
+        f"page_size={'auto:' if requested_page_size <= 0 else ''}{args.page_size}, "
+        f"num_pages={args.num_pages}, "
         f"no_final={args.no_final}, "
         f"final_only={args.final_only}, "
         f"atomic_final={args.atomic_final}, "
         f"atomic_final_skip_init={args.atomic_final_skip_init}, "
-        f"fuse_down_next_norm={args.fuse_down_next_norm}, "
         f"fa_num_splits={args.fa_num_splits}, "
         f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}, "
+        f"prefer_ready_consumers={args.prefer_ready_consumers}, "
         f"fetch_stride={args.fetch_stride}",
         flush=True,
     )
