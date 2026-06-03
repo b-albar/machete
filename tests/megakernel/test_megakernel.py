@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from machete.kernels.attention import FlashAttentionSm120Op
-from machete.kernels.gemm import GemmOp, GemmSm100Op
+from machete.kernels.gemm import GemmOp
 from machete.kernels.glu import GLUBwdOp, GLUOp
 from machete.kernels.qknorm_rope import QKNormRopeOp
 from machete.kernels.rms_norm import RMSNormOp
@@ -165,7 +165,6 @@ class TestMegakernel:
         """Ops that used backend allowlists now declare their own inline phases."""
         all_thin = ("load", "compute", "store")
         assert GemmOp.inline_phases == all_thin
-        assert GemmSm100Op.inline_phases == all_thin
         assert GLUOp.inline_phases == all_thin
         assert FlashAttentionSm120Op.inline_phases == all_thin
         assert QKNormRopeOp.inline_phases == all_thin

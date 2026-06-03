@@ -316,9 +316,11 @@ def _make_replay_kernel(args, ops, keep_alive):
     scheduler = None
     if args.scheduler == "overlap":
         scheduler = OverlapTileScheduler(
+            fetch_stride=args.fetch_stride if args.fetch_stride > 0 else None,
         )
     elif args.scheduler == "overlap-adaptive":
         scheduler = OverlapTileScheduler(
+            fetch_stride=args.fetch_stride if args.fetch_stride > 0 else None,
             adaptive_fetch_stride=True,
         )
     kernel = Megakernel(
@@ -448,6 +450,12 @@ def main():
         choices=("default", "overlap", "overlap-adaptive"),
         default="overlap",
     )
+    parser.add_argument(
+        "--fetch-stride",
+        type=int,
+        default=0,
+        help="Overlap scheduler fetch stride; 0 uses the scheduler default.",
+    )
     parser.add_argument("--dummy-weights", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--no-final", action="store_true")
@@ -474,7 +482,8 @@ def main():
         f"atomic_final_skip_init={args.atomic_final_skip_init}, "
         f"fuse_down_next_norm={args.fuse_down_next_norm}, "
         f"fa_num_splits={args.fa_num_splits}, "
-        f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}",
+        f"prefetch_gate_up={args.prefetch_gate_up}, scheduler={args.scheduler}, "
+        f"fetch_stride={args.fetch_stride}",
         flush=True,
     )
     t0 = time.perf_counter()

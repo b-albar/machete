@@ -39,12 +39,12 @@ No output pre-zeroing needed — fp32 accumulator handles full K reduction.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, const_expr
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_inval,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
@@ -61,15 +61,17 @@ def _gemm_epilogue_store_helper(page_ptr, tidx, tiled_mma, acc,
                                 c_dtype,
                                 tile_size_S,
                                 tile_size_N,
-                                activation):
+                                activation,
+                                use_kr_barriers: bool = True):
     """Finalize GEMM accumulators into swizzled shared memory."""
     named_barrier_sync(Int32(2), Int32(num_mma_threads))
 
     if tidx == Int32(0):
         mbarrier_inval(_bf_0)
         mbarrier_inval(_bf_1)
-        mbarrier_inval(_kr_0)
-        mbarrier_inval(_kr_1)
+        if const_expr(use_kr_barriers):
+            mbarrier_inval(_kr_0)
+            mbarrier_inval(_kr_1)
 
     swz_c = cute.make_swizzle(swz_B_c, 4, 3)
     sC = cute.make_tensor(
@@ -500,9 +502,11 @@ class GemmOp(Op):
         with cute.arch.elect_one():
             mbarrier_init(_bf_0, Int32(self.num_mma_warps))
             mbarrier_init(_bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(_kr_0, Int32(1))
-            mbarrier_init(_kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(_kr_0, Int32(1))
+                mbarrier_init(_kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         _k_block = Int32(0)
         while _k_block < Int32(self.num_k_blocks):
@@ -858,6 +862,7 @@ class GemmOp(Op):
             _bf_0, _bf_1, _kr_0, _kr_1,
             self.num_mma_threads, self.swz_B_c, self.c_dtype,
             self.tile_size_S, self.tile_size_N, self.activation,
+            use_kr_barriers=self.num_k_blocks > 2,
         )
 
     @cute.jit
@@ -943,8 +948,7 @@ class GemmOp(Op):
             cute.group_modes(gC, 0, 3),
         )
 
-        with cute.arch.elect_one():
-            cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+        cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
 
     # =========================================================================
     # Scheduling
@@ -1406,9 +1410,11 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
         with cute.arch.elect_one():
             mbarrier_init(_bf_0, Int32(self.num_mma_warps))
             mbarrier_init(_bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(_kr_0, Int32(1))
-            mbarrier_init(_kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(_kr_0, Int32(1))
+                mbarrier_init(_kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         _chunk_base = (
             tile_R * Int32((self.reduce_tile_n + self.tile_K - 1) // self.tile_K)

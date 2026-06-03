@@ -1014,74 +1014,85 @@ class QKNormRopeBwdOp(Op):
         w_reg = cute.make_fragment_like(w_part)
         cute.autovec_copy(w_part, w_reg)
 
-        for local_b in range(self.tile_size_B):
+        # Distribute the flattened (B, S, H) rows across ALL warps rather than
+        # splitting only over H with a serial S loop. Each row (one head's
+        # D-vector) is still owned by a single warp (32 lanes over D), but now
+        # every warp grabs a strided slice of the tile's B*S*H rows so all
+        # available warps stay busy even when tile_size_H < num_warps (notably
+        # the K tensor, where tile_size_H is as small as 2). cos/sin are reloaded
+        # per row; they only depend on s and hit L2, so the redundancy is cheap.
+        # See the analogous decode-matvec S*O flattening win.
+        total_rows = self.tile_size_B * self.tile_size_S * self.tile_size_H
+        d2_regs = self.D2 // 32
+        for work in range(warp_idx, total_rows, num_warps):
+            local_h = work % self.tile_size_H
+            rem = work // self.tile_size_H
+            local_s = rem % self.tile_size_S
+            local_b = rem // self.tile_size_S
             b = tile_b_start + local_b
+            s = tile_s_start + local_s
             if b < Int32(self.B):
-                for local_s in range(self.tile_size_S):
-                    s = tile_s_start + local_s
-                    if s < Int32(self.S):
-                        m = b * Int32(self.S) + s
-                        cos_row = cute.make_tensor(cos.iterator + s * self.D2, cute.make_layout(self.D2))
-                        sin_row = cute.make_tensor(sin.iterator + s * self.D2, cute.make_layout(self.D2))
-                        cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
-                        sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
-                        cos_reg = cute.make_fragment_like(cos_part)
-                        sin_reg = cute.make_fragment_like(sin_part)
-                        cute.autovec_copy(cos_part, cos_reg)
-                        cute.autovec_copy(sin_part, sin_reg)
+                if s < Int32(self.S):
+                    m = b * Int32(self.S) + s
+                    h = tile_h_start + local_h
+                    row_base = m * Int32(self.H * self.D) + h * Int32(self.D)
 
-                        for local_h in range(warp_idx, self.tile_size_H, num_warps):
-                            h = tile_h_start + local_h
-                            row_base = m * Int32(self.H * self.D) + h * Int32(self.D)
+                    cos_row = cute.make_tensor(cos.iterator + s * self.D2, cute.make_layout(self.D2))
+                    sin_row = cute.make_tensor(sin.iterator + s * self.D2, cute.make_layout(self.D2))
+                    cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
+                    sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
+                    cos_reg = cute.make_fragment_like(cos_part)
+                    sin_reg = cute.make_fragment_like(sin_part)
+                    cute.autovec_copy(cos_part, cos_reg)
+                    cute.autovec_copy(sin_part, sin_reg)
 
-                            q_row = cute.make_tensor(q.iterator + row_base, cute.make_layout(self.D))
-                            dout_row = cute.make_tensor(dout.iterator + row_base, cute.make_layout(self.D))
-                            dq_row = cute.make_tensor(dq.iterator + row_base, cute.make_layout(self.D))
+                    q_row = cute.make_tensor(q.iterator + row_base, cute.make_layout(self.D))
+                    dout_row = cute.make_tensor(dout.iterator + row_base, cute.make_layout(self.D))
+                    dq_row = cute.make_tensor(dq.iterator + row_base, cute.make_layout(self.D))
 
-                            q_part = cute.local_partition(q_row, thr_layout, lane_idx)
-                            dout_part = cute.local_partition(dout_row, thr_layout, lane_idx)
-                            dq_part = cute.local_partition(dq_row, thr_layout, lane_idx)
+                    q_part = cute.local_partition(q_row, thr_layout, lane_idx)
+                    dout_part = cute.local_partition(dout_row, thr_layout, lane_idx)
+                    dq_part = cute.local_partition(dq_row, thr_layout, lane_idx)
 
-                            q_reg = cute.make_fragment_like(q_part)
-                            dout_reg = cute.make_fragment_like(dout_part)
-                            dq_reg = cute.make_fragment_like(dq_part)
-                            cute.autovec_copy(q_part, q_reg)
-                            cute.autovec_copy(dout_part, dout_reg)
+                    q_reg = cute.make_fragment_like(q_part)
+                    dout_reg = cute.make_fragment_like(dout_part)
+                    dq_reg = cute.make_fragment_like(dq_part)
+                    cute.autovec_copy(q_part, q_reg)
+                    cute.autovec_copy(dout_part, dout_reg)
 
-                            # Backprop through RoPE first.
-                            dnorm_reg = cute.make_fragment_like(dout_reg)
-                            for i in range(cute.size(dout_reg)):
-                                dnorm_reg[i] = dout_reg[i]
+                    # Backprop through RoPE first.
+                    dnorm_reg = cute.make_fragment_like(dout_reg)
+                    for i in range(cute.size(dout_reg)):
+                        dnorm_reg[i] = dout_reg[i]
 
-                            d2_regs = self.D2 // 32
-                            for k in range(d2_regs):
-                                c = cos_reg[k].to(Float32)
-                                sn = sin_reg[k].to(Float32)
-                                d0 = dout_reg[k].to(Float32)
-                                d1 = dout_reg[k + d2_regs].to(Float32)
-                                dnorm_reg[k] = (d0 * c + d1 * sn).to(self.q_dtype)
-                                dnorm_reg[k + d2_regs] = (d1 * c - d0 * sn).to(self.q_dtype)
+                    for k in range(d2_regs):
+                        c = cos_reg[k].to(Float32)
+                        sn = sin_reg[k].to(Float32)
+                        d0 = dout_reg[k].to(Float32)
+                        d1 = dout_reg[k + d2_regs].to(Float32)
+                        dnorm_reg[k] = (d0 * c + d1 * sn).to(self.q_dtype)
+                        dnorm_reg[k + d2_regs] = (d1 * c - d0 * sn).to(self.q_dtype)
 
-                            partial_sq = Float32(0.0)
-                            partial_grad = Float32(0.0)
-                            for i in range(cute.size(q_reg)):
-                                x = q_reg[i].to(Float32)
-                                g = dnorm_reg[i].to(Float32) * w_reg[i].to(Float32)
-                                partial_sq = partial_sq + x * x
-                                partial_grad = partial_grad + g * x
+                    partial_sq = Float32(0.0)
+                    partial_grad = Float32(0.0)
+                    for i in range(cute.size(q_reg)):
+                        x = q_reg[i].to(Float32)
+                        g = dnorm_reg[i].to(Float32) * w_reg[i].to(Float32)
+                        partial_sq = partial_sq + x * x
+                        partial_grad = partial_grad + g * x
 
-                            sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
-                            sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
-                            rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
-                            mean_grad = sum_grad * inv_D
+                    sum_sq = cute.arch.warp_reduction(partial_sq, operator.add)
+                    sum_grad = cute.arch.warp_reduction(partial_grad, operator.add)
+                    rstd = cute.math.rsqrt(sum_sq * inv_D + eps_val, fastmath=True)
+                    mean_grad = sum_grad * inv_D
 
-                            for i in range(cute.size(q_reg)):
-                                x = q_reg[i].to(Float32)
-                                g = dnorm_reg[i].to(Float32) * w_reg[i].to(Float32)
-                                dx = (g - x * rstd * rstd * mean_grad) * rstd
-                                dq_reg[i] = dx.to(self.dq_dtype)
+                    for i in range(cute.size(q_reg)):
+                        x = q_reg[i].to(Float32)
+                        g = dnorm_reg[i].to(Float32) * w_reg[i].to(Float32)
+                        dx = (g - x * rstd * rstd * mean_grad) * rstd
+                        dq_reg[i] = dx.to(self.dq_dtype)
 
-                            cute.autovec_copy(dq_reg, dq_part)
+                    cute.autovec_copy(dq_reg, dq_part)
 
 
 __all__ = ["QKNormRopeOp", "PackedQKNormRopeOp", "QKNormRopeBwdOp"]

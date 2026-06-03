@@ -606,30 +606,42 @@ class Qwen3_5QGateRopeCacheSm120Op(Op):
         k_norm = cute.make_tensor(k_norm_weight.iterator, cute.make_layout(self.HD))
         scratch = self._norm_scratch(page_ptr)
 
-        if tidx < Int32(self.q_heads):
+        # RMS-norm of each head's raw vector: one WARP per head (32 lanes do the
+        # head_dim reduction in parallel + warp_reduction), instead of 1 thread per
+        # head doing a serial head_dim loop (which left 504/510 threads idle and was
+        # the op's single-block bottleneck). Warps 0..q_heads-1 do Q, the next
+        # kv_heads warps do K.
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        if warp_idx < Int32(self.q_heads):
             ss_q = Float32(0.0)
-            d = Int32(0)
-            raw_head = tidx * Int32(2 * self.head_dim)
+            raw_head = warp_idx * Int32(2 * self.head_dim)
+            d = lane_idx
             while d < Int32(self.head_dim):
                 qv = q_raw_row[raw_head + d].to(Float32)
                 ss_q = ss_q + qv * qv
-                d = d + Int32(1)
-            scratch[tidx] = cute.math.rsqrt(
-                ss_q * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_MXFP4_EPS),
-                fastmath=True,
-            )
-        if tidx < Int32(self.kv_heads):
+                d = d + Int32(32)
+            ss_q = cute.arch.warp_reduction(ss_q, operator.add)
+            if lane_idx == Int32(0):
+                scratch[warp_idx] = cute.math.rsqrt(
+                    ss_q * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_MXFP4_EPS),
+                    fastmath=True,
+                )
+        elif warp_idx < Int32(self.q_heads + self.kv_heads):
+            kvh = warp_idx - Int32(self.q_heads)
             ss_k = Float32(0.0)
-            kd = Int32(0)
-            k_head = tidx * Int32(self.head_dim)
+            k_head = kvh * Int32(self.head_dim)
+            kd = lane_idx
             while kd < Int32(self.head_dim):
                 kv = k_raw_row[k_head + kd].to(Float32)
                 ss_k = ss_k + kv * kv
-                kd = kd + Int32(1)
-            scratch[Int32(self.q_heads) + tidx] = cute.math.rsqrt(
-                ss_k * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_MXFP4_EPS),
-                fastmath=True,
-            )
+                kd = kd + Int32(32)
+            ss_k = cute.arch.warp_reduction(ss_k, operator.add)
+            if lane_idx == Int32(0):
+                scratch[Int32(self.q_heads) + kvh] = cute.math.rsqrt(
+                    ss_k * Float32(1.0 / self.head_dim) + Float32(QWEN3_5_MXFP4_EPS),
+                    fastmath=True,
+                )
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
         elem = tidx

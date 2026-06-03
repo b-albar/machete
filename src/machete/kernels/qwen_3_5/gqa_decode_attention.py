@@ -13,8 +13,15 @@ All tensors are BMHD: q/o ``(B, M, QH, HD)``, k/v cache ``(B, T, KVH, HD)``.
 Two ops:
   * :class:`Qwen3_5GqaAttnSplitSm120Op` (B x KVH x SPLIT tiles) -> per-(qhead,split)
     partial max / exp-sum / unnormalized output.
-  * :class:`Qwen3_5GqaAttnCombineSm120Op` (B x QH tiles) -> merge splits, sigmoid
-    gate, write o.
+  * :class:`Qwen3_5GqaAttnCombineSm120Op` (B x KVH x GQA tiles, one head each)
+    -> merge splits, sigmoid gate, write o.
+
+The partials carry an explicit (KVH, GQA) head split (QH == KVH*GQA, KVH outer)
+so the split->combine barrier shares KVH and each combine head waits on *its own*
+kv-head's splits. Tiling the combine over a plain QH axis instead silently drops
+KVH from the dependency (the split tiles KVH but a QH-indexed buffer), letting a
+combine fire after num_splits signals while KVH*num_splits split tiles feed the
+same batch barrier -> cross-KV-head early-fire, wrong once splits span >1 SM wave.
 """
 from __future__ import annotations
 
@@ -48,10 +55,16 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
         "k": (None, ("B", "T", "KVH", "HD")),
         "v": (None, ("B", "T", "KVH", "HD")),
     }
+    # Partials carry an explicit (KVH, GQA) head structure (QH == KVH*GQA, KVH
+    # outer) so the split->combine barrier shares the KVH dim. Without this the
+    # split tiles KVH but writes a QH-indexed buffer, KVH is dropped from the
+    # dependency, and a combine tile fires after only `num_splits` signals while
+    # KVH*num_splits split tiles feed the same batch barrier -> cross-KV-head
+    # early-fire (wrong once splits span >1 SM wave). See combine op below.
     writes = {
-        "m_part": (cutlass.Float32, ("B", "QH", "SPLIT")),
-        "l_part": (cutlass.Float32, ("B", "QH", "SPLIT")),
-        "o_part": (cutlass.Float32, ("B", "QH", "SPLIT", "HD")),
+        "m_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
+        "l_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
+        "o_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT", "HD")),
     }
     tile = ("B", "KVH", "SPLIT")
     dynamic_dims = ("B",)
@@ -75,6 +88,7 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
         op.static_dims["HD"] = int(tensors["k"].shape[3])
         op.static_dims["QH"] = int(tensors["q"].shape[2])
         op.static_dims["KVH"] = int(tensors["k"].shape[2])
+        op.static_dims["GQA"] = gqa
         op.static_dims["SPLIT"] = num_splits
         op.static_dims["kv_group_size"] = gqa
         op.static_dims["chunk"] = chunk
@@ -89,6 +103,7 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
     def _scratch_ptr(self, page_ptr):
         off = Int32(self.kv_group_size * self.chunk * 4)
         return cute.make_ptr(cutlass.Float32, page_ptr + off, cute.AddressSpace.smem)
+
 
     @cute.jit
     def _cmax_ptr(self, page_ptr):
@@ -192,6 +207,7 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
                     lsum[Int32(g)] = s
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
+
         # --- Phase 4: PV (threads own HD positions; v read once / key, reused by GQA) ---
         d_out = tidx
         while d_out < Int32(HD):
@@ -207,45 +223,57 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
                 key = key + Int32(1)
             for g in cutlass.range_constexpr(GQA):
                 qh = kvh * Int32(GQA) + Int32(g)
-                op_base = (tile_B * Int32(self.o_part_stride_B) + qh * Int32(self.o_part_stride_QH)
+                op_base = (tile_B * Int32(self.o_part_stride_B) + qh * Int32(self.o_part_stride_GQA)
                            + split * Int32(self.o_part_stride_SPLIT))
                 o_row = cute.make_tensor(o_part.iterator + op_base, cute.make_layout(HD))
                 o_row[d_out] = acc_o[g]
             d_out = d_out + Int32(self.threads_per_row)
 
         # --- write m_part / l_part (one thread per head) ---
+        # qh*stride_GQA == kvh*stride_KVH + g*stride_GQA (KVH outer, GQA inner),
+        # i.e. the same address as the old QH-indexed buffer.
         if tidx < Int32(GQA):
             qh = kvh * Int32(GQA) + tidx
-            base = tile_B * Int32(self.m_part_stride_B) + qh * Int32(self.m_part_stride_QH) + split * Int32(self.m_part_stride_SPLIT)
+            base = tile_B * Int32(self.m_part_stride_B) + qh * Int32(self.m_part_stride_GQA) + split * Int32(self.m_part_stride_SPLIT)
             cute.make_tensor(m_part.iterator + base, cute.make_layout(1))[Int32(0)] = cmax[tidx]
-            baseL = tile_B * Int32(self.l_part_stride_B) + qh * Int32(self.l_part_stride_QH) + split * Int32(self.l_part_stride_SPLIT)
+            baseL = tile_B * Int32(self.l_part_stride_B) + qh * Int32(self.l_part_stride_GQA) + split * Int32(self.l_part_stride_SPLIT)
             cute.make_tensor(l_part.iterator + baseL, cute.make_layout(1))[Int32(0)] = lsum[tidx]
 
 
 class Qwen3_5GqaAttnCombineSm120Op(Op):
     """Merge the per-split partials for each query head, sigmoid-gate, write o."""
 
+    # Tiles (B, KVH, GQA) -- one head per tile, same as (B, QH), but expressed
+    # via the (KVH, GQA) head split so the split->combine dependency shares the
+    # KVH dim (SPLIT producer-only/many_to_one, GQA consumer-only). This makes
+    # combine(b,kvh,g) wait on barrier(b,kvh) for exactly this kv-head's
+    # num_splits partials instead of the batch-wide pool.
     framework_owned_ranges = True
     reads = {
-        "m_part": (cutlass.Float32, ("B", "QH", "SPLIT")),
-        "l_part": (cutlass.Float32, ("B", "QH", "SPLIT")),
-        "o_part": (cutlass.Float32, ("B", "QH", "SPLIT", "HD")),
+        "m_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
+        "l_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
+        "o_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT", "HD")),
         "gate": (None, ("B", "M", "Q")),
     }
     writes = {"o": (None, ("B", "M", "QH", "HD"))}
-    tile = ("B", "QH")
+    tile = ("B", "KVH", "GQA")
     dynamic_dims = ("B",)
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, num_splits=1, **tensors):
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, num_splits=1,
+                 kv_group_size=QWEN3_5_MXFP4_KV_GROUP_SIZE, **tensors):
+        gqa = int(kv_group_size)
         ts = dict(tile_sizes or {})
         ts.setdefault("B", 1)
-        ts.setdefault("QH", 1)
+        ts.setdefault("KVH", 1)
+        ts.setdefault("GQA", 1)
         op = cls._schedule_single(tile_sizes=ts, **tensors)
         op.static_dims["page_size"] = page_size
         op.static_dims["SPLIT"] = num_splits
         op.static_dims["HD"] = int(tensors["o"].shape[3])
         op.static_dims["QH"] = int(tensors["o"].shape[2])
+        op.static_dims["GQA"] = gqa
+        op.static_dims["KVH"] = int(tensors["o"].shape[2]) // gqa
         return [op]
 
     @cute.jit
@@ -257,20 +285,20 @@ class Qwen3_5GqaAttnCombineSm120Op(Op):
         return cute.make_ptr(cutlass.Float32, page_ptr + Int32(self.SPLIT * 4), cute.AddressSpace.smem)
 
     @cute.jit
-    def compute(self, page_ptr, tile_B, tile_QH, m_part, l_part, o_part, gate, o):
+    def compute(self, page_ptr, tile_B, tile_KVH, tile_GQA, m_part, l_part, o_part, gate, o):
         tidx = cute.arch.thread_idx()[0]
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.warp_idx()
         HD = self.HD
         S = self.SPLIT
-        qh = tile_QH
+        qh = tile_KVH * Int32(self.GQA) + tile_GQA  # one head per tile (KVH outer)
 
         corr = cute.make_tensor(self._corr_ptr(page_ptr), cute.make_layout(S))
         ginv = cute.make_tensor(self._ginv_ptr(page_ptr), cute.make_layout(1))
 
-        m_base = tile_B * Int32(self.m_part_stride_B) + qh * Int32(self.m_part_stride_QH)
+        m_base = tile_B * Int32(self.m_part_stride_B) + qh * Int32(self.m_part_stride_GQA)
         m_row = cute.make_tensor(m_part.iterator + m_base, cute.make_layout(S))
-        l_base = tile_B * Int32(self.l_part_stride_B) + qh * Int32(self.l_part_stride_QH)
+        l_base = tile_B * Int32(self.l_part_stride_B) + qh * Int32(self.l_part_stride_GQA)
         l_row = cute.make_tensor(l_part.iterator + l_base, cute.make_layout(S))
 
         # --- Phase A: global max, correction factors, denominator (warp 0) ---
@@ -305,7 +333,7 @@ class Qwen3_5GqaAttnCombineSm120Op(Op):
             acc = Float32(0.0)
             s = Int32(0)
             while s < Int32(S):
-                op_base = (tile_B * Int32(self.o_part_stride_B) + qh * Int32(self.o_part_stride_QH)
+                op_base = (tile_B * Int32(self.o_part_stride_B) + qh * Int32(self.o_part_stride_GQA)
                            + s * Int32(self.o_part_stride_SPLIT))
                 o_row = cute.make_tensor(o_part.iterator + op_base, cute.make_layout(HD))
                 acc = acc + o_row[d] * corr[s]
@@ -342,16 +370,20 @@ def schedule_qwen3_5_gqa_attention(q, k, v, gate, o, *, page_size=DEFAULT_PAGE_S
     B, M, QH, HD = q.shape
     T = k.shape[1]
     KVH = k.shape[2]
+    GQA = QH // KVH
     if num_splits <= 0:
         num_splits = _auto_num_splits(T, KVH, device=q.device)
-    m_part = torch.empty(B, QH, num_splits, device=q.device, dtype=torch.float32)
-    l_part = torch.empty(B, QH, num_splits, device=q.device, dtype=torch.float32)
-    o_part = torch.empty(B, QH, num_splits, HD, device=q.device, dtype=torch.float32)
+    # Partials are (B, KVH, GQA, SPLIT[, HD]); contiguous, this is the same
+    # memory as (B, QH, SPLIT[, HD]) (QH == KVH*GQA, KVH outer) but exposes the
+    # KVH head split to the split->combine barrier resolver.
+    m_part = torch.empty(B, KVH, GQA, num_splits, device=q.device, dtype=torch.float32)
+    l_part = torch.empty(B, KVH, GQA, num_splits, device=q.device, dtype=torch.float32)
+    o_part = torch.empty(B, KVH, GQA, num_splits, HD, device=q.device, dtype=torch.float32)
 
     split_ops = Qwen3_5GqaAttnSplitSm120Op.schedule(
         q=q, k=k, v=v, m_part=m_part, l_part=l_part, o_part=o_part,
         page_size=page_size, kv_group_size=kv_group_size, num_splits=num_splits)
     combine_ops = Qwen3_5GqaAttnCombineSm120Op.schedule(
         m_part=m_part, l_part=l_part, o_part=o_part, gate=gate, o=o,
-        page_size=page_size, num_splits=num_splits)
+        page_size=page_size, num_splits=num_splits, kv_group_size=kv_group_size)
     return split_ops + combine_ops, [m_part, l_part, o_part]

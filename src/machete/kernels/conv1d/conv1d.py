@@ -363,8 +363,7 @@ class Conv1dOp(Op):
             cute.group_modes(sY, 0, 3),
             cute.group_modes(gY, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
+        cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
@@ -386,8 +385,7 @@ class Conv1dOp(Op):
             cute.group_modes(sY, 0, 3),
             cute.group_modes(gY, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
+        cute.copy(y_p0_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
 class Conv1dBwdOp(Op):
@@ -667,8 +665,7 @@ class Conv1dBwdOp(Op):
             cute.group_modes(sDX, 0, 3),
             cute.group_modes(gDX, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
+        cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
@@ -690,8 +687,7 @@ class Conv1dBwdOp(Op):
             cute.group_modes(sDX, 0, 3),
             cute.group_modes(gDX, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(dx_p0_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
+        cute.copy(dx_p0_tma, tDXsDX, tDXgDX[(None, tile_D, tile_S, tile_B)])
 
 
 __all__ = ["Conv1dOp", "Conv1dBwdOp"]

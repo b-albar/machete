@@ -1,6 +1,11 @@
 .claude/
 *.nanotrace
 *.perfetto
+*.json
+*.sass
+*.ptx
+*.mlir
+*.cubin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

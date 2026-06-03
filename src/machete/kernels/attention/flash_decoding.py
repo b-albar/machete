@@ -39,7 +39,7 @@ from cutlass.cute.nvgpu import warp
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
     named_barrier_sync,
@@ -316,7 +316,7 @@ class _FlashDecodingSplitTmaOp(Op):
         with cute.arch.elect_one():
             mbarrier_init(_kr_K, Int32(1))
             mbarrier_init(_kr_V, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         # TMA Q → page start (plain layout, no swizzle for multi-row TMA)
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)

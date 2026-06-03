@@ -24,7 +24,7 @@ from machete.megakernel.interpreter import (
     mbarrier_arrive_expect_tx,
     mbarrier_inval,
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_wait,
     named_barrier_sync,
 )
@@ -77,9 +77,11 @@ class Qwen3_5StagedDecodeGemmSm120Op(StreamingPipelineOpMixin, GemmOp):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         k_block = Int32(0)
         while k_block < Int32(self.num_k_blocks):
@@ -301,9 +303,11 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         lane_idx = cute.arch.lane_idx()
         row_start = tile_S * Int32(self.tile_size_S)
@@ -490,7 +494,7 @@ class Qwen3_5RangedLmHeadSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             mbarrier_arrive(bf_1)
 
@@ -889,7 +893,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             mbarrier_arrive(bf_1)
 
@@ -1190,7 +1194,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         total_stream_blocks = (tile_3 - tile_N) * Int32(self.num_k_blocks)
         first_stream_blocks = Int32(2)
@@ -1716,7 +1720,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
             with cute.arch.elect_one():
                 mbarrier_init(kr_0, Int32(1))
                 mbarrier_init(kr_1, Int32(1))
-            mbarrier_init_fence()
+            mbarrier_init_fence_async_proxy()
 
             # Phase 2: compute residual-add RMS statistics and residual output.
             rstd_scratch = cute.make_tensor(
@@ -2089,9 +2093,11 @@ class Qwen3_5PackedQkvProjectSm120Op(StreamingPipelineOpMixin, Op):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         total_stream_blocks = Int32(self.num_head_blocks * self.num_k_blocks)
         first_stream_blocks = Int32(2)
@@ -2524,8 +2530,9 @@ class Qwen3_5PackedQkvProjectSm120Op(StreamingPipelineOpMixin, Op):
             if tidx == Int32(0):
                 mbarrier_inval(bf_0)
                 mbarrier_inval(bf_1)
-                mbarrier_inval(kr_0)
-                mbarrier_inval(kr_1)
+                if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+                    mbarrier_inval(kr_0)
+                    mbarrier_inval(kr_1)
 
 
 class Qwen3_5PackedQkvFinalizeSm120Op(Op):

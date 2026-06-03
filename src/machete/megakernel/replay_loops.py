@@ -89,7 +89,7 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _compute_done_mbar(smem_base, Int32(_ip)),
                         Int32(num_mma_warps),
                     )
-                mbarrier_init_fence()
+                mbarrier_init_fence_async_proxy()
 
         named_barrier_sync(Int32(0), Int32(threads_per_block))
 
@@ -737,8 +737,7 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         )
                         if warp_id >= _active_op_warps:
                             setmaxregister_decrease(MIN_IDLE_REGS)
-                        named_barrier_sync(
-                            Int32(1), Int32(num_compute_threads))
+                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
                         if warp_id < _active_op_warps:
                             setmaxregister_increase(mma_reg_count)
                     if const_expr(max_compute_waits > 0):
@@ -1290,16 +1289,9 @@ def build_compute_only_kernel_loop(kernel, kernel_cfg, runtime):
                     tile_3 = (_tile_23 >> Int32(16)) & Int32(65535)
 
                 if _range_axis < Int32(0):
-                    named_barrier_sync(
-                        Int32(1),
-                        Int32(num_compute_threads),
-                    )
                     if _cached_signal_count > Int32(0):
                         global_memory_fence_gpu()
-                        named_barrier_sync(
-                            Int32(1),
-                            Int32(num_compute_threads),
-                        )
+                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
                         if warp_id == Int32(0) and lane_id == Int32(0):
                             if _cached_signal_count == Int32(1):
                                 _sig_barrier = ld_global_i32(

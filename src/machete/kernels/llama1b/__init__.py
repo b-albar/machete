@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Machete Authors
 """Llama-1B decode kernels."""
 
-from .sm100 import (
+from .sm120 import (
     LLAMA1B_CONSUMER_WARPS,
     LLAMA1B_HEAD_DIM,
     LLAMA1B_HIDDEN,
@@ -9,22 +9,8 @@ from .sm100 import (
     LLAMA1B_KV_DIM,
     LLAMA1B_MATVEC_BLOCK,
     LLAMA1B_Q_DIM,
-    LLAMA1B_REDUCTION_DIM_PER_WARP,
     LLAMA1B_ROTARY_D2,
     LLAMA1B_VOCAB,
-    Llama1BDownMatvecSm100Op,
-    Llama1BFinalRmsLmHeadSm100Op,
-    Llama1BMatvecResidualSm100Op,
-    Llama1BResidualAddSm100Op,
-    Llama1BRmsGateUpSiluSm100Op,
-    Llama1BRmsKCacheSm100Op,
-    Llama1BRmsQSm100Op,
-    Llama1BRmsVCacheSm100Op,
-    Llama1BLayerSchedule,
-    schedule_decode_layer_sm100,
-    schedule_final_sm100,
-)
-from .sm120 import (
     Llama1BDecodeAttentionSm120Op,
     Llama1BDecodeAttentionPartialSm120Op,
     Llama1BDecodeAttentionReductionSm120Op,
@@ -76,16 +62,7 @@ __all__ = [
     "LLAMA1B_SM120_CONSUMER_WARPS",
     "LLAMA1B_SM120_REDUCTION_DIM_PER_WARP",
     "LLAMA1B_SM120_THREADS_PER_BLOCK",
-    "LLAMA1B_REDUCTION_DIM_PER_WARP",
     "LLAMA1B_CONSUMER_WARPS",
-    "Llama1BDownMatvecSm100Op",
-    "Llama1BFinalRmsLmHeadSm100Op",
-    "Llama1BMatvecResidualSm100Op",
-    "Llama1BResidualAddSm100Op",
-    "Llama1BRmsGateUpSiluSm100Op",
-    "Llama1BRmsKCacheSm100Op",
-    "Llama1BRmsQSm100Op",
-    "Llama1BRmsVCacheSm100Op",
     "Llama1BDecodeAttentionSm120Op",
     "Llama1BDecodeAttentionPartialSm120Op",
     "Llama1BDecodeAttentionReductionSm120Op",
@@ -110,8 +87,6 @@ __all__ = [
     "Llama1BRmsVCacheSm120Op",
     "Llama1BLayerSchedule",
     "llama1b_sm120_auto_fa_num_splits",
-    "schedule_decode_layer_sm100",
-    "schedule_final_sm100",
     "schedule_decode_layer_sm120",
     "schedule_decode_model_sm120",
     "schedule_final_sm120",

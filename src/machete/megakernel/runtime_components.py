@@ -75,15 +75,14 @@ def build_kernel_static_config(
     threads_per_block = kernel.config.threads_per_block
     active_dma_warps = 0 if use_compute_only_replay else num_dma_warps
     num_mma_warps = (threads_per_block // 32) - active_dma_warps
-    # Regular TMA stores are issued from a single elected lane in the store
-    # dispatcher. Reduce-style stores need all participating lanes, so leave
-    # their dispatch path un-elected.
-    has_tma_reduce_store = any(
+    # Regular TMA/peer stores are single-lane operations. Elect at the replay
+    # dispatch boundary so PTXAS can prove the store path is single-lane in the
+    # full fused kernels. Reduce-style stores need all participating lanes.
+    has_reduce_store = any(
         bool(getattr(op.op_cls, "_TMA_REDUCE_STORES", set()))
         or bool(getattr(op.op_cls, "_PEER_REDUCE_STORES", set()))
         for op in kernel.ops
     )
-
     return {
         "num_sms": kernel.config.num_sms,
         "threads_per_block": threads_per_block,
@@ -105,7 +104,7 @@ def build_kernel_static_config(
         "dma_reg_count": kernel.config.dma_reg_count,
         "mma_reg_count": kernel.config.mma_reg_count,
         "actual_threads_per_block": threads_per_block,
-        "elect_store_dispatch": not has_tma_reduce_store,
+        "elect_store_dispatch": not has_reduce_store,
         "mbarrier_stride": mbarrier_stride,
         "tile_info_bytes": tile_info_bytes,
         "peer_barriers_data_ptr": (

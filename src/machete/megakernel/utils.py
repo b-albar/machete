@@ -1,10 +1,15 @@
 # Copyright (c) 2025, Machete Authors
-"""Debug utilities for inspecting compiled megakernels (PTX, SASS, CUBIN)."""
+"""Megakernel utilities: host-side compiled-kernel inspection (PTX/SASS/CUBIN)
+and device-side PTX helpers callable from ``@cute.jit`` kernels."""
 
 import os
 import struct
 import subprocess
 import tempfile
+
+from cutlass import Int32
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 
 def extract_cubin(kernel) -> bytes:
@@ -147,3 +152,54 @@ def dump_cubin(kernel, path: str) -> None:
     cubin = extract_cubin(kernel)
     with open(path, "wb") as f:
         f.write(cubin)
+
+
+# =============================================================================
+# Device-side global-prefetch PTX helpers (callable from @cute.jit kernels)
+# =============================================================================
+
+
+def _prefetch_asm(level: str):
+    return (
+        "{\n"
+        ".reg .u64 addr;\n"
+        "cvt.u64.u32 addr, $1;\n"
+        "add.u64 addr, addr, $0;\n"
+        f"prefetch.global.{level} [addr];\n"
+        "}\n"
+    )
+
+
+@dsl_user_op
+def prefetch_ptr_l2(ptr, byte_offset: Int32, *, loc=None, ip=None) -> None:
+    """Prefetch a global line into L2 (``prefetch.global.L2``). ``byte_offset`` is
+    added to ``ptr`` before the prefetch."""
+    llvm.inline_asm(
+        None,
+        [ptr.llvm_ptr, Int32(byte_offset).ir_value(loc=loc, ip=ip)],
+        _prefetch_asm("L2"),
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def prefetch_ptr_l1(ptr, byte_offset: Int32, *, loc=None, ip=None) -> None:
+    """Prefetch a global line into L1 (``prefetch.global.L1``). Closer than L2 but
+    L1 is small and smem-shared, so streaming no-reuse data risks thrashing reused
+    data out of L1 -- only a win when the line is read soon and the set fits L1."""
+    llvm.inline_asm(
+        None,
+        [ptr.llvm_ptr, Int32(byte_offset).ir_value(loc=loc, ip=ip)],
+        _prefetch_asm("L1"),
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

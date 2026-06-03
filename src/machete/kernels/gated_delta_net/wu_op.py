@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu import warp
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -296,7 +296,7 @@ class GDNWUOp(Op):
             mbarrier_init(_bf_1, Int32(1))
             mbarrier_init(_kr_0, Int32(1))
             mbarrier_init(_kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         nbytes = Int32(self._a_bytes + self._tma_k_bytes)

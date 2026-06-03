@@ -187,6 +187,9 @@ class FlashAttentionSm120BwdOp(Op):
         self.q_stride = self.D + self.smem_pad
         self.p_stride = self.tile_size_N + self.smem_pad
         self.compact_32kb = 0
+        # When set (compact 32KB path), Q/dO smem is swizzled instead of
+        # row-padded to avoid bank conflicts without spending extra bytes.
+        self.q_swizzle = 0
 
         # Smem layout: K/V (TMA swizzle, no pad), Q/dO/P/dS (row padded)
         self.kv_tile_bytes = self.tile_size_N * self.D * self.elem_bytes
@@ -203,8 +206,11 @@ class FlashAttentionSm120BwdOp(Op):
 
         total_smem = self.ds_buf_offset + self.ds_buf_bytes
         if total_smem > self.page_size:
-            compact_q_stride = self.D
-            compact_p_stride = self.tile_size_N
+            compact_q_stride = self.D  # Q/dO are swizzled, no row padding needed
+            # P/dS reuse the V smem region (freed after dP); that region has
+            # slack, so keep them ROW-PADDED to avoid their transposed-read
+            # bank conflicts (Q/dO conflicts are handled by swizzle instead).
+            compact_p_stride = self.tile_size_N + self.SMEM_PAD
             compact_q_buf_bytes = self.m_block * compact_q_stride * self.elem_bytes
             compact_do_buf_bytes = self.m_block * compact_q_stride * self.elem_bytes
             compact_p_buf_bytes = self.m_block * compact_p_stride * self.elem_bytes
@@ -212,10 +218,30 @@ class FlashAttentionSm120BwdOp(Op):
             compact_total = 2 * self.kv_tile_bytes + compact_q_buf_bytes + compact_do_buf_bytes
             if compact_total <= self.page_size and compact_p_buf_bytes + compact_ds_buf_bytes <= self.kv_tile_bytes:
                 self.compact_32kb = 1
-                self.num_mma_warps = 2
-                self.mma_layout_m = 1
-                self.mma_layout_n = 2
-                self.mma_perm_m = 16
+                # Compact 32KB layout: K+V+Q+dO fill the page exactly, leaving
+                # zero room for row padding. Unpadded Q/dO would suffer 32-way
+                # bank conflicts on the transposed Q^T/dO^T LdMatrix reads (the
+                # dominant cost — measured 70M conflicts, SM throughput 23%).
+                # Instead we SWIZZLE Q/dO smem (no extra bytes, conflict-free),
+                # mirroring the K/V treatment already used in this kernel. This
+                # also lets us keep all 4 MMA warps (a 2x2 layout over the
+                # m_block=tile_N=32 tile reads in-bounds since both extents are
+                # exactly 32).
+                self.q_swizzle = 1
+                if self.tile_size_N >= 32:
+                    # m_block=tile_N>=32 → a 2x2 MMA layout reads exactly 32
+                    # rows in-bounds, so keep all 4 warps for full MMA throughput.
+                    self.num_mma_warps = 4
+                    self.mma_layout_m = 2
+                    self.mma_layout_n = 2
+                    self.mma_perm_m = 32
+                else:
+                    # tile_N=16 (e.g. D=256): a 2-M-warp layout would read past
+                    # the 16-row buffers, so stay single-M-warp.
+                    self.num_mma_warps = 2
+                    self.mma_layout_m = 1
+                    self.mma_layout_n = 2
+                    self.mma_perm_m = 16
                 self.smem_pad = 0
                 self.q_stride = compact_q_stride
                 self.p_stride = compact_p_stride
@@ -430,6 +456,14 @@ class FlashAttentionSm120BwdOp(Op):
     # MMA Helpers
     # =========================================================================
 
+    def _qdo_ptr(self, base_ptr, swz):
+        """Smem pointer for Q/dO buffers — swizzled in the compact 32KB path
+        (conflict-free, no padding), plain otherwise (row-padded layout)."""
+        p = cute.make_ptr(self.dtype, base_ptr, cute.AddressSpace.smem, assumed_align=128)
+        if self.q_swizzle:
+            p = cute.recast_ptr(p, swz, dtype=self.dtype)
+        return p
+
     def _make_acc_tensor_mn_view(self, acc):
         """Reshape MMA accumulator to (M, N) view for per-row operations."""
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
@@ -488,7 +522,7 @@ class FlashAttentionSm120BwdOp(Op):
             # -- S GEMM: C(m,n) = Q(m,D) @ K^T -> A=Q, B=K, K-dim=D --
             # A = Q_buf (m_block, D), non-transposed, row-padded
             _sQ_A = cute.make_tensor(
-                cute.make_ptr(self.dtype, q_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(q_buf_ptr, kv_swz),
                 cute.make_layout((self.m_block, self.D), stride=(self.q_stride, 1)),
             )
             smem_copy_Q_A = cute.make_tiled_copy_A(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype), tiled_mma)
@@ -511,7 +545,7 @@ class FlashAttentionSm120BwdOp(Op):
             # -- dP GEMM: same shape as S. A=dO, B=V, K-dim=D --
             # A = dO_buf (m_block, D), non-transposed, row-padded
             _sdO_A = cute.make_tensor(
-                cute.make_ptr(self.dtype, do_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(do_buf_ptr, kv_swz),
                 cute.make_layout((self.m_block, self.D), stride=(self.q_stride, 1)),
             )
             smem_copy_dO_A = cute.make_tiled_copy_A(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype), tiled_mma)
@@ -545,7 +579,7 @@ class FlashAttentionSm120BwdOp(Op):
             tPsPt_A = thr_copy_Pt_A.partition_S(_sPt_A)
 
             _sdOt_B = cute.make_tensor(
-                cute.make_ptr(self.dtype, do_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(do_buf_ptr, kv_swz),
                 cute.make_layout((self.D, self.m_block), stride=(1, self.q_stride)),
             )
             smem_copy_dOt_B = cute.make_tiled_copy_B(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype), tiled_mma)
@@ -568,7 +602,7 @@ class FlashAttentionSm120BwdOp(Op):
             tdSsdSt_A = thr_copy_dSt_A.partition_S(_sdSt_A)
 
             _sQt_B = cute.make_tensor(
-                cute.make_ptr(self.dtype, q_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(q_buf_ptr, kv_swz),
                 cute.make_layout((self.D, self.m_block), stride=(1, self.q_stride)),
             )
             smem_copy_Qt_B = cute.make_tiled_copy_B(cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype), tiled_mma)
@@ -600,13 +634,14 @@ class FlashAttentionSm120BwdOp(Op):
             gmem_tiled_copy = cute.make_tiled_copy_tv(async_copy_atom, copy_thread_layout, copy_value_layout)
             thr_copy_cp = gmem_tiled_copy.get_slice(tidx)
 
-            # cpasync smem destinations (row-padded, no swizzle)
+            # cpasync smem destinations (row-padded plain, or swizzled in the
+            # compact 32KB path — matches the LdMatrix source layout above).
             sQ_cp = cute.make_tensor(
-                cute.make_ptr(self.dtype, q_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(q_buf_ptr, kv_swz),
                 cute.make_layout((self.m_block, self.D), stride=(self.q_stride, 1)),
             )
             sdO_cp = cute.make_tensor(
-                cute.make_ptr(self.dtype, do_buf_ptr, cute.AddressSpace.smem, assumed_align=128),
+                self._qdo_ptr(do_buf_ptr, kv_swz),
                 cute.make_layout((self.m_block, self.D), stride=(self.q_stride, 1)),
             )
             tQsQ_cp = thr_copy_cp.partition_D(sQ_cp)
@@ -699,13 +734,26 @@ class FlashAttentionSm120BwdOp(Op):
                 dq_shape = tiled_mma.partition_shape_C((self.m_block, self.D))
                 num_rows_dQ = dq_shape[0][1] * dq_shape[1]
 
-                # Prologue: load Q[0], dO[0] → smem
-                gQ_block = cute.local_tile(gQ_head, (self.m_block, self.D), (Int32(0), Int32(0)))
+                # Causal M-block skipping: a key at column c in this N-tile
+                # receives gradient only from query rows >= c - (N - M). The
+                # smallest such row for this N-tile is kv_start - (N - M), so
+                # M-blocks entirely above the diagonal contribute nothing (their
+                # P/dS are fully zero) and are skipped — halving the work for
+                # causal, mirroring the forward's block skipping.
+                kv_start_tile = tile_N * Int32(self.tile_size_N)
+                m_first = Int32(0)
+                if self.causal:
+                    thr_row = kv_start_tile - Int32(self.N - self.M)
+                    if thr_row > Int32(0):
+                        m_first = thr_row // Int32(self.m_block)
+
+                # Prologue: load Q[m_first], dO[m_first] → smem
+                gQ_block = cute.local_tile(gQ_head, (self.m_block, self.D), (m_first, Int32(0)))
                 tQgQ = thr_copy_cp.partition_S(gQ_block)
                 for ci in cutlass.range_constexpr(cute.size(tQsQ_cp.shape[2])):
                     cute.copy(gmem_tiled_copy, tQgQ[None, None, ci], tQsQ_cp[None, None, ci])
 
-                gdO_block = cute.local_tile(gdO_head, (self.m_block, self.D), (Int32(0), Int32(0)))
+                gdO_block = cute.local_tile(gdO_head, (self.m_block, self.D), (m_first, Int32(0)))
                 tdOgdO = thr_copy_cp.partition_S(gdO_block)
                 for ci in cutlass.range_constexpr(cute.size(tdOsdO_cp.shape[2])):
                     cute.copy(gmem_tiled_copy, tdOgdO[None, None, ci], tdOsdO_cp[None, None, ci])
@@ -714,8 +762,8 @@ class FlashAttentionSm120BwdOp(Op):
                 cute.arch.cp_async_wait_group(0)
                 named_barrier_sync(Int32(2), Int32(self.num_mma_threads))
 
-                # M-block loop
-                m_idx = Int32(0)
+                # M-block loop (starts at m_first for causal)
+                m_idx = m_first
                 while m_idx < Int32(self.num_m_blocks):
                     m_start = m_idx * Int32(self.m_block)
 
@@ -940,8 +988,7 @@ class FlashAttentionSm120BwdOp(Op):
             dk_tma, Int32(0), cute.make_layout(1),
             cute.group_modes(sdK, 0, 4), cute.group_modes(gdK, 0, 4),
         )
-        with cute.arch.elect_one():
-            cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)])
+        cute.copy(dk_tma, tKsK, tKgK[(None, tile_D, tile_H_kv, tile_N, tile_B)])
 
         # dV at page offset kv_tile_bytes
         sdV = cute.make_tensor(
@@ -958,8 +1005,7 @@ class FlashAttentionSm120BwdOp(Op):
             dv_tma, Int32(0), cute.make_layout(1),
             cute.group_modes(sdV, 0, 4), cute.group_modes(gdV, 0, 4),
         )
-        with cute.arch.elect_one():
-            cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)])
+        cute.copy(dv_tma, tVsV, tVgV[(None, tile_D, tile_H_kv, tile_N, tile_B)])
 
 
 __all__ = ["FlashAttentionSm120BwdOp"]

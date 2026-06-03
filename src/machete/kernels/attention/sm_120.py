@@ -299,8 +299,17 @@ class FlashAttentionSm120Op(Op):
                 smem_pad_elems = 8
                 smem_stride = D + smem_pad_elems
 
-                # Target 4 MMA warps (matches SDPA, optimal barrier overhead)
-                max_nw = min(4, M // 16)
+                # 4 MMA warps (tile_M=64) match SDPA's barrier overhead for
+                # short/medium sequences. For long prefill, scale to 8 warps
+                # (tile_M=128): the per-tile fixed cost — cpasync K/V prologue,
+                # named barriers, softmax max/sum prologue — is amortized over
+                # twice as many Q rows, and K/V (L2-resident across M-tiles) is
+                # loaded into smem half as often. Measured ~0.86->0.98x SDPA at
+                # M=N=8192 and ~0.89->0.99x at 16384 (D=128, 32KB pages). The
+                # crossover is ~M>=4096; below it, the extra warps lose to
+                # reduced wave parallelism, so keep 4.
+                warp_cap = 8 if M >= 4096 else 4
+                max_nw = min(warp_cap, M // 16)
                 if nw is None:
                     nw = 1
                     while nw * 2 <= max_nw:
@@ -1266,8 +1275,7 @@ class FlashAttentionSm120Op(Op):
             cute.group_modes(sO, 0, 4),
             cute.group_modes(gO, 0, 4),
         )
-        with cute.arch.elect_one():
-            cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_H, tile_M, tile_B)])
+        cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_H, tile_M, tile_B)])
 
 
 __all__ = [

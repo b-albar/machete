@@ -50,6 +50,13 @@ CONFIGS = [
 ]
 
 
+def _configs_with_fetch_stride(fetch_stride: int):
+    return [
+        (seq_len, batch, page_size, int(fetch_stride))
+        for seq_len, batch, page_size in CONFIGS
+    ]
+
+
 def _config_for(
     ops,
     page_size: int,
@@ -69,11 +76,17 @@ def _config_for(
     )
 
 
-def _scheduler(variant: str):
+def _scheduler(variant: str, fetch_stride: int | None = None):
     if variant == "default":
         return None
     if variant in ("overlap", "overlap-adaptive"):
+        resolved_fetch_stride = (
+            int(fetch_stride)
+            if fetch_stride is not None and int(fetch_stride) > 0
+            else None
+        )
         return OverlapTileScheduler(
+            fetch_stride=resolved_fetch_stride,
             adaptive_fetch_stride=variant == "overlap-adaptive",
         )
     raise ValueError(f"unknown scheduler variant: {variant}")
@@ -597,21 +610,29 @@ def _torch_backward_spec(batch: int, seq_len: int, page_size: int):
     return KernelBenchSpec(launch_fn=_launch, stream=(torch.cuda.current_stream(), None), _keep_alive=[*args, dy, compiled, sink])
 
 
-@Benchmark.configs(["seq_len", "batch", "page_size"], CONFIGS)
-def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int):
+@Benchmark.configs(["seq_len", "batch", "page_size", "fetch_stride"], _configs_with_fetch_stride(0))
+def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_stride: int = 0):
     args = _alloc_layer(batch, seq_len)
     return {
         "torch_compile": _torch_forward_spec(batch, seq_len, page_size),
-        "megakernel": megakernel_forward_build(*args, page_size=page_size, scheduler=_scheduler("overlap"))[0],
+        "megakernel": megakernel_forward_build(
+            *args,
+            page_size=page_size,
+            scheduler=_scheduler("overlap", fetch_stride),
+        )[0],
     }
 
 
-@Benchmark.configs(["seq_len", "batch", "page_size"], CONFIGS)
-def bench_qwen35_layer_bwd(seq_len: int, batch: int, page_size: int):
+@Benchmark.configs(["seq_len", "batch", "page_size", "fetch_stride"], _configs_with_fetch_stride(0))
+def bench_qwen35_layer_bwd(seq_len: int, batch: int, page_size: int, fetch_stride: int = 0):
     args = _alloc_layer(batch, seq_len)
     return {
         "torch_compile": _torch_backward_spec(batch, seq_len, page_size),
-        "megakernel": megakernel_layer_bwd_build(*args, page_size=page_size, scheduler=_scheduler("overlap"))[0],
+        "megakernel": megakernel_layer_bwd_build(
+            *args,
+            page_size=page_size,
+            scheduler=_scheduler("overlap", fetch_stride),
+        )[0],
     }
 
 
@@ -621,13 +642,19 @@ if __name__ == "__main__":
     parser.add_argument("--seq-len", type=int, nargs="+", default=[128])
     parser.add_argument("--page-size", type=int, nargs="+", default=[DEFAULT_PAGE_SIZE])
     parser.add_argument("--direction", choices=["forward", "backward"], nargs="+", default=["forward", "backward"])
+    parser.add_argument(
+        "--fetch-stride",
+        type=int,
+        default=0,
+        help="Overlap scheduler fetch stride; 0 uses the scheduler default.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rep", type=int, default=20)
     args = parser.parse_args()
 
     if "forward" in args.direction:
         bench_qwen35_layer_fwd._benchmark._configs = [
-            (seq_len, batch, page_size)
+            (seq_len, batch, page_size, int(args.fetch_stride))
             for seq_len in args.seq_len
             for batch in args.batch
             for page_size in args.page_size
@@ -635,7 +662,7 @@ if __name__ == "__main__":
         bench_qwen35_layer_fwd._benchmark.run(mode="kernel", warmup=args.warmup, rep=args.rep, export_csv=False)
     if "backward" in args.direction:
         bench_qwen35_layer_bwd._benchmark._configs = [
-            (seq_len, batch, page_size)
+            (seq_len, batch, page_size, int(args.fetch_stride))
             for seq_len in args.seq_len
             for batch in args.batch
             for page_size in args.page_size

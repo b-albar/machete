@@ -300,7 +300,6 @@ def global_memory_fence_gpu(*, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
-
 # =============================================================================
 # Instruction Stream Access
 # =============================================================================
@@ -516,16 +515,17 @@ def mbarrier_init(
 
 
 @dsl_user_op
-def mbarrier_init_fence(
+def mbarrier_init_fence_async_proxy(
     *,
     loc=None,
     ip=None,
 ) -> None:
-    """Fence after mbarrier initialization.
+    """Order mbarrier init before async-proxy users.
 
-    Issues a fence.proxy.async to ensure mbarrier initialization is visible
-    to all threads before any arrive/wait operations. Must be called after
-    all mbarrier_init calls and before any mbarrier_arrive/mbarrier_wait.
+    Use this only when a just-initialized mbarrier may be touched by async
+    proxy operations, such as TMA/bulk async copies using the mbarrier for
+    transaction completion. Generic mbarrier arrive/wait users do not require
+    a generic<->async proxy fence.
     """
     llvm.inline_asm(
         None,
@@ -536,6 +536,11 @@ def mbarrier_init_fence(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+def mbarrier_init_fence(*, loc=None, ip=None) -> None:
+    """Backward-compatible alias for async-proxy mbarrier init ordering."""
+    mbarrier_init_fence_async_proxy(loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -865,6 +870,7 @@ __all__ = [
     # mbarrier primitives
     "mbarrier_init",
     "mbarrier_init_fence",
+    "mbarrier_init_fence_async_proxy",
     "mbarrier_inval",
     "mbarrier_arrive",
     "mbarrier_arrive_expect_tx",

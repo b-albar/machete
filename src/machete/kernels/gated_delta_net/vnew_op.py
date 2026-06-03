@@ -17,13 +17,13 @@ Tiling: (B, NH, S, V) — fully parallel over all chunks.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, const_expr
 from cutlass.cute.nvgpu import warp
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -228,9 +228,11 @@ class GDNVNewOp(Op):
         with cute.arch.elect_one():
             mbarrier_init(_bf_0, Int32(1))
             mbarrier_init(_bf_1, Int32(1))
-            mbarrier_init(_kr_0, Int32(1))
-            mbarrier_init(_kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.NK > 2):
+                mbarrier_init(_kr_0, Int32(1))
+                mbarrier_init(_kr_1, Int32(1))
+        if const_expr(self.NK > 2):
+            mbarrier_init_fence_async_proxy()
 
         _k_block = Int32(0)
         while _k_block < Int32(self.NK):

@@ -29,6 +29,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 from machete.megakernel.interpreter import named_barrier_sync
+from machete.megakernel.utils import prefetch_ptr_l1, prefetch_ptr_l2
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE, PipelineSpec
 
 
@@ -449,27 +450,6 @@ def _nvfp4_reg_dot8_f16a(
     return Float32(result)
 
 
-@dsl_user_op
-def _prefetch_ptr_l2(ptr, byte_offset: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [
-            ptr.llvm_ptr,
-            Int32(byte_offset).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        ".reg .u64 addr;\n"
-        "cvt.u64.u32 addr, $1;\n"
-        "add.u64 addr, addr, $0;\n"
-        "prefetch.global.L2 [addr];\n"
-        "}\n",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 @cute.jit
 def _read_packed_u32(packed_row, byte_idx):
     """Read 4 consecutive packed-fp4 bytes (at 4-aligned byte_idx) as ONE u32 via a
@@ -575,8 +555,8 @@ class _Nvfp4WeightMixin:
             scale_idx = k >> Int32(5)
         else:
             scale_idx = k // Int32(self.group_size)
-        _prefetch_ptr_l2(packed_row.iterator, byte_idx)
-        _prefetch_ptr_l2(scale_row.iterator, scale_idx * Int32(2))
+        prefetch_ptr_l2(packed_row.iterator, byte_idx)
+        prefetch_ptr_l2(scale_row.iterator, scale_idx * Int32(2))
 
     @cute.jit
     def _dot16_nvfp4_values(
@@ -633,8 +613,19 @@ class _Nvfp4WeightMixin:
     def _dot_nvfp4(self, a_row, packed_row, scale_row):
         lane_idx = cute.arch.lane_idx()
         acc = Float32(0.0)
-        full_k = Int32((self.K // 8) * 8)
-        k = lane_idx * Int32(8)
+        full_k_py = (self.K // 8) * 8
+        full_k = Int32(full_k_py)
+        # Unroll the stride-256 K-loop (static count) so the independent packed
+        # weight loads (_read_packed_u32) and scale loads pipeline across
+        # iterations instead of serializing on a dynamic-while back-edge. This is
+        # the fix for the long_scoreboard (global-load latency) stall that keeps
+        # the memory-bound decode matvec/LM-head at ~30% DRAM BW.
+        n_bulk = full_k_py // 256
+        for i in cutlass.range_constexpr(n_bulk):
+            k = lane_idx * Int32(8) + Int32(i * 256)
+            acc = acc + self._dot8_nvfp4(a_row, packed_row, scale_row, k)
+        # residual stride-256 blocks (only for K not a multiple of 256) + sub-8 tail
+        k = lane_idx * Int32(8) + Int32(n_bulk * 256)
         while k < full_k:
             acc = acc + self._dot8_nvfp4(a_row, packed_row, scale_row, k)
             k = k + Int32(256)
@@ -1637,8 +1628,32 @@ class MatvecPairNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                     )
                     acc0 = Float32(0.0)
                     acc1 = Float32(0.0)
-                    full_k = Int32((self.K // 8) * 8)
-                    k = lane_idx * Int32(8)
+                    full_k_py = (self.K // 8) * 8
+                    full_k = Int32(full_k_py)
+                    n_bulk = full_k_py // 256
+                    # Seed v0..v7 (see Quad) so the residual while has a typed carry at n_bulk==0.
+                    v0 = Float32(0.0); v1 = Float32(0.0); v2 = Float32(0.0); v3 = Float32(0.0)
+                    v4 = Float32(0.0); v5 = Float32(0.0); v6 = Float32(0.0); v7 = Float32(0.0)
+                    # Unrolled K-loop so the 2 per-output weight loads pipeline.
+                    for i in cutlass.range_constexpr(n_bulk):
+                        k = lane_idx * Int32(8) + Int32(i * 256)
+                        v0 = a_row[k].to(Float32)
+                        v1 = a_row[k + Int32(1)].to(Float32)
+                        v2 = a_row[k + Int32(2)].to(Float32)
+                        v3 = a_row[k + Int32(3)].to(Float32)
+                        v4 = a_row[k + Int32(4)].to(Float32)
+                        v5 = a_row[k + Int32(5)].to(Float32)
+                        v6 = a_row[k + Int32(6)].to(Float32)
+                        v7 = a_row[k + Int32(7)].to(Float32)
+                        acc0 = acc0 + self._dot8_nvfp4_values(
+                            packed0_row, scale0_row, k,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        )
+                        acc1 = acc1 + self._dot8_nvfp4_values(
+                            packed1_row, scale1_row, k,
+                            v0, v1, v2, v3, v4, v5, v6, v7,
+                        )
+                    k = lane_idx * Int32(8) + Int32(n_bulk * 256)
                     while k < full_k:
                         v0 = a_row[k].to(Float32)
                         v1 = a_row[k + Int32(1)].to(Float32)
@@ -1765,8 +1780,32 @@ class MatvecQuadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                     acc1 = Float32(0.0)
                     acc2 = Float32(0.0)
                     acc3 = Float32(0.0)
-                    full_k = Int32((self.K // 8) * 8)
-                    k = lane_idx * Int32(8)
+                    full_k_py = (self.K // 8) * 8
+                    full_k = Int32(full_k_py)
+                    n_bulk = full_k_py // 256
+                    # Seed v0..v7 to Float32 so the residual while below has a typed
+                    # (not None) carry when n_bulk == 0 (K < 256); dead-overwritten
+                    # whenever the unrolled body or the while actually runs.
+                    v0 = Float32(0.0); v1 = Float32(0.0); v2 = Float32(0.0); v3 = Float32(0.0)
+                    v4 = Float32(0.0); v5 = Float32(0.0); v6 = Float32(0.0); v7 = Float32(0.0)
+                    # Unrolled K-loop: the 4 independent per-output weight loads
+                    # pipeline across iterations instead of serializing on the while
+                    # back-edge (hides global-load latency).
+                    for i in cutlass.range_constexpr(n_bulk):
+                        k = lane_idx * Int32(8) + Int32(i * 256)
+                        v0 = a_row[k].to(Float32)
+                        v1 = a_row[k + Int32(1)].to(Float32)
+                        v2 = a_row[k + Int32(2)].to(Float32)
+                        v3 = a_row[k + Int32(3)].to(Float32)
+                        v4 = a_row[k + Int32(4)].to(Float32)
+                        v5 = a_row[k + Int32(5)].to(Float32)
+                        v6 = a_row[k + Int32(6)].to(Float32)
+                        v7 = a_row[k + Int32(7)].to(Float32)
+                        acc0 = acc0 + self._dot8_nvfp4_values(packed0_row, scale0_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc1 = acc1 + self._dot8_nvfp4_values(packed1_row, scale1_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc2 = acc2 + self._dot8_nvfp4_values(packed2_row, scale2_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                        acc3 = acc3 + self._dot8_nvfp4_values(packed3_row, scale3_row, k, v0, v1, v2, v3, v4, v5, v6, v7)
+                    k = lane_idx * Int32(8) + Int32(n_bulk * 256)
                     while k < full_k:
                         v0 = a_row[k].to(Float32)
                         v1 = a_row[k + Int32(1)].to(Float32)
@@ -2443,14 +2482,26 @@ class RmsGateUpSiluNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm120Base):
                     )
                     gate_acc = Float32(0.0)
                     up_acc = Float32(0.0)
-                    full_k = Int32((self.K // 8) * 8)
-                    k2 = lane_idx * Int32(8)
+                    full_k_py = (self.K // 8) * 8
+                    full_k = Int32(full_k_py)
+                    n_bulk = full_k_py // 256
+                    # Unrolled stride-256 K-loop: independent gate/up weight loads
+                    # pipeline across iterations (hides global-load latency); the L2
+                    # prefetch stays as a compile-time-guarded hint for the next block.
+                    for i in cutlass.range_constexpr(n_bulk):
+                        k2 = lane_idx * Int32(8) + Int32(i * 256)
+                        if const_expr(self.prefetch_nvfp4 and i + 1 < n_bulk):
+                            next_k = lane_idx * Int32(8) + Int32((i + 1) * 256)
+                            self._prefetch_dot8_nvfp4_values(gate_packed_row, gate_scale_row, next_k)
+                            self._prefetch_dot8_nvfp4_values(up_packed_row, up_scale_row, next_k)
+                        gate_acc = gate_acc + self._dot8_nvfp4_f16a(
+                            gate_packed_row, na_u32, gate_scale_row, k2
+                        )
+                        up_acc = up_acc + self._dot8_nvfp4_f16a(
+                            up_packed_row, na_u32, up_scale_row, k2
+                        )
+                    k2 = lane_idx * Int32(8) + Int32(n_bulk * 256)
                     while k2 < full_k:
-                        if const_expr(self.prefetch_nvfp4):
-                            next_k = k2 + Int32(256)
-                            if next_k < full_k:
-                                self._prefetch_dot8_nvfp4_values(gate_packed_row, gate_scale_row, next_k)
-                                self._prefetch_dot8_nvfp4_values(up_packed_row, up_scale_row, next_k)
                         gate_acc = gate_acc + self._dot8_nvfp4_f16a(
                             gate_packed_row, na_u32, gate_scale_row, k2
                         )
@@ -2950,13 +3001,19 @@ class FinalRmsTop1PartialLmHeadNvfp4Sm120Op(_Nvfp4WeightMixin, _DecodeMatvecSm12
                     cute.make_layout(self.G),
                 )
                 acc = Float32(0.0)
-                full_k = Int32((self.K // 16) * 16)
-                k2 = lane_idx * Int32(16)
+                full_k_py = (self.K // 16) * 16
+                full_k = Int32(full_k_py)
+                n_bulk = full_k_py // 512
+                # Unrolled K-loop: the vocab-row weight loads pipeline instead of
+                # serializing on the while back-edge (LM head is the biggest decode op).
+                for i in cutlass.range_constexpr(n_bulk):
+                    k2 = lane_idx * Int32(16) + Int32(i * 512)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
+                k2 = lane_idx * Int32(16) + Int32(n_bulk * 512)
                 while k2 < full_k:
                     acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
-                    acc = acc + self._dot8_nvfp4_f16a(
-                        packed_row, norm_u32, scale_row, k2 + Int32(8)
-                    )
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
                 while k2 < Int32(self.K):
@@ -3090,13 +3147,19 @@ class FinalAddRmsTop1PartialLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm1
                     cute.make_layout(self.G),
                 )
                 acc = Float32(0.0)
-                full_k = Int32((self.K // 16) * 16)
-                k2 = lane_idx * Int32(16)
+                full_k_py = (self.K // 16) * 16
+                full_k = Int32(full_k_py)
+                n_bulk = full_k_py // 512
+                # Unrolled K-loop: the vocab-row weight loads pipeline instead of
+                # serializing on the while back-edge (LM head is the biggest decode op).
+                for i in cutlass.range_constexpr(n_bulk):
+                    k2 = lane_idx * Int32(16) + Int32(i * 512)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
+                k2 = lane_idx * Int32(16) + Int32(n_bulk * 512)
                 while k2 < full_k:
                     acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
-                    acc = acc + self._dot8_nvfp4_f16a(
-                        packed_row, norm_u32, scale_row, k2 + Int32(8)
-                    )
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
                 while k2 < Int32(self.K):
@@ -3333,13 +3396,19 @@ class FinalAddRmsTop1AtomicLmHeadNvfp4Sm120Op(FinalRmsTop1PartialLmHeadNvfp4Sm12
                     cute.make_layout(self.G),
                 )
                 acc = Float32(0.0)
-                full_k = Int32((self.K // 16) * 16)
-                k2 = lane_idx * Int32(16)
+                full_k_py = (self.K // 16) * 16
+                full_k = Int32(full_k_py)
+                n_bulk = full_k_py // 512
+                # Unrolled K-loop: the vocab-row weight loads pipeline instead of
+                # serializing on the while back-edge (LM head is the biggest decode op).
+                for i in cutlass.range_constexpr(n_bulk):
+                    k2 = lane_idx * Int32(16) + Int32(i * 512)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
+                k2 = lane_idx * Int32(16) + Int32(n_bulk * 512)
                 while k2 < full_k:
                     acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2)
-                    acc = acc + self._dot8_nvfp4_f16a(
-                        packed_row, norm_u32, scale_row, k2 + Int32(8)
-                    )
+                    acc = acc + self._dot8_nvfp4_f16a(packed_row, norm_u32, scale_row, k2 + Int32(8))
                     k2 = k2 + Int32(512)
                 k2 = full_k + lane_idx
                 while k2 < Int32(self.K):

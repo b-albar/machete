@@ -22,23 +22,21 @@ from machete.megakernel.interpreter import (
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_wait,
     named_barrier_sync,
 )
 from machete.megakernel.ops import Op, StreamingPipelineOpMixin
 
-from .sm100 import (
-    LLAMA1B_CONSUMER_WARPS,
-    LLAMA1B_HEAD_DIM,
-    LLAMA1B_HIDDEN,
-    LLAMA1B_INTERMEDIATE,
-    LLAMA1B_KV_DIM,
-    LLAMA1B_MATVEC_BLOCK,
-    LLAMA1B_Q_DIM,
-    LLAMA1B_ROTARY_D2,
-    LLAMA1B_VOCAB,
-)
+LLAMA1B_HIDDEN = 2048
+LLAMA1B_HEAD_DIM = 64
+LLAMA1B_ROTARY_D2 = 32
+LLAMA1B_Q_DIM = 2048
+LLAMA1B_KV_DIM = 512
+LLAMA1B_INTERMEDIATE = 8192
+LLAMA1B_VOCAB = 128256
+LLAMA1B_MATVEC_BLOCK = 16
+LLAMA1B_CONSUMER_WARPS = 4
 
 LLAMA1B_SM120_MATVEC_BLOCK = 12
 LLAMA1B_SM120_QKV_HEAD_BLOCK = 12
@@ -259,7 +257,8 @@ class _Llama1BStagedWeightMatvecSm120Base(StreamingPipelineOpMixin, Op):
             if const_expr(self.staged_num_buffers != 1):
                 mbarrier_init(kr_0, Int32(1))
                 mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        if const_expr(self.staged_num_buffers != 1):
+            mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             if const_expr(self.staged_num_buffers != 1):
                 mbarrier_arrive(bf_1)
@@ -1364,7 +1363,7 @@ class Llama1BRmsKVCacheSm120Op(_Llama1BStagedRmsResidualMatvecSm120Base):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             mbarrier_arrive(bf_1)
 
@@ -1991,7 +1990,8 @@ class Llama1BRmsUpGateSiluSm120Op(_Llama1BStagedRmsMatvecSm120Base):
             if const_expr(self.staged_num_buffers != 1):
                 mbarrier_init(kr_0, Int32(1))
                 mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        if const_expr(self.staged_num_buffers != 1):
+            mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             if const_expr(self.staged_num_buffers != 1):
                 mbarrier_arrive(bf_1)
@@ -2294,7 +2294,7 @@ class Llama1BRmsUpGateSiluKStreamSm120Op(_Llama1BStagedRmsMatvecSm120Base):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         range_end = tile_3
         if range_end <= tile_O:
@@ -2567,7 +2567,7 @@ class Llama1BFinalRmsLmHeadKStreamSm120Op(_Llama1BStagedRmsMatvecSm120Base):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         range_end = tile_3
         if range_end <= tile_O:
@@ -2926,7 +2926,7 @@ class Llama1BFinalRmsTop1PartialLmHeadKStreamSm120Op(Llama1BFinalRmsLmHeadKStrea
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         range_end = tile_3
         if range_end <= tile_P:
