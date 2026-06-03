@@ -51,7 +51,7 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
 
     framework_owned_ranges = True
     reads = {
-        "q": (None, ("B", "M", "QH", "HD")),
+        "q": (None, ("B", "M", "KVH", "GQA", "HD")),
         "k": (None, ("B", "T", "KVH", "HD")),
         "v": (None, ("B", "T", "KVH", "HD")),
     }
@@ -86,7 +86,7 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
         op.static_dims["page_size"] = page_size
         op.static_dims["T"] = T
         op.static_dims["HD"] = int(tensors["k"].shape[3])
-        op.static_dims["QH"] = int(tensors["q"].shape[2])
+        op.static_dims["QH"] = int(tensors["q"].shape[2]) * int(tensors["q"].shape[3])
         op.static_dims["KVH"] = int(tensors["k"].shape[2])
         op.static_dims["GQA"] = gqa
         op.static_dims["SPLIT"] = num_splits
@@ -149,8 +149,11 @@ class Qwen3_5GqaAttnSplitSm120Op(Op):
             k_base = tile_B * Int32(self.k_stride_B) + n * Int32(self.k_stride_T) + kvh * Int32(self.k_stride_KVH)
             k_row = cute.make_tensor(k.iterator + k_base, cute.make_layout(HD))
             for g in cutlass.range_constexpr(GQA):
-                qh = kvh * Int32(GQA) + Int32(g)
-                q_base = tile_B * Int32(self.q_stride_B) + qh * Int32(self.q_stride_QH)
+                q_base = (
+                    tile_B * Int32(self.q_stride_B)
+                    + kvh * Int32(self.q_stride_KVH)
+                    + Int32(g) * Int32(self.q_stride_GQA)
+                )
                 q_row = cute.make_tensor(q.iterator + q_base, cute.make_layout(HD))
                 acc = Float32(0.0)
                 d = lane_idx
@@ -253,7 +256,7 @@ class Qwen3_5GqaAttnCombineSm120Op(Op):
         "m_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
         "l_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT")),
         "o_part": (cutlass.Float32, ("B", "KVH", "GQA", "SPLIT", "HD")),
-        "gate": (None, ("B", "M", "Q")),
+        "gate": (None, ("B", "M", "KVH", "GQA", "HD")),
     }
     writes = {"o": (None, ("B", "M", "QH", "HD"))}
     tile = ("B", "KVH", "GQA")
@@ -322,7 +325,11 @@ class Qwen3_5GqaAttnCombineSm120Op(Op):
         named_barrier_sync(Int32(2), Int32(self.threads_per_row))
 
         rinv = ginv[Int32(0)]
-        gate_base = tile_B * Int32(self.gate_stride_B) + qh * Int32(HD)
+        gate_base = (
+            tile_B * Int32(self.gate_stride_B)
+            + tile_KVH * Int32(self.gate_stride_KVH)
+            + tile_GQA * Int32(self.gate_stride_GQA)
+        )
         gate_row = cute.make_tensor(gate.iterator + gate_base, cute.make_layout(HD))
         out_base = tile_B * Int32(self.o_stride_B) + qh * Int32(self.o_stride_QH)
         out_row = cute.make_tensor(o.iterator + out_base, cute.make_layout(HD))
@@ -367,10 +374,9 @@ def schedule_qwen3_5_gqa_attention(q, k, v, gate, o, *, page_size=DEFAULT_PAGE_S
     Returns ``(ops, keep_alive)``. All tensors are BMHD.
     """
     import torch
-    B, M, QH, HD = q.shape
+    B, M, KVH, GQA, HD = q.shape
     T = k.shape[1]
-    KVH = k.shape[2]
-    GQA = QH // KVH
+    QH = KVH * GQA
     if num_splits <= 0:
         num_splits = _auto_num_splits(T, KVH, device=q.device)
     # Partials are (B, KVH, GQA, SPLIT[, HD]); contiguous, this is the same

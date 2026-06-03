@@ -121,6 +121,7 @@ def test_qwen_full_attention_mxfp4_schedule_uses_native_ops():
     assert RmsGateUpSiluMxfp4SimtSm120Op in op_classes
     post = layer.ops[3]
     assert post.op_cls is Qwen3_5QGateRopeCacheSm120Op
+    assert post.tile_sizes["KVH"] == 1
     assert post.static_dims["head_dim"] == QWEN3_5_MXFP4_HEAD_DIM
 
 
@@ -157,8 +158,8 @@ def test_qwen_q_gate_rope_cache_postprocess_matches_reference():
             sin=sin,
             q_norm_weight=q_norm,
             k_norm_weight=k_norm,
-            q=q,
-            gate=gate,
+            q=q.view(batch, seq, kv_heads, q_heads // kv_heads, head_dim),
+            gate=gate.view(batch, seq, kv_heads, q_heads // kv_heads, head_dim),
             k_cache=k_cache,
             v_cache=v_cache,
             cache_pos=cache_pos,
@@ -211,6 +212,9 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
         MatvecPairMxfp4SimtSm120Op,
         MatvecQuadMxfp4SimtSm120Op,
         MatvecResidualMxfp4SimtSm120Op,
+        QWEN3_5_MXFP4_GATE_UP_BLOCK,
+        QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK,
+        QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK,
         QWEN3_5_MXFP4_SIMT_OPS,
         RmsGateUpSiluMxfp4SimtSm120Op,
     )
@@ -264,7 +268,6 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
     mlp_h = torch.empty(batch, seq_len, QWEN3_5_MXFP4_INTERMEDIATE, device="cuda", dtype=dtype)
     dn_state = torch.empty(batch, 16, 128, 128, device="cuda", dtype=torch.float32)
     conv_buf = torch.empty(batch, conv_channels, 4, device="cuda", dtype=torch.float32)
-
     layer = schedule_qwen3_5_deltanet_mxfp4_sm120(
         layer_idx=layer_idx,
         batch=batch,
@@ -283,6 +286,8 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
         mlp_h_buf=mlp_h,
         dn_state=dn_state,
         conv_buf=conv_buf,
+        matvec_block=QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK,
+        qkv_matvec_block=QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK,
         fp4_ops=QWEN3_5_MXFP4_SIMT_OPS,
     )
 
@@ -297,6 +302,10 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
     assert RmsGateUpSiluMxfp4SimtSm120Op in op_classes
     assert op_classes[-1] is MatvecMxfp4SimtSm120Op
     assert layer.ops[3].op_cls is Qwen3_5DeltaNetCoreSm120Op
+    assert layer.ops[1].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK
+    assert layer.ops[4].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK
+    assert layer.ops[5].tile_sizes["D"] == QWEN3_5_MXFP4_GATE_UP_BLOCK
+    assert layer.ops[-1].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK
 
     builder = InstructionStreamBuilder()
     for op in layer.ops:
@@ -308,7 +317,9 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
 
 
 def test_qwen_deltanet_core_matches_reference():
-    from machete.kernels.qwen_3_5 import Qwen3_5DeltaNetCoreSm120Op
+    from machete.kernels.qwen_3_5 import (
+        Qwen3_5DeltaNetCoreSm120Op,
+    )
     from machete.megakernel import Megakernel, MegakernelConfig
 
     major, _minor = torch.cuda.get_device_capability()
