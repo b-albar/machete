@@ -40,6 +40,7 @@ TILE_INFO_TILE_3: int = 5
 TILE_INFO_INSTRUCTION_IDX: int = 6
 TILE_INFO_OP_CONFIG: int = 8
 TILE_INFO_PAGE_ID: int = 10
+TILE_INFO_STORE_STATE: int = 11
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -54,8 +55,10 @@ FLAG_DISPATCH_LOAD: int = 4    # Controller → Loader: page slot to load next
 FLAG_PRODUCE_IDX: int = 16     # Controller: produce counter (read by store warp)
 FLAG_STORE_IDX: int = 20       # Store warp: store counter (read by controller)
 FLAG_LOAD_DONE: int = 24       # Controller: signals all instructions consumed
-FLAG_DATA_RELEASE_IDX: int = 28  # Store warp: physical page release counter
-FLAG_DATA_PRODUCE_IDX: int = 32  # Controller: physical page produce counter
+FLAG_DATA_PRODUCE_IDX: int = 32  # Controller: next-physical-page cursor (0..num_pages-1)
+FLAG_PAGE_PHASE_BITS: int = 8    # Controller-private: per-page mbarrier phase bits
+                                 # (bit pid = page_finished[pid] wait-phase). MAX_PAGES<=16
+                                 # so all page phases pack into one int32.
 
 
 # =============================================================================
@@ -305,6 +308,10 @@ class NPageLayout:
     num_pages: int = 2
     page_size: int = 16384
     num_slots: int | None = None
+    # When True, reserve an extra per-physical-page mbarrier array
+    # (page_finished[num_pages]) used by the decoupled multi-page / page-free
+    # allocator. Kept off by default so single-page kernels are byte-identical.
+    page_release_mbarriers: bool = False
 
     # Scratch area layout (ring buffer):
     # - Per-slot tile info: num_slots * 48 bytes
@@ -344,7 +351,11 @@ class NPageLayout:
             self.iq_offset + IQ_DEPTH * self._IQ_ENTRY_SIZE, 8
         )
 
-        num_mbarriers = 2 * self.num_slots  # work_notify + compute_done
+        # work_notify[num_slots] + compute_done[num_slots], and optionally
+        # page_finished[num_pages] for the decoupled per-page allocator.
+        num_mbarriers = 2 * self.num_slots
+        if self.page_release_mbarriers:
+            num_mbarriers += self.num_pages
         raw_scratch_size = (
             self.mbarrier_offset
             + num_mbarriers * self._MBARRIER_SIZE
@@ -369,12 +380,25 @@ class NPageLayout:
         """Get offset to the compute_done mbarrier for a given work slot."""
         return self.mbarrier_offset + self.num_slots * self._MBARRIER_SIZE + slot_idx * self._MBARRIER_SIZE
 
+    def page_finished_mbar_offset(self, page_idx: int) -> int:
+        """Offset of the page_finished mbarrier for a given physical page.
+
+        Only valid when ``page_release_mbarriers`` is set. Lives right after the
+        work_notify and compute_done arrays: [work_notify[S]][compute_done[S]][page_finished[P]].
+        """
+        return (
+            self.mbarrier_offset
+            + 2 * self.num_slots * self._MBARRIER_SIZE
+            + page_idx * self._MBARRIER_SIZE
+        )
+
     @classmethod
     def for_device(
         cls,
         page_size: int = 16384,
         max_smem: int | None = None,
         min_pages: int = 2,
+        page_release_mbarriers: bool = False,
     ) -> "NPageLayout":
         """Create layout with maximum pages that fit in device shared memory.
 
@@ -382,6 +406,7 @@ class NPageLayout:
             page_size: Size of each page in bytes
             max_smem: Maximum shared memory (None = auto-detect from GPU)
             min_pages: Minimum number of pages required
+            page_release_mbarriers: reserve page_finished[num_pages] mbarriers
 
         Returns:
             NPageLayout configured for maximum pages
@@ -413,12 +438,18 @@ class NPageLayout:
 
         # Try from max down to find largest that actually fits
         for n in range(max_possible, min_pages - 1, -1):
-            layout = cls(num_pages=n, page_size=page_size)
+            layout = cls(
+                num_pages=n,
+                page_size=page_size,
+                page_release_mbarriers=page_release_mbarriers,
+            )
             if layout.total_size <= max_smem:
                 return layout
 
-        # Fallback to minimum
-        return cls(num_pages=min_pages, page_size=page_size)
+        raise ValueError(
+            f"Cannot fit {min_pages} pages of {page_size // 1024}KB plus "
+            f"scratch in {max_smem // 1024}KB shared memory"
+        )
 
     def __repr__(self) -> str:
         return (

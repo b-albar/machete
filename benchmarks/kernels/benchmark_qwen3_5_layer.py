@@ -25,6 +25,7 @@ from machete.kernels.decode_matvec import ResidualAddSm120Op
 from machete.kernels.gemm import GemmOp, ProjectionDaReduceGemmOp
 from machete.kernels.glu import GLUBwdOp, GLUOp
 from machete.kernels.qknorm_rope import PackedQKNormRopeOp, QKNormRopeBwdOp, QKNormRopeOp
+from machete.kernels.qwen_3_5.qwen_3_5_forward import schedule_qwen3_5_forward_ops
 from machete.kernels.qwen_3_5.sm120 import QWEN3_5_EPS
 from machete.kernels.rms_norm import RMSNormBwdOp, RMSNormOp
 from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
@@ -49,6 +50,14 @@ CONFIGS = [
     (512, 1, DEFAULT_PAGE_SIZE),
 ]
 
+BENCH_USE_PACKED_QKV_PROJECTION = True
+BENCH_USE_FUSED_RMS_PROJ = False
+BENCH_USE_QKNORM_4D = True
+BENCH_USE_TMA_ATTENTION = False
+BENCH_USE_SPLIT_ATTENTION = False
+BENCH_SPLIT_ATTENTION_SPLITS = 0
+BENCH_ATTENTION_TILE_M = None
+
 
 def _configs_with_fetch_stride(fetch_stride: int):
     return [
@@ -67,8 +76,9 @@ def _config_for(
 ) -> MegakernelConfig:
     gemm_ops = [op for op in ops if issubclass(op.op_cls, GemmOp)]
     gemm_config = GemmOp.kernel_config(gemm_ops or ops)
+    threads_per_block = max(256, gemm_config.threads_per_block)
     return MegakernelConfig(
-        threads_per_block=max(256, gemm_config.threads_per_block),
+        threads_per_block=threads_per_block,
         page_size=max(page_size, *(op.static_dims.get("page_size", page_size) for op in ops)),
         num_pages=num_pages,
         page_free_extra_slots=page_free_extra_slots,
@@ -92,29 +102,12 @@ def _scheduler(variant: str, fetch_stride: int | None = None):
     raise ValueError(f"unknown scheduler variant: {variant}")
 
 
-def _rms_tile_sizes_for_overlap(scheduler, rms_tile_s: int | None) -> dict[str, int] | None:
-    if rms_tile_s is not None:
-        return {"S": int(rms_tile_s)}
-    if scheduler is None:
-        return None
-    return {"S": 8}
-
-
 def _rope_tables(seq_len: int, dtype: torch.dtype, device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
     pos = torch.arange(seq_len, device=device, dtype=torch.float32)
     dims = torch.arange(D2, device=device, dtype=torch.float32)
     inv_freq = torch.pow(torch.tensor(10000000.0, device=device, dtype=torch.float32), -dims / D2)
     angles = pos[:, None] * inv_freq[None, :]
     return torch.cos(angles).to(dtype).contiguous(), torch.sin(angles).to(dtype).contiguous()
-
-
-def _flatten_heads(x: torch.Tensor, heads: int) -> torch.Tensor:
-    return x.reshape(x.shape[0] * x.shape[1], heads, HEAD_DIM)
-
-
-def _unflatten_heads(x: torch.Tensor, batch: int, seq_len: int, heads: int) -> torch.Tensor:
-    return x.reshape(batch, seq_len, heads, HEAD_DIM)
-
 
 def megakernel_forward_build(
     batch: int,
@@ -141,128 +134,54 @@ def megakernel_forward_build(
     page_free_extra_slots: int = 0,
     gemm_tile_sizes: dict[str, dict[str, int]] | None = None,
     rms_tile_s: int | None = None,
+    adaptive_gemm_tiling: bool = False,
     use_packed_qk: bool = True,
+    use_qwen_projection: bool = False,
+    use_packed_qkv_projection: bool = True,
+    use_fused_rms_proj: bool = False,
+    use_qknorm_4d: bool = True,
+    use_cpasync_projection: bool = False,
+    use_tma_attention: bool = False,
+    use_split_attention: bool = False,
+    split_attention_splits: int = 0,
+    attention_tile_m: int | None = None,
+    forward_op_limit: int | None = None,
 ):
-    dtype = x.dtype
-    device = x.device
-    cos_flat = cos.repeat(batch, 1).contiguous()
-    sin_flat = sin.repeat(batch, 1).contiguous()
-
-    x0 = torch.empty_like(x)
-    if use_packed_qk:
-        qk = torch.empty(batch, seq_len, Q_DIM + KV_DIM, dtype=dtype, device=device)
-        q = qk[..., :Q_DIM]
-        k = qk[..., Q_DIM:]
-        w_qk = torch.cat((w_q, w_k), dim=0).contiguous()
-    else:
-        qk = None
-        w_qk = None
-        q = torch.empty(batch, seq_len, Q_DIM, dtype=dtype, device=device)
-        k = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
-    v = torch.empty(batch, seq_len, KV_DIM, dtype=dtype, device=device)
-    attn = torch.empty(batch, seq_len, Q_DIM, dtype=dtype, device=device)
-    lse = torch.empty(batch, seq_len, NUM_Q_HEADS, dtype=torch.float32, device=device)
-    attn_proj = torch.empty_like(x)
-    residual1 = torch.empty_like(x)
-    x1 = torch.empty_like(x)
-    gate_up = torch.empty(batch, seq_len, 2 * INTERMEDIATE, dtype=dtype, device=device)
-    mlp = torch.empty(batch, seq_len, INTERMEDIATE, dtype=dtype, device=device)
-    mlp_out = torch.empty_like(x)
-    y = torch.empty_like(x)
-
-    qh = _flatten_heads(q, NUM_Q_HEADS)
-    kh = _flatten_heads(k, NUM_KV_HEADS)
-    qkh = (
-        qk.reshape(batch * seq_len, NUM_Q_HEADS + NUM_KV_HEADS, HEAD_DIM)
-        if qk is not None
-        else None
-    )
-    kh4 = _unflatten_heads(k, batch, seq_len, NUM_KV_HEADS)
-    vh = _unflatten_heads(v, batch, seq_len, NUM_KV_HEADS)
-    attn_h = _unflatten_heads(attn, batch, seq_len, NUM_Q_HEADS)
-
-    gemm_tile_sizes = gemm_tile_sizes or {}
-    rms_tile_sizes = _rms_tile_sizes_for_overlap(scheduler, rms_tile_s)
-
-    def _gemm(name: str, *, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
-        return GemmOp.schedule(
-            a=a,
-            b=b,
-            c=c,
-            page_size=page_size,
-            tile_sizes=gemm_tile_sizes.get(name),
-        )
-
-    ops = []
-    ops += RMSNormOp.schedule(
-        x=x,
-        weight=attn_norm,
-        y=x0,
+    forward = schedule_qwen3_5_forward_ops(
+        batch,
+        seq_len,
+        x,
+        residual,
+        attn_norm,
+        w_q,
+        w_k,
+        w_v,
+        q_norm,
+        k_norm,
+        cos,
+        sin,
+        w_o,
+        mlp_norm,
+        w_gate_up,
+        w_down,
         page_size=page_size,
-        eps=QWEN3_5_EPS,
-        tile_sizes=rms_tile_sizes,
+        scheduler=scheduler,
+        gemm_tile_sizes=gemm_tile_sizes,
+        rms_tile_s=rms_tile_s,
+        adaptive_gemm_tiling=adaptive_gemm_tiling,
+        use_packed_qk=use_packed_qk,
+        use_qwen_projection=use_qwen_projection,
+        use_packed_qkv_projection=use_packed_qkv_projection,
+        use_fused_rms_proj=use_fused_rms_proj,
+        use_qknorm_4d=use_qknorm_4d,
+        use_cpasync_projection=use_cpasync_projection,
+        use_tma_attention=use_tma_attention,
+        use_split_attention=use_split_attention,
+        split_attention_splits=split_attention_splits,
+        attention_tile_m=attention_tile_m,
+        op_limit=forward_op_limit,
     )
-    if use_packed_qk:
-        ops += _gemm("qk", a=x0, b=w_qk, c=qk)
-    else:
-        ops += _gemm("q", a=x0, b=w_q, c=q)
-        ops += _gemm("k", a=x0, b=w_k, c=k)
-    ops += _gemm("v", a=x0, b=w_v, c=v)
-    if use_packed_qk:
-        ops += PackedQKNormRopeOp.schedule(
-            qk=qkh,
-            q_norm_weight=q_norm,
-            k_norm_weight=k_norm,
-            cos=cos_flat,
-            sin=sin_flat,
-            page_size=page_size,
-            eps=QWEN3_5_EPS,
-            num_q_heads=NUM_Q_HEADS,
-            num_k_heads=NUM_KV_HEADS,
-        )
-    else:
-        ops += QKNormRopeOp.schedule(q=qh, norm_weight=q_norm, cos=cos_flat, sin=sin_flat, page_size=page_size, eps=QWEN3_5_EPS)
-        ops += QKNormRopeOp.schedule(q=kh, norm_weight=k_norm, cos=cos_flat, sin=sin_flat, page_size=page_size, eps=QWEN3_5_EPS)
-    ops += FlashAttentionSm120Op.schedule(
-        q=_unflatten_heads(q, batch, seq_len, NUM_Q_HEADS),
-        k=kh4,
-        v=vh,
-        o=attn_h,
-        lse=lse,
-        causal=True,
-        kv_group_size=KV_GROUP_SIZE,
-        page_size=page_size,
-        write_lse=True,
-    )
-    ops += _gemm("o", a=attn, b=w_o, c=attn_proj)
-    # Fuse the post-attention residual add into the MLP-norm RMSNorm via the
-    # pre-norm fused-add path (residual_out = x + residual_in; y = rmsnorm(...)).
-    #   residual1 = residual + attn_proj;  x1 = rmsnorm(residual1)
-    # This removes a separate add op from the critical path (the MLP RMSNorm
-    # otherwise stalls in dep_wait on the Add) and avoids an extra global
-    # round-trip of residual1. residual1 is still emitted (residual_out) for the
-    # final residual add. Note: `residual_in` alone drives the pre-norm add;
-    # the `residual=True` flag is a different (post-norm) op and must NOT be set.
-    ops += RMSNormOp.schedule(
-        x=attn_proj,
-        residual_in=residual,
-        residual_out=residual1,
-        weight=mlp_norm,
-        y=x1,
-        page_size=page_size,
-        eps=QWEN3_5_EPS,
-        tile_sizes=rms_tile_sizes,
-    )
-    ops += _gemm("gate_up", a=x1, b=w_gate_up, c=gate_up)
-    ops += GLUOp.schedule(x=gate_up, y=mlp, activation="silu", page_size=page_size)
-    ops += _gemm("down", a=mlp, b=w_down, c=mlp_out)
-    ops += ResidualAddSm120Op.schedule(
-        x=mlp_out,
-        residual_in=residual1,
-        residual_out=y,
-        tile_sizes={"S": 16, "K": 256},
-        page_size=page_size,
-    )
+    ops = forward.ops
 
     kernel = Megakernel(
         ops,
@@ -278,12 +197,10 @@ def megakernel_forward_build(
     spec = kernel.bench_spec(
         keep_alive=[
             x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
-            w_o, mlp_norm, w_gate_up, w_down, cos_flat, sin_flat, x0, q, k, v,
-            qk, w_qk, qh, kh, qkh, kh4, vh, attn, attn_h, lse, attn_proj,
-            residual1, x1, gate_up, mlp, mlp_out, y, kernel,
+            w_o, mlp_norm, w_gate_up, w_down, *forward.keep_alive, kernel,
         ]
     )
-    return spec, y, residual1
+    return spec, forward.output, forward.residual
 
 
 def megakernel_layer_bwd_build(
@@ -610,6 +527,230 @@ def _torch_backward_spec(batch: int, seq_len: int, page_size: int):
     return KernelBenchSpec(launch_fn=_launch, stream=(torch.cuda.current_stream(), None), _keep_alive=[*args, dy, compiled, sink])
 
 
+# =============================================================================
+# Incremental forward harness: build the megakernel one op at a time, and at
+# each step compare to the equivalent torch.compile partial (speed) and to an
+# eager fp32 reference (accuracy), plus export a perfetto trace.
+# =============================================================================
+
+_INCR_TRACE_DIR = _REPO_ROOT / "traces" / "qwen3_5_forward"
+
+
+def _rmsn(t: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.rms_norm(
+        t.float(), (t.shape[-1],), w.float(), eps=QWEN3_5_EPS
+    ).to(t.dtype)
+
+
+def _qk_norm_rope(q, k, q_norm, k_norm, cos, sin):
+    b, s = q.shape[0], q.shape[1]
+    qh = _rmsn(q.view(b, s, NUM_Q_HEADS, HEAD_DIM), q_norm)
+    kh = _rmsn(k.view(b, s, NUM_KV_HEADS, HEAD_DIM), k_norm)
+    c = cos[None, :, None, :]
+    s_ = sin[None, :, None, :]
+    q1, q2 = qh[..., :D2], qh[..., D2 : 2 * D2]
+    k1, k2 = kh[..., :D2], kh[..., D2 : 2 * D2]
+    qh = torch.cat((q1 * c - q2 * s_, q2 * c + q1 * s_, qh[..., 2 * D2 :]), dim=-1)
+    kh = torch.cat((k1 * c - k2 * s_, k2 * c + k1 * s_, kh[..., 2 * D2 :]), dim=-1)
+    return qh.reshape(b, s, Q_DIM), kh.reshape(b, s, KV_DIM)
+
+
+def _attn(q, k, v):
+    b, s = q.shape[0], q.shape[1]
+    qh = q.view(b, s, NUM_Q_HEADS, HEAD_DIM)
+    kh = k.view(b, s, NUM_KV_HEADS, HEAD_DIM)
+    vh = v.view(b, s, NUM_KV_HEADS, HEAD_DIM)
+    k_rep = kh.repeat_interleave(KV_GROUP_SIZE, dim=2)
+    v_rep = vh.repeat_interleave(KV_GROUP_SIZE, dim=2)
+    out = torch.nn.functional.scaled_dot_product_attention(
+        qh.transpose(1, 2), k_rep.transpose(1, 2), v_rep.transpose(1, 2), is_causal=True
+    ).transpose(1, 2)
+    return out.reshape(b, s, Q_DIM)
+
+
+def _stage_fn(op_limit: int, *, use_packed_qkv_projection: bool = False):
+    """Return f(*args[2:]) -> tuple of tensors the megakernel materializes at op_limit.
+
+    Element 0 is the tensor to accuracy-check (the megakernel's `output`); the
+    rest are extra outputs the megakernel also produces at this prefix. Returning
+    ALL of them prevents torch.compile from dead-code-eliminating work the
+    megakernel actually performs (e.g. q/k when only v is the step-3 output) so
+    the speed comparison covers the same work.
+    """
+
+    def f(x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
+          w_o, mlp_norm, w_gate_up, w_down):
+        x0 = _rmsn(x, attn_norm)
+        if op_limit == 1:
+            return (x0,)
+        q = x0 @ w_q.t()
+        k = x0 @ w_k.t()
+        qk = torch.cat((q, k), dim=-1)
+        v = x0 @ w_v.t()
+        if use_packed_qkv_projection:
+            if op_limit == 2:
+                return (qk, v)
+        else:
+            if op_limit == 2:
+                return (qk,)
+            if op_limit == 3:
+                return (v, qk)
+        qn, kn = _qk_norm_rope(q, k, q_norm, k_norm, cos, sin)
+        qknorm_step = 3 if use_packed_qkv_projection else 4
+        if op_limit == qknorm_step:
+            return (torch.cat((qn, kn), dim=-1), v)
+        attn = _attn(qn, kn, v)
+        if op_limit == qknorm_step + 1:
+            return (attn,)
+        attn_proj = attn @ w_o.t()
+        if op_limit == qknorm_step + 2:
+            return (attn_proj,)
+        residual1 = residual + attn_proj
+        x1 = _rmsn(residual1, mlp_norm)
+        if op_limit == qknorm_step + 3:
+            return (x1,)
+        gate_up = x1 @ w_gate_up.t()
+        if op_limit == qknorm_step + 4:
+            return (gate_up,)
+        gate, up = gate_up.chunk(2, dim=-1)
+        mlp = torch.nn.functional.silu(gate.float()).to(up.dtype) * up
+        if op_limit == qknorm_step + 5:
+            return (mlp,)
+        mlp_out = mlp @ w_down.t()
+        if op_limit == qknorm_step + 6:
+            if use_packed_qkv_projection:
+                return (residual1 + mlp_out,)
+            return (mlp_out,)
+        return (residual1 + mlp_out,)
+
+    return f
+
+
+_STEP_NAMES = {
+    1: "rmsnorm", 2: "qk_proj", 3: "v_proj", 4: "qk_norm_rope", 5: "attention",
+    6: "o_proj", 7: "post_rmsnorm", 8: "gate_up", 9: "glu", 10: "down", 11: "residual",
+}
+
+_PACKED_QKV_STEP_NAMES = {
+    1: "rmsnorm", 2: "qkv_proj", 3: "qk_norm_rope", 4: "attention",
+    5: "o_proj", 6: "post_rmsnorm", 7: "gate_up", 8: "glu", 9: "down_residual",
+}
+
+
+def _time_kernel_spec(spec, warmup: int, rep: int) -> float:
+    import statistics
+    for _ in range(warmup):
+        spec.setup_fn(); spec.launch_fn()
+    torch.cuda.synchronize()
+    bench_stream = spec.stream[0]
+    times = []
+    for _ in range(rep):
+        spec.setup_fn()
+        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(bench_stream):
+            s.record(); spec.launch_fn(); e.record()
+        e.synchronize(); times.append(s.elapsed_time(e) * 1000.0)
+    return statistics.median(times)
+
+
+def _time_torch(fn, args, warmup: int, rep: int) -> float:
+    import statistics
+    for _ in range(warmup):
+        fn(*args)
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(rep):
+        s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+        s.record(); fn(*args); e.record()
+        e.synchronize(); times.append(s.elapsed_time(e) * 1000.0)
+    return statistics.median(times)
+
+
+def run_incremental(batch, seqs, steps, *, page_size=DEFAULT_PAGE_SIZE,
+                    do_torch=True, do_trace=True, torch_mode="max-autotune",
+                    warmup=8, rep=30, use_packed_qkv_projection=False,
+                    use_fused_rms_proj=False, use_qknorm_4d=True,
+                    use_tma_attention=False, use_split_attention=False,
+                    split_attention_splits=0):
+    import contextlib, io
+    _INCR_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    for seq_len in seqs:
+        args = _alloc_layer(batch, seq_len)
+        tensors = args[2:]
+        print(f"\n=== B={batch} S={seq_len} pg={page_size//1024}K ===")
+        print(f"{'step':>4} {'op':14} {'mk_us':>9} {'torch_us':>9} {'speedup':>8} "
+              f"{'max_abs':>10} {'max_rel':>10}")
+        for op_limit in steps:
+            with contextlib.redirect_stdout(io.StringIO()):
+                spec, mk_out, _ = megakernel_forward_build(
+                    *args, page_size=page_size, scheduler=_scheduler("overlap"),
+                    use_packed_qkv_projection=use_packed_qkv_projection,
+                    use_fused_rms_proj=use_fused_rms_proj,
+                    use_qknorm_4d=use_qknorm_4d,
+                    use_tma_attention=use_tma_attention,
+                    use_split_attention=use_split_attention,
+                    split_attention_splits=split_attention_splits,
+                    forward_op_limit=op_limit)
+            spec.setup_fn(); spec.launch_fn(); torch.cuda.synchronize()
+            stage_fn = _stage_fn(op_limit, use_packed_qkv_projection=use_packed_qkv_projection)
+            ref = stage_fn(*tensors)[0].float()
+            got = mk_out.float()
+            max_abs = (got - ref).abs().max().item()
+            denom = ref.abs().max().item() + 1e-6
+            max_rel = max_abs / denom
+            mk_us = _time_kernel_spec(spec, warmup, rep)
+            torch_us = float("nan"); speed = float("nan")
+            if do_torch:
+                fn = torch.compile(stage_fn, mode=torch_mode)
+                fn(*tensors); torch.cuda.synchronize()
+                torch_us = _time_torch(fn, tensors, warmup, rep)
+                speed = torch_us / mk_us
+            names = _PACKED_QKV_STEP_NAMES if use_packed_qkv_projection else _STEP_NAMES
+            name = names.get(op_limit, f"op{op_limit}")
+            print(f"{op_limit:>4} {name:14} {mk_us:9.2f} {torch_us:9.2f} {speed:7.2f}x "
+                  f"{max_abs:10.2e} {max_rel:10.2e}")
+            if do_trace:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tspec, tk, _ = _build_traced_forward(
+                        args,
+                        page_size,
+                        op_limit,
+                        use_packed_qkv_projection=use_packed_qkv_projection,
+                        use_fused_rms_proj=use_fused_rms_proj,
+                        use_qknorm_4d=use_qknorm_4d,
+                    )
+                tspec.setup_fn(); tspec.launch_fn(); torch.cuda.synchronize()
+                suffix = ""
+                if use_packed_qkv_projection:
+                    suffix += "_packed_qkv"
+                if use_fused_rms_proj:
+                    suffix += "_fused_rms_proj"
+                path = _INCR_TRACE_DIR / f"step{op_limit:02d}_{name}_b{batch}_s{seq_len}{suffix}.perfetto.json"
+                tk.write_trace_perfetto(str(path))
+
+
+def _build_traced_forward(
+    args,
+    page_size,
+    op_limit,
+    *,
+    use_packed_qkv_projection=False,
+    use_fused_rms_proj=False,
+    use_qknorm_4d=True,
+):
+    forward = schedule_qwen3_5_forward_ops(
+        *args, page_size=page_size, scheduler=_scheduler("overlap"),
+        use_packed_qk=True,
+        use_packed_qkv_projection=use_packed_qkv_projection,
+        use_fused_rms_proj=use_fused_rms_proj,
+        use_qknorm_4d=use_qknorm_4d,
+        op_limit=op_limit)
+    kernel = Megakernel(forward.ops, config=_config_for(forward.ops, page_size, tracing=True),
+                        scheduler=_scheduler("overlap"))
+    spec = kernel.bench_spec(keep_alive=[*args, *forward.keep_alive, kernel])
+    return spec, kernel, forward.output
+
+
 @Benchmark.configs(["seq_len", "batch", "page_size", "fetch_stride"], _configs_with_fetch_stride(0))
 def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_stride: int = 0):
     args = _alloc_layer(batch, seq_len)
@@ -619,6 +760,13 @@ def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_strid
             *args,
             page_size=page_size,
             scheduler=_scheduler("overlap", fetch_stride),
+            use_packed_qkv_projection=BENCH_USE_PACKED_QKV_PROJECTION,
+            use_fused_rms_proj=BENCH_USE_FUSED_RMS_PROJ,
+            use_qknorm_4d=BENCH_USE_QKNORM_4D,
+            use_tma_attention=BENCH_USE_TMA_ATTENTION,
+            use_split_attention=BENCH_USE_SPLIT_ATTENTION,
+            split_attention_splits=BENCH_SPLIT_ATTENTION_SPLITS,
+            attention_tile_m=BENCH_ATTENTION_TILE_M,
         )[0],
     }
 
@@ -650,7 +798,102 @@ if __name__ == "__main__":
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rep", type=int, default=20)
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Build the forward megakernel one op at a time; compare each step to "
+        "torch.compile (speed) and an eager fp32 reference (accuracy), and write a "
+        "perfetto trace per step into traces/qwen3_5_forward/.",
+    )
+    parser.add_argument("--steps", type=int, nargs="+", default=list(range(1, 12)),
+                        help="Which op_limit steps to run in --incremental mode.")
+    parser.add_argument("--no-torch", dest="incr_torch", action="store_false", default=True,
+                        help="Skip torch.compile timing in --incremental mode.")
+    parser.add_argument("--no-trace", dest="incr_trace", action="store_false", default=True,
+                        help="Skip perfetto trace export in --incremental mode.")
+    parser.add_argument("--torch-mode", default="max-autotune",
+                        help="torch.compile mode used for the per-step comparison.")
+    qkv_group = parser.add_mutually_exclusive_group()
+    qkv_group.add_argument(
+        "--packed-qkv-projection",
+        dest="packed_qkv_projection",
+        action="store_true",
+        default=True,
+        help="Use one Qwen-local QKV projection buffer/op instead of separate packed QK + V projection.",
+    )
+    qkv_group.add_argument(
+        "--separate-v-projection",
+        dest="packed_qkv_projection",
+        action="store_false",
+        help="Use the older packed-QK plus separate V projection path.",
+    )
+    parser.add_argument(
+        "--fused-rms-proj",
+        action="store_true",
+        help="Fuse the first RMSNorm into the first projection op in the Qwen-local forward path.",
+    )
+    parser.add_argument(
+        "--attention-tile-m",
+        type=int,
+        default=None,
+        help="Override Qwen forward attention M tile for overlap experiments.",
+    )
+    attn_group = parser.add_mutually_exclusive_group()
+    attn_group.add_argument(
+        "--tma-attention",
+        action="store_true",
+        help="Use Qwen-local full attention with compute-issued TMA K/V loads.",
+    )
+    attn_group.add_argument(
+        "--split-attention",
+        action="store_true",
+        help="Use split-KV attention experiment. Currently decode-shaped and not valid for large M.",
+    )
+    parser.add_argument(
+        "--split-attention-splits",
+        type=int,
+        default=0,
+        help="Number of split-KV chunks for --split-attention; 0 auto-selects.",
+    )
+    qknorm_group = parser.add_mutually_exclusive_group()
+    qknorm_group.add_argument(
+        "--qknorm-4d",
+        dest="qknorm_4d",
+        action="store_true",
+        default=True,
+        help="Use the Qwen-local 4D packed QKNorm dependency path.",
+    )
+    qknorm_group.add_argument(
+        "--flat-qknorm",
+        dest="qknorm_4d",
+        action="store_false",
+        help="Use the older flattened packed QKNorm path.",
+    )
     args = parser.parse_args()
+
+    BENCH_USE_PACKED_QKV_PROJECTION = args.packed_qkv_projection
+    BENCH_USE_FUSED_RMS_PROJ = args.fused_rms_proj
+    BENCH_USE_QKNORM_4D = args.qknorm_4d
+    BENCH_USE_TMA_ATTENTION = args.tma_attention
+    BENCH_USE_SPLIT_ATTENTION = args.split_attention
+    BENCH_SPLIT_ATTENTION_SPLITS = args.split_attention_splits
+    BENCH_ATTENTION_TILE_M = args.attention_tile_m
+
+    if args.incremental:
+        for batch in args.batch:
+            for page_size in args.page_size:
+                run_incremental(
+                    batch, args.seq_len, args.steps, page_size=page_size,
+                    do_torch=args.incr_torch, do_trace=args.incr_trace,
+                    torch_mode=args.torch_mode, warmup=args.warmup, rep=args.rep,
+            use_packed_qkv_projection=args.packed_qkv_projection,
+            use_fused_rms_proj=args.fused_rms_proj,
+            use_qknorm_4d=args.qknorm_4d,
+            use_tma_attention=args.tma_attention,
+            use_split_attention=args.split_attention,
+            split_attention_splits=args.split_attention_splits,
+        )
+        sys.exit(0)
 
     if "forward" in args.direction:
         bench_qwen35_layer_fwd._benchmark._configs = [

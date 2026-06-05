@@ -16,7 +16,6 @@ from .backend_dispatch import compile_phase_dispatch_inputs
 from .ops import build_op_config, is_compile_static_dim
 
 
-NUM_DMA_WARPS = 3
 PHASE_NAMES = ("load", "compute", "store", "communicate")
 
 
@@ -205,7 +204,7 @@ def build_handler_backend_ir(kernel) -> BackendIR:
     }
     phase_transport_idx: Dict[str, Dict[Tuple[str, ...], int]] = {phase: {} for phase in PHASE_NAMES}
     phase_compile_transport_records: Dict[str, List[Tuple[str, ...]]] = {phase: [] for phase in PHASE_NAMES}
-    num_dma_warps = 0 if kernel._use_compute_only_replay() else NUM_DMA_WARPS
+    num_dma_warps = 0 if kernel._use_compute_only_replay() else kernel._num_dma_warps()
     num_compute_threads = kernel.config.threads_per_block - num_dma_warps * 32
 
     for i, op in enumerate(kernel.ops):
@@ -379,7 +378,7 @@ class HandlerBackend:
         return compile_phase_dispatch_inputs(
             self,
             kernel,
-            num_dma_warps=0 if kernel._use_compute_only_replay() else NUM_DMA_WARPS,
+            num_dma_warps=0 if kernel._use_compute_only_replay() else kernel._num_dma_warps(),
             phase_should_noinline=phase_should_noinline,
         )
 

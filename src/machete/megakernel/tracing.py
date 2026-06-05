@@ -25,14 +25,16 @@ class TracingState:
     builder: object = None       # DynamicTraceBuilder
     block_type: object = None    # BlockType
     trace_types: dict = field(default_factory=dict)
-    load_fmts: List[int] = field(default_factory=list)
+    load_emit_fmts: List[int] = field(default_factory=list)
+    load_done_fmts: List[int] = field(default_factory=list)
     compute_fmts: List[int] = field(default_factory=list)
     store_fmts: List[int] = field(default_factory=list)
     dep_wait_fmt: int = 0
     data_wait_fmt: int = 0
     compute_wait_fmt: int = 0
     ring_full_wait_fmt: int = 0
-    load_fmts_tensor: object = None
+    load_emit_fmts_tensor: object = None
+    load_done_fmts_tensor: object = None
     compute_fmts_tensor: object = None
     store_fmts_tensor: object = None
 
@@ -70,7 +72,7 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
         cls_name = op.op_cls.__name__
         if cls_name not in seen_classes:
             seen_classes[cls_name] = {}
-            for phase in ("load", "compute", "store"):
+            for phase in ("load_emit", "load_done", "compute", "store"):
                 key = f"{cls_name}_{phase}"
                 tt = TraceType(
                     name=key,
@@ -81,7 +83,8 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
                 )
                 seen_classes[cls_name][phase] = tt
                 state.trace_types[key] = tt
-        state.load_fmts.append(seen_classes[cls_name]["load"].id)
+        state.load_emit_fmts.append(seen_classes[cls_name]["load_emit"].id)
+        state.load_done_fmts.append(seen_classes[cls_name]["load_done"].id)
         state.compute_fmts.append(seen_classes[cls_name]["compute"].id)
         state.store_fmts.append(seen_classes[cls_name]["store"].id)
 
@@ -140,8 +143,11 @@ def setup_tracing(ops, num_sms, total_tiles, device="cuda") -> TracingState:
     state.builder.set_track_type(store_track, lane=2)
     state.builder.set_track_type(controller_track, lane=3)
 
-    state.load_fmts_tensor = torch.tensor(
-        state.load_fmts, dtype=torch.int32, device=device
+    state.load_emit_fmts_tensor = torch.tensor(
+        state.load_emit_fmts, dtype=torch.int32, device=device
+    )
+    state.load_done_fmts_tensor = torch.tensor(
+        state.load_done_fmts, dtype=torch.int32, device=device
     )
     state.compute_fmts_tensor = torch.tensor(
         state.compute_fmts, dtype=torch.int32, device=device
@@ -274,7 +280,8 @@ def get_trace_exec_globals(state: TracingState) -> dict:
             "end_event_dynamic_raw_2": end_event_dynamic_raw_2,
             "finish_lane_dynamic_raw": finish_lane_dynamic_raw,
             "trace_row_stride": state.builder.row_stride_bytes,
-            "trace_load_fmt_ptr": Int64(state.load_fmts_tensor.data_ptr()),
+            "trace_load_emit_fmt_ptr": Int64(state.load_emit_fmts_tensor.data_ptr()),
+            "trace_load_done_fmt_ptr": Int64(state.load_done_fmts_tensor.data_ptr()),
             "trace_compute_fmt_ptr": Int64(state.compute_fmts_tensor.data_ptr()),
             "trace_store_fmt_ptr": Int64(state.store_fmts_tensor.data_ptr()),
             "trace_dep_wait_fmt": state.dep_wait_fmt,

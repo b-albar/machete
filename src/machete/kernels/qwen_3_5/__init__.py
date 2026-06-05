@@ -76,10 +76,20 @@ from .mxfp4_ops import (
     schedule_qwen3_5_mxfp4_simt_decode_sm120,
     schedule_qwen3_5_mxfp4_decode_sm120,
 )
+from .qwen_3_5_forward import (
+    Qwen3_5ForwardOverlapScheduler,
+    Qwen3_5ForwardSchedule,
+    qwen3_5_forward_gemm_tile_sizes,
+    schedule_qwen3_5_forward_ops,
+)
 
 schedule_qwen3_5_decode_sm120 = schedule_qwen3_5_mxfp4_decode_sm120
 
 __all__ = [
+    "Qwen3_5ForwardOverlapScheduler",
+    "Qwen3_5ForwardSchedule",
+    "qwen3_5_forward_gemm_tile_sizes",
+    "schedule_qwen3_5_forward_ops",
     "MXFP4SimtWeight",
     "empty_mxfp4_simt_weight",
     "quantize_mxfp4_simt_weight",

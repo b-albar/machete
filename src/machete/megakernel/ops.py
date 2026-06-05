@@ -34,7 +34,7 @@ Shared config helpers intentionally mirror common CuTe DSL patterns:
 import math
 import struct
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, Iterable, List, Optional, Tuple, Type, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
@@ -589,15 +589,11 @@ def _tensor_storage_span(meta: TensorMeta) -> Optional[Tuple[int, int]]:
 def _parse_dims(dims) -> List[str]:
     """Parse dimension specification into a list of dimension names.
 
-    Accepts:
-        - Tuple/list of strings: ("M", "H", "D") → ["M", "H", "D"]
-        - Comma-separated string (legacy): "M, H, D" → ["M", "H", "D"]
+    Accepts tuple/list of strings: ("M", "H", "D") -> ["M", "H", "D"].
     """
     if isinstance(dims, (tuple, list)):
         return list(dims)
-    if isinstance(dims, str):
-        return [d.strip() for d in dims.split(",")]
-    raise TypeError(f"dims must be tuple, list, or str, got {type(dims)}")
+    raise TypeError(f"dims must be tuple or list, got {type(dims)}")
 
 
 def _parse_tile_spec(tile) -> Tuple[str, ...]:
@@ -847,6 +843,7 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
         "_TMA_STORES": set(getattr(cls, "tma_stores", set())),
         "_TMA_COMPUTE_STORES": set(getattr(cls, "tma_compute_stores", set())),
         "_TMA_REDUCE_STORES": set(getattr(cls, "tma_reduce_stores", set())),
+        "_COMPUTE_REDUCE_STORES": set(getattr(cls, "compute_reduce_stores", set())),
         "_PEER_STORES": set(getattr(cls, "peer_stores", set())),
         "_PEER_REDUCE_STORES": set(getattr(cls, "peer_reduce_stores", set())),
     }
@@ -871,6 +868,12 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
         "tma_reduce_stores",
         "writes",
     )
+    _validate_tensor_set(
+        transfer_sets["_COMPUTE_REDUCE_STORES"],
+        write_names,
+        "compute_reduce_stores",
+        "writes",
+    )
     _validate_tensor_set(transfer_sets["_PEER_STORES"], write_names, "peer_stores", "writes")
     _validate_tensor_set(
         transfer_sets["_PEER_REDUCE_STORES"],
@@ -884,6 +887,8 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
 def _collect_tma_tensor_dims(unique_tensors, transfer_sets):
     """Map each TMA-capable tensor name to its declared dimension list."""
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
+    # compute_reduce_stores is scheduling metadata for compute-side atomics; it
+    # does not require TMA descriptor generation.
     tma_tensor_names = (
         transfer_sets["_TMA_LOADS"]
         | transfer_sets["_TMA_COMPUTE_LOADS"]
@@ -1184,6 +1189,10 @@ class Op:
     inline_phases: ClassVar[Tuple[str, ...]] = ()
     sync_compute_warps_after_tile: ClassVar[bool] = False
     uses_smem_page: ClassVar[bool] = True
+    # Number of distinct shared-memory ring pages this op's phases want.
+    # Default 1 = the classic single-page behavior. Override the classmethod
+    # below to derive the count from the megakernel page_size.
+    requested_page_count: ClassVar[int] = 1
 
     def __init__(self, **config):
         """Initialize Op instance with compile-time configuration.
@@ -1213,6 +1222,20 @@ class Op:
         self._bind_phase("store", type(self).store_phase)
         self._bind_phase("communicate", type(self).communicate_phase)
 
+    @cute.jit
+    def store_step(self, page_ptr, store_state_ptr) -> None:
+        """Optional stepped store entry point.
+
+        Subclasses that override this method advance ``store_state_ptr`` toward
+        ``store_step_count()``. The default is inert and is never selected unless
+        a scheduled op opts into the store-step phase.
+        """
+        pass
+
+    def store_step_count(self) -> int:
+        """Return the fixed number of store-step iterations for this op."""
+        return 0
+
     def should_noinline_phase(self, phase_name: str) -> bool:
         """Return whether a generated wrapper for ``phase_name`` should be noinline.
 
@@ -1223,6 +1246,33 @@ class Op:
         if phase_name in type(self).inline_phases:
             return False
         return True
+
+    @classmethod
+    def requested_page_count_for(cls, page_size: int) -> int:
+        """Number of distinct smem ring pages this op's phases want (>= 1).
+
+        The framework passes one base ``page_ptr`` to ``load``/``compute``/
+        ``store`` for ops that return N > 1 here. The op addresses sub-page i
+        as ``page_ptr + i * machete_aligned_page_size``. The default reads the
+        ``requested_page_count`` class variable; override to derive N from
+        ``page_size`` (e.g. an attention op asking for 2 pages at a 32 KB
+        page_size to deepen its K/V pipeline).
+        """
+        return max(1, int(getattr(cls, "requested_page_count", 1)))
+
+    @classmethod
+    def page_release_after_compute_mask(cls, page_size: int) -> int:
+        """Per-page release-timing bitmask over this op's requested pages.
+
+        Bit ``i`` set  => page ``i`` is released for reuse right after the
+                          op's ``compute`` finishes (early / out-of-order,
+                          Hazy-style) — use for compute-only scratch pages
+                          that the ``store`` phase does not read.
+        Bit ``i`` clear => page ``i`` is released after ``store`` (default).
+
+        Default 0 = every page released after store = classic behavior.
+        """
+        return 0
 
     @classmethod
     def pipeline_protocol(cls) -> Optional[InstructionPageProtocol]:

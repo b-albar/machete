@@ -55,8 +55,12 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
 
         is_store_warp = warp_id == Int32(num_mma_warps + 2)
 
-        if warp_id >= Int32(num_mma_warps):
-            setmaxregister_decrease(dma_reg_count)
+        if warp_id == Int32(num_mma_warps):
+            setmaxregister_decrease(controller_reg_count)
+        if warp_id == Int32(num_mma_warps + 1):
+            setmaxregister_decrease(loader_reg_count)
+        if is_store_warp:
+            setmaxregister_decrease(store_reg_count)
         if warp_id < Int32(num_mma_warps):
             setmaxregister_increase(mma_reg_count)
 
@@ -76,7 +80,6 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                 st_shared_i32(flags_ptr + FLAG_PRODUCE_IDX, Int32(0))
                 st_shared_i32(flags_ptr + FLAG_STORE_IDX, Int32(0))
                 st_shared_i32(flags_ptr + FLAG_LOAD_DONE, Int32(0))
-                st_shared_i32(flags_ptr + FLAG_DATA_RELEASE_IDX, Int32(0))
                 st_shared_i32(flags_ptr + FLAG_DATA_PRODUCE_IDX, Int32(0))
                 for _ip in range(num_slots):
                     _slot_ti = smem_base + Int32(ring_state_offset) + Int32(_ip) * Int32(tile_info_bytes)
@@ -89,6 +92,18 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _compute_done_mbar(smem_base, Int32(_ip)),
                         Int32(num_mma_warps),
                     )
+                if const_expr(has_page_free_ops):
+                    # Per-physical-page release mbarriers. Init count=1 and
+                    # pre-arrive so every page starts "free" (phase 0 complete);
+                    # the controller waits on these to claim a page, the
+                    # compute/store warp arrives one to release it.
+                    st_shared_i32(flags_ptr + FLAG_PAGE_PHASE_BITS, Int32(0))
+                    for _pp in range(num_pages):
+                        mbarrier_init(
+                            _page_finished_mbar(smem_base, Int32(_pp)),
+                            Int32(1),
+                        )
+                        mbarrier_arrive(_page_finished_mbar(smem_base, Int32(_pp)))
                 mbarrier_init_fence_async_proxy()
 
         named_barrier_sync(Int32(0), Int32(threads_per_block))
@@ -293,10 +308,48 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
 
                         _p_slot = produce_idx % Int32(num_slots)
                         _p_ti = smem_base + Int32(ring_state_offset) + _p_slot * Int32(tile_info_bytes)
-                        st_shared_i32(
-                            _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),
-                            _p_slot % Int32(num_pages),
-                        )
+                        if const_expr(has_page_free_ops):
+                            # Decoupled physical-page allocator. Each tile claims
+                            # N (>=1) *contiguous* physical pages starting at a
+                            # rolling cursor; the op receives the base page and
+                            # addresses sub-page i at base + i*aligned_page_size.
+                            # Each physical page is gated by its own page_finished
+                            # mbarrier (released after compute OR store, per op
+                            # mask), so a freed page is reclaimable out-of-order.
+                            _ctrl_no_page = (
+                                (_ctrl_cached_phase_mask // Int32(1 << _INSTR_NO_SMEM_PAGE_BIT))
+                                % Int32(2)
+                            )
+                            st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_PAGE_ID), Int32(-1))
+                            if _ctrl_no_page == Int32(0):
+                                _alloc_n = _op_meta_i32(
+                                    op_meta_ptr, _instr_op, Int32(_OP_META_PAGE_COUNT)
+                                )
+                                _np_ptr = flags_ptr + Int32(FLAG_DATA_PRODUCE_IDX)
+                                _ph_ptr = flags_ptr + Int32(FLAG_PAGE_PHASE_BITS)
+                                _np = ld_shared_i32(_np_ptr)
+                                if (_np + _alloc_n) > Int32(num_pages):
+                                    _np = Int32(0)
+                                _phbits = ld_shared_i32(_ph_ptr)
+                                for _ai in range_constexpr(MAX_REQUESTED_N):
+                                    if Int32(_ai) < _alloc_n:
+                                        _apid = _np + Int32(_ai)
+                                        _aph = (_phbits >> _apid) & Int32(1)
+                                        mbarrier_wait(
+                                            _page_finished_mbar(smem_base, _apid), _aph
+                                        )
+                                        _phbits = _phbits ^ (Int32(1) << _apid)
+                                st_shared_i32(_ph_ptr, _phbits)
+                                st_shared_i32(_p_ti + Int32(4 * _TILE_INFO_PAGE_ID), _np)
+                                _np2 = _np + _alloc_n
+                                if _np2 == Int32(num_pages):
+                                    _np2 = Int32(0)
+                                st_shared_i32(_np_ptr, _np2)
+                        else:
+                            st_shared_i32(
+                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),
+                                _p_slot % Int32(num_pages),
+                            )
                         _p_t0 = _ctrl_cached_t0
                         _p_t1 = _ctrl_cached_t1
                         _p_t2 = _ctrl_cached_t2
@@ -373,7 +426,11 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                 if _ldr_idx < _p_idx:
                     _dl_slot = _ldr_idx % Int32(num_slots)
                     _dl_ti = smem_base + Int32(ring_state_offset) + _dl_slot * Int32(tile_info_bytes)
+                    _dl_loaded = Int32(0)
+                    _dl_page = _dl_slot
                     _dl_op = ld_shared_i32(_dl_ti)
+                    if _dl_op == Int32(TileInstruction.END_MARKER):
+                        _dl_loaded = Int32(1)
                     if _dl_op != Int32(TileInstruction.END_MARKER):
                         _dl_meta_base = _op_meta_base(_dl_op)
                         _dl_handler = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_HANDLER_IDX))
@@ -392,14 +449,13 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _dl_3 = _dl_3 + _op_meta_i32_base(op_meta_ptr, _dl_meta_base, Int32(_OP_META_ORIGIN_3))
                         _dl_config = ld_shared_i64(_dl_ti + Int32(4 * _TILE_INFO_OP_CONFIG))
                         _dl_mbar = _work_notify_mbar(smem_base, _dl_slot)
-                        if const_expr(tracing):
-                            _tl = trace_start()
-                        _dl_page = _dl_slot
                         if const_expr(has_page_free_ops):
                             _dl_page = ld_shared_i32(_dl_ti + Int32(4 * _TILE_INFO_PAGE_ID))
                             _dl_pp = _get_page_ptr(smem_base, _dl_page)
                         else:
                             _dl_pp = _get_page_ptr(smem_base, _dl_slot)
+                        if const_expr(tracing):
+                            _tle = trace_start()
                         if const_expr(dispatch_load_uses_handler_local_idx):
                             dispatch_load(
                                 _dl_handler,
@@ -423,17 +479,33 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                                 _dl_config,
                                 _dl_mbar,
                             )
+                        _dl_loaded = Int32(1)
                         if const_expr(tracing):
                             _dma_lane = end_event_dynamic_raw_2(
-                                _tl,
+                                _tle,
                                 _trace_buf,
                                 Int32(trace_row_stride),
                                 _dma_lane,
-                                ld_global_i32(trace_load_fmt_ptr, _dl_op),
+                                ld_global_i32(trace_load_emit_fmt_ptr, _dl_op),
                                 _dl_op,
                                 _dl_page,
                             )
-                    _ldr_idx = _ldr_idx + Int32(1)
+                    if _dl_loaded == Int32(1):
+                        if const_expr(tracing):
+                            if _dl_op != Int32(TileInstruction.END_MARKER):
+                                _tld = trace_start()
+                                _dma_lane = end_event_dynamic_raw_2(
+                                    _tld,
+                                    _trace_buf,
+                                    Int32(trace_row_stride),
+                                    _dma_lane,
+                                    ld_global_i32(trace_load_done_fmt_ptr, _dl_op),
+                                    _dl_op,
+                                    _dl_page,
+                                )
+                        _ldr_idx = _ldr_idx + Int32(1)
+                    if _dl_loaded != Int32(1):
+                        nanosleep(Int32(loader_idle_sleep_ns))
                 else:
                     nanosleep(Int32(loader_idle_sleep_ns))
 
@@ -519,12 +591,97 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                         _ds_pp = _get_page_ptr(smem_base, _ds_page)
                     else:
                         _ds_pp = _get_page_ptr(smem_base, _s_slot)
+                    _ds_phase_mask = _op_meta_i32_base(
+                        op_meta_ptr, _ds_meta_base, Int32(_OP_META_PHASE_MASK)
+                    )
+                    _ds_has_store_step = (
+                        (_ds_phase_mask // Int32(_OP_PHASE_STORE_STEP)) % Int32(2)
+                    )
+                    _ds_store_step_count = _op_meta_i32_base(
+                        op_meta_ptr, _ds_meta_base, Int32(_OP_META_STORE_STEP_COUNT)
+                    )
+                    _ds_store_state_ptr = _ds_ti + Int32(4 * _TILE_INFO_STORE_STATE)
+                    st_shared_i32(_ds_store_state_ptr, Int32(0))
                     # Elect once at the dispatch boundary. Electing only inside
                     # each op store lets PTXAS lose the single-lane proof in the
                     # fused Qwen kernels and can reintroduce serialized UTMASTG
                     # loops.
-                    if const_expr(elect_store_dispatch):
-                        with cute.arch.elect_one():
+                    if _ds_has_store_step == Int32(1):
+                        while ld_shared_i32(_ds_store_state_ptr) < _ds_store_step_count:
+                            if const_expr(elect_store_dispatch):
+                                with cute.arch.elect_one():
+                                    if const_expr(dispatch_store_step_uses_handler_local_idx):
+                                        dispatch_store_step(
+                                            _ds_handler,
+                                            _ds_handler_local,
+                                            _ds_pp,
+                                            _ds_0,
+                                            _ds_1,
+                                            _ds_2,
+                                            _ds_3,
+                                            _ds_config,
+                                            _ds_store_state_ptr,
+                                        )
+                                    else:
+                                        dispatch_store_step(
+                                            _ds_handler,
+                                            _ds_pp,
+                                            _ds_0,
+                                            _ds_1,
+                                            _ds_2,
+                                            _ds_3,
+                                            _ds_config,
+                                            _ds_store_state_ptr,
+                                        )
+                            else:
+                                if const_expr(dispatch_store_step_uses_handler_local_idx):
+                                    dispatch_store_step(
+                                        _ds_handler,
+                                        _ds_handler_local,
+                                        _ds_pp,
+                                        _ds_0,
+                                        _ds_1,
+                                        _ds_2,
+                                        _ds_3,
+                                        _ds_config,
+                                        _ds_store_state_ptr,
+                                    )
+                                else:
+                                    dispatch_store_step(
+                                        _ds_handler,
+                                        _ds_pp,
+                                        _ds_0,
+                                        _ds_1,
+                                        _ds_2,
+                                        _ds_3,
+                                        _ds_config,
+                                        _ds_store_state_ptr,
+                                    )
+                    if _ds_has_store_step == Int32(0):
+                        if const_expr(elect_store_dispatch):
+                            with cute.arch.elect_one():
+                                if const_expr(dispatch_store_uses_handler_local_idx):
+                                    dispatch_store(
+                                        _ds_handler,
+                                        _ds_handler_local,
+                                        _ds_pp,
+                                        _ds_0,
+                                        _ds_1,
+                                        _ds_2,
+                                        _ds_3,
+                                        _ds_config,
+                                    )
+                                else:
+                                    dispatch_store(
+                                        _ds_handler,
+                                        _ds_pp,
+                                        _ds_0,
+                                        _ds_1,
+                                        _ds_2,
+                                        _ds_3,
+                                        _ds_config,
+                                    )
+                        else:
                             if const_expr(dispatch_store_uses_handler_local_idx):
                                 dispatch_store(
                                     _ds_handler,
@@ -546,28 +703,6 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                                     _ds_3,
                                     _ds_config,
                                 )
-                    else:
-                        if const_expr(dispatch_store_uses_handler_local_idx):
-                            dispatch_store(
-                                _ds_handler,
-                                _ds_handler_local,
-                                _ds_pp,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_config,
-                            )
-                        else:
-                            dispatch_store(
-                                _ds_handler,
-                                _ds_pp,
-                                _ds_0,
-                                _ds_1,
-                                _ds_2,
-                                _ds_3,
-                                _ds_config,
-                            )
                     if const_expr(has_communicate):
                         if const_expr(dispatch_communicate_uses_handler_local_idx):
                             dispatch_communicate(
@@ -645,6 +780,25 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
                                 _ds_lin,
                                 Int64(_peer_barriers_data_ptr),
                             )
+                        if const_expr(has_page_free_ops):
+                            # Release the tile's after-store pages (release-mask
+                            # bit clear). After-compute pages were already freed
+                            # by the compute warp. _ds_page holds the base page.
+                            if _ds_page >= Int32(0):
+                                _ds_n = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_PAGE_COUNT)
+                                )
+                                _ds_relm = _op_meta_i32_base(
+                                    op_meta_ptr, _ds_meta_base, Int32(_OP_META_PAGE_REL_MASK)
+                                )
+                                for _ri in range_constexpr(MAX_REQUESTED_N):
+                                    if Int32(_ri) < _ds_n:
+                                        if ((_ds_relm >> Int32(_ri)) & Int32(1)) == Int32(0):
+                                            mbarrier_arrive(
+                                                _page_finished_mbar(
+                                                    smem_base, _ds_page + Int32(_ri)
+                                                )
+                                            )
                         st_shared_i32(store_idx_ptr, _s_idx + Int32(1))
 
                 if _s_idx >= _p_idx:
@@ -860,6 +1014,29 @@ def build_ring_kernel_loop(kernel, kernel_cfg: Dict[str, Any], runtime: Dict[str
 
                     with cute.arch.elect_one():
                         mbarrier_arrive(_compute_done_mbar(smem_base, slot))
+
+                    if const_expr(has_page_free_ops):
+                        # Early-release this tile's after-compute pages (release
+                        # mask bit set). Sync all compute warps first so no warp
+                        # still reads the page, then one thread arrives each
+                        # page_finished mbarrier (count=1). _page_id is the base.
+                        named_barrier_sync(Int32(1), Int32(num_compute_threads))
+                        if warp_id == Int32(0):
+                            with cute.arch.elect_one():
+                                _ce_n = _op_meta_i32(
+                                    op_meta_ptr, op_idx, Int32(_OP_META_PAGE_COUNT)
+                                )
+                                _ce_relm = _op_meta_i32(
+                                    op_meta_ptr, op_idx, Int32(_OP_META_PAGE_REL_MASK)
+                                )
+                                for _ci in range_constexpr(MAX_REQUESTED_N):
+                                    if Int32(_ci) < _ce_n:
+                                        if ((_ce_relm >> Int32(_ci)) & Int32(1)) != Int32(0):
+                                            mbarrier_arrive(
+                                                _page_finished_mbar(
+                                                    smem_base, _page_id + Int32(_ci)
+                                                )
+                                            )
 
                     consume_ptr = consume_ptr + Int32(1)
 

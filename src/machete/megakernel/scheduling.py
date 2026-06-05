@@ -211,21 +211,6 @@ class TileInstruction:
 # =============================================================================
 
 
-def _linear_strides(tile_counts: Tuple[int, ...]) -> Tuple[int, ...]:
-    """Compute row-major linear strides from tile counts, padded to MAX_TILE_DIMS.
-
-    For tile_counts = (4, 8, 2): strides = (16, 2, 1, 0, 0)
-    stride[i] = product of tile_counts[i+1:]
-    """
-    ndims = len(tile_counts)
-    strides = [0] * MAX_TILE_DIMS
-    stride = 1
-    for i in range(ndims - 1, -1, -1):
-        strides[i] = stride
-        stride *= tile_counts[i]
-    return tuple(strides)
-
-
 @dataclass
 class _OpRecord:
     """Internal record for an op added to the builder."""
@@ -399,61 +384,6 @@ def _group_consumer_deps(edges: List["_DepEdge"]) -> Dict[int, List["_DepEdge"]]
     for edge in edges:
         consumer_deps.setdefault(edge.consumer_idx, []).append(edge)
     return consumer_deps
-
-
-def _build_linear_chain_dependency_plan(op_records: List["_OpRecord"]) -> DependencyPlan:
-    """Build the legacy dependency plan for ops without named buffers.
-
-    This fallback preserves old behavior for simple tests and ad-hoc kernels,
-    but keeps the no-metadata path out of the main named-buffer resolver.
-    """
-    formulas: Dict[int, Tuple[List[BarrierFormula], List[BarrierFormula]]] = {}
-    controller_wait_formulas: Dict[int, List[BarrierFormula]] = {}
-    compute_wait_formulas: Dict[int, List[BarrierFormula]] = {
-        i: [] for i in range(len(op_records))
-    }
-    edges = [
-        _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one")
-        for i in range(1, len(op_records))
-    ]
-    barrier_counter = 0
-
-    for i, rec in enumerate(op_records):
-        op = rec.op
-        signal_base = barrier_counter
-        coeffs = _linear_strides(op.tile_counts)
-        signal_formulas = [BarrierFormula(base=signal_base, coeffs=coeffs)]
-
-        wait_formulas: List[BarrierFormula] = []
-        if i > 0:
-            prev_op = op_records[i - 1].op
-            prev_base = barrier_counter - prev_op.total_tiles
-            guard = (
-                prev_op.total_tiles
-                if prev_op.total_tiles != op.total_tiles
-                else BarrierFormula.NO_GUARD
-            )
-            wait_formulas.append(
-                BarrierFormula(
-                    base=prev_base,
-                    coeffs=coeffs,
-                    expected=1,
-                    guard_max=guard,
-                )
-            )
-
-        formulas[i] = (wait_formulas, signal_formulas)
-        controller_wait_formulas[i] = wait_formulas
-        barrier_counter += op.total_tiles
-
-    return DependencyPlan(
-        formulas=formulas,
-        barrier_count=barrier_counter,
-        edges=edges,
-        consumer_deps=_group_consumer_deps(edges),
-        controller_wait_formulas=controller_wait_formulas,
-        compute_wait_formulas=compute_wait_formulas,
-    )
 
 
 def _coalesce_coordinate_ranges(
@@ -965,7 +895,8 @@ class InstructionStreamBuilder:
                        dim_names={"batch": 0})
         # OpB reads OpA's output → OpB batch=0 waits for all 32 seqlen tiles
 
-    Fallback (no INPUTS/OUTPUTS): linear chain with 1:1 tile mapping.
+    Multi-op graphs must declare INPUTS/OUTPUTS. Single-op graphs may omit
+    them and run without barriers.
     """
 
     def __init__(self):
@@ -1088,6 +1019,24 @@ class InstructionStreamBuilder:
     def _has_named_buffers(self) -> bool:
         """Check if any op declares INPUTS or OUTPUTS."""
         return any(r.op.op_cls.INPUTS or r.op.op_cls.OUTPUTS for r in self._op_records)
+
+    def _requires_named_buffers(self) -> bool:
+        """Return whether dependency resolution needs named buffer metadata."""
+        return len(self._op_records) > 1
+
+    def _validate_named_buffer_requirements(self) -> None:
+        if not self._requires_named_buffers():
+            return
+        missing = [
+            f"{rec.op_idx}:{rec.op.op_cls.__name__}"
+            for rec in self._op_records
+            if not rec.op.op_cls.INPUTS and not rec.op.op_cls.OUTPUTS
+        ]
+        if missing:
+            raise ValueError(
+                "Multi-op megakernel graphs require each op to declare INPUTS "
+                f"or OUTPUTS; missing for {', '.join(missing)}."
+            )
 
     def _build_buffer_producers(self, *, strict: bool = False) -> Dict[str, int]:
         """Track latest producer op_idx per buffer name, respecting tensor identity.
@@ -1289,7 +1238,10 @@ class InstructionStreamBuilder:
     @staticmethod
     def _is_reduce_store(op: ScheduledOp, buf: str) -> bool:
         """Whether this output is accumulated atomically rather than overwritten."""
-        return buf in getattr(op.op_cls, "_TMA_REDUCE_STORES", set())
+        return (
+            buf in getattr(op.op_cls, "_TMA_REDUCE_STORES", set())
+            or buf in getattr(op.op_cls, "_COMPUTE_REDUCE_STORES", set())
+        )
 
     def _resolve_named_dep_pairs(
         self,
@@ -1458,11 +1410,9 @@ class InstructionStreamBuilder:
         Returns a list of _DepEdge with producer/consumer indices and
         dependency kind. Used by build() to determine tile emission order.
         """
+        self._validate_named_buffer_requirements()
         if not self._has_named_buffers():
-            return [
-                _DepEdge(producer_idx=i - 1, consumer_idx=i, kind="one_to_one")
-                for i in range(1, len(self._op_records))
-            ]
+            return []
 
         buffer_producers = self._build_buffer_producers()
         tensor_ptr_deps = self._build_tensor_ptr_deps()
@@ -1500,6 +1450,7 @@ class InstructionStreamBuilder:
         if self._cached_dependency_plan is not None:
             return self._cached_dependency_plan
 
+        self._validate_named_buffer_requirements()
         if self._has_named_buffers():
             formulas, count = self._resolve_named_formulas()
             edges = self._resolve_dep_edges()
@@ -1522,7 +1473,15 @@ class InstructionStreamBuilder:
                 compute_wait_formulas=compute_wait_formulas,
             )
         else:
-            plan = _build_linear_chain_dependency_plan(self._op_records)
+            formulas = {i: ([], []) for i in range(len(self._op_records))}
+            plan = DependencyPlan(
+                formulas=formulas,
+                barrier_count=0,
+                edges=[],
+                consumer_deps={},
+                controller_wait_formulas={i: [] for i in range(len(self._op_records))},
+                compute_wait_formulas={i: [] for i in range(len(self._op_records))},
+            )
 
         self._cached_dependency_plan = plan
         self._cached_controller_wait_formulas = plan.controller_wait_formulas
@@ -1551,6 +1510,9 @@ class InstructionStreamBuilder:
         controller_wait_inputs = set(getattr(consumer.op_cls, "controller_wait_inputs", set()))
         if dep.consumer_buffer in controller_wait_inputs:
             return False
+        compute_wait_inputs = set(getattr(consumer.op_cls, "compute_wait_inputs", set()))
+        if dep.consumer_buffer in compute_wait_inputs:
+            return True
         tma_loads = set(getattr(consumer.op_cls, "_TMA_LOADS", set()))
         tma_compute_loads = set(getattr(consumer.op_cls, "_TMA_COMPUTE_LOADS", set()))
         if dep.consumer_buffer in tma_compute_loads:

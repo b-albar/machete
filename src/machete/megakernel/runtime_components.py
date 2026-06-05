@@ -18,9 +18,9 @@ from .interpreter import (
 )
 from .paged_memory import (
     FLAG_DATA_PRODUCE_IDX,
-    FLAG_DATA_RELEASE_IDX,
     FLAG_DISPATCH_LOAD,
     FLAG_LOAD_DONE,
+    FLAG_PAGE_PHASE_BITS,
     FLAG_PRODUCE_IDX,
     FLAG_STORE_IDX,
     ld_shared_i64,
@@ -98,10 +98,15 @@ def build_kernel_static_config(
         "aligned_page_size": layout.aligned_page_size,
         "work_notify_mbar_offset_0": layout.work_notify_mbar_offset(0),
         "compute_done_mbar_offset_0": layout.compute_done_mbar_offset(0),
+        "page_finished_mbar_offset_0": layout.page_finished_mbar_offset(0),
+        "max_requested_page_count": int(getattr(kernel, "_max_requested_page_count", 1)),
         "num_mma_warps": num_mma_warps,
         "num_compute_threads": num_mma_warps * 32,
         "num_dma_warps": active_dma_warps,
         "dma_reg_count": kernel.config.dma_reg_count,
+        "controller_reg_count": kernel.config.resolved_controller_reg_count,
+        "loader_reg_count": kernel.config.resolved_loader_reg_count,
+        "store_reg_count": kernel.config.resolved_store_reg_count,
         "mma_reg_count": kernel.config.mma_reg_count,
         "actual_threads_per_block": threads_per_block,
         "elect_store_dispatch": not has_reduce_store,
@@ -132,6 +137,7 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         dispatch_load,
         dispatch_compute,
         dispatch_store,
+        dispatch_store_step,
         dispatch_communicate,
         phase_uses_handler_local_idx,
         phase_uses_runtime_transport_selector,
@@ -174,6 +180,20 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         return (
             smem_base
             + Int32(kernel_cfg["compute_done_mbar_offset_0"])
+            + page_idx * Int32(kernel_cfg["mbarrier_stride"])
+        )
+
+    @cute.jit
+    def _page_finished_mbar(smem_base: Int32, page_idx: Int32) -> Int32:
+        """Return the per-physical-page release mbarrier address.
+
+        Only meaningful when the decoupled allocator is active
+        (kernel_cfg['has_page_free_ops']); arrives signal a page is free to
+        reallocate, the controller waits on it before claiming the page.
+        """
+        return (
+            smem_base
+            + Int32(kernel_cfg["page_finished_mbar_offset_0"])
             + page_idx * Int32(kernel_cfg["mbarrier_stride"])
         )
 
@@ -305,6 +325,7 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         "dispatch_load": dispatch_load,
         "dispatch_compute": dispatch_compute,
         "dispatch_store": dispatch_store,
+        "dispatch_store_step": dispatch_store_step,
         "dispatch_communicate": dispatch_communicate,
         "phase_uses_handler_local_idx": phase_uses_handler_local_idx,
         "phase_uses_runtime_transport_selector": phase_uses_runtime_transport_selector,
@@ -323,6 +344,7 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         "_get_page_ptr": _get_page_ptr,
         "_work_notify_mbar": _work_notify_mbar,
         "_compute_done_mbar": _compute_done_mbar,
+        "_page_finished_mbar": _page_finished_mbar,
         "phase_tensor_names": phase_tensor_names,
         "phase_tma_names": phase_tma_names,
         "all_tma_canonical": all_tma_canonical,
@@ -347,6 +369,9 @@ def build_kernel_extra_exec_globals(
     exec_globals = {
         "_work_notify_mbar": runtime["_work_notify_mbar"],
         "_compute_done_mbar": runtime["_compute_done_mbar"],
+        "_page_finished_mbar": runtime["_page_finished_mbar"],
+        "MAX_REQUESTED_N": int(kernel_cfg["max_requested_page_count"]),
+        "dispatch_store_step": runtime["dispatch_store_step"],
         "decompose_tile": runtime["decompose_tile"],
         "advance_tile": runtime["advance_tile"],
         "ld_shared_v2_b32": ld_shared_v2_b32,
@@ -359,14 +384,17 @@ def build_kernel_extra_exec_globals(
         "setmaxregister_increase": runtime["setmaxregister_increase"],
         "setmaxregister_decrease": runtime["setmaxregister_decrease"],
         "dma_reg_count": kernel_cfg["dma_reg_count"],
+        "controller_reg_count": kernel_cfg["controller_reg_count"],
+        "loader_reg_count": kernel_cfg["loader_reg_count"],
+        "store_reg_count": kernel_cfg["store_reg_count"],
         "mma_reg_count": kernel_cfg["mma_reg_count"],
         "tile_info_bytes": kernel_cfg["tile_info_bytes"],
         "FLAG_DISPATCH_LOAD": FLAG_DISPATCH_LOAD,
         "FLAG_PRODUCE_IDX": FLAG_PRODUCE_IDX,
         "FLAG_STORE_IDX": FLAG_STORE_IDX,
         "FLAG_LOAD_DONE": FLAG_LOAD_DONE,
-        "FLAG_DATA_RELEASE_IDX": FLAG_DATA_RELEASE_IDX,
         "FLAG_DATA_PRODUCE_IDX": FLAG_DATA_PRODUCE_IDX,
+        "FLAG_PAGE_PHASE_BITS": FLAG_PAGE_PHASE_BITS,
         "_op_meta_i32": runtime["_op_meta_i32"],
         "_op_meta_base": runtime["_op_meta_base"],
         "_op_meta_i32_base": runtime["_op_meta_i32_base"],
@@ -388,6 +416,7 @@ def build_kernel_extra_exec_globals(
         "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
         "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
         "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
+        "dispatch_store_step_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"].get("store_step", runtime["phase_uses_handler_local_idx"]["store"]),
         "dispatch_communicate_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["communicate"],
         "MIN_IDLE_REGS": min_idle_regs,
         "_OP_PHASE_LOAD": op_phase_load,

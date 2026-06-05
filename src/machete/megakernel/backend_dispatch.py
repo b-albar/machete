@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -445,6 +444,7 @@ def make_local_switch_binder(
     phase_tensor_names: List[str],
     phase_tma_names: List[str],
     is_load: bool,
+    has_step_state: bool,
     phase_fn,
     accept_handler_local_idx: bool,
     accept_transport_selector: bool,
@@ -502,6 +502,10 @@ def make_local_switch_binder(
             if is_load:
                 work_mbar = args[cursor]
                 cursor += 1
+            step_state_ptr = None
+            if has_step_state:
+                step_state_ptr = args[cursor]
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
 
@@ -511,6 +515,8 @@ def make_local_switch_binder(
                 call_args = [page_ptr, *tile_vals, op_config_ptr]
                 if is_load:
                     call_args.append(work_mbar)
+                if has_step_state:
+                    call_args.append(step_state_ptr)
                 call_args.extend(phase_args[pos] for pos in direct_tensor_positions)
                 call_args.extend(phase_args[pos] for pos in direct_tma_positions)
                 _call_phase(call_args, bool(direct_elect))
@@ -530,6 +536,8 @@ def make_local_switch_binder(
                     call_args = [page_ptr, *tile_vals, op_config_ptr]
                     if is_load:
                         call_args.append(work_mbar)
+                    if has_step_state:
+                        call_args.append(step_state_ptr)
                     call_args.extend(phase_args[pos] for pos in tensor_positions)
                     call_args.extend(phase_args[pos] for pos in tma_positions)
                     _call_phase(call_args, elect_by_op_idx[op_idx])
@@ -546,6 +554,10 @@ def make_local_switch_binder(
             if is_load:
                 work_mbar = args[cursor]
                 cursor += 1
+            step_state_ptr = None
+            if has_step_state:
+                step_state_ptr = args[cursor]
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
 
@@ -554,6 +566,8 @@ def make_local_switch_binder(
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
                 call_args.append(work_mbar)
+            if has_step_state:
+                call_args.append(step_state_ptr)
             call_args.extend(phase_args[pos] for pos in direct_tensor_positions)
             call_args.extend(phase_args[pos] for pos in direct_tma_positions)
             _call_phase(call_args, bool(direct_elect))
@@ -575,6 +589,7 @@ def make_transport_record_binder(
     elect_dispatch_by_local_id: Dict[int, bool],
     handler_local_transport_positions: Tuple[Tuple[int, ...], ...],
     is_load: bool,
+    has_step_state: bool,
     phase_fn,
     accept_handler_local_idx: bool,
     accept_transport_selector: bool,
@@ -705,6 +720,10 @@ def make_transport_record_binder(
             if is_load:
                 work_mbar = args[cursor]
                 cursor += 1
+            step_state_ptr = None
+            if has_step_state:
+                step_state_ptr = args[cursor]
+                cursor += 1
             selector_ptr = None
             if accept_transport_selector:
                 selector_ptr = args[cursor]
@@ -719,6 +738,8 @@ def make_transport_record_binder(
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
                 call_args.append(work_mbar)
+            if has_step_state:
+                call_args.append(step_state_ptr)
             if use_direct_call:
                 call_args.extend(
                     phase_args[pos] for pos in direct_transport_positions
@@ -755,6 +776,10 @@ def make_transport_record_binder(
             if is_load:
                 work_mbar = args[cursor]
                 cursor += 1
+            step_state_ptr = None
+            if has_step_state:
+                step_state_ptr = args[cursor]
+                cursor += 1
             if accept_transport_selector:
                 cursor += 1
             if accept_desc_slot_selector:
@@ -765,6 +790,8 @@ def make_transport_record_binder(
             call_args = [page_ptr, *tile_vals, op_config_ptr]
             if is_load:
                 call_args.append(work_mbar)
+            if has_step_state:
+                call_args.append(step_state_ptr)
             for slot, candidate_positions in enumerate(candidate_positions_by_slot):
                 call_args.append(phase_args[direct_transport_positions[slot]])
             if desc_slot_count:
@@ -797,6 +824,7 @@ def build_exec_dispatch_fn(
 ):
     """Build a two-level dispatch: handler tree plus per-handler local binders."""
     is_load = phase_name == "load"
+    has_step_state = phase_name == "store_step"
 
     handler_to_ops: Dict[int, List[int]] = {}
     for op_idx_const, handler_idx in enumerate(op_handler_indices):
@@ -916,6 +944,7 @@ def build_exec_dispatch_fn(
                     else phase_handler_local_transport_positions[handler_idx]
                 ),
                 is_load=is_load,
+                has_step_state=has_step_state,
                 phase_fn=phase_fns[handler_idx],
                 accept_handler_local_idx=phase_uses_handler_local_idx,
                 accept_transport_selector=phase_uses_runtime_transport_selector,
@@ -943,6 +972,7 @@ def build_exec_dispatch_fn(
                 phase_tensor_names=all_canonical,
                 phase_tma_names=all_tma_canonical or [],
                 is_load=is_load,
+                has_step_state=has_step_state,
                 phase_fn=phase_fns[handler_idx],
                 accept_handler_local_idx=phase_uses_handler_local_idx,
                 accept_transport_selector=phase_uses_runtime_transport_selector,
@@ -1003,6 +1033,7 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
     load_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     compute_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     store_fns: List[Any] = [None] * len(backend.ir.handler_specs)
+    store_step_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     communicate_fns: List[Any] = [None] * len(backend.ir.handler_specs)
     handler_warps: List[int] = [num_mma_warps] * len(backend.ir.handler_specs)
     phase_fn_lists = {"load": load_fns, "compute": compute_fns, "store": store_fns}
@@ -1011,6 +1042,77 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
     ops_by_handler: Dict[int, List[int]] = {}
     for op_idx, handler_idx in enumerate(op_handler_indices):
         ops_by_handler.setdefault(handler_idx, []).append(op_idx)
+
+    def _compile_handler_phase(
+        *,
+        instance,
+        handler_spec,
+        handler_idx: int,
+        compile_key,
+        phase_name: str,
+        signature_phase: str,
+        extra_params=None,
+    ):
+        """Compile one handler phase using another phase's tensor/TMA signature."""
+        handler_phase_rebinds = tma_layout.handler_rebind_specs.get(handler_idx, {}).get(signature_phase, [])
+        effective_rebinds = handler_phase_rebinds
+        handler_phase_tma_params = []
+        seen_handler_tma_params = set()
+        extra_reconstruct_tensor_names = []
+        for spec in handler_phase_rebinds:
+            for name in (
+                spec["desc_pool_name"],
+                spec["wrapper_atom_name"],
+            ):
+                if name in seen_handler_tma_params:
+                    continue
+                seen_handler_tma_params.add(name)
+                handler_phase_tma_params.append(name)
+            if getattr(backend, "runtime_transport_records", False):
+                if spec["tensor_name"] not in extra_reconstruct_tensor_names:
+                    extra_reconstruct_tensor_names.append(spec["tensor_name"])
+            else:
+                if spec["runtime_tensor_name"] in seen_handler_tma_params:
+                    continue
+                seen_handler_tma_params.add(spec["runtime_tensor_name"])
+                handler_phase_tma_params.append(spec["runtime_tensor_name"])
+        for spec in handler_phase_rebinds:
+            if spec["desc_slot_name"] in seen_handler_tma_params:
+                continue
+            seen_handler_tma_params.add(spec["desc_slot_name"])
+            handler_phase_tma_params.append(spec["desc_slot_name"])
+        if getattr(backend, "runtime_transport_records", False):
+            effective_rebinds = []
+            for spec in handler_phase_rebinds:
+                updated_spec = dict(spec)
+                updated_spec["runtime_tensor_name"] = spec["tensor_name"]
+                effective_rebinds.append(updated_spec)
+        handler_phase_tma_mapping = {
+            name: name
+            for name in handler_spec.local_tma_args[signature_phase]
+        }
+        instance._machete_tma_rebind_specs[phase_name] = effective_rebinds
+        compiled_fn = compile_phase(
+            instance,
+            phase_name,
+            tensor_param_names=list(handler_spec.local_tensor_names[signature_phase]),
+            tma_param_names=handler_phase_tma_params,
+            tma_local_mapping=handler_phase_tma_mapping,
+            noinline=phase_should_noinline(instance, signature_phase),
+            reconstruct_tensors=True,
+            extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
+            extra_params=extra_params,
+        )
+        fn_targets = [compiled_fn]
+        wrapped = getattr(compiled_fn, "__wrapped__", None)
+        if wrapped is not None and wrapped is not compiled_fn:
+            fn_targets.append(wrapped)
+        debug_name = f"{type(instance).__name__}_{phase_name}_h{handler_idx}"
+        for target in fn_targets:
+            target._machete_handler_idx = handler_idx
+            target._machete_compile_key = compile_key
+            target.__name__ = debug_name
+        return compiled_fn
 
     for i, op in enumerate(ops):
         handler_idx = op_handler_indices[i]
@@ -1023,97 +1125,49 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
                 handler_idx,
                 {phase: [] for phase in PHASE_NAMES},
             )
-            handler_op_indices = ops_by_handler[handler_idx]
             for phase_name, fn_list in phase_fn_lists.items():
-                handler_phase_rebinds = tma_layout.handler_rebind_specs.get(handler_idx, {}).get(phase_name, [])
-                handler_local_ids = [
-                    op_phase_local_indices[phase_name][op_idx]
-                    for op_idx in handler_op_indices
-                ]
-                handler_uses_local_idx = group_uses_handler_local_idx(
-                    handler_local_ids=handler_local_ids,
-                    op_indices=handler_op_indices,
-                    op_phase_tensor_args=phase_op_tensor_args[phase_name],
-                    op_phase_tma_args=tma_layout.op_phase_tma_args[phase_name],
+                fn_list[handler_idx] = _compile_handler_phase(
+                    instance=instance,
+                    handler_spec=handler_spec,
+                    handler_idx=handler_idx,
+                    compile_key=compile_keys[i],
+                    phase_name=phase_name,
+                    signature_phase=phase_name,
                 )
-                effective_rebinds = handler_phase_rebinds
-                handler_phase_tma_params = []
-                seen_handler_tma_params = set()
-                extra_reconstruct_tensor_names = []
-                for spec in handler_phase_rebinds:
-                    for name in (
-                        spec["desc_pool_name"],
-                        spec["wrapper_atom_name"],
-                    ):
-                        if name in seen_handler_tma_params:
-                            continue
-                        seen_handler_tma_params.add(name)
-                        handler_phase_tma_params.append(name)
-                    if getattr(backend, "runtime_transport_records", False):
-                        if spec["tensor_name"] not in extra_reconstruct_tensor_names:
-                            extra_reconstruct_tensor_names.append(spec["tensor_name"])
-                    else:
-                        if spec["runtime_tensor_name"] in seen_handler_tma_params:
-                            continue
-                        seen_handler_tma_params.add(spec["runtime_tensor_name"])
-                        handler_phase_tma_params.append(spec["runtime_tensor_name"])
-                for spec in handler_phase_rebinds:
-                    if spec["desc_slot_name"] in seen_handler_tma_params:
-                        continue
-                    seen_handler_tma_params.add(spec["desc_slot_name"])
-                    handler_phase_tma_params.append(spec["desc_slot_name"])
-                if getattr(backend, "runtime_transport_records", False):
-                    effective_rebinds = []
-                    for spec in handler_phase_rebinds:
-                        updated_spec = dict(spec)
-                        updated_spec["runtime_tensor_name"] = spec["tensor_name"]
-                        effective_rebinds.append(updated_spec)
-                handler_phase_tma_mapping = {
-                    name: name
-                    for name in handler_spec.local_tma_args[phase_name]
-                }
-                instance._machete_tma_rebind_specs[phase_name] = effective_rebinds
-                phase_noinline = phase_should_noinline(instance, phase_name)
-                compiled_fn = compile_phase(
-                    instance,
-                    phase_name,
-                    tensor_param_names=list(handler_spec.local_tensor_names[phase_name]),
-                    tma_param_names=handler_phase_tma_params,
-                    tma_local_mapping=handler_phase_tma_mapping,
-                    noinline=phase_noinline,
-                    reconstruct_tensors=True,
-                    extra_reconstruct_tensor_names=extra_reconstruct_tensor_names,
+            if store_step_fns[handler_idx] is None:
+                store_step_fns[handler_idx] = _compile_handler_phase(
+                    instance=instance,
+                    handler_spec=handler_spec,
+                    handler_idx=handler_idx,
+                    compile_key=compile_keys[i],
+                    phase_name="store_step",
+                    signature_phase="store",
+                    extra_params=["store_state_ptr"],
                 )
-                fn_targets = [compiled_fn]
-                wrapped = getattr(compiled_fn, "__wrapped__", None)
-                if wrapped is not None and wrapped is not compiled_fn:
-                    fn_targets.append(wrapped)
-                debug_name = f"{type(instance).__name__}_{phase_name}_h{handler_idx}"
-                for target in fn_targets:
-                    target._machete_handler_idx = handler_idx
-                    target._machete_compile_key = compile_keys[i]
-                    target.__name__ = debug_name
-                fn_list[handler_idx] = compiled_fn
 
-    def _build_dispatch(phase_fns, phase_name):
+    def _build_dispatch(phase_fns, phase_name, signature_phase=None):
+        signature_phase = signature_phase or phase_name
         return build_exec_dispatch_fn(
             phase_fns=phase_fns,
             phase_name=phase_name,
             op_handler_indices=op_handler_indices,
-            op_phase_local_indices=op_phase_local_indices[phase_name],
-            op_phase_tensor_args=phase_op_tensor_args[phase_name],
-            op_phase_tma_args=tma_layout.op_phase_tma_args[phase_name],
-            op_phase_elect_dispatch=op_phase_elect_dispatch[phase_name],
-            phase_handler_local_transport_positions=tma_layout.runtime_phase_local_transport_positions[phase_name],
-            phase_handler_local_desc_slots=tma_layout.runtime_phase_local_desc_slots[phase_name],
-            all_canonical=phase_tensor_names[phase_name],
-            all_tma_canonical=tma_layout.phase_tma_names[phase_name],
+            op_phase_local_indices=op_phase_local_indices[signature_phase],
+            op_phase_tensor_args=phase_op_tensor_args[signature_phase],
+            op_phase_tma_args=tma_layout.op_phase_tma_args[signature_phase],
+            op_phase_elect_dispatch=op_phase_elect_dispatch[signature_phase],
+            phase_handler_local_transport_positions=tma_layout.runtime_phase_local_transport_positions[signature_phase],
+            phase_handler_local_desc_slots=tma_layout.runtime_phase_local_desc_slots[signature_phase],
+            all_canonical=phase_tensor_names[signature_phase],
+            all_tma_canonical=tma_layout.phase_tma_names[signature_phase],
             runtime_transport_records=getattr(backend, "runtime_transport_records", False),
         )
 
     dispatch_load, load_uses_local_idx, load_uses_runtime_selector, load_uses_desc_slot_selector = _build_dispatch(load_fns, "load")
     dispatch_compute, compute_uses_local_idx, compute_uses_runtime_selector, compute_uses_desc_slot_selector = _build_dispatch(compute_fns, "compute")
     dispatch_store, store_uses_local_idx, store_uses_runtime_selector, store_uses_desc_slot_selector = _build_dispatch(store_fns, "store")
+    dispatch_store_step, store_step_uses_local_idx, store_step_uses_runtime_selector, store_step_uses_desc_slot_selector = _build_dispatch(
+        store_step_fns, "store_step", "store"
+    )
     if has_communicate:
         dispatch_communicate, communicate_uses_local_idx, communicate_uses_runtime_selector, communicate_uses_desc_slot_selector = _build_dispatch(
             communicate_fns, "communicate"
@@ -1128,23 +1182,27 @@ def compile_phase_dispatch_inputs(backend, kernel, *, num_dma_warps: int, phase_
         "dispatch_load": dispatch_load,
         "dispatch_compute": dispatch_compute,
         "dispatch_store": dispatch_store,
+        "dispatch_store_step": dispatch_store_step,
         "dispatch_communicate": dispatch_communicate,
         "phase_uses_handler_local_idx": {
             "load": load_uses_local_idx,
             "compute": compute_uses_local_idx,
             "store": store_uses_local_idx,
+            "store_step": store_step_uses_local_idx,
             "communicate": communicate_uses_local_idx,
         },
         "phase_uses_runtime_transport_selector": {
             "load": load_uses_runtime_selector,
             "compute": compute_uses_runtime_selector,
             "store": store_uses_runtime_selector,
+            "store_step": store_step_uses_runtime_selector,
             "communicate": communicate_uses_runtime_selector,
         },
         "phase_uses_desc_slot_selector": {
             "load": load_uses_desc_slot_selector,
             "compute": compute_uses_desc_slot_selector,
             "store": store_uses_desc_slot_selector,
+            "store_step": store_step_uses_desc_slot_selector,
             "communicate": communicate_uses_desc_slot_selector,
         },
         "has_communicate": has_communicate,

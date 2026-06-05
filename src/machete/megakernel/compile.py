@@ -426,6 +426,7 @@ def _build_phase_wrapper(
             "page_ptr",
             "op_config_ptr",
             "work_mbar",
+            "store_state_ptr",
             "start_linear",
             "tile_count",
         }
@@ -455,6 +456,11 @@ def _build_phase_wrapper(
     # Check if method expects special framework params
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
+    for extra_param in extra_params or []:
+        if extra_param == "work_mbar":
+            continue
+        if extra_param in method_params:
+            call_args.append(extra_param)
 
     call_str = ", ".join(call_args)
 

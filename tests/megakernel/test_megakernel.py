@@ -30,12 +30,14 @@ class TestMegakernel:
     def test_megakernel_creation(self):
         """Test creating a megakernel instance."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
+
+        class NopSourceOp(get_nop_op()):
+            OUTPUTS = ["x"]
 
         # Define some operations
         ops = [
-            ScheduledOp(NopOp, tile_counts=(32,)),
-            ScheduledOp(NopOp, tile_counts=(16,)),
+            ScheduledOp(NopSourceOp, tile_counts=(32,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopSourceOp, tile_counts=(16,), tensor_ptrs={"x": 2}),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -49,12 +51,14 @@ class TestMegakernel:
     def test_backend_does_not_duplicate_identical_handlers(self):
         """Repeated identical ops should share one emitted handler body."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
+
+        class NopSourceOp(get_nop_op()):
+            OUTPUTS = ["x"]
 
         ops = [
-            ScheduledOp(NopOp, tile_counts=(32,)),
-            ScheduledOp(NopOp, tile_counts=(16,)),
-            ScheduledOp(NopOp, tile_counts=(8,)),
+            ScheduledOp(NopSourceOp, tile_counts=(32,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopSourceOp, tile_counts=(16,), tensor_ptrs={"x": 2}),
+            ScheduledOp(NopSourceOp, tile_counts=(8,), tensor_ptrs={"x": 3}),
         ]
 
         kernel = Megakernel(
@@ -176,9 +180,10 @@ class TestMegakernel:
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
 
         class DefaultSyncOp(Op):
-            pass
+            OUTPUTS = ["x"]
 
         class SyncOp(Op):
+            OUTPUTS = ["y"]
             sync_compute_warps_after_tile = True
 
         assert not Megakernel(

@@ -581,7 +581,6 @@ def test_page_ring_uses_one_slot_per_physical_page():
 
     assert kernel._layout.num_pages == 3
     assert kernel._layout.num_slots == 3
-    assert not kernel._use_physical_page_ring
 
 
 def test_tile_sizes_specialize_device_code():
@@ -602,166 +601,25 @@ def test_tile_sizes_specialize_device_code():
     assert build_op_config(op_b)["tile_size_M"] == 64
 
 
-# =============================================================================
-# Linear Chain Tests (no INPUTS/OUTPUTS)
-# =============================================================================
+class TestUnnamedDependencyRequirements:
+    """Unnamed ops no longer imply an automatic linear dependency chain."""
 
-
-class TestLinearChainFormulas:
-    """Test that linear chain ops (no INPUTS/OUTPUTS) produce correct barrier formulas."""
-
-    def test_first_op_has_no_wait_formulas(self):
-        """First op should have no wait formulas."""
+    def test_single_unnamed_op_has_no_barriers(self):
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         formulas = builder.get_op_barrier_formulas()
 
-        wait, signal = formulas[0]
-        assert len(wait) == 0
-        assert len(signal) == 1
+        assert formulas[0] == ([], [])
+        assert builder.num_barriers == 0
+        assert builder.total_tiles == 4
 
-    def test_first_op_signals_own_barrier(self):
-        """First op should signal barrier = tiles[0] (base=0, coeffs[0]=1)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        _, signal = formulas[0]
-        sf = signal[0]
-        assert sf.base == 0
-        assert sf.coeffs[0] == 1
-        # Higher coeffs are strides for the linear index
-        # but tiles beyond dim 0 are 0 for 1D ops, so they don't affect the result
-
-        # Verify: tiles[0]=0 → barrier 0, tiles[0]=3 → barrier 3
-        assert sf.compute_index((0, 0, 0)) == 0
-        assert sf.compute_index((3, 0, 0)) == 3
-
-    def test_second_op_waits_on_first(self):
-        """Second op should wait on first op's barriers with expected=1."""
+    def test_multi_op_graph_requires_named_buffers(self):
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
 
-        wait, signal = formulas[1]
-        assert len(wait) == 1
-        assert len(signal) == 1
-
-        wf = wait[0]
-        assert wf.base == 0  # Wait on op0's barriers
-        assert wf.coeffs[0] == 1
-        assert wf.expected == 1
-        assert not wf.has_guard  # Same tile count, no guard
-
-        sf = signal[0]
-        assert sf.base == 4  # Signal op1's own barriers
-
-    def test_three_op_chain(self):
-        """Three-op chain: op2 waits on op1 (not op0)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 0-1
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 2-3
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 4-5
-
-        formulas = builder.get_op_barrier_formulas()
-        assert builder.num_barriers == 6
-
-        # Op 0: no wait, signal base=0
-        assert len(formulas[0][0]) == 0
-        assert formulas[0][1][0].base == 0
-
-        # Op 1: wait base=0, signal base=2
-        assert formulas[1][0][0].base == 0
-        assert formulas[1][1][0].base == 2
-
-        # Op 2: wait base=2, signal base=4
-        assert formulas[2][0][0].base == 2
-        assert formulas[2][1][0].base == 4
-
-    def test_barrier_count_matches_total_tiles(self):
-        """num_barriers should equal total tiles across all ops."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(16,))
-        builder.add_op(_NOPOp, tile_counts=(16,))
-        builder.add_op(_NOPOp, tile_counts=(16,))
-
-        assert builder.num_barriers == 48
-        assert builder.total_tiles == 48
-
-    def test_2d_formula_strides(self):
-        """2D grid should produce correct strides in formulas (row-major)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4, 3))
-        builder.add_op(_NOPOp, tile_counts=(4, 3))
-        formulas = builder.get_op_barrier_formulas()
-
-        sf = formulas[0][1][0]
-        assert sf.coeffs[0] == 3   # stride for dim 0 = tile_counts[1] = 3
-        assert sf.coeffs[1] == 1   # stride for dim 1 = 1 (innermost)
-
-        # Verify row-major: (0,0,0)→0, (1,0,0)→3, (0,1,0)→1, (3,2,0)→11
-        assert sf.compute_index((0, 0, 0)) == 0
-        assert sf.compute_index((1, 0, 0)) == 3
-        assert sf.compute_index((0, 1, 0)) == 1
-        assert sf.compute_index((3, 2, 0)) == 11
-
-    def test_3d_formula_strides(self):
-        """3D grid should produce correct strides in formulas (row-major)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(2, 3, 2))
-        formulas = builder.get_op_barrier_formulas()
-
-        sf = formulas[0][1][0]
-        assert sf.coeffs[0] == 6  # stride for dim 0 = tile_counts[1] * tile_counts[2] = 3*2
-        assert sf.coeffs[1] == 2  # stride for dim 1 = tile_counts[2] = 2
-        assert sf.coeffs[2] == 1  # stride for dim 2 = 1 (innermost)
-
-
-class TestMismatchedTileCounts:
-    """Test dependency behavior when sequential ops have different tile counts."""
-
-    def test_fewer_tiles_in_second_op(self):
-        """When op1 has fewer tiles, guard is set to prev op's total tiles."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert wf.base == 0
-        assert wf.expected == 1
-        assert wf.has_guard  # Guard active because tile counts differ
-        assert wf.guard_max == 8
-
-    def test_more_tiles_in_second_op(self):
-        """When op1 has more tiles, guard prevents waiting on non-existent barriers."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert wf.base == 0
-        assert wf.expected == 1
-        assert wf.has_guard
-        assert wf.guard_max == 4  # Only 4 barriers from op0
-
-        # Tiles 0-3 pass guard, tiles 4-7 don't
-        assert wf.is_guarded((0, 0, 0)) is True
-        assert wf.is_guarded((3, 0, 0)) is True
-        assert wf.is_guarded((4, 0, 0)) is False
-        assert wf.is_guarded((7, 0, 0)) is False
-
-    def test_same_tiles_no_guard(self):
-        """When tile counts match, no guard is needed."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert not wf.has_guard  # No guard needed
+        with pytest.raises(ValueError, match="require each op to declare INPUTS or OUTPUTS"):
+            builder.get_op_barrier_formulas()
 
 
 class TestInstructionStreamMultiDim:
@@ -830,7 +688,6 @@ class TestTileInstructionPacking:
         """Packed tensor values should encode op index and tile coordinates."""
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
         tensor = builder.build_tensor(device="cpu")
         instructions = builder.build()
 
@@ -871,6 +728,12 @@ class _FanInOp(Op):
     """Test op that consumes both 'x' and 'y'."""
     INPUTS: ClassVar[List[str]] = ["x", "y"]
     OUTPUTS: ClassVar[List[str]] = []
+
+
+class _IndependentOp(Op):
+    """Named source op with no dependencies."""
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["independent"]
 
 
 class _PackedQKVProducerOp(Op):
@@ -1288,8 +1151,8 @@ class TestLevelBatchedScheduling:
     def test_two_op_chain_batched(self):
         """A 2-op chain emits all source tiles before consumer tiles."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]  # strip end marker
 
         assert len(instructions) == 8
@@ -1302,9 +1165,9 @@ class TestLevelBatchedScheduling:
     def test_three_op_chain_batched(self):
         """A 3-op chain emits source first, then wavefront for consumers."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ScratchReaderOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]
 
         assert len(instructions) == 12
@@ -1325,8 +1188,8 @@ class TestLevelBatchedScheduling:
     def test_all_tiles_present(self):
         """Interleaved build must emit all tiles from all ops."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
         instructions = builder.build()[:-1]
 
         assert len(instructions) == 12
@@ -1352,8 +1215,8 @@ class TestLevelBatchedScheduling:
     def test_dependency_order_respected(self):
         """Consumer tile k must appear after producer tile k in the stream."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]
 
         # Track emission position of each (op_idx, tiles[0])
@@ -1380,8 +1243,8 @@ class TestSchedulerAPI:
     def test_explicit_scheduler_parameter(self):
         """Can pass scheduler directly to build()."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         # Using explicit scheduler should work
         scheduler = BackwardScheduler()
@@ -1391,8 +1254,8 @@ class TestSchedulerAPI:
     def test_backward_scheduler_respects_dependencies(self):
         """BackwardScheduler must still respect dependencies."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         scheduler = BackwardScheduler()
         instructions = builder.build(scheduler=scheduler)[:-1]
@@ -1412,8 +1275,8 @@ class TestSchedulerAPI:
     def test_backward_scheduler_all_tiles_present(self):
         """BackwardScheduler must emit all tiles."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
 
         scheduler = BackwardScheduler()
         instructions = builder.build(scheduler=scheduler)[:-1]
@@ -1436,8 +1299,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_preserves_stride_for_ready_chain_tiles(self):
         """OverlapTileScheduler should preserve broad producer/consumer waves."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
 
@@ -1449,8 +1312,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_respects_fetch_stride_waves(self):
         """Stride-aware overlap should not create same-round dependencies."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_ProducerOp, tile_counts=(8,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(8,), dim_names={"batch": 0})
 
         instructions = builder.build(scheduler=OverlapTileScheduler(fetch_stride=4))[:-1]
 
@@ -1464,8 +1327,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_adaptive_fetch_stride_uses_wider_small_waves(self):
         """Adaptive overlap can use two CTA waves for short instruction streams."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_ProducerOp, tile_counts=(8,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(8,), dim_names={"batch": 0})
         scheduler = OverlapTileScheduler(adaptive_fetch_stride=True)
         scheduler.bind_num_blocks(4)
 
@@ -1524,7 +1387,7 @@ class TestSchedulerAPI:
         """Ready-consumer mode should not move unrelated sinks ahead of the chain."""
         builder = InstructionStreamBuilder()
         builder.add_op(_ProducerOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_IndependentOp, tile_counts=(4,))
         builder.add_op(_ConsumerOp, tile_counts=(4,))
 
         instructions = builder.build(
@@ -1543,7 +1406,7 @@ class TestSchedulerAPI:
         """Slack gives strided CTA streams runway before consuming a newly-ready barrier."""
         builder = InstructionStreamBuilder()
         builder.add_op(_ProducerOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_IndependentOp, tile_counts=(4,))
         builder.add_op(_ConsumerOp, tile_counts=(4,))
 
         instructions = builder.build(
@@ -1614,13 +1477,12 @@ class TestTupleAndStringDimFormats:
             ("D", "x", 1),
         ]
 
-    def test_string_format_still_works(self):
-        """Legacy string format still parses correctly."""
-        tensors, dims = _build_tensor_and_dim_lists(
-            {"x": (None, "M, D")}, {"y": (None, "M, D")}
-        )
-        assert tensors == [("x", None, ["M", "D"]), ("y", None, ["M", "D"])]
-        assert dims == [("M", "x", 0), ("D", "x", 1)]
+    def test_string_format_rejected(self):
+        """Dim declarations must use tuple/list form."""
+        with pytest.raises(TypeError, match="dims must be tuple or list"):
+            _build_tensor_and_dim_lists(
+                {"x": (None, "M, D")}, {"y": (None, "M, D")}
+            )
 
 
 class TestNdimValidation:
