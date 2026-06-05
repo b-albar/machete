@@ -355,6 +355,12 @@ def build_handler_backend_ir(kernel) -> BackendIR:
 class HandlerBackend:
     """Backend that dispatches by unique handler index rather than raw op index."""
 
+    # Use compact runtime transport records for TMA dispatch. Phase wrappers
+    # receive descriptor pools and shared wrapper atoms, then reconstruct the
+    # concrete gmem tensor from op_config_ptr instead of passing every runtime
+    # TMA tensor through the dispatch call.
+    runtime_transport_records = True
+
     def __init__(self, ir: BackendIR):
         self.ir = ir
 

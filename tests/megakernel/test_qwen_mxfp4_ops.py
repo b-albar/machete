@@ -27,14 +27,12 @@ def _dequantize_mxfp4_simt_weight(qweight):
 
 
 def test_qwen_full_attention_mxfp4_schedule_uses_native_ops():
-    from machete.kernels.decode_matvec import (
-        RmsAddNormSm120Op,
-    )
     from machete.kernels.qwen_3_5.mxfp4_ops import (
         MatvecMxfp4SimtSm120Op,
         MatvecPairMxfp4SimtSm120Op,
         MatvecResidualMxfp4SimtSm120Op,
         QWEN3_5_MXFP4_SIMT_OPS,
+        RmsAddNormMatvecMxfp4SimtSm120Op,
         RmsGateUpSiluMxfp4SimtSm120Op,
     )
     from machete.kernels.qwen_3_5 import (
@@ -111,15 +109,15 @@ def test_qwen_full_attention_mxfp4_schedule_uses_native_ops():
     )
 
     op_classes = [op.op_cls for op in layer.ops]
-    assert op_classes[0] is RmsAddNormSm120Op
+    assert op_classes[0] is RmsAddNormMatvecMxfp4SimtSm120Op
     assert op_classes.count(MatvecPairMxfp4SimtSm120Op) == 1
-    assert op_classes.count(MatvecMxfp4SimtSm120Op) >= 2
+    assert op_classes.count(MatvecMxfp4SimtSm120Op) >= 1
     assert Qwen3_5QGateRopeCacheSm120Op in op_classes
     assert Qwen3_5GqaAttnSplitSm120Op in op_classes
     assert Qwen3_5GqaAttnCombineSm120Op in op_classes
     assert MatvecResidualMxfp4SimtSm120Op in op_classes
     assert RmsGateUpSiluMxfp4SimtSm120Op in op_classes
-    post = layer.ops[3]
+    post = layer.ops[2]
     assert post.op_cls is Qwen3_5QGateRopeCacheSm120Op
     assert post.tile_sizes["KVH"] == 1
     assert post.static_dims["head_dim"] == QWEN3_5_MXFP4_HEAD_DIM
@@ -205,7 +203,6 @@ def test_qwen_q_gate_rope_cache_postprocess_matches_reference():
 def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
     from machete.kernels.decode_matvec import (
         MatvecPairSm120Op,
-        RmsAddNormSm120Op,
     )
     from machete.kernels.qwen_3_5.mxfp4_ops import (
         MatvecMxfp4SimtSm120Op,
@@ -216,6 +213,7 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
         QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK,
         QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK,
         QWEN3_5_MXFP4_SIMT_OPS,
+        RmsAddNormQuadMxfp4SimtSm120Op,
         RmsGateUpSiluMxfp4SimtSm120Op,
     )
     from machete.kernels.qwen_3_5 import (
@@ -292,8 +290,8 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
     )
 
     op_classes = [op.op_cls for op in layer.ops]
-    assert op_classes[0] is RmsAddNormSm120Op
-    assert op_classes.count(MatvecQuadMxfp4SimtSm120Op) == 1
+    assert op_classes[0] is RmsAddNormQuadMxfp4SimtSm120Op
+    assert op_classes.count(MatvecQuadMxfp4SimtSm120Op) == 0
     assert op_classes.count(MatvecPairMxfp4SimtSm120Op) == 0
     assert op_classes.count(MatvecMxfp4SimtSm120Op) >= 1
     assert op_classes.count(MatvecPairSm120Op) == 1
@@ -301,18 +299,18 @@ def test_qwen_deltanet_mxfp4_schedule_uses_native_ops():
     assert MatvecResidualMxfp4SimtSm120Op in op_classes
     assert RmsGateUpSiluMxfp4SimtSm120Op in op_classes
     assert op_classes[-1] is MatvecMxfp4SimtSm120Op
-    assert layer.ops[3].op_cls is Qwen3_5DeltaNetCoreSm120Op
-    assert layer.ops[1].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK
-    assert layer.ops[4].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK
-    assert layer.ops[5].tile_sizes["D"] == QWEN3_5_MXFP4_GATE_UP_BLOCK
+    assert layer.ops[2].op_cls is Qwen3_5DeltaNetCoreSm120Op
+    assert layer.ops[0].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_QKV_MATVEC_BLOCK
+    assert layer.ops[3].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK
+    assert layer.ops[4].tile_sizes["D"] == QWEN3_5_MXFP4_GATE_UP_BLOCK
     assert layer.ops[-1].tile_sizes["O"] == QWEN3_5_MXFP4_SIMT_MATVEC_BLOCK
 
     builder = InstructionStreamBuilder()
     for op in layer.ops:
         builder.add_op(op)
     formulas = builder.get_op_barrier_formulas()
-    deltanet_signal = formulas[3][1][0]
-    residual_wait = next(wait for wait in formulas[4][0] if wait.base == deltanet_signal.base)
+    deltanet_signal = formulas[2][1][0]
+    residual_wait = next(wait for wait in formulas[3][0] if wait.base == deltanet_signal.base)
     assert residual_wait.expected == QWEN3_5_MXFP4_DN_NUM_HEADS
 
 
