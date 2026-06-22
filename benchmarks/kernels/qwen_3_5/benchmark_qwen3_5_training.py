@@ -118,8 +118,10 @@ def _forward_spec(batch: int, seq_len: int, page_size: int, variant: str = "defa
     ops += GLUOp.schedule(x=gate_up, y=mlp, activation="silu", page_size=page_size)
     ops += GemmOp.schedule(a=mlp, b=w_down, c=y, page_size=page_size)
 
-    kernel = Megakernel(ops, config=_config_for(ops), scheduler=_scheduler_for_variant(variant))
-    return kernel.bench_spec(keep_alive=[x, norm, hidden, gate_up, mlp, y, w_gate_up, w_down])
+    with suppress_stdout_stderr():
+        kernel = Megakernel(ops, config=_config_for(ops), scheduler=_scheduler_for_variant(variant))
+        spec = kernel.bench_spec(keep_alive=[x, norm, hidden, gate_up, mlp, y, w_gate_up, w_down])
+    return spec
 
 
 def _torch_forward_impl(x, norm, w_gate_up, w_down):
@@ -167,8 +169,10 @@ def _backward_spec(batch: int, seq_len: int, page_size: int, variant: str = "def
         pointwise_page_size=pointwise_page_size,
     )
     ops = backward.ops
-    kernel = Megakernel(ops, config=_config_for(ops), scheduler=_scheduler_for_variant(variant))
-    return kernel.bench_spec(keep_alive=[*backward.keep_alive, kernel])
+    with suppress_stdout_stderr():
+        kernel = Megakernel(ops, config=_config_for(ops), scheduler=_scheduler_for_variant(variant))
+        spec = kernel.bench_spec(keep_alive=[*backward.keep_alive, kernel])
+    return spec
 
 
 def _torch_backward_impl(x, hidden, gate_up, mlp, dy, norm, w_gate_up, w_down):

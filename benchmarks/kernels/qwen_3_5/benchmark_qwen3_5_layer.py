@@ -210,23 +210,24 @@ def megakernel_forward_build(
     )
     ops = forward.ops
 
-    kernel = Megakernel(
-        ops,
-        config=_config_for(
+    with suppress_stdout_stderr():
+        kernel = Megakernel(
             ops,
-            page_size,
-            tracing=tracing,
-            num_pages=num_pages,
-            page_free_extra_slots=page_free_extra_slots,
-        ),
-        scheduler=scheduler,
-    )
-    spec = kernel.bench_spec(
-        keep_alive=[
-            x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
-            w_o, mlp_norm, w_gate_up, w_down, *forward.keep_alive, kernel,
-        ]
-    )
+            config=_config_for(
+                ops,
+                page_size,
+                tracing=tracing,
+                num_pages=num_pages,
+                page_free_extra_slots=page_free_extra_slots,
+            ),
+            scheduler=scheduler,
+        )
+        spec = kernel.bench_spec(
+            keep_alive=[
+                x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
+                w_o, mlp_norm, w_gate_up, w_down, *forward.keep_alive, kernel,
+            ]
+        )
     return spec, forward.output, forward.residual
 
 
@@ -281,23 +282,24 @@ def megakernel_layer_bwd_build(
     )
     ops = backward.ops
 
-    kernel = Megakernel(
-        ops,
-        config=_config_for(
+    with suppress_stdout_stderr():
+        kernel = Megakernel(
             ops,
-            page_size,
-            tracing=tracing,
-            num_pages=num_pages,
-            page_free_extra_slots=page_free_extra_slots,
-        ),
-        scheduler=scheduler,
-    )
-    spec = kernel.bench_spec(
-        keep_alive=[
-            x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
-            w_o, mlp_norm, w_gate_up, w_down, *backward.keep_alive, kernel,
-        ]
-    )
+            config=_config_for(
+                ops,
+                page_size,
+                tracing=tracing,
+                num_pages=num_pages,
+                page_free_extra_slots=page_free_extra_slots,
+            ),
+            scheduler=scheduler,
+        )
+        spec = kernel.bench_spec(
+            keep_alive=[
+                x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
+                w_o, mlp_norm, w_gate_up, w_down, *backward.keep_alive, kernel,
+            ]
+        )
     return spec, backward.output
 
 
