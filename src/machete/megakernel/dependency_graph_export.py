@@ -45,10 +45,16 @@ def export_dependency_graph_csv(builder, op_csv: str, tile_csv: str) -> None:
 
     edge_rows = []
     edge_by_pair: Dict[Tuple[int, int], List[object]] = {}
+    edge_by_pair_phase: Dict[Tuple[int, int, str], List[object]] = {}
     for edge_id, edge in enumerate(edges):
         producer = builder._op_records[edge.producer_idx].op
         consumer = builder._op_records[edge.consumer_idx].op
         edge_by_pair.setdefault((edge.producer_idx, edge.consumer_idx), []).append(edge)
+        wait_phase = "compute" if builder._dep_wait_can_move_to_compute(edge) else "controller"
+        edge_by_pair_phase.setdefault(
+            (edge.producer_idx, edge.consumer_idx, wait_phase),
+            [],
+        ).append(edge)
         edge_rows.append(
             {
                 "edge_id": edge_id,
@@ -134,7 +140,10 @@ def export_dependency_graph_csv(builder, op_csv: str, tile_csv: str) -> None:
                             continue
                         barrier_idx = formula.compute_index(consumer_tile)
                         for prod_idx, prod_op, prod_tile, prod_linear in barrier_signals.get(barrier_idx, []):
-                            pair_edges = edge_by_pair.get((prod_idx, rec.op_idx), [])
+                            pair_edges = edge_by_pair_phase.get(
+                                (prod_idx, rec.op_idx, wait_phase),
+                                edge_by_pair.get((prod_idx, rec.op_idx), []),
+                            )
                             producer_buffer = "|".join(sorted({edge.producer_buffer for edge in pair_edges}))
                             consumer_buffer = "|".join(sorted({edge.consumer_buffer for edge in pair_edges}))
                             kind = "|".join(sorted({edge.kind for edge in pair_edges}))

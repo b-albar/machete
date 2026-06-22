@@ -40,7 +40,6 @@ TILE_INFO_TILE_3: int = 5
 TILE_INFO_INSTRUCTION_IDX: int = 6
 TILE_INFO_OP_CONFIG: int = 8
 TILE_INFO_PAGE_ID: int = 10
-TILE_INFO_STORE_STATE: int = 11
 
 # Flag offsets within the flags region (each int32 = 4 bytes).
 # Used by controller, loader, and store warps for inter-warp communication.
@@ -312,6 +311,10 @@ class NPageLayout:
     # (page_finished[num_pages]) used by the decoupled multi-page / page-free
     # allocator. Kept off by default so single-page kernels are byte-identical.
     page_release_mbarriers: bool = False
+    # Max pages a single op requests. With the decoupled allocator on, each slot
+    # gets a small per-slot page-address table of this many int32 entries so an
+    # op can address arbitrary (possibly non-contiguous) pages by indirection.
+    max_pages_per_op: int = 1
 
     # Scratch area layout (ring buffer):
     # - Per-slot tile info: num_slots * 48 bytes
@@ -356,10 +359,18 @@ class NPageLayout:
         num_mbarriers = 2 * self.num_slots
         if self.page_release_mbarriers:
             num_mbarriers += self.num_pages
-        raw_scratch_size = (
-            self.mbarrier_offset
-            + num_mbarriers * self._MBARRIER_SIZE
-        )
+        mbar_end = self.mbarrier_offset + num_mbarriers * self._MBARRIER_SIZE
+
+        # Per-slot page-address table (decoupled allocator only): the controller
+        # writes each of an op's pages' data addresses here, so the op can read
+        # arbitrary / non-contiguous page addresses by indirection.
+        if self.page_release_mbarriers:
+            self.page_addr_table_offset = _align_up(mbar_end, 4)
+            table_bytes = self.num_slots * self.max_pages_per_op * 4
+            raw_scratch_size = self.page_addr_table_offset + table_bytes
+        else:
+            self.page_addr_table_offset = mbar_end
+            raw_scratch_size = mbar_end
 
         # 128-byte alignment: required for TMA base address alignment (PTX spec)
         self.scratch_size = _align_up(raw_scratch_size, 128)
@@ -399,6 +410,7 @@ class NPageLayout:
         max_smem: int | None = None,
         min_pages: int = 2,
         page_release_mbarriers: bool = False,
+        max_pages_per_op: int = 1,
     ) -> "NPageLayout":
         """Create layout with maximum pages that fit in device shared memory.
 
@@ -442,6 +454,7 @@ class NPageLayout:
                 num_pages=n,
                 page_size=page_size,
                 page_release_mbarriers=page_release_mbarriers,
+                max_pages_per_op=max_pages_per_op,
             )
             if layout.total_size <= max_smem:
                 return layout

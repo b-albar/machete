@@ -107,6 +107,10 @@ def benchmark_cross_entropy(BT, V, page_size):
     return results
 
 
+# Keep the common benchmark module naming convention available to callers.
+bench_cross_entropy = benchmark_cross_entropy
+
+
 # =============================================================================
 # Main
 # =============================================================================

@@ -7,6 +7,172 @@ from types import SimpleNamespace
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_qwen_forward_tma_attention_rejects_page_filling_o_tile():
+    from machete.kernels.qwen_3_5.qwen_3_5_forward import (
+        HEAD_DIM,
+        NUM_KV_HEADS,
+        NUM_Q_HEADS,
+        Qwen3_5ForwardTmaAttentionOp,
+    )
+
+    dtype = torch.bfloat16
+    batch, seq_len = 1, 64
+    q = torch.empty(batch, seq_len, NUM_Q_HEADS, HEAD_DIM, device="cuda", dtype=dtype)
+    k = torch.empty(batch, seq_len, NUM_KV_HEADS, HEAD_DIM, device="cuda", dtype=dtype)
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    lse = torch.empty(batch, seq_len, NUM_Q_HEADS, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="tile_M=64"):
+        Qwen3_5ForwardTmaAttentionOp.schedule(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            causal=True,
+            kv_group_size=NUM_Q_HEADS // NUM_KV_HEADS,
+            page_size=32768,
+            tile_sizes={"M": 64},
+        )
+
+
+def test_qwen_forward_three_page_tma_attention_uses_larger_kv_block():
+    from machete.kernels.qwen_3_5.qwen_3_5_forward import (
+        HEAD_DIM,
+        NUM_KV_HEADS,
+        NUM_Q_HEADS,
+        Qwen3_5ForwardThreePageTmaAttentionOp,
+    )
+
+    dtype = torch.bfloat16
+    batch, seq_len = 1, 64
+    q = torch.empty(batch, seq_len, NUM_Q_HEADS, HEAD_DIM, device="cuda", dtype=dtype)
+    k = torch.empty(batch, seq_len, NUM_KV_HEADS, HEAD_DIM, device="cuda", dtype=dtype)
+    v = torch.empty_like(k)
+    o = torch.empty_like(q)
+    lse = torch.empty(batch, seq_len, NUM_Q_HEADS, device="cuda", dtype=torch.float32)
+
+    op = Qwen3_5ForwardThreePageTmaAttentionOp.schedule(
+        q=q,
+        k=k,
+        v=v,
+        o=o,
+        lse=lse,
+        causal=True,
+        kv_group_size=NUM_Q_HEADS // NUM_KV_HEADS,
+        page_size=32768,
+        tile_sizes={"M": 64},
+        write_lse=False,
+    )[0]
+
+    assert op.op_cls.requested_page_count == 3
+    assert op.static_dims["tma_n_block"] == 64
+    assert op.static_dims["tma_separate_kv_pages"] == 1
+    assert op.static_dims["tma_scratch_after_k"] == 0
+
+
+def test_qwen_forward_layer_dependencies_are_region_declared():
+    from machete.kernels.qwen_3_5.qwen_3_5_forward import (
+        DEFAULT_PAGE_SIZE,
+        HEAD_DIM,
+        HIDDEN,
+        INTERMEDIATE,
+        KV_DIM,
+        Q_DIM,
+        schedule_qwen3_5_forward_ops,
+    )
+    from machete.megakernel import OverlapTileScheduler
+    from machete.megakernel.scheduling import InstructionStreamBuilder
+
+    dtype = torch.bfloat16
+    batch, seq_len, d2 = 1, 128, 32
+    cos = torch.empty(seq_len, d2, device="cuda", dtype=dtype)
+    sin = torch.empty_like(cos)
+    args = (
+        batch,
+        seq_len,
+        torch.empty(batch, seq_len, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(batch, seq_len, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(Q_DIM, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(KV_DIM, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(KV_DIM, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(HEAD_DIM, device="cuda", dtype=dtype),
+        torch.empty(HEAD_DIM, device="cuda", dtype=dtype),
+        cos,
+        sin,
+        torch.empty(HIDDEN, Q_DIM, device="cuda", dtype=dtype),
+        torch.empty(HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(2 * INTERMEDIATE, HIDDEN, device="cuda", dtype=dtype),
+        torch.empty(HIDDEN, INTERMEDIATE, device="cuda", dtype=dtype),
+    )
+    variants = [
+        dict(
+            use_split_attention=True,
+            split_attention_splits=1,
+            use_qknorm_4d=True,
+            use_tma_attention=True,
+            attention_tile_m=32,
+        ),
+        dict(
+            use_split_attention=True,
+            split_attention_splits=1,
+            use_qknorm_4d=True,
+            use_tma_attention=True,
+            use_packed_qkv_projection=False,
+            attention_tile_m=32,
+        ),
+        dict(
+            use_split_attention=False,
+            use_qknorm_4d=True,
+            use_tma_attention=True,
+            attention_tile_m=32,
+        ),
+        dict(
+            use_split_attention=True,
+            split_attention_splits=1,
+            use_qknorm_4d=False,
+            use_tma_attention=True,
+            attention_tile_m=32,
+        ),
+    ]
+
+    for kwargs in variants:
+        forward = schedule_qwen3_5_forward_ops(
+            *args,
+            page_size=DEFAULT_PAGE_SIZE,
+            scheduler=OverlapTileScheduler(),
+            **kwargs,
+        )
+        builder = InstructionStreamBuilder()
+        for op in forward.ops:
+            builder.add_op(op)
+        non_declared_edges = [
+            (
+                dep.producer_op,
+                dep.producer_buffer,
+                dep.consumer_op,
+                dep.consumer_buffer,
+                dep.mode,
+            )
+            for dep in builder.dependency_resolutions()
+            if dep.mode not in {"declared_group", "declared_shared"}
+        ]
+
+        assert not non_declared_edges
+        glu_x_edges = [
+            dep
+            for dep in builder.dependency_resolutions()
+            if dep.consumer_op == "Qwen3_5ForwardDirectGLUOp"
+            and dep.consumer_buffer == "x"
+        ]
+        if glu_x_edges:
+            assert [dep.mode for dep in glu_x_edges] == ["declared_group", "declared_group"]
+            assert [dep.consumer_region_index for dep in glu_x_edges] == [0, 1]
+        assert builder.dependency_plan().barrier_count > 0
+
+
 def _qweight(rows, cols, group_size=32):
     from machete.kernels.qwen_3_5.mxfp4_ops import empty_mxfp4_simt_weight
 

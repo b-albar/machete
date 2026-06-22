@@ -9,7 +9,6 @@ The suite is organized by responsibility first, then by subsystem.
   Examples:
   - scheduler/dependency math in `tests/megakernel/deps/`
   - instruction-stream and barrier tests in `tests/megakernel/test_ops.py`
-  - lightweight patching behavior tests
 
 - `smoke`
   Compile-and-run coverage for the default maintained paths.
@@ -21,7 +20,7 @@ The suite is organized by responsibility first, then by subsystem.
   Examples:
   - persistent megakernel integration chains
   - Qwen prefill coverage
-  - heavier attention / MoE / patching flows
+  - heavier attention / MoE flows
 
 - `slow`
   Expensive end-to-end tests that should be run deliberately, not as the first gate.
@@ -32,8 +31,6 @@ The suite is organized by responsibility first, then by subsystem.
   Kernel-level op tests under `tests/kernels`
 - `megakernel`
   Framework and persistent-runtime tests under `tests/megakernel`
-- `patching`
-  Model patching tests under `tests/patching`
 - `deps`
   Scheduler dependency-mapping coverage under `tests/megakernel/deps`
 - `arch_sm120`
@@ -48,7 +45,7 @@ Markers are attached automatically from `tests/conftest.py`, so file layout and 
 2. Maintained GPU smoke gate:
    `pytest -m "smoke and gpu and not slow"`
 3. Focused subsystem validation:
-   `pytest -m "kernels or megakernel or patching"`
+   `pytest -m "kernels or megakernel"`
 4. Heavier end-to-end checks:
    `pytest -m integration`
 5. Expensive full checks:

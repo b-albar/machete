@@ -25,15 +25,20 @@ from x). Backward overwrites in-place (dx has same stride as x, no barrier).
 
 import cutlass
 import cutlass.cute as cute
+from dataclasses import replace
 from cutlass import Int32, Float32
 
 from machete.megakernel.ops import (
+    AccessRegions,
     Op,
     DEFAULT_PAGE_SIZE,
+    RegionAxis,
+    TensorAccessRegion,
     config_dim_i32,
     config_ptr_i64,
 )
 from machete.megakernel.interpreter import (
+    global_memory_fence_gpu,
     mbarrier_arrive_expect_tx,
     named_barrier_sync,
 )
@@ -321,6 +326,13 @@ def _glu_forward_core_direct(page_ptr, y_offset, tile_S,
                     y_reg[i] = (act_val * u).to(x_dtype)
 
                 cute.autovec_copy(y_reg, y_part)
+
+        # DirectGLU writes global memory from the compute phase. In the full
+        # replay path there is no store-warp fence for this op, so publish these
+        # writes before the framework signals compute_done and a later TMA load
+        # may consume y.
+        global_memory_fence_gpu()
+        cute.arch.fence_proxy("async.global")
 
 
 @cute.jit
@@ -620,6 +632,58 @@ class DirectGLUOp(Op):
         self.rows_per_warp = (
             self.tile_size_S + self.num_warps - 1
         ) // self.num_warps
+
+    @classmethod
+    def access_regions(cls, op) -> AccessRegions:
+        regions = super().access_regions(op)
+        x_region = regions.reads.get("x")
+        if x_region is None:
+            return regions
+
+        d_axis = regions.writes.get("y").axis("D") if regions.writes.get("y") is not None else None
+        if d_axis is None or d_axis.tile_dim != "D":
+            return regions
+
+        tile_size_d = int(d_axis.tile_size)
+        d_extent = int(d_axis.extent)
+        d_tiles = op.tile_counts[op.dim_names["D"]]
+
+        def packed_region(offset_tiles: int) -> TensorAccessRegion:
+            axes = []
+            for axis in x_region.axes:
+                if axis.name == "N":
+                    axes.append(
+                        RegionAxis(
+                            name="N",
+                            extent=d_extent,
+                            tile_dim="D",
+                            tile_size=tile_size_d,
+                            tile_origin=int(op.tile_origins.get("D", 0)),
+                        )
+                    )
+                else:
+                    axes.append(axis)
+            return replace(
+                x_region,
+                axes=tuple(axes),
+                group_index_dim="N",
+                group_index_offset=offset_tiles,
+                group_index_group_tiles=1,
+            )
+
+        y_region = regions.writes.get("y")
+        writes = dict(regions.writes)
+        if y_region is not None:
+            writes["y"] = replace(
+                y_region,
+                group_dim="D",
+                group_tiles=1,
+                group_count=d_tiles,
+            )
+        return AccessRegions(
+            reads={"x": (packed_region(0), packed_region(d_tiles))},
+            writes=writes,
+        )
 
     @classmethod
     def schedule(cls, tile_sizes=None, activation="silu", page_size=DEFAULT_PAGE_SIZE, **tensors):

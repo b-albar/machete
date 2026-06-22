@@ -81,6 +81,29 @@ class TestMegakernelHost:
 
         assert k0._make_cache_key() == k1._make_cache_key()
 
+    def test_compute_only_metadata_uses_compact_stride(self):
+        """Compute-only replay should not carry full load/store phase metadata."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = _named_nop_op()
+
+        ops = [
+            ScheduledOp(NopOp, tile_counts=(4,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopOp, tile_counts=(4,), tensor_ptrs={"x": 2}),
+        ]
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, num_pages=1),
+            device="cpu",
+        )
+
+        assert kernel._use_compute_only_replay()
+        kernel._prepare_tensors()
+
+        op_meta = kernel._op_meta_exec_globals()
+        assert op_meta["_OP_META_STRIDE"] == 11
+        assert "_OP_META_PHASE_MASK" not in op_meta
+        assert kernel._op_metadata_tensor.numel() == len(ops) * 11
+
 
 # =============================================================================
 # GPU Tests (Require Hopper)

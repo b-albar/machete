@@ -892,28 +892,28 @@ class GemmOp(Op):
 
         C is 3D (B, S, N) — TMA coord includes tile_B.
         """
-        swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
-        sC = cute.make_tensor(
-            cute.recast_ptr(
-                cute.make_ptr(self.c_dtype, page_ptr,
-                              cute.AddressSpace.smem, assumed_align=128),
-                swz_c, dtype=self.c_dtype),
-            cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
-                             stride=(1, self.tile_size_N,
-                                     self.tile_size_N * self.tile_size_S)),
-        )
+        if cute.arch.lane_idx() == Int32(0):
+            swz_c = cute.make_swizzle(self.swz_B_c, 4, 3)
+            sC = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.make_ptr(self.c_dtype, page_ptr,
+                                  cute.AddressSpace.smem, assumed_align=128),
+                    swz_c, dtype=self.c_dtype),
+                cute.make_layout((self.tile_size_N, self.tile_size_S, 1),
+                                 stride=(1, self.tile_size_N,
+                                         self.tile_size_N * self.tile_size_S)),
+            )
 
-        gC = cute.local_tile(
-            c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
-            (None, None, None),
-        )
-        tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
-            c_tma, Int32(0), cute.make_layout(1),
-            cute.group_modes(sC, 0, 3),
-            cute.group_modes(gC, 0, 3),
-        )
-
-        cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+            gC = cute.local_tile(
+                c_tma_gmem, (self.tile_size_N, self.tile_size_S, 1),
+                (None, None, None),
+            )
+            tCsC, tCgC = cute.nvgpu.cpasync.tma_partition(
+                c_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sC, 0, 3),
+                cute.group_modes(gC, 0, 3),
+            )
+            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
@@ -1376,19 +1376,19 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
 
     reads = {
         "a": (None, ("B", "S", "K")),
-        "a_scale": (None, ("B", "S", "K")),
         "b": (None, ("N", "K")),
         "_chunk": (cutlass.Int32, ("R",)),
     }
     writes = {"c": (None, ("B", "S", "N"))}
     tile = ("B", "S", "N", "R")
-    tma_loads = {"a", "a_scale", "b"}
+    tma_loads = {"a", "b"}
     tma_stores = set()
     tma_reduce_stores = {"c"}
     peer_reduce_stores = set()
 
     def __init__(self, **config):
         super().__init__(**config)
+        self.a_scale_dtype = getattr(self, "a_scale_dtype", self.a_dtype)
         self.reduce_tile_n = getattr(self, "reduce_tile_n", self.K)
         self.reduce_k_block_offset = getattr(self, "reduce_k_block_offset", 0)
         self.num_k_blocks = (self.reduce_tile_n + self.tile_K - 1) // self.tile_K
@@ -1396,8 +1396,7 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
 
     @cute.jit
     def load(self, page_ptr, tile_B, tile_S, tile_N, tile_R,
-             a_tma, a_tma_gmem, a_scale_tma, a_scale_tma_gmem,
-             b_tma, b_tma_gmem,
+             a_tma, a_tma_gmem, b_tma, b_tma_gmem,
              work_mbar):
         """TMA load A/B K-blocks for one reduction chunk."""
         swz = cute.make_swizzle(self.swz_B_ab, 4, 3)
@@ -1451,24 +1450,6 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
                 cute.group_modes(sA, 0, 3),
                 cute.group_modes(gA, 0, 3))
 
-            sScale_ptr = cute.recast_ptr(
-                cute.make_ptr(self.a_scale_dtype,
-                              _buf_base + Int32(self.a_scale_offset),
-                              cute.AddressSpace.smem),
-                swz, dtype=self.a_scale_dtype)
-            sScale = cute.make_tensor(
-                sScale_ptr,
-                cute.make_layout((self.tile_K, self.tile_size_S, 1),
-                                 stride=(1, self.tile_K,
-                                         self.tile_K * self.tile_size_S)))
-            gScale = cute.local_tile(
-                a_scale_tma_gmem, (self.tile_K, self.tile_size_S, 1),
-                (None, None, None))
-            tScaleS, tScaleG = cute.nvgpu.cpasync.tma_partition(
-                a_scale_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sScale, 0, 3),
-                cute.group_modes(gScale, 0, 3))
-
             sB_ptr = cute.recast_ptr(
                 cute.make_ptr(self.b_dtype,
                               _buf_base + Int32(self.b_offset),
@@ -1494,10 +1475,6 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
                         mbarrier_arrive_expect_tx(work_mbar, nbytes)
                 cute.copy(a_tma, tAgA[(None, _global_k_block, tile_S, tile_B)],
                           tAsA, tma_bar_ptr=_mbar_ptr)
-                if self.has_a_scale:
-                    cute.copy(a_scale_tma,
-                              tScaleG[(None, _global_k_block, tile_S, tile_B)],
-                              tScaleS, tma_bar_ptr=_mbar_ptr)
                 cute.copy(b_tma, tBgB[(None, _global_k_block, tile_N)], tBsB,
                           tma_bar_ptr=_mbar_ptr)
 
@@ -1517,10 +1494,6 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
 
                 cute.copy(a_tma, tAgA[(None, _global_k_block, tile_S, tile_B)],
                           tAsA, tma_bar_ptr=_kr_ptr)
-                if self.has_a_scale:
-                    cute.copy(a_scale_tma,
-                              tScaleG[(None, _global_k_block, tile_S, tile_B)],
-                              tScaleS, tma_bar_ptr=_kr_ptr)
                 cute.copy(b_tma, tBgB[(None, _global_k_block, tile_N)], tBsB,
                           tma_bar_ptr=_kr_ptr)
 
@@ -1530,8 +1503,6 @@ class ProjectionDaReduceGemmOp(GemmRowParallelOp):
     def schedule(cls, *, reduce_tile_n=1024, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         import torch
 
-        if "a_scale" not in tensors:
-            tensors["a_scale"] = tensors["a"]
         k_extent = int(tensors["a"].shape[-1])
         if reduce_tile_n <= 0:
             raise ValueError("reduce_tile_n must be positive")

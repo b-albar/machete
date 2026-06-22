@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import operator
 
 import cutlass
@@ -37,7 +37,14 @@ from machete.kernels.decode_matvec.sm120 import (
 )
 from machete.megakernel.interpreter import named_barrier_sync
 from machete.megakernel.utils import prefetch_ptr_l2
-from machete.megakernel.ops import DEFAULT_PAGE_SIZE, Op, PipelineSpec
+from machete.megakernel.ops import (
+    AccessRegions,
+    DEFAULT_PAGE_SIZE,
+    Op,
+    PipelineSpec,
+    RegionAxis,
+    TensorAccessRegion,
+)
 from machete.quantization.mxfp4 import quantize_mxfp4_weight
 
 
@@ -526,6 +533,54 @@ def _last_dim_slice(tensor, start: int, stop: int):
     return tensor[:, :, start:stop]
 
 
+def _schedule_mlp_down_mxfp4(
+    *,
+    fp4_ops,
+    x,
+    norm_weight,
+    gate_packed,
+    gate_scales,
+    up_packed,
+    up_scales,
+    down_packed,
+    down_scales,
+    mlp_h_buf,
+    x_out,
+    seq_len,
+    page_size,
+    eps,
+    group_size,
+    gate_up_block,
+    matvec_block,
+    prefetch_gate_up,
+):
+    ops = []
+    ops += fp4_ops.rms_gate_up_silu.schedule(
+        x=x,
+        norm_weight=norm_weight,
+        gate_packed=gate_packed,
+        gate_scales=gate_scales,
+        up_packed=up_packed,
+        up_scales=up_scales,
+        y=mlp_h_buf,
+        tile_sizes={"S": seq_len, "D": gate_up_block},
+        page_size=page_size,
+        eps=eps,
+        group_size=group_size,
+        prefetch_nvfp4=prefetch_gate_up,
+    )
+    ops += fp4_ops.matvec.schedule(
+        a=mlp_h_buf,
+        weight_packed=down_packed,
+        weight_scales=down_scales,
+        y=x_out,
+        tile_sizes={"S": seq_len, "O": matvec_block},
+        page_size=page_size,
+        group_size=group_size,
+    )
+    return ops
+
+
 def _schedule_mxfp4_pair_projection(
     *,
     x,
@@ -629,6 +684,28 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
     dynamic_dims = ("B",)
 
     @classmethod
+    def access_regions(cls, op) -> AccessRegions:
+        regions = super().access_regions(op)
+        y_region = regions.writes.get("y")
+        if y_region is None:
+            return regions
+        y_axes = tuple(
+            axis for axis in y_region.axes
+            if axis.name != "V"
+        ) + (
+            RegionAxis(
+                name="V",
+                extent=QWEN3_5_MXFP4_DN_NUM_HEADS * QWEN3_5_MXFP4_DN_VALUE_DIM,
+                tile_dim="H",
+                tile_size=QWEN3_5_MXFP4_DN_VALUE_DIM,
+                tile_origin=int(op.tile_origins.get("H", 0)),
+            ),
+        )
+        writes = dict(regions.writes)
+        writes["y"] = replace(y_region, axes=y_axes)
+        return AccessRegions(reads=regions.reads, writes=writes)
+
+    @classmethod
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
@@ -636,8 +713,6 @@ class Qwen3_5DeltaNetCoreSm120Op(Op):
         tile_sizes.setdefault("H", 1)
         op = cls._schedule_single(tile_sizes=tile_sizes, **tensors)
         op.static_dims["page_size"] = page_size
-        op.static_dims["barrier_signal_y_alias_H"] = "V"
-        op.static_dims["barrier_signal_y_tile_size_H"] = QWEN3_5_MXFP4_DN_VALUE_DIM
         return [op]
 
     @cute.jit
@@ -1153,28 +1228,25 @@ def schedule_qwen3_5_deltanet_mxfp4_sm120(
         page_size=page_size,
         group_size=group_size,
     )
-    ops += fp4_ops.rms_gate_up_silu.schedule(
+    ops += _schedule_mlp_down_mxfp4(
+        fp4_ops=fp4_ops,
         x=residual_out,
         norm_weight=weights[f"{pfx}.mlp_norm"],
         gate_packed=gate_packed,
         gate_scales=gate_scales,
         up_packed=up_packed,
         up_scales=up_scales,
-        y=mlp_h_buf,
-        tile_sizes={"S": seq_len, "D": gate_up_block},
+        down_packed=down_packed,
+        down_scales=down_scales,
+        mlp_h_buf=mlp_h_buf,
+        x_out=x_out,
+        seq_len=seq_len,
         page_size=page_size,
         eps=QWEN3_5_MXFP4_EPS,
         group_size=group_size,
-        prefetch_nvfp4=prefetch_gate_up,
-    )
-    ops += fp4_ops.matvec.schedule(
-        a=mlp_h_buf,
-        weight_packed=down_packed,
-        weight_scales=down_scales,
-        y=x_out,
-        tile_sizes={"S": seq_len, "O": matvec_block},
-        page_size=page_size,
-        group_size=group_size,
+        gate_up_block=gate_up_block,
+        matvec_block=matvec_block,
+        prefetch_gate_up=prefetch_gate_up,
     )
 
     keep = [
@@ -1343,28 +1415,25 @@ def schedule_qwen3_5_full_attention_mxfp4_sm120(
             page_size=page_size,
             group_size=group_size,
         )
-        ops += fp4_ops.rms_gate_up_silu.schedule(
+        ops += _schedule_mlp_down_mxfp4(
+            fp4_ops=fp4_ops,
             x=residual_out,
             norm_weight=weights[f"{pfx}.mlp_norm"],
             gate_packed=gate_packed,
             gate_scales=gate_scales,
             up_packed=up_packed,
             up_scales=up_scales,
-            y=mlp_h_buf,
-            tile_sizes={"S": seq_len, "D": gate_up_block},
+            down_packed=down_packed,
+            down_scales=down_scales,
+            mlp_h_buf=mlp_h_buf,
+            x_out=x_out,
+            seq_len=seq_len,
             page_size=page_size,
             eps=QWEN3_5_MXFP4_EPS,
             group_size=group_size,
-            prefetch_nvfp4=prefetch_gate_up,
-        )
-        ops += fp4_ops.matvec.schedule(
-            a=mlp_h_buf,
-            weight_packed=down_packed,
-            weight_scales=down_scales,
-            y=x_out,
-            tile_sizes={"S": seq_len, "O": matvec_block},
-            page_size=page_size,
-            group_size=group_size,
+            gate_up_block=gate_up_block,
+            matvec_block=matvec_block,
+            prefetch_gate_up=prefetch_gate_up,
         )
         keep = [
             cos, sin, q_grouped, q_gate_grouped, k_window, v_window, o_4d,

@@ -91,15 +91,6 @@ def _suite_markers_for_path(path: Path) -> tuple[str, ...]:
         }:
             markers.append("slow")
         return tuple(markers)
-    if "patching" in parts:
-        markers = ["patching"]
-        if path.name in {"test_linear.py", "test_rope.py", "test_attention.py"}:
-            markers.append("unit")
-        if path.name in {"test_qwen.py", "test_glm4.py", "test_llama.py"}:
-            markers.append("integration")
-        if path.name in {"test_qwen.py", "test_glm4.py"}:
-            markers.append("slow")
-        return tuple(markers)
     return ()
 
 

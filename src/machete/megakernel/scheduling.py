@@ -34,8 +34,11 @@ from .ops import (
     MAX_TILE_DIMS,
     Op,
     ScheduledOp,
+    TensorAccessRegion,
     build_op_config,
+    iter_tensor_access_regions,
     last_dim_slice_region,
+    tensor_access_region_at,
     tensor_meta_overlaps,
 )
 from .timing_profile import TimingProfile
@@ -255,6 +258,30 @@ class DependencyPlan:
 
 
 @dataclass(frozen=True)
+class DependencyResolution:
+    """Host-side explanation for how one dependency edge was lowered.
+
+    ``mode`` is intentionally coarse and stable enough for tests and debugging:
+    - ``declared_shared``: both ops declared regions and no grouped axis was needed
+    - ``declared_group``: an op-declared producer group refined the dependency
+    - ``last_dim_fallback``: legacy alias-slice fallback refined the dependency
+    - ``legacy_dims``: dependency used only op tile/dim metadata
+    """
+
+    producer_idx: int
+    consumer_idx: int
+    producer_op: str
+    consumer_op: str
+    producer_buffer: str
+    consumer_buffer: str
+    mode: str
+    shared_pairs: Tuple[Tuple[str, str, str], ...]
+    producer_only_dims: Tuple[str, ...]
+    producer_region_index: int = 0
+    consumer_region_index: int = 0
+
+
+@dataclass(frozen=True)
 class _DepPair:
     """Resolved logical dependency between two scheduled ops."""
 
@@ -262,16 +289,25 @@ class _DepPair:
     consumer_idx: int
     producer_buffer: str = ""
     consumer_buffer: str = ""
+    producer_region_index: int = 0
+    consumer_region_index: int = 0
 
 
 @dataclass(frozen=True)
-class _LastDimRegionDep:
-    """Producer-only tiled dimension grouped by a consumer's last-dim slice."""
+class _RegionDep:
+    """Producer-only tiled dimension grouped into scheduler-visible regions."""
 
     producer_dim: str
     group_index: int
     group_count: int
     group_tiles: int
+    consumer_dim: Optional[str] = None
+    consumer_group_tiles: int = 1
+    group_index_mode: str = "exact"
+    prefix_producer_dim: Optional[str] = None
+    prefix_group_count: int = 1
+    prefix_group_tiles: int = 1
+    prefix_consumer_dim: Optional[str] = None
 
 # =============================================================================
 # Tile Schedulers
@@ -520,11 +556,18 @@ class OverlapTileScheduler(TileScheduler):
         prefer_ready_consumers: bool = False,
         dependency_slack_waves: int = 0,
         dependency_slack_op_indices: Optional[Set[int]] = None,
+        readiness_wait_phase: str = "all",
     ):
         self.fetch_stride = fetch_stride
         self.adaptive_fetch_stride = bool(adaptive_fetch_stride)
         self.prefer_data_movement = prefer_data_movement
         self.prefer_ready_consumers = prefer_ready_consumers
+        if readiness_wait_phase not in ("all", "controller"):
+            raise ValueError(
+                "readiness_wait_phase must be 'all' or 'controller', "
+                f"got {readiness_wait_phase!r}"
+            )
+        self.readiness_wait_phase = readiness_wait_phase
         self.dependency_slack_waves = max(0, int(dependency_slack_waves))
         self.dependency_slack_op_indices = (
             {int(op_idx) for op_idx in dependency_slack_op_indices}
@@ -540,9 +583,13 @@ class OverlapTileScheduler(TileScheduler):
             self.fetch_stride = max(1, int(num_blocks))
 
     def _resolve_fetch_stride(self, total_tiles: int) -> int:
-        if self.fetch_stride is not None:
-            return max(1, int(self.fetch_stride))
         num_blocks = max(1, int(self._bound_num_blocks or 1))
+        if self.fetch_stride is not None:
+            # Persistent CTAs fetch instruction indices as block_id + k * num_blocks.
+            # A scheduler wave smaller than num_blocks is not an executable wave:
+            # CTAs beyond that short wave would immediately fetch later instructions,
+            # potentially turning host-side "ready" consumers into runtime dep waits.
+            return max(num_blocks, int(self.fetch_stride))
         if self.adaptive_fetch_stride and total_tiles <= 14 * num_blocks:
             return 2 * num_blocks
         return num_blocks
@@ -569,6 +616,8 @@ class OverlapTileScheduler(TileScheduler):
             score += 1
         if (
             getattr(op_cls, "_TMA_STORES", set())
+            or getattr(op_cls, "_TMA_COMPUTE_STORES", set())
+            or getattr(op_cls, "_TMA_COMPUTE_REDUCE_STORES", set())
             or getattr(op_cls, "_TMA_REDUCE_STORES", set())
             or getattr(op_cls, "_PEER_STORES", set())
             or getattr(op_cls, "_PEER_REDUCE_STORES", set())
@@ -905,15 +954,20 @@ class InstructionStreamBuilder:
         self._cached_dependency_plan: Optional[DependencyPlan] = None
         self._cached_controller_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
         self._cached_compute_wait_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
+        self._cached_store_signal_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
+        self._cached_compute_signal_formulas: Optional[Dict[int, List[BarrierFormula]]] = None
         self._op_wait_counts: Dict[int, int] = {}
         self._op_compute_wait_counts: Dict[int, int] = {}
         self._op_signal_counts: Dict[int, int] = {}
+        self._op_compute_signal_counts: Dict[int, int] = {}
 
     def _invalidate_resolution_cache(self) -> None:
         """Clear cached formulas after the op list changes."""
         self._cached_dependency_plan = None
         self._cached_controller_wait_formulas = None
         self._cached_compute_wait_formulas = None
+        self._cached_store_signal_formulas = None
+        self._cached_compute_signal_formulas = None
 
     def _logical_tiles_for_instruction(self, instr: TileInstruction) -> List[Tuple[int, ...]]:
         """Return logical tiles covered by one possibly range-owned instruction."""
@@ -1240,8 +1294,102 @@ class InstructionStreamBuilder:
         """Whether this output is accumulated atomically rather than overwritten."""
         return (
             buf in getattr(op.op_cls, "_TMA_REDUCE_STORES", set())
+            or buf in getattr(op.op_cls, "_TMA_COMPUTE_REDUCE_STORES", set())
             or buf in getattr(op.op_cls, "_COMPUTE_REDUCE_STORES", set())
         )
+
+    def _matching_producer_region_indices(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        producer_buffer: str,
+        consumer_buffer: str,
+        consumer_region_index: int = 0,
+    ) -> Tuple[int, ...]:
+        """Select producer write regions that can satisfy one consumer read region.
+
+        A producer may declare several logical write regions for the same buffer
+        when one physical tensor is later consumed as disjoint views.  Prefer an
+        explicit region tensor-name match, then fall back to conservative
+        axis-range overlap.
+        """
+        producer_regions = iter_tensor_access_regions(
+            producer.access_regions().writes.get(producer_buffer)
+        )
+        if len(producer_regions) <= 1:
+            return (0,)
+        consumer_region = self._access_region(
+            consumer,
+            role="wait",
+            buffer_name=consumer_buffer,
+            region_index=consumer_region_index,
+        )
+        if consumer_region is None:
+            return tuple(range(len(producer_regions)))
+
+        consumer_names = {consumer_buffer, consumer_region.tensor}
+        named = tuple(
+            idx
+            for idx, region in enumerate(producer_regions)
+            if region.tensor in consumer_names
+        )
+        if named:
+            return named
+
+        overlapping = tuple(
+            idx
+            for idx, region in enumerate(producer_regions)
+            if self._regions_may_overlap(
+                producer,
+                consumer,
+                producer_buffer,
+                consumer_buffer,
+                region,
+                consumer_region,
+            )
+        )
+        return overlapping or tuple(range(len(producer_regions)))
+
+    def _regions_may_overlap(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        producer_buffer: str,
+        consumer_buffer: str,
+        producer_region: TensorAccessRegion,
+        consumer_region: TensorAccessRegion,
+    ) -> bool:
+        producer_axes = {
+            self._region_axis_canonical_name(
+                producer,
+                role="signal",
+                buffer_name=producer_buffer,
+                region=producer_region,
+                axis_name=axis.name,
+            ): axis
+            for axis in producer_region.axes
+        }
+        consumer_axes = {
+            self._region_axis_canonical_name(
+                consumer,
+                role="wait",
+                buffer_name=consumer_buffer,
+                region=consumer_region,
+                axis_name=axis.name,
+            ): axis
+            for axis in consumer_region.axes
+        }
+        shared = set(producer_axes) & set(consumer_axes)
+        if not shared:
+            return True
+        for name in shared:
+            p_axis = producer_axes[name]
+            c_axis = consumer_axes[name]
+            p_stop = p_axis.extent if p_axis.stop is None else p_axis.stop
+            c_stop = c_axis.extent if c_axis.stop is None else c_axis.stop
+            if max(p_axis.start, c_axis.start) >= min(p_stop, c_stop):
+                return False
+        return True
 
     def _resolve_named_dep_pairs(
         self,
@@ -1250,7 +1398,7 @@ class InstructionStreamBuilder:
     ) -> List[_DepPair]:
         """Resolve ordered op pairs for RAW plus shared-storage anti-dependencies."""
         pairs: List[_DepPair] = []
-        seen: Set[Tuple[int, int, str, str]] = set()
+        seen: Set[Tuple[int, int, str, str, int, int]] = set()
         raw_pairs: Set[Tuple[int, int]] = set()
 
         # RAW edges from declared inputs.
@@ -1261,18 +1409,40 @@ class InstructionStreamBuilder:
                     continue
                 for prod_idx in prod_indices:
                     for prod_buf in self._find_producer_buffers(prod_idx, rec.op, buf):
-                        seen_key = (prod_idx, rec.op_idx, prod_buf, buf)
-                        if seen_key not in seen:
-                            seen.add(seen_key)
-                            raw_pairs.add((prod_idx, rec.op_idx))
-                            pairs.append(
-                                _DepPair(
-                                    producer_idx=prod_idx,
-                                    consumer_idx=rec.op_idx,
-                                    producer_buffer=prod_buf,
-                                    consumer_buffer=buf,
+                        region_count = self._access_region_count(
+                            rec.op,
+                            role="wait",
+                            buffer_name=buf,
+                        )
+                        for consumer_region_index in range(region_count):
+                            for producer_region_index in self._matching_producer_region_indices(
+                                self._op_records[prod_idx].op,
+                                rec.op,
+                                prod_buf,
+                                buf,
+                                consumer_region_index,
+                            ):
+                                seen_key = (
+                                    prod_idx,
+                                    rec.op_idx,
+                                    prod_buf,
+                                    buf,
+                                    producer_region_index,
+                                    consumer_region_index,
                                 )
-                            )
+                                if seen_key not in seen:
+                                    seen.add(seen_key)
+                                    raw_pairs.add((prod_idx, rec.op_idx))
+                                    pairs.append(
+                                        _DepPair(
+                                            producer_idx=prod_idx,
+                                            consumer_idx=rec.op_idx,
+                                            producer_buffer=prod_buf,
+                                            consumer_buffer=buf,
+                                            producer_region_index=producer_region_index,
+                                            consumer_region_index=consumer_region_index,
+                                        )
+                                    )
 
                 # Split-K / row-parallel style reductions have multiple
                 # associative writers for one logical tensor. The latest writer
@@ -1288,18 +1458,40 @@ class InstructionStreamBuilder:
                                 continue
                             cand_meta = cand.op.tensor_metas.get(cand_name)
                             if cand_meta is not None and tensor_meta_overlaps(cand_meta, cons_meta):
-                                seen_key = (cand_idx, rec.op_idx, cand_name, buf)
-                                if seen_key not in seen:
-                                    seen.add(seen_key)
-                                    raw_pairs.add((cand_idx, rec.op_idx))
-                                    pairs.append(
-                                        _DepPair(
-                                            producer_idx=cand_idx,
-                                            consumer_idx=rec.op_idx,
-                                            producer_buffer=cand_name,
-                                            consumer_buffer=buf,
+                                region_count = self._access_region_count(
+                                    rec.op,
+                                    role="wait",
+                                    buffer_name=buf,
+                                )
+                                for consumer_region_index in range(region_count):
+                                    for producer_region_index in self._matching_producer_region_indices(
+                                        cand.op,
+                                        rec.op,
+                                        cand_name,
+                                        buf,
+                                        consumer_region_index,
+                                    ):
+                                        seen_key = (
+                                            cand_idx,
+                                            rec.op_idx,
+                                            cand_name,
+                                            buf,
+                                            producer_region_index,
+                                            consumer_region_index,
                                         )
-                                    )
+                                        if seen_key not in seen:
+                                            seen.add(seen_key)
+                                            raw_pairs.add((cand_idx, rec.op_idx))
+                                            pairs.append(
+                                                _DepPair(
+                                                    producer_idx=cand_idx,
+                                                    consumer_idx=rec.op_idx,
+                                                    producer_buffer=cand_name,
+                                                    consumer_buffer=buf,
+                                                    producer_region_index=producer_region_index,
+                                                    consumer_region_index=consumer_region_index,
+                                                )
+                                            )
                                 added_reduce = True
                         if added_reduce:
                             continue
@@ -1347,7 +1539,7 @@ class InstructionStreamBuilder:
                             for cand_name in cand.op.op_cls.OUTPUTS
                         ):
                             continue
-                        seen_key = (cand_idx, rec.op_idx, cand_buf, out_name)
+                        seen_key = (cand_idx, rec.op_idx, cand_buf, out_name, 0, 0)
                         if seen_key not in seen:
                             seen.add(seen_key)
                             pairs.append(
@@ -1423,10 +1615,30 @@ class InstructionStreamBuilder:
             cons_idx = dep.consumer_idx
             producer = self._op_records[prod_idx]
             consumer = self._op_records[cons_idx]
-            p_dims = set(producer.op.dim_names.keys())
-            c_dims = set(consumer.op.dim_names.keys())
-            producer_only = p_dims - c_dims
-            consumer_only = c_dims - p_dims
+            shared_pairs, producer_only_dims, _region_dep, _mode = self._lower_dependency_region(dep)
+            producer_dims = {producer_dim for _, producer_dim, _ in shared_pairs}
+            producer_dims.update(producer_only_dims)
+            consumer_dims = {consumer_dim for _, _, consumer_dim in shared_pairs}
+            consumer_region = self._access_region(
+                consumer.op,
+                role="wait",
+                buffer_name=dep.consumer_buffer,
+                region_index=dep.consumer_region_index,
+            )
+            if consumer_region is None:
+                consumer_dims.update(consumer.op.dim_names.keys())
+            else:
+                consumer_dims.update(
+                    dim
+                    for dim in self._region_tiled_dim_map(
+                        consumer.op,
+                        role="wait",
+                        buffer_name=dep.consumer_buffer,
+                        region=consumer_region,
+                    ).values()
+                )
+            producer_only = producer_dims - consumer_dims
+            consumer_only = consumer_dims - producer_dims
 
             if producer_only:
                 kind = "many_to_one"
@@ -1444,6 +1656,112 @@ class InstructionStreamBuilder:
             ))
 
         return edges
+
+    def _lower_dependency_region(
+        self,
+        dep: _DepPair,
+    ) -> Tuple[List[Tuple[str, str, str]], List[str], Optional[_RegionDep], str]:
+        """Resolve shared dims plus optional declared producer-region grouping."""
+        producer = self._op_records[dep.producer_idx].op
+        consumer = self._op_records[dep.consumer_idx].op
+        shared_pairs, producer_only_dims = self._declared_shared_dim_pairs(
+            producer,
+            consumer,
+            dep.producer_buffer,
+            dep.consumer_buffer,
+            dep.producer_region_index,
+            dep.consumer_region_index,
+        )
+        shared_pairs, incompatible_dims = self._compatible_shared_dim_pairs(
+            producer,
+            consumer,
+            shared_pairs,
+            dep.producer_buffer,
+            dep.consumer_buffer,
+            dep.producer_region_index,
+            dep.consumer_region_index,
+        )
+        producer_only_dims.extend(incompatible_dims)
+
+        declared = self._declared_region_dep(
+            producer,
+            consumer,
+            dep.producer_buffer,
+            dep.consumer_buffer,
+            producer_only_dims,
+            dep.producer_region_index,
+            dep.consumer_region_index,
+        )
+        if declared is not None:
+            return shared_pairs, producer_only_dims, declared, "declared_group"
+
+        fallback = self._last_dim_region_dep(
+            producer,
+            consumer,
+            dep.producer_buffer,
+            dep.consumer_buffer,
+            producer_only_dims,
+        )
+        if fallback is not None:
+            return shared_pairs, producer_only_dims, fallback, "last_dim_fallback"
+
+        producer_region = self._access_region(
+            producer,
+            role="signal",
+            buffer_name=dep.producer_buffer,
+            region_index=dep.producer_region_index,
+        )
+        consumer_region = self._access_region(
+            consumer,
+            role="wait",
+            buffer_name=dep.consumer_buffer,
+            region_index=dep.consumer_region_index,
+        )
+        mode = (
+            "declared_shared"
+            if producer_region is not None and consumer_region is not None
+            else "legacy_dims"
+        )
+        return shared_pairs, producer_only_dims, None, mode
+
+    def dependency_resolutions(self) -> List[DependencyResolution]:
+        """Return how every named dependency edge is lowered.
+
+        This is a host/debug API. It deliberately mirrors the same region
+        selection logic used by ``_resolve_named_formulas`` so tests can assert
+        that a graph is fully region-declared without poking individual private
+        helpers.
+        """
+        self._validate_named_buffer_requirements()
+        if not self._has_named_buffers():
+            return []
+
+        buffer_producers = self._build_buffer_producers(strict=True)
+        tensor_ptr_deps = self._build_tensor_ptr_deps()
+        resolutions: List[DependencyResolution] = []
+
+        for dep in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
+            producer = self._op_records[dep.producer_idx].op
+            consumer = self._op_records[dep.consumer_idx].op
+            shared_pairs, producer_only_dims, _region_dep, mode = self._lower_dependency_region(dep)
+
+            resolutions.append(
+                DependencyResolution(
+                    producer_idx=dep.producer_idx,
+                    consumer_idx=dep.consumer_idx,
+                    producer_op=producer.op_cls.__name__,
+                    consumer_op=consumer.op_cls.__name__,
+                    producer_buffer=dep.producer_buffer,
+                    consumer_buffer=dep.consumer_buffer,
+                    mode=mode,
+                    shared_pairs=tuple(shared_pairs),
+                    producer_only_dims=tuple(producer_only_dims),
+                    producer_region_index=dep.producer_region_index,
+                    consumer_region_index=dep.consumer_region_index,
+                )
+            )
+
+        return resolutions
 
     def dependency_plan(self) -> DependencyPlan:
         """Return the resolved dependency plan for this instruction stream."""
@@ -1531,6 +1849,31 @@ class InstructionStreamBuilder:
             return dep.consumer_buffer in compute_params
         return True
 
+    def _producer_signal_phase(self, dep: _DepPair) -> str:
+        """Return the phase that makes a producer buffer visible to consumers.
+
+        Most full-replay producers publish outputs after the store phase because
+        TMA S->G completion must be waited before signaling. A mixed producer
+        can opt specific buffers into compute-side signaling when those buffers
+        are written directly by compute and do not depend on the store warp.
+        """
+        producer = self._op_records[dep.producer_idx].op
+        op_cls = producer.op_cls
+        buffer_name = dep.producer_buffer
+        if buffer_name in set(getattr(op_cls, "compute_signal_outputs", ())):
+            return "compute"
+        store_like = (
+            set(getattr(op_cls, "_TMA_STORES", set()))
+            | set(getattr(op_cls, "_TMA_REDUCE_STORES", set()))
+            | set(getattr(op_cls, "_PEER_STORES", set()))
+            | set(getattr(op_cls, "_PEER_REDUCE_STORES", set()))
+        )
+        if buffer_name in store_like:
+            return "store"
+        if getattr(op_cls, "store", None) is getattr(Op, "store", None):
+            return "compute"
+        return "store"
+
     @staticmethod
     def _buffer_static_keys(prefix: str, role: str, buffer_name: str, suffix: str) -> Tuple[str, ...]:
         if buffer_name:
@@ -1602,6 +1945,173 @@ class InstructionStreamBuilder:
         producer_only_dims = [producer_dims[canonical_name] for canonical_name in producer_only]
         return shared_pairs, producer_only_dims
 
+    def _access_region(
+        self,
+        op: ScheduledOp,
+        *,
+        role: str,
+        buffer_name: str,
+        region_index: int = 0,
+    ) -> Optional[TensorAccessRegion]:
+        if not buffer_name:
+            return None
+        regions = op.access_regions()
+        if role == "signal":
+            return tensor_access_region_at(regions.writes.get(buffer_name), region_index)
+        if role == "wait":
+            return tensor_access_region_at(regions.reads.get(buffer_name), region_index)
+        raise ValueError(f"unknown access-region role {role!r}")
+
+    def _access_region_count(
+        self,
+        op: ScheduledOp,
+        *,
+        role: str,
+        buffer_name: str,
+    ) -> int:
+        if not buffer_name:
+            return 1
+        regions = op.access_regions()
+        if role == "signal":
+            return max(1, len(iter_tensor_access_regions(regions.writes.get(buffer_name))))
+        if role == "wait":
+            return max(1, len(iter_tensor_access_regions(regions.reads.get(buffer_name))))
+        raise ValueError(f"unknown access-region role {role!r}")
+
+    def _region_axis_canonical_name(
+        self,
+        op: ScheduledOp,
+        *,
+        role: str,
+        buffer_name: str,
+        region: TensorAccessRegion,
+        axis_name: str,
+    ) -> str:
+        axis = region.axis(axis_name)
+        if axis is None:
+            return axis_name
+        if axis.tile_dim is None:
+            return axis.name
+        return self._static_dim_lookup(
+            op,
+            prefix="barrier",
+            role=role,
+            buffer_name=buffer_name,
+            suffix=f"alias_{axis.tile_dim}",
+            fallback=op.dim_aliases.get(axis.tile_dim, axis.name),
+        )
+
+    def _region_tiled_dim_map(
+        self,
+        op: ScheduledOp,
+        *,
+        role: str,
+        buffer_name: str,
+        region: TensorAccessRegion,
+    ) -> Dict[str, str]:
+        canonical_to_dim: Dict[str, str] = {}
+        for axis in region.axes:
+            if axis.tile_dim is None:
+                continue
+            if role == "wait" and axis.name == region.group_index_dim:
+                continue
+            if role == "wait" and axis.name == region.prefix_index_dim:
+                continue
+            if axis.tile_dim not in op.dim_names:
+                raise ValueError(
+                    f"{op.op_cls.__name__} region for {buffer_name!r} maps axis "
+                    f"{axis.name!r} to non-tiled dim {axis.tile_dim!r}"
+                )
+            canonical_name = self._region_axis_canonical_name(
+                op,
+                role=role,
+                buffer_name=buffer_name,
+                region=region,
+                axis_name=axis.name,
+            )
+            canonical_to_dim[canonical_name] = axis.tile_dim
+        return canonical_to_dim
+
+    def _declared_shared_dim_pairs(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        producer_buffer: str = "",
+        consumer_buffer: str = "",
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
+    ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
+        """Resolve dependency dimensions from op-declared access regions."""
+        producer_region = self._access_region(
+            producer,
+            role="signal",
+            buffer_name=producer_buffer,
+            region_index=producer_region_index,
+        )
+        consumer_region = self._access_region(
+            consumer,
+            role="wait",
+            buffer_name=consumer_buffer,
+            region_index=consumer_region_index,
+        )
+        if producer_region is None or consumer_region is None:
+            return self._shared_dim_pairs(
+                producer,
+                consumer,
+                producer_buffer,
+                consumer_buffer,
+            )
+
+        producer_dims = self._region_tiled_dim_map(
+            producer,
+            role="signal",
+            buffer_name=producer_buffer,
+            region=producer_region,
+        )
+        consumer_dims = self._region_tiled_dim_map(
+            consumer,
+            role="wait",
+            buffer_name=consumer_buffer,
+            region=consumer_region,
+        )
+        shared_canonical = set(producer_dims) & set(consumer_dims)
+        if (
+            producer_region.group_dim is not None
+            and (
+                consumer_region.group_index is not None
+                or consumer_region.group_index_dim is not None
+                or consumer_region.group_index_all
+            )
+        ):
+            group_axis = producer_region.axis(producer_region.group_dim)
+            if group_axis is not None and group_axis.tile_dim is not None:
+                group_canonical = self._region_axis_canonical_name(
+                    producer,
+                    role="signal",
+                    buffer_name=producer_buffer,
+                    region=producer_region,
+                    axis_name=producer_region.group_dim,
+                )
+                shared_canonical.discard(group_canonical)
+        if consumer_region.prefix_dim is not None:
+            prefix_axis = producer_region.axis(consumer_region.prefix_dim)
+            if prefix_axis is not None and prefix_axis.tile_dim is not None:
+                prefix_canonical = self._region_axis_canonical_name(
+                    producer,
+                    role="signal",
+                    buffer_name=producer_buffer,
+                    region=producer_region,
+                    axis_name=consumer_region.prefix_dim,
+                )
+                shared_canonical.discard(prefix_canonical)
+        producer_only = set(producer_dims) - shared_canonical
+        shared_pairs = [
+            (canonical_name, producer_dims[canonical_name], consumer_dims[canonical_name])
+            for canonical_name in shared_canonical
+        ]
+        producer_only_dims = [producer_dims[canonical_name] for canonical_name in producer_only]
+        return shared_pairs, producer_only_dims
+
     def _compatible_shared_dim_pairs(
         self,
         producer: ScheduledOp,
@@ -1609,14 +2119,16 @@ class InstructionStreamBuilder:
         shared_pairs: List[Tuple[str, str, str]],
         producer_buffer: str = "",
         consumer_buffer: str = "",
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
     ) -> Tuple[List[Tuple[str, str, str]], List[str]]:
         """Filter shared dims down to those representable by BarrierFormula."""
         incompatible_dims = []
         compatible_pairs = []
 
         for canonical_name, producer_dim, consumer_dim in shared_pairs:
-            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer)
-            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer)
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer, producer_region_index)
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer, consumer_region_index)
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
             producer_tiles = self._barrier_axis_tile_span(
@@ -1625,6 +2137,7 @@ class InstructionStreamBuilder:
                 "signal",
                 producer_buffer,
                 producer.tiles_for_axis(producer_axis),
+                producer_region_index,
             )
             consumer_tiles = self._barrier_axis_tile_span(
                 consumer,
@@ -1632,14 +2145,16 @@ class InstructionStreamBuilder:
                 "wait",
                 consumer_buffer,
                 consumer.tiles_for_axis(consumer_axis),
+                consumer_region_index,
             )
             producer_group_count = self._barrier_group_count(
                 producer,
                 producer_dim,
                 "signal",
                 producer_buffer,
+                producer_region_index,
             )
-            consumer_offset = self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer)
+            consumer_offset = self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer, consumer_region_index)
 
             if (
                 producer_tile_size != consumer_tile_size
@@ -1693,6 +2208,8 @@ class InstructionStreamBuilder:
         producer_only_dims: List[str],
         producer_buffer: str = "",
         consumer_buffer: str = "",
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, int]:
         """Compute divisor vectors plus expected/barrier counts for a dependency edge."""
         producer_divs = [1] * MAX_TILE_DIMS
@@ -1702,8 +2219,8 @@ class InstructionStreamBuilder:
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             producer_axis = producer.dim_names[producer_dim]
             consumer_axis = consumer.dim_names[consumer_dim]
-            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer)
-            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer)
+            producer_tile_size = self._barrier_tile_size(producer, producer_dim, "signal", producer_buffer, producer_region_index)
+            consumer_tile_size = self._barrier_tile_size(consumer, consumer_dim, "wait", consumer_buffer, consumer_region_index)
             if producer_tile_size > consumer_tile_size:
                 consumer_divs[consumer_axis] = producer_tile_size // consumer_tile_size
             elif consumer_tile_size > producer_tile_size:
@@ -1719,12 +2236,14 @@ class InstructionStreamBuilder:
                 producer_dim,
                 "signal",
                 producer_buffer,
+                producer_region_index,
             )
             consumer_group_count = self._barrier_group_count(
                 consumer,
                 consumer_dim,
                 "wait",
                 consumer_buffer,
+                consumer_region_index,
             )
             if producer_group_count is not None:
                 num_barriers *= int(producer_group_count)
@@ -1738,6 +2257,7 @@ class InstructionStreamBuilder:
                         "signal",
                         producer_buffer,
                         producer.tiles_for_axis(producer_axis),
+                        producer_region_index,
                     ),
                     self._barrier_axis_tile_span(
                         consumer,
@@ -1745,13 +2265,22 @@ class InstructionStreamBuilder:
                         "wait",
                         consumer_buffer,
                         consumer.tiles_for_axis(consumer_axis),
+                        consumer_region_index,
                     ),
                 )
 
         if producer_only_dims:
             collapsed = 1
             for producer_dim in producer_only_dims:
-                collapsed *= producer.tiles_for_axis(producer.dim_names[producer_dim])
+                producer_axis = producer.dim_names[producer_dim]
+                collapsed *= self._barrier_axis_tile_span(
+                    producer,
+                    producer_dim,
+                    "signal",
+                    producer_buffer,
+                    producer.tiles_for_axis(producer_axis),
+                    producer_region_index,
+                )
             expected *= collapsed
 
         return tuple(producer_divs), tuple(consumer_divs), expected, num_barriers
@@ -1782,8 +2311,11 @@ class InstructionStreamBuilder:
             consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
         return tuple(producer_coeffs), tuple(consumer_coeffs)
 
-    def _barrier_tile_size(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "") -> int:
+    def _barrier_tile_size(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "", region_index: int = 0) -> int:
         """Return role-specific tile size used only for barrier index mapping."""
+        axis = self._region_axis_for_dim(op, dim, role, buffer_name, region_index)
+        if axis is not None:
+            return int(axis.tile_size)
         return int(
             self._static_dim_lookup(
                 op,
@@ -1798,8 +2330,64 @@ class InstructionStreamBuilder:
             )
         )
 
-    def _barrier_index_offset(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "") -> int:
+    def _region_axis_for_dim(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        region_index: int = 0,
+    ):
+        region = self._access_region(op, role=role, buffer_name=buffer_name, region_index=region_index)
+        if region is None:
+            return None
+        axis = region.axis(dim)
+        if axis is None or axis.tile_dim != dim:
+            return None
+        return axis
+
+    def _region_axis_tile_bounds(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        region_index: int = 0,
+    ) -> Optional[Tuple[int, int]]:
+        axis = self._region_axis_for_dim(op, dim, role, buffer_name, region_index)
+        if axis is None:
+            return None
+        start = int(axis.start)
+        stop = int(axis.stop if axis.stop is not None else axis.extent)
+        tile_size = int(axis.tile_size)
+        origin = int(axis.tile_origin)
+        start_tile = start // tile_size - origin
+        stop_tile = (stop + tile_size - 1) // tile_size - origin
+        return start_tile, stop_tile
+
+    def _region_axis_is_sliced(
+        self,
+        op: ScheduledOp,
+        dim: str,
+        role: str,
+        buffer_name: str,
+        region_index: int = 0,
+    ) -> bool:
+        axis = self._region_axis_for_dim(op, dim, role, buffer_name, region_index)
+        if axis is None:
+            return False
+        stop = int(axis.stop if axis.stop is not None else axis.extent)
+        return int(axis.start) != 0 or stop != int(axis.extent)
+
+    def _barrier_index_offset(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "", region_index: int = 0) -> int:
         """Return role-specific barrier index offset for packed/subset views."""
+        bounds = (
+            self._region_axis_tile_bounds(op, dim, role, buffer_name, region_index)
+            if self._region_axis_is_sliced(op, dim, role, buffer_name, region_index)
+            else None
+        )
+        if bounds is not None:
+            return bounds[0]
         return int(
             self._static_dim_lookup(
                 op,
@@ -1811,7 +2399,12 @@ class InstructionStreamBuilder:
             )
         )
 
-    def _barrier_group_count(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = ""):
+    def _barrier_group_count(self, op: ScheduledOp, dim: str, role: str, buffer_name: str = "", region_index: int = 0):
+        region = self._access_region(op, role=role, buffer_name=buffer_name, region_index=region_index)
+        if region is not None:
+            axis = self._region_axis_for_dim(op, dim, role, buffer_name, region_index)
+            if axis is not None and region.group_dim == axis.name:
+                return region.group_count
         value = self._static_dim_lookup(
             op,
             prefix="barrier",
@@ -1830,7 +2423,12 @@ class InstructionStreamBuilder:
         buffer_name: str,
         bound: str,
         fallback: int,
+        region_index: int = 0,
     ) -> int:
+        if self._region_axis_is_sliced(op, dim, role, buffer_name, region_index):
+            bounds = self._region_axis_tile_bounds(op, dim, role, buffer_name, region_index)
+            if bounds is not None:
+                return bounds[0] if bound == "min" else bounds[1]
         return int(
             self._static_dim_lookup(
                 op,
@@ -1849,7 +2447,10 @@ class InstructionStreamBuilder:
         role: str,
         buffer_name: str,
         bound: str,
+        region_index: int = 0,
     ) -> bool:
+        if self._region_axis_is_sliced(op, dim, role, buffer_name, region_index):
+            return True
         suffix = f"guard_{bound}_{dim}"
         if any(key in op.static_dims for key in self._buffer_static_keys("barrier", role, buffer_name, suffix)):
             return True
@@ -1862,9 +2463,17 @@ class InstructionStreamBuilder:
         role: str,
         buffer_name: str,
         fallback: int,
+        region_index: int = 0,
     ) -> int:
-        guard_min = self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0)
-        guard_max = self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD)
+        bounds = (
+            self._region_axis_tile_bounds(op, dim, role, buffer_name, region_index)
+            if self._region_axis_is_sliced(op, dim, role, buffer_name, region_index)
+            else None
+        )
+        if bounds is not None:
+            return max(0, min(bounds[1], fallback) - max(0, bounds[0]))
+        guard_min = self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0, region_index)
+        guard_max = self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD, region_index)
         if guard_min == 0 and guard_max == BarrierFormula.NO_GUARD:
             return fallback
         return max(0, min(guard_max, fallback) - max(0, guard_min))
@@ -1876,6 +2485,7 @@ class InstructionStreamBuilder:
         buffer_name: str,
         shared_pairs: List[Tuple[str, str, str]],
         pair_index: int,
+        region_index: int = 0,
     ) -> Tuple[int, int, Optional[Tuple[int, ...]]]:
         if not shared_pairs:
             return 0, BarrierFormula.NO_GUARD, None
@@ -1885,11 +2495,11 @@ class InstructionStreamBuilder:
         has_axis_guard = False
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
             dim = producer_dim if pair_index == 1 else consumer_dim
-            mins.append(self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0))
-            maxs.append(self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD))
+            mins.append(self._barrier_guard_bound(op, dim, role, buffer_name, "min", 0, region_index))
+            maxs.append(self._barrier_guard_bound(op, dim, role, buffer_name, "max", BarrierFormula.NO_GUARD, region_index))
             if (
-                self._has_barrier_guard_bound(op, dim, role, buffer_name, "min")
-                or self._has_barrier_guard_bound(op, dim, role, buffer_name, "max")
+                self._has_barrier_guard_bound(op, dim, role, buffer_name, "min", region_index)
+                or self._has_barrier_guard_bound(op, dim, role, buffer_name, "max", region_index)
             ):
                 guard_coeffs[op.dim_names[dim]] = 1
                 has_axis_guard = True
@@ -1904,13 +2514,15 @@ class InstructionStreamBuilder:
         shared_pairs: List[Tuple[str, str, str]],
         producer_buffer: str = "",
         consumer_buffer: str = "",
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
     ) -> Tuple[int, int]:
         """Compute optional constant offsets for shared-dim barrier mappings."""
         producer_offset = 0
         consumer_offset = 0
         for _canonical_name, producer_dim, consumer_dim in shared_pairs:
-            producer_offset += self._barrier_index_offset(producer, producer_dim, "signal", producer_buffer)
-            consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer)
+            producer_offset += self._barrier_index_offset(producer, producer_dim, "signal", producer_buffer, producer_region_index)
+            consumer_offset += self._barrier_index_offset(consumer, consumer_dim, "wait", consumer_buffer, consumer_region_index)
         return producer_offset, consumer_offset
 
     @staticmethod
@@ -1949,6 +2561,8 @@ class InstructionStreamBuilder:
         consumer_guard_min: int,
         consumer_guard_max: int,
         consumer_guard_coeffs: Optional[Tuple[int, ...]],
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
     ) -> Tuple[int, int, int, int, Optional[Tuple[int, ...]], int, int, Optional[Tuple[int, ...]]]:
         """Restrict barrier formulas to the actual overlap of windowed tile domains.
 
@@ -1966,12 +2580,14 @@ class InstructionStreamBuilder:
                 producer_dim,
                 "signal",
                 producer_buffer,
+                producer_region_index,
             )
             consumer_tile_size = self._barrier_tile_size(
                 consumer,
                 consumer_dim,
                 "wait",
                 consumer_buffer,
+                consumer_region_index,
             )
             producer_start = producer.tile_origin_for_axis(producer_axis) * producer_tile_size
             producer_end = producer_start + producer.tiles_for_axis(producer_axis) * producer_tile_size
@@ -2053,7 +2669,9 @@ class InstructionStreamBuilder:
         producer_buffer: str,
         consumer_buffer: str,
         producer_only_dims: List[str],
-    ) -> Optional[_LastDimRegionDep]:
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
+    ) -> Optional[_RegionDep]:
         """Detect full-producer to sliced-consumer dependencies.
 
         This covers the decode MLP pattern where an up/gate op writes
@@ -2121,11 +2739,219 @@ class InstructionStreamBuilder:
         if producer_tiles != group_tiles * group_count:
             return None
 
-        return _LastDimRegionDep(
+        return _RegionDep(
             producer_dim=producer_dim,
             group_index=group_index,
             group_count=group_count,
             group_tiles=group_tiles,
+        )
+
+    def _declared_region_dep(
+        self,
+        producer: ScheduledOp,
+        consumer: ScheduledOp,
+        producer_buffer: str,
+        consumer_buffer: str,
+        producer_only_dims: List[str],
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
+    ) -> Optional[_RegionDep]:
+        """Resolve scheduler-visible groups from op access-region declarations."""
+        producer_region = self._access_region(
+            producer,
+            role="signal",
+            buffer_name=producer_buffer,
+            region_index=producer_region_index,
+        )
+        consumer_region = self._access_region(
+            consumer,
+            role="wait",
+            buffer_name=consumer_buffer,
+            region_index=consumer_region_index,
+        )
+        if (
+            producer_region is None
+            or consumer_region is None
+            or producer_region.group_dim is None
+        ):
+            return None
+        if (
+            consumer_region.group_index_dim is None
+            and consumer_region.group_index is None
+            and not consumer_region.group_index_all
+        ):
+            return None
+
+        producer_axis = producer_region.axis(producer_region.group_dim)
+        if producer_axis is None:
+            raise ValueError(
+                f"{producer.op_cls.__name__} region for {producer_buffer!r} groups "
+                f"unknown axis {producer_region.group_dim!r}"
+            )
+        producer_dim = producer_axis.tile_dim
+        if producer_dim is None:
+            raise ValueError(
+                f"{producer.op_cls.__name__} region group axis "
+                f"{producer_region.group_dim!r} is not tiled"
+            )
+        canonical_group_dim = self._region_axis_canonical_name(
+            producer,
+            role="signal",
+            buffer_name=producer_buffer,
+            region=producer_region,
+            axis_name=producer_region.group_dim,
+        )
+        if producer_dim not in producer_only_dims:
+            raise ValueError(
+                f"{producer.op_cls.__name__} region group axis {canonical_group_dim!r} "
+                f"for buffer {producer_buffer!r} is not producer-only"
+            )
+
+        group_tiles = int(producer_region.group_tiles)
+        if group_tiles <= 0:
+            raise ValueError("region group_tiles must be positive")
+
+        producer_tiles = producer.tiles_for_axis(producer.dim_names[producer_dim])
+        if producer_tiles % group_tiles != 0:
+            raise ValueError(
+                f"region group_tiles={group_tiles} does not divide "
+                f"producer tiles {producer_tiles} for dim '{producer_dim}'"
+            )
+
+        group_count = (
+            producer_tiles // group_tiles
+            if producer_region.group_count is None
+            else int(producer_region.group_count)
+        )
+        if group_count <= 0 or group_count * group_tiles != producer_tiles:
+            raise ValueError(
+                f"region group_count={group_count} and group_tiles={group_tiles} "
+                f"do not cover {producer_tiles} producer tiles"
+            )
+
+        prefix_producer_dim = None
+        prefix_group_count = 1
+        prefix_group_tiles = 1
+        prefix_consumer_dim = None
+        if consumer_region.prefix_dim is not None:
+            prefix_axis = producer_region.axis(consumer_region.prefix_dim)
+            if prefix_axis is None or prefix_axis.tile_dim is None:
+                raise ValueError(
+                    f"{producer.op_cls.__name__} region prefix_dim "
+                    f"{consumer_region.prefix_dim!r} for buffer {producer_buffer!r} "
+                    "is not a tiled producer axis"
+                )
+            prefix_producer_dim = prefix_axis.tile_dim
+            if prefix_producer_dim == producer_dim:
+                raise ValueError("prefix_dim must be distinct from group_dim")
+            if prefix_producer_dim not in producer_only_dims:
+                prefix_canonical = self._region_axis_canonical_name(
+                    producer,
+                    role="signal",
+                    buffer_name=producer_buffer,
+                    region=producer_region,
+                    axis_name=consumer_region.prefix_dim,
+                )
+                raise ValueError(
+                    f"{producer.op_cls.__name__} region prefix axis {prefix_canonical!r} "
+                    f"for buffer {producer_buffer!r} is not producer-only"
+                )
+            prefix_group_tiles = int(consumer_region.prefix_group_tiles)
+            if prefix_group_tiles <= 0:
+                raise ValueError("region prefix_group_tiles must be positive")
+            prefix_producer_tiles = producer.tiles_for_axis(producer.dim_names[prefix_producer_dim])
+            if prefix_producer_tiles % prefix_group_tiles != 0:
+                raise ValueError(
+                    f"region prefix_group_tiles={prefix_group_tiles} does not divide "
+                    f"producer tiles {prefix_producer_tiles} for dim '{prefix_producer_dim}'"
+                )
+            prefix_group_count = (
+                prefix_producer_tiles // prefix_group_tiles
+                if consumer_region.prefix_group_count is None
+                else int(consumer_region.prefix_group_count)
+            )
+            if prefix_group_count <= 0 or prefix_group_count * prefix_group_tiles != prefix_producer_tiles:
+                raise ValueError(
+                    f"region prefix_group_count={prefix_group_count} and "
+                    f"prefix_group_tiles={prefix_group_tiles} do not cover "
+                    f"{prefix_producer_tiles} producer tiles"
+                )
+            prefix_consumer_axis = consumer_region.axis(consumer_region.prefix_index_dim)
+            if prefix_consumer_axis is None or prefix_consumer_axis.tile_dim is None:
+                raise ValueError(
+                    f"{consumer.op_cls.__name__} region prefix_index_dim "
+                    f"{consumer_region.prefix_index_dim!r} for buffer {consumer_buffer!r} "
+                    "is not a tiled consumer axis"
+                )
+            prefix_consumer_dim = prefix_consumer_axis.tile_dim
+
+        if consumer_region.group_index_all:
+            return _RegionDep(
+                producer_dim=producer_dim,
+                group_index=0,
+                group_count=1,
+                group_tiles=producer_tiles,
+                prefix_producer_dim=prefix_producer_dim,
+                prefix_group_count=prefix_group_count,
+                prefix_group_tiles=prefix_group_tiles,
+                prefix_consumer_dim=prefix_consumer_dim,
+            )
+
+        if consumer_region.group_index_dim is not None:
+            consumer_axis = consumer_region.axis(consumer_region.group_index_dim)
+            if consumer_axis is None or consumer_axis.tile_dim is None:
+                raise ValueError(
+                    f"{consumer.op_cls.__name__} region group_index_dim "
+                    f"{consumer_region.group_index_dim!r} for buffer {consumer_buffer!r} "
+                    "is not a tiled consumer axis"
+                )
+            consumer_dim = consumer_axis.tile_dim
+            consumer_group_tiles = int(consumer_region.group_index_group_tiles)
+            if consumer_group_tiles <= 0:
+                raise ValueError("region group_index_group_tiles must be positive")
+            consumer_tiles = consumer.tiles_for_axis(consumer.dim_names[consumer_dim])
+            group_index_offset = int(consumer_region.group_index_offset)
+            if group_index_offset + consumer_tiles * consumer_group_tiles > group_count:
+                consumer_canonical = self._region_axis_canonical_name(
+                    consumer,
+                    role="wait",
+                    buffer_name=consumer_buffer,
+                    region=consumer_region,
+                    axis_name=consumer_region.group_index_dim,
+                )
+                raise ValueError(
+                    f"region consumer axis '{consumer_canonical}' selects groups "
+                    f"[{group_index_offset}, {group_index_offset + consumer_tiles * consumer_group_tiles}) "
+                    f"outside producer group_count={group_count}"
+                )
+            return _RegionDep(
+                producer_dim=producer_dim,
+                group_index=group_index_offset,
+                group_count=group_count,
+                group_tiles=group_tiles,
+                consumer_dim=consumer_dim,
+                consumer_group_tiles=consumer_group_tiles,
+                group_index_mode=consumer_region.group_index_mode,
+                prefix_producer_dim=prefix_producer_dim,
+                prefix_group_count=prefix_group_count,
+                prefix_group_tiles=prefix_group_tiles,
+                prefix_consumer_dim=prefix_consumer_dim,
+            )
+
+        group_index = int(consumer_region.group_index) + int(consumer_region.group_index_offset)
+        if group_index < 0 or group_index >= group_count:
+            raise ValueError(
+                f"region group_index={group_index} outside [0, {group_count})"
+            )
+        return _RegionDep(
+            producer_dim=producer_dim,
+            group_index=group_index,
+            group_count=group_count,
+            group_tiles=group_tiles,
+            prefix_producer_dim=prefix_producer_dim,
+            prefix_group_count=prefix_group_count,
+            prefix_group_tiles=prefix_group_tiles,
+            prefix_consumer_dim=prefix_consumer_dim,
         )
 
     def _barrier_region_formula_components(
@@ -2134,9 +2960,12 @@ class InstructionStreamBuilder:
         consumer: ScheduledOp,
         shared_pairs: List[Tuple[str, str, str]],
         producer_only_dims: List[str],
-        region: _LastDimRegionDep,
+        region: _RegionDep,
         producer_buffer: str,
         consumer_buffer: str,
+        producer_region_index: int = 0,
+        consumer_region_index: int = 0,
+        map_consumer_group: bool = True,
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], int, int, int, int]:
         """Build barrier formulas for one producer-only last-dim region edge."""
         producer_divs, consumer_divs, expected, _ = self._barrier_formula_params(
@@ -2146,20 +2975,40 @@ class InstructionStreamBuilder:
             [],
             producer_buffer,
             consumer_buffer,
+            producer_region_index,
+            consumer_region_index,
         )
         producer_divs = list(producer_divs)
-        producer_divs[producer.dim_names[region.producer_dim]] = region.group_tiles
-        expected *= region.group_tiles
+        consumer_divs = list(consumer_divs)
+        producer_group_span = region.group_tiles
+        consumer_grouped = region.consumer_dim is not None and map_consumer_group
+        if consumer_grouped:
+            producer_group_span *= region.consumer_group_tiles
+        producer_divs[producer.dim_names[region.producer_dim]] = producer_group_span
+        expected *= producer_group_span
+        if region.prefix_producer_dim is not None:
+            producer_divs[producer.dim_names[region.prefix_producer_dim]] = region.prefix_group_tiles
+            expected *= region.prefix_group_tiles
 
         remaining_producer_only = [
-            dim for dim in producer_only_dims if dim != region.producer_dim
+            dim for dim in producer_only_dims
+            if dim != region.producer_dim and dim != region.prefix_producer_dim
         ]
         for producer_dim in remaining_producer_only:
-            expected *= producer.tiles_for_axis(producer.dim_names[producer_dim])
+            producer_axis = producer.dim_names[producer_dim]
+            expected *= self._barrier_axis_tile_span(
+                producer,
+                producer_dim,
+                "signal",
+                producer_buffer,
+                producer.tiles_for_axis(producer_axis),
+                producer_region_index,
+            )
 
         shared_pairs_sorted = sorted(shared_pairs, key=lambda item: item[0])
         shared_strides: Dict[str, int] = {}
-        stride = region.group_count
+        prefix_group_count = region.prefix_group_count if region.prefix_producer_dim is not None else 1
+        stride = region.group_count * prefix_group_count
         for canonical_name, producer_dim, consumer_dim in reversed(shared_pairs_sorted):
             shared_strides[canonical_name] = stride
             producer_axis = producer.dim_names[producer_dim]
@@ -2171,14 +3020,16 @@ class InstructionStreamBuilder:
                     "signal",
                     producer_buffer,
                     producer.tiles_for_axis(producer_axis),
+                    producer_region_index,
                 ),
                 self._barrier_axis_tile_span(
                     consumer,
                     consumer_dim,
-                    "wait",
-                    consumer_buffer,
-                    consumer.tiles_for_axis(consumer_axis),
-                ),
+                        "wait",
+                        consumer_buffer,
+                        consumer.tiles_for_axis(consumer_axis),
+                        consumer_region_index,
+                    ),
             )
 
         producer_coeffs = [0] * MAX_TILE_DIMS
@@ -2187,6 +3038,12 @@ class InstructionStreamBuilder:
             producer_coeffs[producer.dim_names[producer_dim]] = shared_strides[canonical_name]
             consumer_coeffs[consumer.dim_names[consumer_dim]] = shared_strides[canonical_name]
         producer_coeffs[producer.dim_names[region.producer_dim]] = 1
+        if region.prefix_producer_dim is not None:
+            producer_coeffs[producer.dim_names[region.prefix_producer_dim]] = region.group_count
+        if consumer_grouped:
+            consumer_axis = consumer.dim_names[region.consumer_dim]
+            consumer_divs[consumer_axis] = 1
+            consumer_coeffs[consumer_axis] = 1
 
         producer_offset, consumer_offset = self._barrier_formula_offsets(
             producer,
@@ -2194,15 +3051,20 @@ class InstructionStreamBuilder:
             shared_pairs,
             producer_buffer,
             consumer_buffer,
+            producer_region_index,
+            consumer_region_index,
         )
-        consumer_offset += region.group_index
+        if consumer_grouped:
+            consumer_offset += region.group_index // max(1, region.consumer_group_tiles)
+        elif region.consumer_dim is None:
+            consumer_offset += region.group_index
 
         num_barriers = stride
         return (
             tuple(producer_coeffs),
             tuple(consumer_coeffs),
             tuple(producer_divs),
-            consumer_divs,
+            tuple(consumer_divs),
             expected,
             num_barriers,
             producer_offset,
@@ -2237,8 +3099,32 @@ class InstructionStreamBuilder:
         compute_wait_formulas: Dict[int, List[BarrierFormula]] = {
             i: [] for i in range(len(self._op_records))
         }
+        store_signal_formulas: Dict[int, List[BarrierFormula]] = {
+            i: [] for i in range(len(self._op_records))
+        }
+        compute_signal_formulas: Dict[int, List[BarrierFormula]] = {
+            i: [] for i in range(len(self._op_records))
+        }
         barrier_counter = 0
-        signal_family_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], int, int], int] = {}
+        signal_family_cache: Dict[Tuple[int, str, Tuple[int, ...], Tuple[int, ...], int, int], int] = {}
+        controller_wait_keys: Dict[int, Set[Tuple]] = {
+            i: set() for i in range(len(self._op_records))
+        }
+        compute_wait_keys: Dict[int, Set[Tuple]] = {
+            i: set() for i in range(len(self._op_records))
+        }
+
+        def _formula_key(formula: BarrierFormula) -> Tuple:
+            return (
+                formula.base,
+                formula.coeffs,
+                formula.divs,
+                formula.offset,
+                formula.expected,
+                formula.guard_min,
+                formula.guard_max,
+                formula.guard_coeffs,
+            )
 
         for dep in self._resolve_named_dep_pairs(buffer_producers, tensor_ptr_deps):
                 prod_idx = dep.producer_idx
@@ -2249,27 +3135,13 @@ class InstructionStreamBuilder:
                 p_op = producer.op
                 c_op = consumer.op
 
-                shared_pairs, producer_only_dims = self._shared_dim_pairs(
-                    p_op,
-                    c_op,
-                    dep.producer_buffer,
-                    dep.consumer_buffer,
-                )
-                shared_pairs, incompatible_dims = self._compatible_shared_dim_pairs(
-                    p_op,
-                    c_op,
-                    shared_pairs,
-                    dep.producer_buffer,
-                    dep.consumer_buffer,
-                )
-                producer_only_dims.extend(incompatible_dims)
-
-                region_dep = self._last_dim_region_dep(
-                    p_op,
-                    c_op,
-                    dep.producer_buffer,
-                    dep.consumer_buffer,
-                    producer_only_dims,
+                shared_pairs, producer_only_dims, region_dep, _mode = self._lower_dependency_region(dep)
+                prefix_region_dep = (
+                    region_dep is not None
+                    and (
+                        region_dep.group_index_mode == "prefix"
+                        or region_dep.prefix_producer_dim is not None
+                    )
                 )
                 if region_dep is not None:
                     (
@@ -2289,6 +3161,9 @@ class InstructionStreamBuilder:
                         region_dep,
                         dep.producer_buffer,
                         dep.consumer_buffer,
+                        dep.producer_region_index,
+                        dep.consumer_region_index,
+                        map_consumer_group=not prefix_region_dep,
                     )
                 else:
                     producer_divs, consumer_divs, expected, num_barriers = self._barrier_formula_params(
@@ -2298,6 +3173,8 @@ class InstructionStreamBuilder:
                         producer_only_dims,
                         dep.producer_buffer,
                         dep.consumer_buffer,
+                        dep.producer_region_index,
+                        dep.consumer_region_index,
                     )
                     producer_coeffs, consumer_coeffs = self._barrier_formula_coeffs(
                         p_op,
@@ -2310,6 +3187,8 @@ class InstructionStreamBuilder:
                         shared_pairs,
                         dep.producer_buffer,
                         dep.consumer_buffer,
+                        dep.producer_region_index,
+                        dep.consumer_region_index,
                     )
                 producer_guard_min, producer_guard_max, producer_guard_coeffs = self._barrier_formula_guard(
                     p_op,
@@ -2317,13 +3196,43 @@ class InstructionStreamBuilder:
                     dep.producer_buffer,
                     shared_pairs,
                     1,
+                    dep.producer_region_index,
                 )
+                for producer_only_dim in producer_only_dims:
+                    bounds = (
+                        self._region_axis_tile_bounds(
+                            p_op,
+                            producer_only_dim,
+                            "signal",
+                            dep.producer_buffer,
+                            dep.producer_region_index,
+                        )
+                        if self._region_axis_is_sliced(
+                            p_op,
+                            producer_only_dim,
+                            "signal",
+                            dep.producer_buffer,
+                            dep.producer_region_index,
+                        )
+                        else None
+                    )
+                    if bounds is None:
+                        continue
+                    producer_guard_min, producer_guard_max, producer_guard_coeffs = self._merge_axis_guard(
+                        producer_guard_min,
+                        producer_guard_max,
+                        producer_guard_coeffs,
+                        axis=p_op.dim_names[producer_only_dim],
+                        start=bounds[0],
+                        end=bounds[1],
+                    )
                 consumer_guard_min, consumer_guard_max, consumer_guard_coeffs = self._barrier_formula_guard(
                     c_op,
                     "wait",
                     dep.consumer_buffer,
                     shared_pairs,
                     0,
+                    dep.consumer_region_index,
                 )
                 (
                     producer_offset,
@@ -2352,12 +3261,16 @@ class InstructionStreamBuilder:
                     consumer_guard_min,
                     consumer_guard_max,
                     consumer_guard_coeffs,
+                    dep.producer_region_index,
+                    dep.consumer_region_index,
                 )
 
                 # Fan-out consumers can share the same producer-side readiness
                 # counter. Each consumer still keeps its own expected count.
+                signal_phase = self._producer_signal_phase(dep)
                 signal_key = (
                     prod_idx,
+                    signal_phase,
                     producer_coeffs,
                     producer_divs,
                     num_barriers,
@@ -2370,38 +3283,123 @@ class InstructionStreamBuilder:
                 if signal_base is None:
                     signal_base = barrier_counter
                     signal_family_cache[signal_key] = signal_base
-                    formulas[prod_idx][1].append(
-                        BarrierFormula(
-                            base=signal_base,
-                            coeffs=producer_coeffs,
-                            divs=producer_divs,
-                            offset=producer_offset,
-                            guard_min=producer_guard_min,
-                            guard_max=producer_guard_max,
-                            guard_coeffs=producer_guard_coeffs,
-                        )
+                    signal_formula = BarrierFormula(
+                        base=signal_base,
+                        coeffs=producer_coeffs,
+                        divs=producer_divs,
+                        offset=producer_offset,
+                        guard_min=producer_guard_min,
+                        guard_max=producer_guard_max,
+                        guard_coeffs=producer_guard_coeffs,
                     )
+                    formulas[prod_idx][1].append(signal_formula)
+                    if signal_phase == "compute":
+                        compute_signal_formulas[prod_idx].append(signal_formula)
+                    else:
+                        store_signal_formulas[prod_idx].append(signal_formula)
                     barrier_counter += num_barriers
 
-                wait_formula = BarrierFormula(
-                    base=signal_base,
-                    coeffs=consumer_coeffs,
-                    divs=consumer_divs,
-                    offset=consumer_offset,
-                    expected=expected,
-                    guard_min=consumer_guard_min,
-                    guard_max=consumer_guard_max,
-                    guard_coeffs=consumer_guard_coeffs,
-                )
-                if self._dep_wait_can_move_to_compute(dep):
-                    formulas[cons_idx][0].append(wait_formula)
-                    compute_wait_formulas[cons_idx].append(wait_formula)
+                wait_formulas = []
+                if prefix_region_dep:
+                    assert region_dep is not None
+                    if region_dep.prefix_producer_dim is not None:
+                        assert region_dep.prefix_consumer_dim is not None
+                        prefix_consumer_dim = region_dep.prefix_consumer_dim
+                        prefix_group_count = region_dep.prefix_group_count
+                        prefix_offset_stride = region_dep.group_count
+                        producer_prefix_tile_size = self._barrier_tile_size(
+                            p_op,
+                            region_dep.prefix_producer_dim,
+                            "signal",
+                            dep.producer_buffer,
+                            dep.producer_region_index,
+                        )
+                        consumer_prefix_tile_size = self._barrier_tile_size(
+                            c_op,
+                            prefix_consumer_dim,
+                            "wait",
+                            dep.consumer_buffer,
+                            dep.consumer_region_index,
+                        )
+                        prefix_group_span = producer_prefix_tile_size * region_dep.prefix_group_tiles
+                    else:
+                        assert region_dep.consumer_dim is not None
+                        prefix_consumer_dim = region_dep.consumer_dim
+                        prefix_group_count = region_dep.group_count
+                        prefix_offset_stride = 1
+                        producer_prefix_tile_size = self._barrier_tile_size(
+                            p_op,
+                            region_dep.producer_dim,
+                            "signal",
+                            dep.producer_buffer,
+                            dep.producer_region_index,
+                        )
+                        consumer_prefix_tile_size = self._barrier_tile_size(
+                            c_op,
+                            prefix_consumer_dim,
+                            "wait",
+                            dep.consumer_buffer,
+                            dep.consumer_region_index,
+                        )
+                        prefix_group_span = producer_prefix_tile_size * region_dep.group_tiles
+                    consumer_axis = c_op.dim_names[prefix_consumer_dim]
+                    axis_guard_coeffs = [0] * MAX_TILE_DIMS
+                    axis_guard_coeffs[consumer_axis] = 1
+                    axis_guard_coeffs_tuple = tuple(axis_guard_coeffs)
+                    if (
+                        consumer_guard_coeffs is not None
+                        and consumer_guard_coeffs != axis_guard_coeffs_tuple
+                    ):
+                        raise ValueError(
+                            "prefix region dependencies require consumer guards that "
+                            f"can be expressed on axis {prefix_consumer_dim!r}"
+                        )
+                    for group_idx in range(prefix_group_count):
+                        group_start = group_idx * prefix_group_span
+                        guard_start = group_start // consumer_prefix_tile_size
+                        wait_formulas.append(
+                            BarrierFormula(
+                                base=signal_base,
+                                coeffs=consumer_coeffs,
+                                divs=consumer_divs,
+                                offset=consumer_offset + group_idx * prefix_offset_stride,
+                                expected=expected,
+                                guard_min=max(consumer_guard_min, guard_start),
+                                guard_max=consumer_guard_max,
+                                guard_coeffs=axis_guard_coeffs_tuple,
+                            )
+                        )
                 else:
-                    formulas[cons_idx][0].append(wait_formula)
-                    controller_wait_formulas[cons_idx].append(wait_formula)
+                    wait_formulas.append(
+                        BarrierFormula(
+                            base=signal_base,
+                            coeffs=consumer_coeffs,
+                            divs=consumer_divs,
+                            offset=consumer_offset,
+                            expected=expected,
+                            guard_min=consumer_guard_min,
+                            guard_max=consumer_guard_max,
+                            guard_coeffs=consumer_guard_coeffs,
+                        )
+                    )
+
+                for wait_formula in wait_formulas:
+                    wait_key = _formula_key(wait_formula)
+                    if self._dep_wait_can_move_to_compute(dep):
+                        if wait_key not in controller_wait_keys[cons_idx] and wait_key not in compute_wait_keys[cons_idx]:
+                            formulas[cons_idx][0].append(wait_formula)
+                            compute_wait_formulas[cons_idx].append(wait_formula)
+                            compute_wait_keys[cons_idx].add(wait_key)
+                    else:
+                        if wait_key not in controller_wait_keys[cons_idx]:
+                            formulas[cons_idx][0].append(wait_formula)
+                            controller_wait_formulas[cons_idx].append(wait_formula)
+                            controller_wait_keys[cons_idx].add(wait_key)
 
         self._cached_controller_wait_formulas = controller_wait_formulas
         self._cached_compute_wait_formulas = compute_wait_formulas
+        self._cached_store_signal_formulas = store_signal_formulas
+        self._cached_compute_signal_formulas = compute_signal_formulas
         return formulas, barrier_counter
 
     def build(self, scheduler: Optional[TileScheduler] = None) -> List[TileInstruction]:
@@ -2424,6 +3422,14 @@ class InstructionStreamBuilder:
 
         if hasattr(scheduler, "schedule_with_formulas"):
             schedule_formulas = plan.formulas
+            if getattr(scheduler, "readiness_wait_phase", "all") == "controller":
+                schedule_formulas = {
+                    op_idx: (
+                        plan.controller_wait_formulas.get(op_idx, []),
+                        signals,
+                    )
+                    for op_idx, (_waits, signals) in plan.formulas.items()
+                }
             instructions = scheduler.schedule_with_formulas(
                 self._op_records,
                 plan.edges,
@@ -2724,11 +3730,51 @@ class InstructionStreamBuilder:
         """
         import torch
 
-        formulas = self.dependency_plan().formulas
-        raw_signal_data = [
-            self._build_signal_info_entry(instr, formulas)
+        plan = self.dependency_plan()
+        store_signal_formulas = (
+            self._cached_store_signal_formulas
+            if self._cached_store_signal_formulas is not None
+            else {op_idx: signals for op_idx, (_waits, signals) in plan.formulas.items()}
+        )
+        compute_signal_formulas = (
+            self._cached_compute_signal_formulas
+            if self._cached_compute_signal_formulas is not None
+            else {i: [] for i in range(len(self._op_records))}
+        )
+        raw_store_signal_data = [
+            self._build_signal_info_entry(
+                instr,
+                {instr.op_idx: ([], store_signal_formulas.get(instr.op_idx, []))}
+                if instr.op_idx != TileInstruction.END_MARKER
+                else {},
+            )
             for instr in instructions
         ]
+        raw_compute_signal_data = [
+            self._build_signal_info_entry(
+                instr,
+                {instr.op_idx: ([], compute_signal_formulas.get(instr.op_idx, []))}
+                if instr.op_idx != TileInstruction.END_MARKER
+                else {},
+            )
+            for instr in instructions
+        ]
+        store_counts = self._max_counts_by_op(
+            instructions, raw_store_signal_data, pair_width=1
+        )
+        compute_counts = self._max_counts_by_op(
+            instructions, raw_compute_signal_data, pair_width=1
+        )
+        raw_signal_data = []
+        for instr, store_entry, compute_entry in zip(
+            instructions, raw_store_signal_data, raw_compute_signal_data
+        ):
+            store_width = 0 if instr.op_idx == TileInstruction.END_MARKER else store_counts.get(instr.op_idx, 0)
+            padded_store = list(store_entry)
+            while len(padded_store) < store_width:
+                padded_store.append(-1)
+            raw_signal_data.append(padded_store + list(compute_entry))
+
         max_signals = max(1, max((len(entry) for entry in raw_signal_data), default=0))
         signal_data = []
         for entry in raw_signal_data:
@@ -2736,7 +3782,8 @@ class InstructionStreamBuilder:
             while len(padded) < max_signals:
                 padded.append(-1)
             signal_data.append(padded)
-        self._op_signal_counts = self._max_counts_by_op(instructions, raw_signal_data, pair_width=1)
+        self._op_signal_counts = store_counts
+        self._op_compute_signal_counts = compute_counts
 
         return torch.tensor(signal_data, dtype=torch.int32, device=device)
 
@@ -2833,6 +3880,7 @@ class InstructionStreamBuilder:
 __all__ = [
     "BarrierFormula",
     "DependencyPlan",
+    "DependencyResolution",
     "INSTRUCTION_WORDS",
     "INSTR_BARRIER_META_IDX",
     "INSTR_OP_IDX",

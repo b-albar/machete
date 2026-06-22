@@ -2,10 +2,11 @@
 """Validation suite for multi-page requests + per-page release mbarriers.
 
 Exercises the decoupled physical-page allocator added to the phased ring
-replay: an op declares it wants N (>1) shared-memory pages, receives a
-contiguous N-page region (sub-page i at page_ptr + i*machete_aligned_page_size),
-and each physical page is released independently via its own page_finished
-mbarrier — either after compute (early/out-of-order) or after store.
+replay: an op declares it wants N (>1) shared-memory pages and receives
+`page_ptr` as a per-slot table of N (possibly non-contiguous) page addresses;
+it reads page i via `self.page_address(page_ptr, i)`. Each physical page is
+released independently via its own page_finished mbarrier — either after
+compute (early/out-of-order) or after store.
 
 The `DualPageOp` below routes data x -> page1 -> page0 with a "trap": it writes
 x+1 into page1, clobbers page0, then copies page1 back into page0. The result is
@@ -28,7 +29,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from machete.megakernel.megakernel import Megakernel, MegakernelConfig
 from machete.megakernel.ops import Op
-from machete.megakernel.paged_memory import NPageLayout, ld_shared_i32, st_shared_i32
+from machete.megakernel.paged_memory import NPageLayout
 from machete.megakernel.interpreter import mbarrier_arrive_expect_tx
 from machete.utils.testing import is_hopper_available
 
@@ -45,8 +46,9 @@ TRAP = -999.0
 class DualPageOp(Op):
     """x + 1 routed through a second, early-released page (distinctness trap).
 
-    Requests 2 pages. page0 (page_ptr) is TMA-loaded with x and TMA-stored as y.
-    page1 (page_ptr + aligned_page_size) is scratch, released after compute.
+    Requests 2 pages. page0 is TMA-loaded with x and TMA-stored as y; page1 is
+    scratch, released after compute. Addresses come from the per-slot table via
+    self.page_address(page_ptr, i) — the two pages may be non-contiguous.
     """
 
     reads = {"x": (None, ("M", "N"))}
@@ -65,8 +67,9 @@ class DualPageOp(Op):
 
     @cute.jit
     def load(self, page_ptr, tile_M, x_tma, x_tma_gmem, work_mbar):
+        # page_ptr is the per-slot page-address table; page 0 is the data page.
         sA = cute.make_tensor(
-            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 0), cute.AddressSpace.smem),
             cute.make_layout((self.N, self.tile_size_M)),
         )
         gA = cute.local_tile(x_tma_gmem, (self.N, self.tile_size_M), (None, None))
@@ -85,17 +88,14 @@ class DualPageOp(Op):
     def compute(self, page_ptr, tile_M, x, y):
         tidx = cute.arch.thread_idx()[0]
         total_elems = self.tile_size_M * self.N
-        # page0 holds x (from load); page1 is the contiguous next physical page.
+        # page0 holds x (from load); page1 is a second, possibly non-contiguous
+        # physical page — both addresses come from the per-slot table.
         s0 = cute.make_tensor(
-            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 0), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
         s1 = cute.make_tensor(
-            cute.make_ptr(
-                self.x_dtype,
-                page_ptr + Int32(self.machete_aligned_page_size),
-                cute.AddressSpace.smem,
-            ),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 1), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
         one = self.x_dtype(1.0)
@@ -108,7 +108,7 @@ class DualPageOp(Op):
     @cute.jit
     def store(self, page_ptr, tile_M, y_tma, y_tma_gmem):
         sA = cute.make_tensor(
-            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.y_dtype, self.page_address(page_ptr, 0), cute.AddressSpace.smem),
             cute.make_layout((self.N, self.tile_size_M)),
         )
         gA = cute.local_tile(y_tma_gmem, (self.N, self.tile_size_M), (None, None))
@@ -187,15 +187,11 @@ class StoreReadsSecondPageOp(DualPageOp):
         tidx = cute.arch.thread_idx()[0]
         total_elems = self.tile_size_M * self.N
         s0 = cute.make_tensor(
-            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 0), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
         s1 = cute.make_tensor(
-            cute.make_ptr(
-                self.x_dtype,
-                page_ptr + Int32(self.machete_aligned_page_size),
-                cute.AddressSpace.smem,
-            ),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 1), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
         three = self.x_dtype(3.0)
@@ -207,11 +203,7 @@ class StoreReadsSecondPageOp(DualPageOp):
     @cute.jit
     def store(self, page_ptr, tile_M, y_tma, y_tma_gmem):
         sA = cute.make_tensor(
-            cute.make_ptr(
-                self.y_dtype,
-                page_ptr + Int32(self.machete_aligned_page_size),
-                cute.AddressSpace.smem,
-            ),
+            cute.make_ptr(self.y_dtype, self.page_address(page_ptr, 1), cute.AddressSpace.smem),
             cute.make_layout((self.N, self.tile_size_M)),
         )
         gA = cute.local_tile(y_tma_gmem, (self.N, self.tile_size_M), (None, None))
@@ -224,54 +216,54 @@ class StoreReadsSecondPageOp(DualPageOp):
             cute.copy(y_tma, tAsA, tAgA[(None, 0, tile_M)])
 
 
-class StoreStepReadsSecondPageOp(StoreReadsSecondPageOp):
-    """Exercise store_step state while page1 remains live until store release."""
+class ManualComputeReleaseOp(DualPageOp):
+    """Release page1 explicitly from inside compute after its last read."""
 
-    enable_store_step_by_default = True
+    @classmethod
+    def page_release_after_compute_mask(cls, page_size: int) -> int:
+        return 0
 
-    def store_step_count(self) -> int:
-        return 2
+    @classmethod
+    def page_release_inside_compute_mask(cls, page_size: int) -> int:
+        return 0b10
 
     @cute.jit
-    def store_step(
+    def compute(
         self,
         page_ptr,
         tile_M,
-        y_tma,
-        y_tma_gmem,
-        store_state_ptr,
+        x,
+        y,
+        page_release_table_ptr,
+        page_release_page_base,
+        page_release_mbar_base,
+        page_release_mbar_stride,
+        page_release_page_size,
     ):
-        state = ld_shared_i32(store_state_ptr)
+        tidx = cute.arch.thread_idx()[0]
         total_elems = self.tile_size_M * self.N
         s0 = cute.make_tensor(
-            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 0), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
         s1 = cute.make_tensor(
-            cute.make_ptr(
-                self.y_dtype,
-                page_ptr + Int32(self.machete_aligned_page_size),
-                cute.AddressSpace.smem,
-            ),
+            cute.make_ptr(self.x_dtype, self.page_address(page_ptr, 1), cute.AddressSpace.smem),
             cute.make_layout((total_elems,)),
         )
-        if state == Int32(0):
-            for i in range(total_elems):
-                s0[i] = s1[i]
-            st_shared_i32(store_state_ptr, Int32(1))
-        if state == Int32(1):
-            sA = cute.make_tensor(
-                cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
-                cute.make_layout((self.N, self.tile_size_M)),
-            )
-            gA = cute.local_tile(y_tma_gmem, (self.N, self.tile_size_M), (None, None))
-            tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
-                y_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sA, 0, 2),
-                cute.group_modes(gA, 0, 2),
-            )
-            cute.copy(y_tma, tAsA, tAgA[(None, 0, tile_M)])
-            st_shared_i32(store_state_ptr, Int32(2))
+        one = self.x_dtype(1.0)
+        trap = self.x_dtype(TRAP)
+        for i in range(tidx, total_elems, self.threads_per_row):
+            s1[i] = s0[i] + one
+            s0[i] = trap
+            s0[i] = s1[i]
+        self.release_compute_page_sync(
+            1,
+            page_release_table_ptr,
+            page_release_page_base,
+            page_release_mbar_base,
+            page_release_mbar_stride,
+            page_release_page_size,
+        )
 
 
 class _NoPageMultiPageOp(DualPageOp):
@@ -334,9 +326,10 @@ class TestMultiPageAllocator:
         )
         torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
-    def test_skip_on_wrap_tight_ring(self):
-        """3-page ring with N=2: the allocator must skip the wrap (pages {0,1}
-        only) and never straddle the boundary, across many tiles."""
+    def test_wrap_noncontiguous_tight_ring(self):
+        """3-page ring with N=2: the rolling cursor wraps, so a tile's two pages
+        become non-contiguous (e.g. {2,0}). The page-address table must still
+        deliver them correctly across many tiles."""
         x, y = self._run(
             TILE_M * 6, config=MegakernelConfig(num_pages=3, page_size=16384)
         )
@@ -372,14 +365,14 @@ class TestMultiPageAllocator:
         )
         torch.testing.assert_close(y, x + 3.0, atol=1e-3, rtol=1e-3)
 
-    def test_store_step_can_read_second_page(self):
-        """Stepped store copies page1 to page0, then TMA-stores in a later step."""
+    def test_page_can_be_released_inside_compute(self):
+        """Manual compute release excludes page1 from automatic release paths."""
         x, y = self._run(
-            TILE_M * 4,
-            op_cls=StoreStepReadsSecondPageOp,
+            TILE_M * 6,
+            op_cls=ManualComputeReleaseOp,
             config=MegakernelConfig(num_pages=3, page_size=16384),
         )
-        torch.testing.assert_close(y, x + 3.0, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(y, x + 1.0, atol=1e-3, rtol=1e-3)
 
     def test_requires_enough_pages(self):
         """An op requesting more pages than fit must raise, not silently corrupt."""

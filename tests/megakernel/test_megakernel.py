@@ -175,28 +175,6 @@ class TestMegakernel:
         assert RMSNormOp.inline_phases == all_thin
         assert GLUBwdOp.inline_phases == ("compute",)
 
-    def test_compute_sync_policy_is_op_owned(self):
-        """CTA compute sync is derived from op requirements."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-
-        class DefaultSyncOp(Op):
-            OUTPUTS = ["x"]
-
-        class SyncOp(Op):
-            OUTPUTS = ["y"]
-            sync_compute_warps_after_tile = True
-
-        assert not Megakernel(
-            [ScheduledOp(DefaultSyncOp, tile_counts=(1,))],
-            config=MegakernelConfig(num_sms=1),
-            device="cpu",
-        )._sync_compute_warps_after_tile()
-        assert Megakernel(
-            [ScheduledOp(DefaultSyncOp, tile_counts=(1,)), ScheduledOp(SyncOp, tile_counts=(1,))],
-            config=MegakernelConfig(num_sms=1),
-            device="cpu",
-        )._sync_compute_warps_after_tile()
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):
         """Test that validation checks for Hopper+ Architecture."""

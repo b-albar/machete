@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "machete"
 version = "0.1"
-description = "Custom kernels in CuteDSL and applications"
+description = "A framework for megakernels"
 requires-python = ">=3.10"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -83,7 +83,6 @@ markers = [
     "gpu: tests that exercise CUDA kernels or device runtime behavior",
     "kernels: kernel-level tests under tests/kernels",
     "megakernel: megakernel framework tests under tests/megakernel",
-    "patching: model patching/integration tests under tests/patching and tests/test_patch.py",
     "unit: fast host-side or narrowly scoped behavioral coverage",
     "smoke: compile-and-run sanity coverage for maintained default paths",
     "integration: multi-op, model, or cross-subsystem coverage",

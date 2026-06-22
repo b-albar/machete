@@ -18,7 +18,7 @@ from cutlass import Float32, Int32, const_expr
 from machete.kernels.gemm import GemmOp
 from machete.kernels.gemm.gemm import _gemm_epilogue_store_no_mbar_inval_helper
 from machete.kernels.qknorm_rope import QKNormRopeOp as _BaseQKNormRopeOp
-from machete.kernels.qknorm_rope.qknorm_rope import CopyBulkS2GOp, group_bulk_copy_modes
+from cutlass.cute.nvgpu.cpasync import CopyBulkS2GOp
 from machete.megakernel.interpreter import (
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
@@ -1561,6 +1561,8 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
         )
         with cute.arch.elect_one():
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
 
         # Phase 2: accumulate per-head chunk sums of squares for Q/K normalization.
         head = tile_N // Int32(self.head_chunks)
@@ -2754,7 +2756,8 @@ class Qwen3_5QKNormRopeKCacheStoreSm120Op(_BaseQKNormRopeOp):
                     + head_start * Int32(self.dst_k_stride_H),
                     cute.make_layout((self.q_row_elems,)),
                 )
-                ssrc_k, kdst = group_bulk_copy_modes(s_tile, dst_k_tile)
+                ssrc_k = cute.group_modes(s_tile, 0, 1)
+                kdst = cute.group_modes(dst_k_tile, 0, 1)
                 cute.copy(s2g, ssrc_k, kdst)
 
 

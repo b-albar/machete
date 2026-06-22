@@ -82,24 +82,26 @@ def bench_flash_decoding(H, M, N, D, page_size):
     torch.cuda.synchronize()
 
     if is_hopper_or_newer() and CUTLASS_AVAILABLE:
-        # Standard FA (single CTA per head)
-        try:
-            o_fa = torch.zeros_like(q)
-            ops_fa = FlashAttentionSm120Op.schedule(
-                q=q, k=k, v=v, o=o_fa, page_size=page_size,
-            )
-            config_fa = FlashAttentionSm120Op.kernel_config(ops_fa)
-            kernel_fa = Megakernel(ops_fa, config=config_fa)
-            with contextlib.redirect_stdout(io.StringIO()):
-                kernel_fa.run()
-            torch.cuda.synchronize()
-            _check_close("fa_mega", o_fa, ref)
-            funcs["fa_mega"] = kernel_fa.bench_spec(
-                setup_fn=lambda o=o_fa: o.zero_(),
-                keep_alive=[q, k, v, o_fa],
-            )
-        except Exception as e:
-            print(f"  FA megakernel failed: {e}")
+        # Standard direct FA (single CTA per head). The generic direct op is a
+        # D<=64 baseline; D128 decode is covered by flash_dec below.
+        if D <= FlashAttentionSm120Op.max_supported_D:
+            try:
+                o_fa = torch.zeros_like(q)
+                ops_fa = FlashAttentionSm120Op.schedule(
+                    q=q, k=k, v=v, o=o_fa, page_size=page_size,
+                )
+                config_fa = FlashAttentionSm120Op.kernel_config(ops_fa)
+                kernel_fa = Megakernel(ops_fa, config=config_fa)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    kernel_fa.run()
+                torch.cuda.synchronize()
+                _check_close("fa_mega", o_fa, ref)
+                funcs["fa_mega"] = kernel_fa.bench_spec(
+                    setup_fn=lambda o=o_fa: o.zero_(),
+                    keep_alive=[q, k, v, o_fa],
+                )
+            except Exception as e:
+                print(f"  FA megakernel failed: {e}")
 
         # Flash Decoding (split-KV, multi-CTA, cp.async K/V)
         try:

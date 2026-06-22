@@ -113,7 +113,7 @@ def build_kernel_loop_source(
             return f"{fn_name}({call_args}, {extra_params})"
 
         body = re.sub(
-            r"(dispatch_(?:store_step|load|compute|store|communicate))\(([^)]*)\)",
+            r"(dispatch_(?:load|compute|store|communicate))\(([^)]*)\)",
             _rewrite_dispatch,
             body,
         )

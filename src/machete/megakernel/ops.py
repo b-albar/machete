@@ -34,7 +34,7 @@ Shared config helpers intentionally mirror common CuTe DSL patterns:
 import math
 import struct
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -42,7 +42,8 @@ import torch
 from cutlass import Int32
 
 from .dim_windows import parse_dim_windows, resolve_schedule_domain, window_tensor_metas
-from .interpreter import ld_global_i32, ld_global_i64
+from .interpreter import ld_global_i32, ld_global_i64, mbarrier_arrive, named_barrier_sync
+from .paged_memory import ld_shared_i32
 
 
 # =============================================================================
@@ -321,6 +322,126 @@ class InstructionPageProtocol:
 
 
 @dataclass(frozen=True)
+class RegionAxis:
+    """One logical axis of an op-declared tensor access region.
+
+    ``name`` is the dependency-visible logical name. ``tile_dim`` is the
+    scheduled tile dimension that traverses this axis, when the region is tiled.
+    This keeps execution tiles and dependency regions in one declared view.
+    """
+
+    name: str
+    extent: int = 1
+    tile_dim: Optional[str] = None
+    tile_size: int = 1
+    tile_origin: int = 0
+    start: int = 0
+    stop: Optional[int] = None
+
+    def __post_init__(self):
+        if self.extent < 0:
+            raise ValueError(f"region axis {self.name!r} extent must be non-negative")
+        if self.tile_size < 1:
+            raise ValueError(f"region axis {self.name!r} tile_size must be >= 1")
+        if self.tile_origin < 0:
+            raise ValueError(f"region axis {self.name!r} tile_origin must be >= 0")
+        if self.start < 0:
+            raise ValueError(f"region axis {self.name!r} start must be >= 0")
+        if self.stop is not None and self.stop < self.start:
+            raise ValueError(f"region axis {self.name!r} stop must be >= start")
+
+
+@dataclass(frozen=True)
+class TensorAccessRegion:
+    """Read or write region for one declared tensor.
+
+    Region grouping refines a producer-only tiled axis into scheduler-visible
+    regions. Consumers can either wait on a fixed ``group_index`` or map one of
+    their own tiled axes to producer groups with ``group_index_dim``.  The
+    default mapping is exact.  ``group_index_mode="prefix"`` makes consumer tile
+    ``i`` wait on all producer groups up to the mapped group for causal prefix
+    dependencies.
+    """
+
+    tensor: str
+    axes: Tuple[RegionAxis, ...]
+    group_dim: Optional[str] = None
+    group_tiles: int = 1
+    group_count: Optional[int] = None
+    group_index: Optional[int] = None
+    group_index_offset: int = 0
+    group_index_dim: Optional[str] = None
+    group_index_group_tiles: int = 1
+    group_index_mode: str = "exact"
+    group_index_all: bool = False
+    prefix_dim: Optional[str] = None
+    prefix_index_dim: Optional[str] = None
+    prefix_group_tiles: int = 1
+    prefix_group_count: Optional[int] = None
+
+    def __post_init__(self):
+        if self.group_tiles < 1:
+            raise ValueError("TensorAccessRegion.group_tiles must be >= 1")
+        if self.group_count is not None and self.group_count < 1:
+            raise ValueError("TensorAccessRegion.group_count must be >= 1")
+        if self.group_index is not None and self.group_index < 0:
+            raise ValueError("TensorAccessRegion.group_index must be >= 0")
+        if self.group_index_offset < 0:
+            raise ValueError("TensorAccessRegion.group_index_offset must be >= 0")
+        if self.group_index_group_tiles < 1:
+            raise ValueError("TensorAccessRegion.group_index_group_tiles must be >= 1")
+        if self.group_index_mode not in ("exact", "prefix"):
+            raise ValueError("TensorAccessRegion.group_index_mode must be 'exact' or 'prefix'")
+        if self.group_index_mode == "prefix" and self.group_index_dim is None:
+            raise ValueError("group_index_mode='prefix' requires group_index_dim")
+        if self.prefix_group_tiles < 1:
+            raise ValueError("TensorAccessRegion.prefix_group_tiles must be >= 1")
+        if self.prefix_group_count is not None and self.prefix_group_count < 1:
+            raise ValueError("TensorAccessRegion.prefix_group_count must be >= 1")
+        if (self.prefix_dim is None) != (self.prefix_index_dim is None):
+            raise ValueError("prefix_dim and prefix_index_dim must be specified together")
+        if self.group_index is not None and self.group_index_dim is not None:
+            raise ValueError("group_index and group_index_dim are mutually exclusive")
+        if self.group_index_all and (self.group_index is not None or self.group_index_dim is not None):
+            raise ValueError("group_index_all is mutually exclusive with group_index/group_index_dim")
+
+    def axis(self, name: str) -> Optional[RegionAxis]:
+        for axis in self.axes:
+            if axis.name == name or axis.tile_dim == name:
+                return axis
+        return None
+
+
+@dataclass(frozen=True)
+class AccessRegions:
+    """Dependency-visible read/write regions declared by one scheduled op."""
+
+    reads: Dict[str, Union[TensorAccessRegion, Tuple[TensorAccessRegion, ...], List[TensorAccessRegion]]] = field(default_factory=dict)
+    writes: Dict[str, Union[TensorAccessRegion, Tuple[TensorAccessRegion, ...], List[TensorAccessRegion]]] = field(default_factory=dict)
+
+
+def iter_tensor_access_regions(
+    access: Optional[Union[TensorAccessRegion, Tuple[TensorAccessRegion, ...], List[TensorAccessRegion]]]
+) -> Tuple[TensorAccessRegion, ...]:
+    """Normalize one access-region declaration to a tuple of regions."""
+    if access is None:
+        return ()
+    if isinstance(access, TensorAccessRegion):
+        return (access,)
+    return tuple(access)
+
+
+def tensor_access_region_at(
+    access: Optional[Union[TensorAccessRegion, Tuple[TensorAccessRegion, ...], List[TensorAccessRegion]]],
+    index: int = 0,
+) -> Optional[TensorAccessRegion]:
+    regions = iter_tensor_access_regions(access)
+    if index < 0 or index >= len(regions):
+        return None
+    return regions[index]
+
+
+@dataclass(frozen=True)
 class PipelineABI:
     """Execution ABI for ops that declare ``pipeline`` resources.
 
@@ -586,6 +707,45 @@ def _tensor_storage_span(meta: TensorMeta) -> Optional[Tuple[int, int]]:
     return (lo, hi + 1)
 
 
+def _default_tensor_access_region(op, tensor_name: str, dims: Tuple[str, ...]) -> TensorAccessRegion:
+    """Build the default declared access region for one scheduled tensor."""
+    meta = op.tensor_metas.get(tensor_name)
+    axes: List[RegionAxis] = []
+    for axis_idx, dim_name in enumerate(dims):
+        if meta is not None and axis_idx < len(meta.shape):
+            extent = int(meta.shape[axis_idx])
+        else:
+            extent = int(op.static_dims.get(dim_name, 1))
+        tile_dim = dim_name if dim_name in op.dim_names else None
+        tile_size = int(op.tile_sizes.get(dim_name, max(1, extent))) if tile_dim else max(1, extent)
+        tile_origin = int(op.tile_origins.get(dim_name, 0)) if tile_dim else 0
+        axes.append(
+            RegionAxis(
+                name=dim_name,
+                extent=extent,
+                tile_dim=tile_dim,
+                tile_size=tile_size,
+                tile_origin=tile_origin,
+                start=0,
+                stop=extent,
+            )
+        )
+    return TensorAccessRegion(tensor=tensor_name, axes=tuple(axes))
+
+
+def _default_access_regions(op) -> AccessRegions:
+    """Infer dependency regions from the op's normal tensor/tile declarations."""
+    reads: Dict[str, TensorAccessRegion] = {}
+    writes: Dict[str, TensorAccessRegion] = {}
+    for tensor_name, _, dims in getattr(op.op_cls, "_UNIQUE_TENSORS", ()):
+        region = _default_tensor_access_region(op, tensor_name, tuple(dims))
+        if tensor_name in getattr(op.op_cls, "reads", {}):
+            reads[tensor_name] = region
+        if tensor_name in getattr(op.op_cls, "writes", {}):
+            writes[tensor_name] = region
+    return AccessRegions(reads=reads, writes=writes)
+
+
 def _parse_dims(dims) -> List[str]:
     """Parse dimension specification into a list of dimension names.
 
@@ -842,6 +1002,7 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
         "_TMA_COMPUTE_LOADS": set(getattr(cls, "tma_compute_loads", set())),
         "_TMA_STORES": set(getattr(cls, "tma_stores", set())),
         "_TMA_COMPUTE_STORES": set(getattr(cls, "tma_compute_stores", set())),
+        "_TMA_COMPUTE_REDUCE_STORES": set(getattr(cls, "tma_compute_reduce_stores", set())),
         "_TMA_REDUCE_STORES": set(getattr(cls, "tma_reduce_stores", set())),
         "_COMPUTE_REDUCE_STORES": set(getattr(cls, "compute_reduce_stores", set())),
         "_PEER_STORES": set(getattr(cls, "peer_stores", set())),
@@ -860,6 +1021,12 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
         transfer_sets["_TMA_COMPUTE_STORES"],
         write_names,
         "tma_compute_stores",
+        "writes",
+    )
+    _validate_tensor_set(
+        transfer_sets["_TMA_COMPUTE_REDUCE_STORES"],
+        write_names,
+        "tma_compute_reduce_stores",
         "writes",
     )
     _validate_tensor_set(
@@ -887,13 +1054,14 @@ def _resolve_transfer_tensor_sets(cls, reads, writes):
 def _collect_tma_tensor_dims(unique_tensors, transfer_sets):
     """Map each TMA-capable tensor name to its declared dimension list."""
     tensor_dims_map = {name: dims for name, _, dims in unique_tensors}
-    # compute_reduce_stores is scheduling metadata for compute-side atomics; it
-    # does not require TMA descriptor generation.
+    # compute_reduce_stores is scheduling metadata for scalar compute-side
+    # atomics; it does not require TMA descriptor generation.
     tma_tensor_names = (
         transfer_sets["_TMA_LOADS"]
         | transfer_sets["_TMA_COMPUTE_LOADS"]
         | transfer_sets["_TMA_STORES"]
         | transfer_sets["_TMA_COMPUTE_STORES"]
+        | transfer_sets["_TMA_COMPUTE_REDUCE_STORES"]
         | transfer_sets["_TMA_REDUCE_STORES"]
         | transfer_sets["_PEER_STORES"]
         | transfer_sets["_PEER_REDUCE_STORES"]
@@ -1076,7 +1244,11 @@ def _process_op_declarations(cls):
         if phase == "load":
             tma_names = cls._TMA_LOADS
         elif phase == "compute":
-            tma_names = cls._TMA_COMPUTE_LOADS | cls._TMA_COMPUTE_STORES
+            tma_names = (
+                cls._TMA_COMPUTE_LOADS
+                | cls._TMA_COMPUTE_STORES
+                | cls._TMA_COMPUTE_REDUCE_STORES
+            )
         elif phase == "store":
             tma_names = cls._TMA_STORES | cls._TMA_REDUCE_STORES
         else:
@@ -1187,8 +1359,12 @@ class Op:
     store_phase: ClassVar[Optional[str]] = None
     communicate_phase: ClassVar[Optional[str]] = None
     inline_phases: ClassVar[Tuple[str, ...]] = ()
-    sync_compute_warps_after_tile: ClassVar[bool] = False
     uses_smem_page: ClassVar[bool] = True
+    # Outputs whose global-memory value is complete at the end of compute even
+    # when the op also has a store phase for other outputs. This lets the
+    # dependency scheduler signal those buffers before the store warp drains
+    # unrelated TMA stores.
+    compute_signal_outputs: ClassVar[Tuple[str, ...]] = ()
     # Number of distinct shared-memory ring pages this op's phases want.
     # Default 1 = the classic single-page behavior. Override the classmethod
     # below to derive the count from the megakernel page_size.
@@ -1222,20 +1398,6 @@ class Op:
         self._bind_phase("store", type(self).store_phase)
         self._bind_phase("communicate", type(self).communicate_phase)
 
-    @cute.jit
-    def store_step(self, page_ptr, store_state_ptr) -> None:
-        """Optional stepped store entry point.
-
-        Subclasses that override this method advance ``store_state_ptr`` toward
-        ``store_step_count()``. The default is inert and is never selected unless
-        a scheduled op opts into the store-step phase.
-        """
-        pass
-
-    def store_step_count(self) -> int:
-        """Return the fixed number of store-step iterations for this op."""
-        return 0
-
     def should_noinline_phase(self, phase_name: str) -> bool:
         """Return whether a generated wrapper for ``phase_name`` should be noinline.
 
@@ -1251,12 +1413,13 @@ class Op:
     def requested_page_count_for(cls, page_size: int) -> int:
         """Number of distinct smem ring pages this op's phases want (>= 1).
 
-        The framework passes one base ``page_ptr`` to ``load``/``compute``/
-        ``store`` for ops that return N > 1 here. The op addresses sub-page i
-        as ``page_ptr + i * machete_aligned_page_size``. The default reads the
+        The framework passes a per-tile page-address table as ``page_ptr`` to
+        ``load``/``compute``/``store`` for ops that return N > 1 here. The op
+        addresses page i with ``self.page_address(page_ptr, i)``. Single-page
+        ops receive the direct page data address. The default reads the
         ``requested_page_count`` class variable; override to derive N from
-        ``page_size`` (e.g. an attention op asking for 2 pages at a 32 KB
-        page_size to deepen its K/V pipeline).
+        ``page_size`` (e.g. an attention op asking for 2 pages at a 32 KB page
+        size to deepen its K/V pipeline).
         """
         return max(1, int(getattr(cls, "requested_page_count", 1)))
 
@@ -1273,6 +1436,92 @@ class Op:
         Default 0 = every page released after store = classic behavior.
         """
         return 0
+
+    @classmethod
+    def page_release_inside_compute_mask(cls, page_size: int) -> int:
+        """Per-page mask for pages released manually inside ``compute``.
+
+        Ops whose compute phase stops using a page before the end of compute can
+        set bit ``i`` here and call ``self.release_compute_page_sync(i, ...)`` or
+        ``self.release_compute_page_relaxed(i, ...)`` from a converged point in
+        ``compute``. Manually released pages are excluded from the framework's
+        automatic after-compute and after-store release paths.
+        """
+        return 0
+
+    @classmethod
+    def access_regions(cls, op: "ScheduledOp") -> AccessRegions:
+        """Return dependency-visible tensor regions for one scheduled op.
+
+        The default is derived from ``reads``/``writes``/``tile`` declarations.
+        Ops with views that do not match their execution tile grid can override
+        this classmethod and return ``AccessRegions`` with custom axes or region
+        grouping. The scheduler lowers these declarations to compact barrier
+        formulas; the replay loop does not interpret this object at runtime.
+        """
+        return _default_access_regions(op)
+
+    @cute.jit
+    def page_address(self, page_ptr, page_idx):
+        """Shared-memory data address of this op's page ``page_idx``.
+
+        Ops that request more than one page receive ``page_ptr`` as a per-slot
+        table of page addresses (filled by the framework's decoupled allocator);
+        the pages may be non-contiguous, so read entry ``page_idx`` from the
+        table. Single-page ops should use ``page_ptr`` directly (it is already
+        the page's data address) and do not need this helper.
+        """
+        return ld_shared_i32(page_ptr + Int32(page_idx * 4))
+
+    @cute.jit
+    def release_compute_page_sync(
+        self,
+        local_page_idx,
+        page_release_table_ptr,
+        page_release_page_base,
+        page_release_mbar_base,
+        page_release_mbar_stride,
+        page_release_page_size,
+    ) -> None:
+        """Release an op page from inside compute after synchronizing compute warps.
+
+        This must be called by all compute threads in converged control flow.
+        Use only for pages declared in ``page_release_inside_compute_mask``.
+        """
+        named_barrier_sync(Int32(1), Int32(self.threads_per_row))
+        self.release_compute_page_relaxed(
+            local_page_idx,
+            page_release_table_ptr,
+            page_release_page_base,
+            page_release_mbar_base,
+            page_release_mbar_stride,
+            page_release_page_size,
+        )
+
+    @cute.jit
+    def release_compute_page_relaxed(
+        self,
+        local_page_idx,
+        page_release_table_ptr,
+        page_release_page_base,
+        page_release_mbar_base,
+        page_release_mbar_stride,
+        page_release_page_size,
+    ) -> None:
+        """Release an op page from inside compute without adding a sync.
+
+        The caller must already guarantee that no compute thread will read the
+        page again and that thread 0 reaches this call exactly once.
+        """
+        tidx = cute.arch.thread_idx()[0]
+        if tidx == Int32(0):
+            page_addr = ld_shared_i32(
+                page_release_table_ptr + Int32(local_page_idx) * Int32(4)
+            )
+            page_id = (page_addr - page_release_page_base) // page_release_page_size
+            mbarrier_arrive(
+                page_release_mbar_base + page_id * page_release_mbar_stride
+            )
 
     @classmethod
     def pipeline_protocol(cls) -> Optional[InstructionPageProtocol]:
@@ -1531,6 +1780,10 @@ class ScheduledOp:
                 return int(self.tile_origins.get(dim_name, 0))
         return 0
 
+    def access_regions(self) -> AccessRegions:
+        """Return op-declared dependency regions for this scheduled instance."""
+        return self.op_cls.access_regions(self)
+
 __all__ = [
     # Constants
     "MAX_TILE_DIMS",
@@ -1541,8 +1794,11 @@ __all__ = [
     "PageRole",
     "PipelineSpec",
     "PipelineABI",
+    "AccessRegions",
+    "RegionAxis",
     "StreamingPipelineOpMixin",
     "SemaphoreRole",
+    "TensorAccessRegion",
     "TensorMeta",
     # Protocol
     "Op",

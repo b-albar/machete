@@ -40,6 +40,7 @@ from .registries import (
 
 from .scheduling import (
     BarrierFormula,
+    DependencyResolution,
     INSTRUCTION_WORDS,
     INSTR_BARRIER_META_IDX,
     INSTR_OP_IDX,
@@ -101,6 +102,7 @@ __all__ = [
     "config_flat_tensor",
     # Barrier Formulas
     "BarrierFormula",
+    "DependencyResolution",
     # Compilation
     "cleanup_linecache",
     # Instruction Stream

@@ -26,7 +26,14 @@ DEFAULT_KERNEL_COOLDOWN_MS = 500
 
 
 def _accepts_group_index(fn: Callable) -> bool:
-    """Return True when a benchmark callback can consume a group index."""
+    """Return True when a benchmark callback should receive a group index.
+
+    Many benchmark closures use default positional arguments only to capture
+    objects, e.g. ``lambda c=c: c.zero_()``. Passing the input-group index to
+    those callables overwrites the captured object and can turn a valid closure
+    into ``int(...)``. Only pass a group index when the callable has a required
+    positional parameter or accepts varargs.
+    """
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -34,7 +41,13 @@ def _accepts_group_index(fn: Callable) -> bool:
     for param in sig.parameters.values():
         if param.kind == inspect.Parameter.VAR_POSITIONAL:
             return True
-        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+        if (
+            param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            and param.default is inspect.Parameter.empty
+        ):
             return True
     return False
 

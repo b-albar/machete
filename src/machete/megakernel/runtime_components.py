@@ -75,15 +75,19 @@ def build_kernel_static_config(
     threads_per_block = kernel.config.threads_per_block
     active_dma_warps = 0 if use_compute_only_replay else num_dma_warps
     num_mma_warps = (threads_per_block // 32) - active_dma_warps
-    # Regular TMA/peer stores are single-lane operations. Elect at the replay
-    # dispatch boundary so PTXAS can prove the store path is single-lane in the
-    # full fused kernels. Reduce-style stores need all participating lanes.
-    has_reduce_store = any(
-        bool(getattr(op.op_cls, "_TMA_REDUCE_STORES", set()))
-        or bool(getattr(op.op_cls, "_PEER_REDUCE_STORES", set()))
-        for op in kernel.ops
-    )
+    if use_compute_only_replay:
+        dma_reg_count = 0
+        controller_reg_count = 0
+        loader_reg_count = 0
+        store_reg_count = 0
+    else:
+        dma_reg_count = kernel.config.dma_reg_count
+        controller_reg_count = kernel.config.resolved_controller_reg_count
+        loader_reg_count = kernel.config.resolved_loader_reg_count
+        store_reg_count = kernel.config.resolved_store_reg_count
+
     return {
+        "use_compute_only_replay": use_compute_only_replay,
         "num_sms": kernel.config.num_sms,
         "threads_per_block": threads_per_block,
         "smem_size": layout.total_size,
@@ -91,6 +95,16 @@ def build_kernel_static_config(
         "num_pages": layout.num_pages,
         "num_slots": layout.num_slots,
         "has_page_free_ops": kernel._has_page_free_ops and not use_compute_only_replay,
+        "has_compute_signal_ops": (
+            any(
+                int(kernel._builder._op_compute_signal_counts.get(op_idx, 0)) > 0
+                for op_idx in range(len(kernel.ops))
+            )
+            or any(
+                int(op.static_dims.get("compute_signal_count", 0)) > 0
+                for op in kernel.ops
+            )
+        ) and not use_compute_only_replay,
         "iq_offset": layout.iq_offset,
         "flags_offset": layout.flags_offset,
         "ring_state_offset": layout.ring_state_offset,
@@ -99,17 +113,17 @@ def build_kernel_static_config(
         "work_notify_mbar_offset_0": layout.work_notify_mbar_offset(0),
         "compute_done_mbar_offset_0": layout.compute_done_mbar_offset(0),
         "page_finished_mbar_offset_0": layout.page_finished_mbar_offset(0),
+        "page_addr_table_offset": layout.page_addr_table_offset,
         "max_requested_page_count": int(getattr(kernel, "_max_requested_page_count", 1)),
         "num_mma_warps": num_mma_warps,
         "num_compute_threads": num_mma_warps * 32,
         "num_dma_warps": active_dma_warps,
-        "dma_reg_count": kernel.config.dma_reg_count,
-        "controller_reg_count": kernel.config.resolved_controller_reg_count,
-        "loader_reg_count": kernel.config.resolved_loader_reg_count,
-        "store_reg_count": kernel.config.resolved_store_reg_count,
+        "dma_reg_count": dma_reg_count,
+        "controller_reg_count": controller_reg_count,
+        "loader_reg_count": loader_reg_count,
+        "store_reg_count": store_reg_count,
         "mma_reg_count": kernel.config.mma_reg_count,
         "actual_threads_per_block": threads_per_block,
-        "elect_store_dispatch": not has_reduce_store,
         "mbarrier_stride": mbarrier_stride,
         "tile_info_bytes": tile_info_bytes,
         "peer_barriers_data_ptr": (
@@ -122,22 +136,23 @@ def build_kernel_static_config(
 
 def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta: Dict[str, int]) -> Dict[str, Any]:
     """Build reusable runtime helpers needed by `_create_kernel`."""
+    use_compute_only_replay = bool(kernel_cfg["use_compute_only_replay"])
     _OP_META_STRIDE = op_meta["_OP_META_STRIDE"]
-    _OP_META_STRIDE_0 = op_meta["_OP_META_STRIDE_0"]
-    _OP_META_STRIDE_1 = op_meta["_OP_META_STRIDE_1"]
-    _OP_META_STRIDE_2 = op_meta["_OP_META_STRIDE_2"]
-    _OP_META_STRIDE_3 = op_meta["_OP_META_STRIDE_3"]
-    _OP_META_COUNT_0 = op_meta["_OP_META_COUNT_0"]
-    _OP_META_COUNT_1 = op_meta["_OP_META_COUNT_1"]
-    _OP_META_COUNT_2 = op_meta["_OP_META_COUNT_2"]
-    _OP_META_COUNT_3 = op_meta["_OP_META_COUNT_3"]
+    if not use_compute_only_replay:
+        _OP_META_STRIDE_0 = op_meta["_OP_META_STRIDE_0"]
+        _OP_META_STRIDE_1 = op_meta["_OP_META_STRIDE_1"]
+        _OP_META_STRIDE_2 = op_meta["_OP_META_STRIDE_2"]
+        _OP_META_STRIDE_3 = op_meta["_OP_META_STRIDE_3"]
+        _OP_META_COUNT_0 = op_meta["_OP_META_COUNT_0"]
+        _OP_META_COUNT_1 = op_meta["_OP_META_COUNT_1"]
+        _OP_META_COUNT_2 = op_meta["_OP_META_COUNT_2"]
+        _OP_META_COUNT_3 = op_meta["_OP_META_COUNT_3"]
 
     setmaxregister_increase, setmaxregister_decrease = resolve_warp_register_api()
     (
         dispatch_load,
         dispatch_compute,
         dispatch_store,
-        dispatch_store_step,
         dispatch_communicate,
         phase_uses_handler_local_idx,
         phase_uses_runtime_transport_selector,
@@ -147,6 +162,7 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         phase_tensor_names,
         phase_tma_names,
         all_tma_canonical,
+        compute_manual_page_release,
     ) = kernel._build_pipelined_dispatch_fns()
 
     if kernel.config.tracing:
@@ -209,77 +225,81 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
     def _op_meta_i32_base(op_meta_ptr: Int64, op_meta_base: Int32, field: Int32) -> Int32:
         return ld_global_i32(op_meta_ptr, op_meta_base + field)
 
-    @cute.jit
-    def _decompose_tile(op_meta_ptr: Int64, op_meta_base: Int32, linear_idx: Int32):
-        rem = linear_idx
-        t0 = Int32(0)
-        t1 = Int32(0)
-        t2 = Int32(0)
-        t3 = Int32(0)
-        c0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_0))
-        c1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_1))
-        c2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_2))
-        c3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_3))
-        s0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_0))
-        s1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_1))
-        s2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_2))
-        s3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_3))
-        if c0 > Int32(1):
-            if s0 > Int32(1):
-                t0 = rem // s0
-                rem = rem % s0
-            else:
-                t0 = rem
-        if c1 > Int32(1):
-            if s1 > Int32(1):
-                t1 = rem // s1
-                rem = rem % s1
-            else:
-                t1 = rem
-        if c2 > Int32(1):
-            if s2 > Int32(1):
-                t2 = rem // s2
-                rem = rem % s2
-            else:
-                t2 = rem
-        if c3 > Int32(1):
-            if s3 > Int32(1):
-                t3 = rem // s3
-                rem = rem % s3
-            else:
-                t3 = rem
-        return t0, t1, t2, t3
+    if not use_compute_only_replay:
+        @cute.jit
+        def _decompose_tile(op_meta_ptr: Int64, op_meta_base: Int32, linear_idx: Int32):
+            rem = linear_idx
+            t0 = Int32(0)
+            t1 = Int32(0)
+            t2 = Int32(0)
+            t3 = Int32(0)
+            c0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_0))
+            c1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_1))
+            c2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_2))
+            c3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_3))
+            s0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_0))
+            s1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_1))
+            s2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_2))
+            s3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_STRIDE_3))
+            if c0 > Int32(1):
+                if s0 > Int32(1):
+                    t0 = rem // s0
+                    rem = rem % s0
+                else:
+                    t0 = rem
+            if c1 > Int32(1):
+                if s1 > Int32(1):
+                    t1 = rem // s1
+                    rem = rem % s1
+                else:
+                    t1 = rem
+            if c2 > Int32(1):
+                if s2 > Int32(1):
+                    t2 = rem // s2
+                    rem = rem % s2
+                else:
+                    t2 = rem
+            if c3 > Int32(1):
+                if s3 > Int32(1):
+                    t3 = rem // s3
+                    rem = rem % s3
+                else:
+                    t3 = rem
+            return t0, t1, t2, t3
 
-    @cute.jit
-    def _advance_tile(op_meta_ptr: Int64, op_meta_base: Int32, t0: Int32, t1: Int32, t2: Int32, t3: Int32):
-        carry = Int32(1)
-        c3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_3))
-        if carry != Int32(0) and c3 > Int32(1):
-            t3 = t3 + Int32(1)
-            if t3 < c3:
-                carry = Int32(0)
-            else:
-                t3 = Int32(0)
-        c2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_2))
-        if carry != Int32(0) and c2 > Int32(1):
-            t2 = t2 + Int32(1)
-            if t2 < c2:
-                carry = Int32(0)
-            else:
-                t2 = Int32(0)
-        c1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_1))
-        if carry != Int32(0) and c1 > Int32(1):
-            t1 = t1 + Int32(1)
-            if t1 < c1:
-                carry = Int32(0)
-            else:
-                t1 = Int32(0)
-        c0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_0))
-        if carry != Int32(0) and c0 > Int32(1):
-            t0 = t0 + Int32(1)
-            if t0 >= c0:
-                t0 = Int32(0)
-        return t0, t1, t2, t3
+        @cute.jit
+        def _advance_tile(op_meta_ptr: Int64, op_meta_base: Int32, t0: Int32, t1: Int32, t2: Int32, t3: Int32):
+            carry = Int32(1)
+            c3 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_3))
+            if carry != Int32(0) and c3 > Int32(1):
+                t3 = t3 + Int32(1)
+                if t3 < c3:
+                    carry = Int32(0)
+                else:
+                    t3 = Int32(0)
+            c2 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_2))
+            if carry != Int32(0) and c2 > Int32(1):
+                t2 = t2 + Int32(1)
+                if t2 < c2:
+                    carry = Int32(0)
+                else:
+                    t2 = Int32(0)
+            c1 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_1))
+            if carry != Int32(0) and c1 > Int32(1):
+                t1 = t1 + Int32(1)
+                if t1 < c1:
+                    carry = Int32(0)
+                else:
+                    t1 = Int32(0)
+            c0 = _op_meta_i32_base(op_meta_ptr, op_meta_base, Int32(_OP_META_COUNT_0))
+            if carry != Int32(0) and c0 > Int32(1):
+                t0 = t0 + Int32(1)
+                if t0 >= c0:
+                    t0 = Int32(0)
+            return t0, t1, t2, t3
+    else:
+        _decompose_tile = None
+        _advance_tile = None
 
     @cute.jit
     def _signal_barriers_from_meta(
@@ -325,12 +345,12 @@ def build_kernel_runtime_components(kernel, kernel_cfg: Dict[str, Any], op_meta:
         "dispatch_load": dispatch_load,
         "dispatch_compute": dispatch_compute,
         "dispatch_store": dispatch_store,
-        "dispatch_store_step": dispatch_store_step,
         "dispatch_communicate": dispatch_communicate,
         "phase_uses_handler_local_idx": phase_uses_handler_local_idx,
         "phase_uses_runtime_transport_selector": phase_uses_runtime_transport_selector,
         "phase_uses_desc_slot_selector": phase_uses_desc_slot_selector,
         "has_communicate": has_communicate,
+        "compute_manual_page_release": bool(compute_manual_page_release),
         "needs_warp_transition": any(w < kernel_cfg["num_mma_warps"] for w in per_op_warps),
         "max_waits": kernel._max_wait_formulas,
         "max_compute_waits": kernel._max_compute_wait_formulas,
@@ -359,7 +379,6 @@ def build_kernel_extra_exec_globals(
     *,
     op_meta: Dict[str, int],
     tile_info: Dict[str, int],
-    sync_compute_warps_after_tile: bool,
     min_idle_regs: int,
     op_phase_load: int,
     op_phase_store: int,
@@ -371,7 +390,10 @@ def build_kernel_extra_exec_globals(
         "_compute_done_mbar": runtime["_compute_done_mbar"],
         "_page_finished_mbar": runtime["_page_finished_mbar"],
         "MAX_REQUESTED_N": int(kernel_cfg["max_requested_page_count"]),
-        "dispatch_store_step": runtime["dispatch_store_step"],
+        "page_addr_table_offset": int(kernel_cfg["page_addr_table_offset"]),
+        "machete_pages_start": int(kernel_cfg["pages_start"]),
+        "machete_aligned_page_size": int(kernel_cfg["aligned_page_size"]),
+        "machete_mbarrier_stride": int(kernel_cfg["mbarrier_stride"]),
         "decompose_tile": runtime["decompose_tile"],
         "advance_tile": runtime["advance_tile"],
         "ld_shared_v2_b32": ld_shared_v2_b32,
@@ -408,15 +430,14 @@ def build_kernel_extra_exec_globals(
         "global_barrier_sleep_ns": int(kernel.config.global_barrier_sleep_ns),
         "ld_global_i32": ld_global_i32,
         "has_communicate": runtime["has_communicate"],
+        "compute_manual_page_release": runtime["compute_manual_page_release"],
         "needs_warp_transition": runtime["needs_warp_transition"],
-        "sync_compute_warps_after_tile": sync_compute_warps_after_tile,
         "loader_idle_sleep_ns": int(kernel.config.loader_idle_sleep_ns),
         "has_page_free_ops": bool(kernel_cfg["has_page_free_ops"]),
-        "elect_store_dispatch": bool(kernel_cfg["elect_store_dispatch"]),
+        "has_compute_signal_ops": bool(kernel_cfg["has_compute_signal_ops"]),
         "dispatch_load_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["load"],
         "dispatch_compute_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["compute"],
         "dispatch_store_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["store"],
-        "dispatch_store_step_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"].get("store_step", runtime["phase_uses_handler_local_idx"]["store"]),
         "dispatch_communicate_uses_handler_local_idx": runtime["phase_uses_handler_local_idx"]["communicate"],
         "MIN_IDLE_REGS": min_idle_regs,
         "_OP_PHASE_LOAD": op_phase_load,

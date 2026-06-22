@@ -19,7 +19,6 @@ from cutlass import Int32, Int64
 from cutlass.cute.nvgpu.cpasync import (
     CopyBulkG2SOp,
     CopyBulkS2GOp,
-    group_bulk_copy_modes,
 )
 from machete.megakernel.megakernel import Megakernel
 from machete.megakernel.ops import Op
@@ -75,7 +74,8 @@ class MulTwoOp(Op):
         # Signal work_mbar with expected tx bytes + issue async copy
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
+        gsrc = cute.group_modes(g_tile, 0, 1)
+        sdst = cute.group_modes(s_tile, 0, 1)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -102,7 +102,8 @@ class MulTwoOp(Op):
             cute.make_layout((self.tile_size_M,)),
         )
 
-        ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+        ssrc = cute.group_modes(s_tile, 0, 1)
+        gdst = cute.group_modes(g_tile, 0, 1)
         cute.copy(s2g, ssrc, gdst)
 
 
@@ -129,7 +130,8 @@ class AddTwoOp(Op):
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
+        gsrc = cute.group_modes(g_tile, 0, 1)
+        sdst = cute.group_modes(s_tile, 0, 1)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -156,7 +158,8 @@ class AddTwoOp(Op):
             cute.make_layout((self.tile_size_M,)),
         )
 
-        ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+        ssrc = cute.group_modes(s_tile, 0, 1)
+        gdst = cute.group_modes(g_tile, 0, 1)
         cute.copy(s2g, ssrc, gdst)
 
 

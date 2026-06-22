@@ -64,6 +64,9 @@ def _effective_page_size(q, page_size):
     return page_size
 
 
+_MAX_SUPPORTED_D = 64
+
+
 class FlashAttentionSm120Op(Op):
     """Cooperative Flash Attention — MMA warps do both cpasync loads and MMA.
 
@@ -89,6 +92,7 @@ class FlashAttentionSm120Op(Op):
     tile = ("B", "M", "H", "D")
     dynamic_dims = ("B", "M", "N")
     inline_phases = ("load", "compute", "store")
+    max_supported_D = _MAX_SUPPORTED_D
 
     # Only Q via TMA (DMA warp), K/V loaded by cpasync in compute
     tma_loads = {"q"}
@@ -131,6 +135,12 @@ class FlashAttentionSm120Op(Op):
         assert self.q_dtype in (cutlass.Float16, cutlass.BFloat16), (
             f"FlashAttentionSm120Op requires fp16 or bf16, got {self.q_dtype}"
         )
+        max_supported_D = int(getattr(type(self), "max_supported_D", _MAX_SUPPORTED_D))
+        if self.D > max_supported_D:
+            raise ValueError(
+                f"{type(self).__name__} currently supports D <= {max_supported_D}; "
+                f"D={self.D} needs a D-blocked MMA path."
+            )
         self.elem_bytes = 2
 
         self.scale_val = 1.0 / (self.D**0.5)
@@ -292,6 +302,12 @@ class FlashAttentionSm120Op(Op):
                 f"FlashAttentionSm120Op requires fp16/bf16, got element_size={q.element_size()}"
             )
             B, M, H, D = q.shape
+            max_supported_D = int(getattr(cls, "max_supported_D", _MAX_SUPPORTED_D))
+            if D > max_supported_D:
+                raise ValueError(
+                    f"{cls.__name__} currently supports D <= {max_supported_D}; "
+                    f"D={D} needs a D-blocked MMA path."
+                )
             elem = q.element_size()
 
             if "M" not in tile_sizes:
@@ -1257,25 +1273,26 @@ class FlashAttentionSm120Op(Op):
     @cute.jit
     def store(self, page_ptr, tile_B, tile_M, tile_H, tile_D, o_tma, o_tma_gmem):
         """TMA store of O from shared to global memory (swizzled)."""
-        _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
+        with cute.arch.elect_one():
+            _o_swz = cute.make_swizzle(self.swizzle_B, self.swizzle_M, self.swizzle_S)
 
-        sO = cute.make_tensor(
-            cute.recast_ptr(cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.q_dtype),
-            cute.make_layout(self._o_tma_smem_shape),
-        )
-        gO = cute.local_tile(
-            o_tma_gmem,
-            self._o_tma_smem_shape,
-            (None, None, None, None),
-        )
-        tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-            o_tma,
-            Int32(0),
-            cute.make_layout(1),
-            cute.group_modes(sO, 0, 4),
-            cute.group_modes(gO, 0, 4),
-        )
-        cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_H, tile_M, tile_B)])
+            sO = cute.make_tensor(
+                cute.recast_ptr(cute.make_ptr(self.q_dtype, page_ptr, cute.AddressSpace.smem), _o_swz, dtype=self.q_dtype),
+                cute.make_layout(self._o_tma_smem_shape),
+            )
+            gO = cute.local_tile(
+                o_tma_gmem,
+                self._o_tma_smem_shape,
+                (None, None, None, None),
+            )
+            tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
+                o_tma,
+                Int32(0),
+                cute.make_layout(1),
+                cute.group_modes(sO, 0, 4),
+                cute.group_modes(gO, 0, 4),
+            )
+            cute.copy(o_tma, tOsO, tOgO[(None, tile_D, tile_H, tile_M, tile_B)])
 
 
 __all__ = [
