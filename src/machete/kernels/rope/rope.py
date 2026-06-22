@@ -32,7 +32,6 @@ from cutlass import Int32, Float32
 from cutlass.cute.nvgpu.cpasync import (
     CopyBulkG2SOp,
     CopyBulkS2GOp,
-    group_bulk_copy_modes,
 )
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
@@ -226,7 +225,8 @@ class RopeOp(Op):
                     ),
                     cute.make_layout((self.q_row_elems,)),
                 )
-                gsrc, sdst = group_bulk_copy_modes(g_q, s_q)
+                gsrc = cute.group_modes(g_q, 0, 1)
+                sdst = cute.group_modes(s_q, 0, 1)
                 cute.copy(g2s_q, gsrc, sdst, mbar_ptr=mbar_ptr)
 
                 # cos: D2 elements
@@ -242,7 +242,8 @@ class RopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gc_src, sc_dst = group_bulk_copy_modes(g_cos, s_cos)
+                gc_src = cute.group_modes(g_cos, 0, 1)
+                sc_dst = cute.group_modes(s_cos, 0, 1)
                 cute.copy(g2s_cs, gc_src, sc_dst, mbar_ptr=mbar_ptr)
 
                 # sin: D2 elements
@@ -258,7 +259,8 @@ class RopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gs_src, ss_dst = group_bulk_copy_modes(g_sin, s_sin)
+                gs_src = cute.group_modes(g_sin, 0, 1)
+                ss_dst = cute.group_modes(s_sin, 0, 1)
                 cute.copy(g2s_cs, gs_src, ss_dst, mbar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -369,7 +371,8 @@ class RopeOp(Op):
                     q.iterator + q_offset,
                     cute.make_layout((self.q_row_elems,)),
                 )
-                ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+                ssrc = cute.group_modes(s_tile, 0, 1)
+                gdst = cute.group_modes(g_tile, 0, 1)
                 cute.copy(s2g, ssrc, gdst)
 
 

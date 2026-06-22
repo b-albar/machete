@@ -10,7 +10,18 @@ import pytest
 import torch
 import cutlass.cute as cute
 from machete.megakernel.backend import _build_compile_key, _phase_param_names_for_instance
-from machete.megakernel.ops import MAX_TILE_DIMS, Op, PipelineSpec, ScheduledOp, build_op_config
+from machete.megakernel.ops import (
+    AccessRegions,
+    MAX_TILE_DIMS,
+    Op,
+    PipelineSpec,
+    RegionAxis,
+    TensorAccessRegion,
+    ScheduledOp,
+    TensorMeta,
+    build_op_config,
+    tensor_meta_overlaps,
+)
 from machete.megakernel.registries import TensorRegistry, validate_op_compatibility
 from machete.megakernel.scheduling import (
     BarrierFormula,
@@ -60,7 +71,20 @@ class _ComputeTmaLoadOp(Op):
     tma_compute_loads = {"x"}
 
 
+class _WindowedBSOp(Op):
+    reads = {"x": (torch.float16, ("B", "S"))}
+    writes = {"y": (torch.float16, ("B", "S"))}
+    tile = ("B", "S")
+
+
+class _WindowedBSDOp(Op):
+    reads = {"x": (torch.float16, ("B", "S", "D"))}
+    writes = {"y": (torch.float16, ("B", "S", "D"))}
+    tile = ("B", "S")
+
+
 class _ProducerTensorOp(Op):
+    reads = {}
     writes = {"x": (torch.float16, ("M",))}
     tile = ("M",)
 
@@ -70,6 +94,21 @@ class _ComputeWaitConsumerOp(Op):
     writes = {"y": (torch.float16, ("M",))}
     tile = ("M",)
     tma_compute_loads = {"x"}
+
+
+class _CustomLoadPhaseConsumerOp(Op):
+    reads = {
+        "x": (torch.float16, ("M",)),
+        "z": (torch.float16, ("M",)),
+    }
+    writes = {"y": (torch.float16, ("M",))}
+    tile = ("M",)
+
+    def load(self, page_ptr, tile_M, z, work_mbar):
+        pass
+
+    def compute(self, page_ptr, tile_M, x):
+        pass
 
 
 class _SerialNonTmaLoadOp(Op):
@@ -94,6 +133,203 @@ def test_pipeline_spec_no_longer_declares_range_metadata():
     spec = PipelineSpec(page_count=1)
 
     assert spec.page_count == 1
+
+
+def test_dim_windows_shrink_tile_domain_but_keep_full_config_dims():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    op = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+
+    assert op.tile_counts == (1, 1)
+    assert op.tile_origin_for_axis(0) == 2
+    assert op.static_dims["B"] == 16
+    assert op.static_dims["S"] == 8
+    assert op.tensor_metas["x"].shape == (4, 8)
+    assert op.tensor_metas["x"].storage_offset == 8 * x.stride(0)
+    assert op.tensor_validation_metas["x"].shape == (16, 8)
+    assert op.tensor_validation_metas["x"].data_ptr == x.data_ptr()
+
+
+def test_dim_windows_reject_non_tiled_dimensions():
+    x = torch.empty(16, 8, 4, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="non-tiled dimension"):
+        _WindowedBSDOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"D": (0, 4)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_reject_unaligned_origins():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="must be aligned"):
+        _WindowedBSOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"B": (2, 4)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_reject_out_of_bounds_extents():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="exceeds full extent"):
+        _WindowedBSOp._schedule_single(
+            tile_sizes={"B": 4, "S": 8},
+            dim_windows={"B": (12, 8)},
+            x=x,
+            y=y,
+        )
+
+
+def test_dim_windows_make_disjoint_tensor_regions_independent():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    op0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    op1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+
+    assert not tensor_meta_overlaps(op0.tensor_metas["y"], op1.tensor_metas["x"])
+
+
+def test_dim_windows_dependency_resolution_skips_disjoint_later_writer():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+    cons0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(cons0)
+
+    edges = builder.dependency_plan().edges
+
+    assert any(edge.producer_idx == 0 and edge.consumer_idx == 2 for edge in edges)
+    assert not any(edge.producer_idx == 1 and edge.consumer_idx == 2 for edge in edges)
+
+
+def test_dim_windows_full_consumer_waits_for_all_overlapping_windows():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        dim_windows={"B": (8, 4)},
+        x=x,
+        y=y,
+    )
+    full_consumer = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 4, "S": 8},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(full_consumer)
+
+    edges = builder.dependency_plan().edges
+
+    assert any(edge.producer_idx == 0 and edge.consumer_idx == 2 for edge in edges)
+    assert any(edge.producer_idx == 1 and edge.consumer_idx == 2 for edge in edges)
+
+
+def test_dim_window_barrier_formulas_are_guarded_to_overlap():
+    x = torch.empty(16, 8, dtype=torch.float16)
+    y = torch.empty_like(x)
+
+    prod0 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        dim_windows={"B": (0, 4)},
+        x=x,
+        y=y,
+    )
+    prod1 = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        dim_windows={"B": (4, 4)},
+        x=x,
+        y=y,
+    )
+    full_consumer = _WindowedBSOp._schedule_single(
+        tile_sizes={"B": 1, "S": 8},
+        x=y,
+        y=x,
+    )
+    builder = InstructionStreamBuilder()
+    builder.add_op(prod0)
+    builder.add_op(prod1)
+    builder.add_op(full_consumer)
+
+    formulas = builder.get_op_barrier_formulas()
+    prod0_signal = formulas[0][1][0]
+    prod1_signal = formulas[1][1][0]
+    consumer_waits = formulas[2][0]
+
+    wait_from_prod0 = next(wait for wait in consumer_waits if wait.base == prod0_signal.base)
+    wait_from_prod1 = next(wait for wait in consumer_waits if wait.base == prod1_signal.base)
+
+    assert prod0_signal.is_guarded((0, 0))
+    assert prod0_signal.is_guarded((3, 0))
+    assert not prod0_signal.is_guarded((4, 0))
+    assert wait_from_prod0.is_guarded((0, 0))
+    assert wait_from_prod0.is_guarded((3, 0))
+    assert not wait_from_prod0.is_guarded((4, 0))
+    assert wait_from_prod0.compute_index((0, 0)) == prod0_signal.compute_index((0, 0))
+
+    assert prod1_signal.is_guarded((0, 0))
+    assert prod1_signal.is_guarded((3, 0))
+    assert wait_from_prod1.is_guarded((4, 0))
+    assert wait_from_prod1.is_guarded((7, 0))
+    assert not wait_from_prod1.is_guarded((3, 0))
+    assert not wait_from_prod1.is_guarded((8, 0))
+    assert wait_from_prod1.compute_index((4, 0)) == prod1_signal.compute_index((0, 0))
+    assert wait_from_prod1.compute_index((7, 0)) == prod1_signal.compute_index((3, 0))
 
 
 def test_scheduler_coordinate_range_coalesces_and_expands_logical_tiles():
@@ -217,6 +453,39 @@ def test_compute_phase_tma_load_declaration_is_registered():
     ]
 
 
+def test_custom_load_dep_wait_moves_to_compute_only_when_load_does_not_read_it():
+    x = torch.empty(4, dtype=torch.float16)
+    z = torch.empty_like(x)
+    y = torch.empty_like(x)
+
+    builder = InstructionStreamBuilder()
+    builder.add_op(_ProducerTensorOp._schedule_single(tile_sizes={"M": 1}, x=x))
+    builder.add_op(_ProducerTensorOp._schedule_single(tile_sizes={"M": 1}, x=z))
+    builder.add_op(
+        _CustomLoadPhaseConsumerOp._schedule_single(
+            tile_sizes={"M": 1},
+            x=x,
+            z=z,
+            y=y,
+        )
+    )
+
+    plan = builder.dependency_plan()
+
+    assert plan.compute_wait_formulas[2]
+    assert plan.controller_wait_formulas[2]
+
+    compute_barriers = {formula.base for formula in plan.compute_wait_formulas[2]}
+    controller_barriers = {formula.base for formula in plan.controller_wait_formulas[2]}
+    signal_by_producer = {
+        producer_idx: {formula.base for formula in formulas[1]}
+        for producer_idx, formulas in plan.formulas.items()
+    }
+
+    assert compute_barriers == signal_by_producer[0]
+    assert controller_barriers == signal_by_producer[1]
+
+
 def test_controller_wait_readiness_keeps_compute_wait_dependencies_ordered():
     """Controller-only readiness can deadlock finite page rings."""
     builder = InstructionStreamBuilder()
@@ -240,7 +509,6 @@ def test_controller_wait_readiness_keeps_compute_wait_dependencies_ordered():
     instructions = builder.build(
         scheduler=OverlapTileScheduler(
             fetch_stride=4,
-            use_controller_waits_for_readiness=True,
         )
     )
 
@@ -306,6 +574,18 @@ def test_barrier_static_dims_do_not_specialize_device_code():
     assert "barrier_wait_alias_H" not in build_op_config(op_a)
 
 
+def test_page_ring_uses_one_slot_per_physical_page():
+    from machete.megakernel import Megakernel, MegakernelConfig
+
+    kernel = Megakernel(
+        [ScheduledOp(_NOPOp, tile_counts=(1,))],
+        config=MegakernelConfig(num_sms=1, num_pages=3, page_size=1024),
+    )
+
+    assert kernel._layout.num_pages == 3
+    assert kernel._layout.num_slots == 3
+
+
 def test_tile_sizes_specialize_device_code():
     """Tile sizes are used in CuTe compile-time loops and must key handlers."""
     op_a = ScheduledOp(_NOPOp, tile_sizes={"M": 16})
@@ -324,166 +604,25 @@ def test_tile_sizes_specialize_device_code():
     assert build_op_config(op_b)["tile_size_M"] == 64
 
 
-# =============================================================================
-# Linear Chain Tests (no INPUTS/OUTPUTS)
-# =============================================================================
+class TestUnnamedDependencyRequirements:
+    """Unnamed ops no longer imply an automatic linear dependency chain."""
 
-
-class TestLinearChainFormulas:
-    """Test that linear chain ops (no INPUTS/OUTPUTS) produce correct barrier formulas."""
-
-    def test_first_op_has_no_wait_formulas(self):
-        """First op should have no wait formulas."""
+    def test_single_unnamed_op_has_no_barriers(self):
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         formulas = builder.get_op_barrier_formulas()
 
-        wait, signal = formulas[0]
-        assert len(wait) == 0
-        assert len(signal) == 1
+        assert formulas[0] == ([], [])
+        assert builder.num_barriers == 0
+        assert builder.total_tiles == 4
 
-    def test_first_op_signals_own_barrier(self):
-        """First op should signal barrier = tiles[0] (base=0, coeffs[0]=1)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        _, signal = formulas[0]
-        sf = signal[0]
-        assert sf.base == 0
-        assert sf.coeffs[0] == 1
-        # Higher coeffs are strides for the linear index
-        # but tiles beyond dim 0 are 0 for 1D ops, so they don't affect the result
-
-        # Verify: tiles[0]=0 → barrier 0, tiles[0]=3 → barrier 3
-        assert sf.compute_index((0, 0, 0)) == 0
-        assert sf.compute_index((3, 0, 0)) == 3
-
-    def test_second_op_waits_on_first(self):
-        """Second op should wait on first op's barriers with expected=1."""
+    def test_multi_op_graph_requires_named_buffers(self):
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
         builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
 
-        wait, signal = formulas[1]
-        assert len(wait) == 1
-        assert len(signal) == 1
-
-        wf = wait[0]
-        assert wf.base == 0  # Wait on op0's barriers
-        assert wf.coeffs[0] == 1
-        assert wf.expected == 1
-        assert not wf.has_guard  # Same tile count, no guard
-
-        sf = signal[0]
-        assert sf.base == 4  # Signal op1's own barriers
-
-    def test_three_op_chain(self):
-        """Three-op chain: op2 waits on op1 (not op0)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 0-1
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 2-3
-        builder.add_op(_NOPOp, tile_counts=(2,))  # barriers 4-5
-
-        formulas = builder.get_op_barrier_formulas()
-        assert builder.num_barriers == 6
-
-        # Op 0: no wait, signal base=0
-        assert len(formulas[0][0]) == 0
-        assert formulas[0][1][0].base == 0
-
-        # Op 1: wait base=0, signal base=2
-        assert formulas[1][0][0].base == 0
-        assert formulas[1][1][0].base == 2
-
-        # Op 2: wait base=2, signal base=4
-        assert formulas[2][0][0].base == 2
-        assert formulas[2][1][0].base == 4
-
-    def test_barrier_count_matches_total_tiles(self):
-        """num_barriers should equal total tiles across all ops."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(16,))
-        builder.add_op(_NOPOp, tile_counts=(16,))
-        builder.add_op(_NOPOp, tile_counts=(16,))
-
-        assert builder.num_barriers == 48
-        assert builder.total_tiles == 48
-
-    def test_2d_formula_strides(self):
-        """2D grid should produce correct strides in formulas (row-major)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4, 3))
-        builder.add_op(_NOPOp, tile_counts=(4, 3))
-        formulas = builder.get_op_barrier_formulas()
-
-        sf = formulas[0][1][0]
-        assert sf.coeffs[0] == 3   # stride for dim 0 = tile_counts[1] = 3
-        assert sf.coeffs[1] == 1   # stride for dim 1 = 1 (innermost)
-
-        # Verify row-major: (0,0,0)→0, (1,0,0)→3, (0,1,0)→1, (3,2,0)→11
-        assert sf.compute_index((0, 0, 0)) == 0
-        assert sf.compute_index((1, 0, 0)) == 3
-        assert sf.compute_index((0, 1, 0)) == 1
-        assert sf.compute_index((3, 2, 0)) == 11
-
-    def test_3d_formula_strides(self):
-        """3D grid should produce correct strides in formulas (row-major)."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(2, 3, 2))
-        formulas = builder.get_op_barrier_formulas()
-
-        sf = formulas[0][1][0]
-        assert sf.coeffs[0] == 6  # stride for dim 0 = tile_counts[1] * tile_counts[2] = 3*2
-        assert sf.coeffs[1] == 2  # stride for dim 1 = tile_counts[2] = 2
-        assert sf.coeffs[2] == 1  # stride for dim 2 = 1 (innermost)
-
-
-class TestMismatchedTileCounts:
-    """Test dependency behavior when sequential ops have different tile counts."""
-
-    def test_fewer_tiles_in_second_op(self):
-        """When op1 has fewer tiles, guard is set to prev op's total tiles."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert wf.base == 0
-        assert wf.expected == 1
-        assert wf.has_guard  # Guard active because tile counts differ
-        assert wf.guard_max == 8
-
-    def test_more_tiles_in_second_op(self):
-        """When op1 has more tiles, guard prevents waiting on non-existent barriers."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert wf.base == 0
-        assert wf.expected == 1
-        assert wf.has_guard
-        assert wf.guard_max == 4  # Only 4 barriers from op0
-
-        # Tiles 0-3 pass guard, tiles 4-7 don't
-        assert wf.is_guarded((0, 0, 0)) is True
-        assert wf.is_guarded((3, 0, 0)) is True
-        assert wf.is_guarded((4, 0, 0)) is False
-        assert wf.is_guarded((7, 0, 0)) is False
-
-    def test_same_tiles_no_guard(self):
-        """When tile counts match, no guard is needed."""
-        builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        formulas = builder.get_op_barrier_formulas()
-
-        wf = formulas[1][0][0]
-        assert not wf.has_guard  # No guard needed
+        with pytest.raises(ValueError, match="require each op to declare INPUTS or OUTPUTS"):
+            builder.get_op_barrier_formulas()
 
 
 class TestInstructionStreamMultiDim:
@@ -552,7 +691,6 @@ class TestTileInstructionPacking:
         """Packed tensor values should encode op index and tile coordinates."""
         builder = InstructionStreamBuilder()
         builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
         tensor = builder.build_tensor(device="cpu")
         instructions = builder.build()
 
@@ -583,6 +721,10 @@ class _ConsumerOp(Op):
     OUTPUTS: ClassVar[List[str]] = []
 
 
+def _axis(name: str, tile_dim: str = None) -> RegionAxis:
+    return RegionAxis(name=name, tile_dim=tile_dim or name)
+
+
 class _ProducerY(Op):
     """Test op that produces buffer 'y'."""
     INPUTS: ClassVar[List[str]] = []
@@ -593,6 +735,12 @@ class _FanInOp(Op):
     """Test op that consumes both 'x' and 'y'."""
     INPUTS: ClassVar[List[str]] = ["x", "y"]
     OUTPUTS: ClassVar[List[str]] = []
+
+
+class _IndependentOp(Op):
+    """Named source op with no dependencies."""
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["independent"]
 
 
 class _PackedQKVProducerOp(Op):
@@ -642,6 +790,18 @@ class _ScratchReaderOp(Op):
     writes = {}
     tile = ("B", "S")
     INPUTS: ClassVar[List[str]] = ["x"]
+
+
+class _BSHDProducerOp(Op):
+    reads = {}
+    writes = {"x": (None, ("B", "S", "H", "D"))}
+    tile = ("B", "S", "H")
+
+
+class _BSKConsumerOp(Op):
+    reads = {"x": (None, ("B", "S", "K"))}
+    writes = {"y": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
 
 
 class TestNamedBufferDeps:
@@ -700,6 +860,775 @@ class TestNamedBufferDeps:
         assert p_signal.compute_index((0, 0, 0)) == 0  # (batch=0, seqlen=0) → barrier 0
         assert p_signal.compute_index((0, 5, 0)) == 0  # (batch=0, seqlen=5) → barrier 0
         assert p_signal.compute_index((2, 3, 0)) == 2  # (batch=2, seqlen=3) → barrier 2
+
+    def test_declared_region_index_refines_producer_only_dim(self):
+        """A split consumer can wait on one declared producer region."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "H"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="H",
+                            group_tiles=2,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("M", "M"),
+                            ),
+                            group_index=1,
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(2, 4, 3),
+                dim_names={"B": 0, "H": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(2, 3),
+                dim_names={"B": 0, "M": 1},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+
+        assert builder.num_barriers == 12  # B * M * H_regions = 2 * 3 * 2
+        assert [dep.mode for dep in builder.dependency_resolutions()] == ["declared_group"]
+        p_signal = formulas[0][1][0]
+        c_wait = formulas[1][0][0]
+
+        assert p_signal.divs[1] == 2
+        assert c_wait.expected == 2
+        assert c_wait.compute_index((1, 2, 0)) == p_signal.compute_index((1, 2, 2))
+        assert c_wait.compute_index((1, 2, 0)) == p_signal.compute_index((1, 3, 2))
+        assert c_wait.compute_index((1, 2, 0)) != p_signal.compute_index((1, 1, 2))
+
+    def test_declared_region_group_can_feed_shared_and_selected_consumers(self):
+        """A grouped producer axis remains shared unless the consumer selects a group."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                _axis("H", "H"),
+                            ),
+                            group_dim="H",
+                            group_tiles=1,
+                            group_count=2,
+                        )
+                    }
+                )
+
+        class _SharedConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                _axis("H", "H"),
+                            ),
+                        )
+                    }
+                )
+
+        class _SelectedConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                            ),
+                            group_index=1,
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 4, 2),
+                dim_names={"B": 0, "S": 1, "H": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_SharedConsumer,
+                tile_counts=(1, 4, 2),
+                dim_names={"B": 0, "S": 1, "H": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_SelectedConsumer,
+                tile_counts=(1, 4),
+                dim_names={"B": 0, "S": 1},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+
+        assert [dep.mode for dep in builder.dependency_resolutions()] == [
+            "declared_shared",
+            "declared_group",
+        ]
+        shared_wait = formulas[1][0][0]
+        selected_wait = formulas[2][0][0]
+        shared_signal = next(signal for signal in formulas[0][1] if signal.base == shared_wait.base)
+        selected_signal = next(signal for signal in formulas[0][1] if signal.base == selected_wait.base)
+
+        assert shared_wait.expected == 1
+        assert shared_wait.compute_index((0, 2, 1)) == shared_signal.compute_index((0, 2, 1))
+
+        assert selected_wait.expected == 1
+        assert selected_wait.compute_index((0, 2)) == selected_signal.compute_index((0, 2, 1))
+        assert selected_wait.compute_index((0, 2)) != selected_signal.compute_index((0, 2, 0))
+
+    def test_declared_region_dim_maps_consumer_tiles_to_regions(self):
+        """A tiled consumer region axis maps dynamically onto producer regions."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "H"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="H",
+                            group_tiles=2,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "R"),
+                                _axis("M", "M"),
+                            ),
+                            group_index_dim="H",
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(2, 4, 3),
+                dim_names={"B": 0, "H": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(2, 2, 3),
+                dim_names={"B": 0, "R": 1, "M": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+
+        assert builder.num_barriers == 12
+        p_signal = formulas[0][1][0]
+        c_wait = formulas[1][0][0]
+
+        assert p_signal.divs[1] == 2
+        assert c_wait.coeffs[1] == 1
+        assert c_wait.expected == 2
+        assert c_wait.compute_index((1, 1, 2)) == p_signal.compute_index((1, 2, 2))
+        assert c_wait.compute_index((1, 1, 2)) == p_signal.compute_index((1, 3, 2))
+        assert c_wait.compute_index((1, 0, 2)) == p_signal.compute_index((1, 0, 2))
+        assert c_wait.compute_index((1, 0, 2)) != p_signal.compute_index((1, 2, 2))
+
+    def test_declared_region_dim_can_cover_multiple_producer_groups(self):
+        """One consumer tile can wait on a contiguous producer-group chunk."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "H"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="H",
+                            group_tiles=1,
+                            group_count=14,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "R"),
+                                _axis("M", "M"),
+                            ),
+                            group_index_dim="H",
+                            group_index_group_tiles=7,
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 14, 2),
+                dim_names={"B": 0, "H": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(1, 2, 2),
+                dim_names={"B": 0, "R": 1, "M": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        p_signal = formulas[0][1][0]
+        c_wait = formulas[1][0][0]
+
+        assert p_signal.divs[1] == 7
+        assert c_wait.expected == 7
+        assert c_wait.compute_index((0, 0, 1)) == p_signal.compute_index((0, 0, 1))
+        assert c_wait.compute_index((0, 0, 1)) == p_signal.compute_index((0, 6, 1))
+        assert c_wait.compute_index((0, 1, 1)) == p_signal.compute_index((0, 7, 1))
+        assert c_wait.compute_index((0, 1, 1)) == p_signal.compute_index((0, 13, 1))
+        assert c_wait.compute_index((0, 0, 1)) != p_signal.compute_index((0, 7, 1))
+
+    def test_declared_region_dim_can_use_group_index_offset(self):
+        """A tiled consumer can map to a later producer group range."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "H"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="H",
+                            group_tiles=2,
+                            group_count=4,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "R"),
+                                _axis("M", "M"),
+                            ),
+                            group_index_dim="H",
+                            group_index_offset=2,
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 8, 2),
+                dim_names={"B": 0, "H": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(1, 2, 2),
+                dim_names={"B": 0, "R": 1, "M": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        p_signal = formulas[0][1][0]
+        c_wait = formulas[1][0][0]
+
+        assert c_wait.expected == 2
+        assert c_wait.compute_index((0, 0, 1)) == p_signal.compute_index((0, 4, 1))
+        assert c_wait.compute_index((0, 0, 1)) == p_signal.compute_index((0, 5, 1))
+        assert c_wait.compute_index((0, 1, 1)) == p_signal.compute_index((0, 6, 1))
+        assert c_wait.compute_index((0, 1, 1)) == p_signal.compute_index((0, 7, 1))
+
+    def test_declared_region_dim_can_wait_on_prefix_groups(self):
+        """A tiled consumer can wait on a producer-group prefix for causal deps."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="S",
+                            group_tiles=1,
+                            group_count=4,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "Q"),
+                                _axis("M", "M"),
+                            ),
+                            group_index_dim="S",
+                            group_index_mode="prefix",
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 4, 2),
+                dim_names={"B": 0, "S": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(1, 4, 2),
+                dim_names={"B": 0, "Q": 1, "M": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        p_signal = formulas[0][1][0]
+        waits = sorted(formulas[1][0], key=lambda formula: formula.offset)
+
+        assert builder.num_barriers == 8  # B * M * S_regions = 1 * 2 * 4
+        assert [dep.mode for dep in builder.dependency_resolutions()] == ["declared_group"]
+        assert len(waits) == 4
+        assert all(wait.expected == 1 for wait in waits)
+
+        for group_idx, wait in enumerate(waits):
+            assert wait.is_guarded((0, group_idx, 1))
+            if group_idx > 0:
+                assert not wait.is_guarded((0, group_idx - 1, 1))
+            assert wait.compute_index((0, 3, 1)) == p_signal.compute_index((0, group_idx, 1))
+
+        tile0_ready_groups = [
+            group_idx for group_idx, wait in enumerate(waits)
+            if wait.is_guarded((0, 0, 1))
+        ]
+        tile2_ready_groups = [
+            group_idx for group_idx, wait in enumerate(waits)
+            if wait.is_guarded((0, 2, 1))
+        ]
+        assert tile0_ready_groups == [0]
+        assert tile2_ready_groups == [0, 1, 2]
+
+    def test_declared_region_can_select_group_and_wait_on_prefix_axis(self):
+        """Packed group selection can combine with a separate causal prefix axis."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                _axis("H", "H"),
+                                _axis("D", "D"),
+                            ),
+                            group_dim="H",
+                            group_tiles=1,
+                            group_count=2,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                RegionAxis(name="S", extent=4, tile_dim="M", tile_size=2),
+                                _axis("D", "D"),
+                            ),
+                            group_index=1,
+                            prefix_dim="S",
+                            prefix_index_dim="S",
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 4, 2, 1),
+                dim_names={"B": 0, "S": 1, "H": 2, "D": 3},
+                tile_sizes={"B": 1, "S": 1, "H": 1, "D": 1},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(1, 2, 1),
+                dim_names={"B": 0, "M": 1, "D": 2},
+                tile_sizes={"B": 1, "M": 2, "D": 1},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        p_signal = formulas[0][1][0]
+        waits = sorted(formulas[1][0], key=lambda formula: formula.offset)
+
+        assert builder.num_barriers == 8  # B * D * H_groups * S_prefix_groups
+        assert len(waits) == 4
+        assert all(wait.expected == 1 for wait in waits)
+
+        assert waits[0].compute_index((0, 0, 0)) == p_signal.compute_index((0, 0, 1, 0))
+        assert waits[1].compute_index((0, 0, 0)) == p_signal.compute_index((0, 1, 1, 0))
+        assert waits[2].compute_index((0, 1, 0)) == p_signal.compute_index((0, 2, 1, 0))
+        assert waits[3].compute_index((0, 1, 0)) == p_signal.compute_index((0, 3, 1, 0))
+        assert not waits[2].is_guarded((0, 0, 0))
+        assert waits[2].is_guarded((0, 1, 0))
+
+    def test_declared_multiple_read_regions_create_distinct_waits(self):
+        """One logical input can depend on two discontiguous producer regions."""
+        class _PackedProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                _axis("N", "N"),
+                            ),
+                            group_dim="N",
+                            group_tiles=1,
+                            group_count=4,
+                        )
+                    }
+                )
+
+        class _PackedConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                base_axes = (
+                    _axis("B", "B"),
+                    _axis("S", "S"),
+                    _axis("N", "D"),
+                )
+                return AccessRegions(
+                    reads={
+                        "x": (
+                            TensorAccessRegion(
+                                tensor="x",
+                                axes=base_axes,
+                                group_index_dim="N",
+                            ),
+                            TensorAccessRegion(
+                                tensor="x",
+                                axes=base_axes,
+                                group_index_dim="N",
+                                group_index_offset=2,
+                            ),
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_PackedProducer,
+                tile_counts=(1, 3, 4),
+                dim_names={"B": 0, "S": 1, "N": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_PackedConsumer,
+                tile_counts=(1, 3, 2),
+                dim_names={"B": 0, "S": 1, "D": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        resolutions = builder.dependency_resolutions()
+
+        assert [dep.mode for dep in resolutions] == ["declared_group", "declared_group"]
+        assert [dep.consumer_region_index for dep in resolutions] == [0, 1]
+        assert len(formulas[0][1]) == 1
+        assert len(formulas[1][0]) == 2
+
+        p_signal = formulas[0][1][0]
+        waits = sorted(formulas[1][0], key=lambda formula: formula.offset)
+        gate_wait, up_wait = waits
+
+        assert gate_wait.expected == 1
+        assert up_wait.expected == 1
+        assert gate_wait.compute_index((0, 2, 1)) == p_signal.compute_index((0, 2, 1))
+        assert up_wait.compute_index((0, 2, 1)) == p_signal.compute_index((0, 2, 3))
+        assert up_wait.compute_index((0, 2, 1)) != p_signal.compute_index((0, 2, 1))
+
+    def test_declared_multiple_write_regions_select_matching_producer_region(self):
+        """One physical output can expose disjoint logical producer regions."""
+        class _PackedProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                base_axes = (
+                    _axis("B", "B"),
+                    _axis("S", "S"),
+                )
+                return AccessRegions(
+                    writes={
+                        "x": (
+                            TensorAccessRegion(
+                                tensor="left",
+                                axes=base_axes + (RegionAxis("N", tile_dim="N", start=0, stop=2),),
+                            ),
+                            TensorAccessRegion(
+                                tensor="right",
+                                axes=base_axes + (RegionAxis("N", tile_dim="N", start=2, stop=4),),
+                            ),
+                        )
+                    }
+                )
+
+        class _LeftConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="left",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("S", "S"),
+                                RegionAxis("N", tile_dim="N", start=0, stop=2),
+                            ),
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_PackedProducer,
+                tile_counts=(1, 3, 4),
+                dim_names={"B": 0, "S": 1, "N": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_LeftConsumer,
+                tile_counts=(1, 3, 2),
+                dim_names={"B": 0, "S": 1, "N": 2},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        resolutions = builder.dependency_resolutions()
+
+        assert len(resolutions) == 1
+        assert resolutions[0].producer_region_index == 0
+        assert len(formulas[0][1]) == 1
+        assert len(formulas[1][0]) == 1
+        assert formulas[1][0][0].expected == 1
+        assert formulas[0][1][0].is_guarded((0, 0, 0))
+        assert formulas[0][1][0].is_guarded((0, 0, 1))
+        assert not formulas[0][1][0].is_guarded((0, 0, 2))
+
+    def test_duplicate_alias_wait_formulas_are_deduplicated(self):
+        """Aliased inputs that lower to the same producer barrier need one wait."""
+        class _AliasProducer(Op):
+            reads = {}
+            writes = {"x": (None, ("M",))}
+            tile = ("M",)
+
+        class _AliasConsumer(Op):
+            reads = {
+                "a": (None, ("M",)),
+                "a_scale": (None, ("M",)),
+            }
+            writes = {}
+            tile = ("M",)
+
+        def _meta(name: str) -> TensorMeta:
+            return TensorMeta(
+                name=name,
+                declared_dims=("M",),
+                ndim=1,
+                shape=(4,),
+                strides=(1,),
+                dtype=None,
+                is_contiguous=True,
+                data_ptr=100,
+                storage_ptr=100,
+                storage_offset=0,
+            )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_AliasProducer,
+                tile_counts=(4,),
+                dim_names={"M": 0},
+                tile_sizes={"M": 1},
+                tensor_metas={"x": _meta("x")},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_AliasConsumer,
+                tile_counts=(4,),
+                dim_names={"M": 0},
+                tile_sizes={"M": 1},
+                tensor_metas={"a": _meta("a"), "a_scale": _meta("a_scale")},
+            )
+        )
+
+        assert len(builder.dependency_resolutions()) == 2
+        formulas = builder.get_op_barrier_formulas()
+        assert len(formulas[0][1]) == 1
+        assert len(formulas[1][0]) == 1
+
+    def test_declared_region_can_wait_for_all_groups(self):
+        """A consumer can explicitly wait for every group of a producer-only axis."""
+        class _RegionProducer(_ProducerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    writes={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("H", "H"),
+                                _axis("M", "M"),
+                            ),
+                            group_dim="H",
+                            group_tiles=2,
+                            group_count=4,
+                        )
+                    }
+                )
+
+        class _RegionConsumer(_ConsumerOp):
+            @classmethod
+            def access_regions(cls, op):
+                return AccessRegions(
+                    reads={
+                        "x": TensorAccessRegion(
+                            tensor="x",
+                            axes=(
+                                _axis("B", "B"),
+                                _axis("M", "M"),
+                            ),
+                            group_index_all=True,
+                        )
+                    }
+                )
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionProducer,
+                tile_counts=(1, 8, 2),
+                dim_names={"B": 0, "H": 1, "M": 2},
+            )
+        )
+        builder.add_op(
+            ScheduledOp(
+                op_cls=_RegionConsumer,
+                tile_counts=(1, 2),
+                dim_names={"B": 0, "M": 1},
+            )
+        )
+        formulas = builder.get_op_barrier_formulas()
+        p_signal = formulas[0][1][0]
+        c_wait = formulas[1][0][0]
+
+        assert [dep.mode for dep in builder.dependency_resolutions()] == ["declared_group"]
+        assert c_wait.expected == 8
+        assert c_wait.compute_index((0, 1)) == p_signal.compute_index((0, 0, 1))
+        assert c_wait.compute_index((0, 1)) == p_signal.compute_index((0, 7, 1))
+        assert p_signal.compute_index((0, 0, 1)) == p_signal.compute_index((0, 7, 1))
 
     def test_one_to_many(self):
         """Producer (batch=4) → Consumer (batch=4, seqlen=8).
@@ -790,6 +1719,39 @@ class TestNamedBufferDeps:
         wait = formulas[1][0]
         assert len(wait) == 1
         assert wait[0].expected == 1
+
+    def test_bshd_producer_feeds_bsk_consumer_by_batch_sequence_group(self):
+        """A BSHD producer should not force each BSK consumer tile to wait for all B/S groups."""
+        b, s, h, d = 4, 128, 16, 128
+        x_bshd = torch.empty(b, s, h, d)
+        x_bsk = x_bshd.view(b, s, h * d)
+        y = torch.empty(b, s, 1)
+
+        prod = _BSHDProducerOp.schedule(
+            x=x_bshd,
+            tile_sizes={"B": 1, "S": 16, "H": 8},
+        )[0]
+        cons = _BSKConsumerOp.schedule(
+            x=x_bsk,
+            y=y,
+            tile_sizes={"B": 1, "S": 128, "N": 1},
+        )[0]
+
+        builder = InstructionStreamBuilder()
+        builder.add_op(prod)
+        builder.add_op(cons)
+        formulas = builder.get_op_barrier_formulas()
+
+        # One barrier per consumer B tile: producer S tiles 0..7 map to B0,
+        # and H contributes two producer tiles per S group.
+        assert builder.num_barriers == b
+        prod_signal = formulas[0][1][0]
+        cons_wait = formulas[1][0][0]
+        assert cons_wait.expected == (s // 16) * (h // 8)
+        assert prod_signal.compute_index((0, 0, 0)) == cons_wait.compute_index((0, 0, 0))
+        assert prod_signal.compute_index((0, 7, 1)) == cons_wait.compute_index((0, 0, 0))
+        assert prod_signal.compute_index((1, 0, 0)) == cons_wait.compute_index((1, 0, 0))
+        assert prod_signal.compute_index((3, 7, 1)) == cons_wait.compute_index((3, 0, 0))
 
     def test_fan_in(self):
         """OpA → "x", OpB → "y", OpC reads ["x", "y"]. OpC has 2 wait formulas."""
@@ -965,8 +1927,8 @@ class TestLevelBatchedScheduling:
     def test_two_op_chain_batched(self):
         """A 2-op chain emits all source tiles before consumer tiles."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]  # strip end marker
 
         assert len(instructions) == 8
@@ -979,9 +1941,9 @@ class TestLevelBatchedScheduling:
     def test_three_op_chain_batched(self):
         """A 3-op chain emits source first, then wavefront for consumers."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ScratchReaderOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]
 
         assert len(instructions) == 12
@@ -1002,8 +1964,8 @@ class TestLevelBatchedScheduling:
     def test_all_tiles_present(self):
         """Interleaved build must emit all tiles from all ops."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
         instructions = builder.build()[:-1]
 
         assert len(instructions) == 12
@@ -1029,8 +1991,8 @@ class TestLevelBatchedScheduling:
     def test_dependency_order_respected(self):
         """Consumer tile k must appear after producer tile k in the stream."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
         instructions = builder.build()[:-1]
 
         # Track emission position of each (op_idx, tiles[0])
@@ -1057,8 +2019,8 @@ class TestSchedulerAPI:
     def test_explicit_scheduler_parameter(self):
         """Can pass scheduler directly to build()."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         # Using explicit scheduler should work
         scheduler = BackwardScheduler()
@@ -1068,8 +2030,8 @@ class TestSchedulerAPI:
     def test_backward_scheduler_respects_dependencies(self):
         """BackwardScheduler must still respect dependencies."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         scheduler = BackwardScheduler()
         instructions = builder.build(scheduler=scheduler)[:-1]
@@ -1089,8 +2051,8 @@ class TestSchedulerAPI:
     def test_backward_scheduler_all_tiles_present(self):
         """BackwardScheduler must emit all tiles."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
-        builder.add_op(_NOPOp, tile_counts=(3, 2))
+        builder.add_op(_ProducerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
+        builder.add_op(_ConsumerOp, tile_counts=(3, 2), dim_names={"M": 0, "N": 1})
 
         scheduler = BackwardScheduler()
         instructions = builder.build(scheduler=scheduler)[:-1]
@@ -1113,8 +2075,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_preserves_stride_for_ready_chain_tiles(self):
         """OverlapTileScheduler should preserve broad producer/consumer waves."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_ProducerOp, tile_counts=(4,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(4,), dim_names={"batch": 0})
 
         instructions = builder.build(scheduler=OverlapTileScheduler())[:-1]
 
@@ -1126,8 +2088,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_respects_fetch_stride_waves(self):
         """Stride-aware overlap should not create same-round dependencies."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_ProducerOp, tile_counts=(8,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(8,), dim_names={"batch": 0})
 
         instructions = builder.build(scheduler=OverlapTileScheduler(fetch_stride=4))[:-1]
 
@@ -1141,8 +2103,8 @@ class TestSchedulerAPI:
     def test_overlap_scheduler_adaptive_fetch_stride_uses_wider_small_waves(self):
         """Adaptive overlap can use two CTA waves for short instruction streams."""
         builder = InstructionStreamBuilder()
-        builder.add_op(_NOPOp, tile_counts=(8,))
-        builder.add_op(_NOPOp, tile_counts=(8,))
+        builder.add_op(_ProducerOp, tile_counts=(8,), dim_names={"batch": 0})
+        builder.add_op(_ConsumerOp, tile_counts=(8,), dim_names={"batch": 0})
         scheduler = OverlapTileScheduler(adaptive_fetch_stride=True)
         scheduler.bind_num_blocks(4)
 
@@ -1201,7 +2163,7 @@ class TestSchedulerAPI:
         """Ready-consumer mode should not move unrelated sinks ahead of the chain."""
         builder = InstructionStreamBuilder()
         builder.add_op(_ProducerOp, tile_counts=(4,))
-        builder.add_op(_NOPOp, tile_counts=(4,))
+        builder.add_op(_IndependentOp, tile_counts=(4,))
         builder.add_op(_ConsumerOp, tile_counts=(4,))
 
         instructions = builder.build(
@@ -1214,6 +2176,26 @@ class TestSchedulerAPI:
 
         assert [(i.op_idx, i.tiles[0]) for i in instructions[:2]] == [
             (0, 0), (0, 1),
+        ]
+
+    def test_overlap_dependency_slack_keeps_ready_consumer_behind_independent_work(self):
+        """Slack gives strided CTA streams runway before consuming a newly-ready barrier."""
+        builder = InstructionStreamBuilder()
+        builder.add_op(_ProducerOp, tile_counts=(4,))
+        builder.add_op(_IndependentOp, tile_counts=(4,))
+        builder.add_op(_ConsumerOp, tile_counts=(4,))
+
+        instructions = builder.build(
+            scheduler=OverlapTileScheduler(
+                fetch_stride=4,
+                prefer_data_movement=False,
+                dependency_slack_waves=1,
+            )
+        )[:-1]
+
+        assert [(i.op_idx, i.tiles[0]) for i in instructions[:8]] == [
+            (0, 0), (0, 1), (0, 2), (0, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
         ]
 
 
@@ -1271,13 +2253,12 @@ class TestTupleAndStringDimFormats:
             ("D", "x", 1),
         ]
 
-    def test_string_format_still_works(self):
-        """Legacy string format still parses correctly."""
-        tensors, dims = _build_tensor_and_dim_lists(
-            {"x": (None, "M, D")}, {"y": (None, "M, D")}
-        )
-        assert tensors == [("x", None, ["M", "D"]), ("y", None, ["M", "D"])]
-        assert dims == [("M", "x", 0), ("D", "x", 1)]
+    def test_string_format_rejected(self):
+        """Dim declarations must use tuple/list form."""
+        with pytest.raises(TypeError, match="dims must be tuple or list"):
+            _build_tensor_and_dim_lists(
+                {"x": (None, "M, D")}, {"y": (None, "M, D")}
+            )
 
 
 class TestNdimValidation:

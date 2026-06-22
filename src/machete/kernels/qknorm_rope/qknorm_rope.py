@@ -29,7 +29,6 @@ from cutlass import Int32, Float32
 from cutlass.cute.nvgpu.cpasync import (
     CopyBulkG2SOp,
     CopyBulkS2GOp,
-    group_bulk_copy_modes,
 )
 
 from machete.megakernel.ops import (
@@ -227,7 +226,8 @@ class QKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.q_row_elems,)),
                 )
-                gsrc, sdst = group_bulk_copy_modes(g_q, s_q)
+                gsrc = cute.group_modes(g_q, 0, 1)
+                sdst = cute.group_modes(s_q, 0, 1)
                 cute.copy(g2s_q, gsrc, sdst, mbar_ptr=mbar_ptr)
 
                 g_cos = cute.make_tensor(
@@ -242,7 +242,8 @@ class QKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gc_src, sc_dst = group_bulk_copy_modes(g_cos, s_cos)
+                gc_src = cute.group_modes(g_cos, 0, 1)
+                sc_dst = cute.group_modes(s_cos, 0, 1)
                 cute.copy(g2s_cs, gc_src, sc_dst, mbar_ptr=mbar_ptr)
 
                 g_sin = cute.make_tensor(
@@ -257,7 +258,8 @@ class QKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gs_src, ss_dst = group_bulk_copy_modes(g_sin, s_sin)
+                gs_src = cute.group_modes(g_sin, 0, 1)
+                ss_dst = cute.group_modes(s_sin, 0, 1)
                 cute.copy(g2s_cs, gs_src, ss_dst, mbar_ptr=mbar_ptr)
 
     # =========================================================================
@@ -497,7 +499,8 @@ class QKNormRopeOp(Op):
                     + head_start * Int32(self.q_stride_H),
                     cute.make_layout((self.q_row_elems,)),
                 )
-                ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+                ssrc = cute.group_modes(s_tile, 0, 1)
+                gdst = cute.group_modes(g_tile, 0, 1)
                 cute.copy(s2g, ssrc, gdst)
 
 
@@ -664,7 +667,8 @@ class PackedQKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.qk_row_elems,)),
                 )
-                gsrc, sdst = group_bulk_copy_modes(g_qk, s_qk)
+                gsrc = cute.group_modes(g_qk, 0, 1)
+                sdst = cute.group_modes(s_qk, 0, 1)
                 cute.copy(g2s_qk, gsrc, sdst, mbar_ptr=mbar_ptr)
 
                 g_cos = cute.make_tensor(cos.iterator + s * self.D2, cute.make_layout((self.D2,)))
@@ -676,7 +680,8 @@ class PackedQKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gc_src, sc_dst = group_bulk_copy_modes(g_cos, s_cos)
+                gc_src = cute.group_modes(g_cos, 0, 1)
+                sc_dst = cute.group_modes(s_cos, 0, 1)
                 cute.copy(g2s_cs, gc_src, sc_dst, mbar_ptr=mbar_ptr)
 
                 g_sin = cute.make_tensor(sin.iterator + s * self.D2, cute.make_layout((self.D2,)))
@@ -688,7 +693,8 @@ class PackedQKNormRopeOp(Op):
                     ),
                     cute.make_layout((self.D2,)),
                 )
-                gs_src, ss_dst = group_bulk_copy_modes(g_sin, s_sin)
+                gs_src = cute.group_modes(g_sin, 0, 1)
+                ss_dst = cute.group_modes(s_sin, 0, 1)
                 cute.copy(g2s_cs, gs_src, ss_dst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -881,7 +887,8 @@ class PackedQKNormRopeOp(Op):
                     qk.iterator + pos * (self.H * self.D) + head_start * self.D,
                     cute.make_layout((self.qk_row_elems,)),
                 )
-                ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+                ssrc = cute.group_modes(s_tile, 0, 1)
+                gdst = cute.group_modes(g_tile, 0, 1)
                 cute.copy(s2g, ssrc, gdst)
 
 
@@ -897,15 +904,14 @@ class QKNormRopeBwdOp(Op):
     """
 
     reads = {
-        "q": (None, ("M", "H", "D")),
-        "dout": (None, ("M", "H", "D")),
+        "q": (None, ("B", "S", "H", "D")),
+        "dout": (None, ("B", "S", "H", "D")),
         "norm_weight": (None, ("D",)),
         "cos": (None, ("S", "D2")),
         "sin": (None, ("S", "D2")),
     }
-    writes = {"dq": (None, ("M", "H", "D"))}
-    tile = ("M", "H")
-    dynamic_dims = ("M",)
+    writes = {"dq": (None, ("B", "S", "H", "D"))}
+    tile = ("B", "S", "H")
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -927,15 +933,15 @@ class QKNormRopeBwdOp(Op):
         q = tensors.get("q")
         if q is None:
             return {}
-        M, H, D = q.shape
+        _B, S, H, D = q.shape
         elem_bytes = q.element_size()
         min_tile_H = max(4, 2048 // (D * elem_bytes))
         tile_H = min(H, min_tile_H)
         while tile_H > 1 and H % tile_H != 0:
             tile_H -= 1
         row_bytes = tile_H * D * elem_bytes
-        tile_M = max(1, page_size // max(row_bytes, 1))
-        return {"H": tile_H, "M": tile_M}
+        tile_rows = max(1, page_size // max(row_bytes, 1))
+        return {"B": 1, "S": min(S, tile_rows), "H": tile_H}
 
     @classmethod
     def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, eps=1e-6, **tensors):
@@ -955,8 +961,8 @@ class QKNormRopeBwdOp(Op):
         return MegakernelConfig(page_size=page_size)
 
     @cute.jit
-    def compute(self, page_ptr, tile_M, tile_H, op_config_ptr):
-        runtime_M = config_dim_i32(op_config_ptr, "M", type(self))
+    def compute(self, page_ptr, tile_B, tile_S, tile_H, op_config_ptr):
+        runtime_M = Int32(self.B * self.S)
         q = config_flat_tensor(
             op_config_ptr,
             "q",
@@ -1004,7 +1010,8 @@ class QKNormRopeBwdOp(Op):
         lane_idx = cute.arch.lane_idx()
         num_warps = self.threads_per_row // 32
         thr_layout = cute.make_layout(32)
-        tile_m_start = tile_M * self.tile_size_M
+        tile_b_start = tile_B * self.tile_size_B
+        tile_s_start = tile_S * self.tile_size_S
         tile_h_start = tile_H * self.tile_size_H
         inv_D = Float32(1.0 / self.D)
         eps_val = Float32(self.eps)
@@ -1014,22 +1021,37 @@ class QKNormRopeBwdOp(Op):
         w_reg = cute.make_fragment_like(w_part)
         cute.autovec_copy(w_part, w_reg)
 
-        for local_m in range(self.tile_size_M):
-            m = tile_m_start + local_m
-            if m < runtime_M:
-                s = m % self.S
-                cos_row = cute.make_tensor(cos.iterator + s * self.D2, cute.make_layout(self.D2))
-                sin_row = cute.make_tensor(sin.iterator + s * self.D2, cute.make_layout(self.D2))
-                cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
-                sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
-                cos_reg = cute.make_fragment_like(cos_part)
-                sin_reg = cute.make_fragment_like(sin_part)
-                cute.autovec_copy(cos_part, cos_reg)
-                cute.autovec_copy(sin_part, sin_reg)
-
-                for local_h in range(warp_idx, self.tile_size_H, num_warps):
+        # Distribute the flattened (B, S, H) rows across ALL warps rather than
+        # splitting only over H with a serial S loop. Each row (one head's
+        # D-vector) is still owned by a single warp (32 lanes over D), but now
+        # every warp grabs a strided slice of the tile's B*S*H rows so all
+        # available warps stay busy even when tile_size_H < num_warps (notably
+        # the K tensor, where tile_size_H is as small as 2). cos/sin are reloaded
+        # per row; they only depend on s and hit L2, so the redundancy is cheap.
+        # See the analogous decode-matvec S*O flattening win.
+        total_rows = self.tile_size_B * self.tile_size_S * self.tile_size_H
+        d2_regs = self.D2 // 32
+        for work in range(warp_idx, total_rows, num_warps):
+            local_h = work % self.tile_size_H
+            rem = work // self.tile_size_H
+            local_s = rem % self.tile_size_S
+            local_b = rem // self.tile_size_S
+            b = tile_b_start + local_b
+            s = tile_s_start + local_s
+            if b < Int32(self.B):
+                if s < Int32(self.S):
+                    m = b * Int32(self.S) + s
                     h = tile_h_start + local_h
                     row_base = m * Int32(self.H * self.D) + h * Int32(self.D)
+
+                    cos_row = cute.make_tensor(cos.iterator + s * self.D2, cute.make_layout(self.D2))
+                    sin_row = cute.make_tensor(sin.iterator + s * self.D2, cute.make_layout(self.D2))
+                    cos_part = cute.local_partition(cos_row, thr_layout, lane_idx)
+                    sin_part = cute.local_partition(sin_row, thr_layout, lane_idx)
+                    cos_reg = cute.make_fragment_like(cos_part)
+                    sin_reg = cute.make_fragment_like(sin_part)
+                    cute.autovec_copy(cos_part, cos_reg)
+                    cute.autovec_copy(sin_part, sin_reg)
 
                     q_row = cute.make_tensor(q.iterator + row_base, cute.make_layout(self.D))
                     dout_row = cute.make_tensor(dout.iterator + row_base, cute.make_layout(self.D))
@@ -1050,7 +1072,6 @@ class QKNormRopeBwdOp(Op):
                     for i in range(cute.size(dout_reg)):
                         dnorm_reg[i] = dout_reg[i]
 
-                    d2_regs = self.D2 // 32
                     for k in range(d2_regs):
                         c = cos_reg[k].to(Float32)
                         sn = sin_reg[k].to(Float32)

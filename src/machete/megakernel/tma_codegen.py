@@ -6,13 +6,21 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Tuple
 
 
+def tma_tensor_rank(desc) -> int:
+    dim_perm = tuple(getattr(desc, "dim_perm", ()) or ())
+    return len(dim_perm) if dim_perm else len(desc.tile_shape)
+
+
+def tma_tensor_name(desc) -> str:
+    return f"tma_{desc.tensor_canonical}_{tma_tensor_rank(desc)}d"
+
+
 def collect_tma_tensor_names(tma_registry) -> List[str]:
     """Return unique parameter names for local static-layout TMA tensors."""
     tensor_names: List[str] = []
     seen = set()
     for desc in tma_registry.descriptors:
-        ndim = len(desc.tile_shape)
-        tensor_name = f"tma_{desc.tensor_canonical}_{ndim}d"
+        tensor_name = tma_tensor_name(desc)
         if tensor_name in seen:
             continue
         seen.add(tensor_name)
@@ -146,12 +154,11 @@ def build_tma_kernel_components(
         return helper_name
 
     for slot, desc in enumerate(tma_registry.descriptors):
-        ndim = len(desc.tile_shape)
         append_tma_descriptor_code(
             tma_creation_lines,
             desc_pool_init_specs,
             desc,
-            f"tma_{desc.tensor_canonical}_{ndim}d",
+            tma_tensor_name(desc),
             helper_name=_helper_name_for_desc(desc),
             create_atom_binding=desc.canonical_atom not in seen_atoms,
             create_gmem_binding=desc.canonical_gmem not in seen_gmems,

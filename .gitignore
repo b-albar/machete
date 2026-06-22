@@ -1,6 +1,12 @@
 .claude/
+traces/
 *.nanotrace
 *.perfetto
+*.json
+*.sass
+*.ptx
+*.mlir
+*.cubin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -53,6 +59,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations

@@ -28,6 +28,7 @@ TMA_PHASE_SPECS = (
     ("load", "_TMA_LOADS", "g2s"),
     ("compute", "_TMA_COMPUTE_LOADS", "g2s"),
     ("compute", "_TMA_COMPUTE_STORES", "s2g"),
+    ("compute", "_TMA_COMPUTE_REDUCE_STORES", "s2g_reduce"),
     ("store", "_TMA_STORES", "s2g"),
     ("store", "_TMA_REDUCE_STORES", "s2g_reduce"),
 )
@@ -77,6 +78,33 @@ def _iter_peer_tma_specs(op_cls):
 def _tensor_dim_permutation(tensor) -> Tuple[int, ...]:
     """Return a stride-sorted permutation suitable for TMA descriptor creation."""
     return tuple(sorted(range(tensor.ndim), key=lambda axis: (tensor.stride(axis), -axis)))
+
+
+def _op_tma_dim_permutation(op_cls, tensor_name: str, op: ScheduledOp, tensor) -> Tuple[int, ...]:
+    """Return the TMA tensor mode permutation for one op tensor.
+
+    Most ops use stride-sorted modes so TMA mode 0 is contiguous.  Some kernels
+    intentionally use a different legal order to match an MMA-friendly shared
+    memory atom, e.g. Flash-style attention K/V as ``(S, D, H, B)`` for BSHD
+    tensors.  Those ops can override ``get_tma_dim_permutation``.
+    """
+    if hasattr(op_cls, "get_tma_dim_permutation"):
+        custom = op_cls.get_tma_dim_permutation(
+            tensor_name,
+            op.tile_sizes,
+            op.static_dims,
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+        )
+        if custom is not None:
+            custom = tuple(custom)
+            if len(custom) != tensor.ndim:
+                raise ValueError(
+                    f"{op_cls.__name__}.get_tma_dim_permutation({tensor_name!r}) "
+                    f"returned rank {len(custom)} for a {tensor.ndim}D tensor"
+                )
+            return custom
+    return _tensor_dim_permutation(tensor)
 
 
 def _resolve_tensor_canonical_name(
@@ -674,7 +702,7 @@ class TMARegistry:
                         continue
 
                     original_ref = op.tensor_refs[tensor_name]
-                    dim_perm = _tensor_dim_permutation(original_ref)
+                    dim_perm = _op_tma_dim_permutation(op_cls, tensor_name, op, original_ref)
                     tma_tile_shape = _compute_tma_tile_shape(
                         op_cls, tensor_name, op, dim_perm=dim_perm)
                     dtype = _resolve_tma_dtype(op, tensor_name)

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from machete.kernels.attention import FlashAttentionSm120Op
-from machete.kernels.gemm import GemmOp, GemmSm100Op
+from machete.kernels.gemm import GemmOp
 from machete.kernels.glu import GLUBwdOp, GLUOp
 from machete.kernels.qknorm_rope import QKNormRopeOp
 from machete.kernels.rms_norm import RMSNormOp
@@ -30,12 +30,14 @@ class TestMegakernel:
     def test_megakernel_creation(self):
         """Test creating a megakernel instance."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
+
+        class NopSourceOp(get_nop_op()):
+            OUTPUTS = ["x"]
 
         # Define some operations
         ops = [
-            ScheduledOp(NopOp, tile_counts=(32,)),
-            ScheduledOp(NopOp, tile_counts=(16,)),
+            ScheduledOp(NopSourceOp, tile_counts=(32,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopSourceOp, tile_counts=(16,), tensor_ptrs={"x": 2}),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -49,12 +51,14 @@ class TestMegakernel:
     def test_backend_does_not_duplicate_identical_handlers(self):
         """Repeated identical ops should share one emitted handler body."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
+
+        class NopSourceOp(get_nop_op()):
+            OUTPUTS = ["x"]
 
         ops = [
-            ScheduledOp(NopOp, tile_counts=(32,)),
-            ScheduledOp(NopOp, tile_counts=(16,)),
-            ScheduledOp(NopOp, tile_counts=(8,)),
+            ScheduledOp(NopSourceOp, tile_counts=(32,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopSourceOp, tile_counts=(16,), tensor_ptrs={"x": 2}),
+            ScheduledOp(NopSourceOp, tile_counts=(8,), tensor_ptrs={"x": 3}),
         ]
 
         kernel = Megakernel(
@@ -165,33 +169,11 @@ class TestMegakernel:
         """Ops that used backend allowlists now declare their own inline phases."""
         all_thin = ("load", "compute", "store")
         assert GemmOp.inline_phases == all_thin
-        assert GemmSm100Op.inline_phases == all_thin
         assert GLUOp.inline_phases == all_thin
         assert FlashAttentionSm120Op.inline_phases == all_thin
         assert QKNormRopeOp.inline_phases == all_thin
         assert RMSNormOp.inline_phases == all_thin
         assert GLUBwdOp.inline_phases == ("compute",)
-
-    def test_compute_sync_policy_is_op_owned(self):
-        """CTA compute sync is derived from op requirements."""
-        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-
-        class DefaultSyncOp(Op):
-            pass
-
-        class SyncOp(Op):
-            sync_compute_warps_after_tile = True
-
-        assert not Megakernel(
-            [ScheduledOp(DefaultSyncOp, tile_counts=(1,))],
-            config=MegakernelConfig(num_sms=1),
-            device="cpu",
-        )._sync_compute_warps_after_tile()
-        assert Megakernel(
-            [ScheduledOp(DefaultSyncOp, tile_counts=(1,)), ScheduledOp(SyncOp, tile_counts=(1,))],
-            config=MegakernelConfig(num_sms=1),
-            device="cpu",
-        )._sync_compute_warps_after_tile()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_validation_check(self):

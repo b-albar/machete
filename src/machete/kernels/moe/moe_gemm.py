@@ -31,12 +31,12 @@ Page layout (2-stage double buffer):
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, const_expr
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -176,9 +176,11 @@ class MoeGemmOp(Op):
         with cute.arch.elect_one():
             mbarrier_init(_bf_0, Int32(1))
             mbarrier_init(_bf_1, Int32(1))
-            mbarrier_init(_kr_0, Int32(1))
-            mbarrier_init(_kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(_kr_0, Int32(1))
+                mbarrier_init(_kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         _k_block = Int32(0)
         while _k_block < Int32(self.num_k_blocks):
@@ -535,8 +537,7 @@ class MoeGemmOp(Op):
             cute.group_modes(gC, 0, 2),
         )
 
-        with cute.arch.elect_one():
-            cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+        cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_M)])
 
     # =========================================================================
     # Communicate (TMA S->G to peer GPU)
@@ -559,8 +560,7 @@ class MoeGemmOp(Op):
             cute.group_modes(gC, 0, 2),
         )
 
-        with cute.arch.elect_one():
-            cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_M)])
+        cute.copy(c_p0_tma, tCsC, tCgC[(None, tile_N, tile_M)])
 
     # =========================================================================
     # Scheduling

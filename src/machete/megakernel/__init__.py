@@ -40,6 +40,7 @@ from .registries import (
 
 from .scheduling import (
     BarrierFormula,
+    DependencyResolution,
     INSTRUCTION_WORDS,
     INSTR_BARRIER_META_IDX,
     INSTR_OP_IDX,
@@ -51,8 +52,11 @@ from .scheduling import (
     TileScheduler,
     BackwardScheduler,
     OverlapTileScheduler,
+    TimingAwareOverlapScheduler,
     InstructionStreamBuilder,
 )
+from .timing_profile import OpTiming, TimingProfile
+from .scheduler_config import scheduler_from_config, scheduler_from_autotune_summary
 
 from .compile import (
     cleanup_linecache,
@@ -98,6 +102,7 @@ __all__ = [
     "config_flat_tensor",
     # Barrier Formulas
     "BarrierFormula",
+    "DependencyResolution",
     # Compilation
     "cleanup_linecache",
     # Instruction Stream
@@ -112,7 +117,12 @@ __all__ = [
     "TileScheduler",
     "BackwardScheduler",
     "OverlapTileScheduler",
+    "TimingAwareOverlapScheduler",
     "InstructionStreamBuilder",
+    "OpTiming",
+    "TimingProfile",
+    "scheduler_from_config",
+    "scheduler_from_autotune_summary",
     # Configuration & Megakernel
     "DEFAULT_PAGE_SIZE",
     "MegakernelConfig",

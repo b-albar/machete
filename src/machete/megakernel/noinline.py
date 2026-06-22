@@ -233,7 +233,10 @@ def _pre_exec_tma_args(args):
         trait = getattr(a, '_trait', None)
         field_namespace = None
         supports_mbar = False
-        if isinstance(trait, (CopyBulkTensorTileG2SNonExecTrait, CopyBulkTensorTileG2SMulticastNonExecTrait)):
+        if isinstance(trait, RuntimeDescTMATrait):
+            field_namespace = trait.field_namespace
+            supports_mbar = trait.supports_mbar
+        elif isinstance(trait, (CopyBulkTensorTileG2SNonExecTrait, CopyBulkTensorTileG2SMulticastNonExecTrait)):
             field_namespace = "tmaload"
             supports_mbar = True
         elif isinstance(trait, CopyBulkTensorTileS2GNonExecTrait):
@@ -243,19 +246,23 @@ def _pre_exec_tma_args(args):
 
         if field_namespace is not None:
             exec_value = atom_make_exec_tma(trait.value)
-            # Use a generic typed pointer here. Lowering from a byval kernel
-            # argument-backed descriptor field to addrspace(1) leaves an
-            # unrealized conversion cast in LLVM translation, while generic
-            # typed descriptor pointers lower cleanly and are accepted by the
-            # raw NVGPU ``atom_make_tma_*`` ops.
-            ptr_type = runtime_desc_ptr_type()
-            desc_ptr = cn.get_tma_desc_addr(ptr_type, exec_value)
+            if isinstance(trait, RuntimeDescTMATrait):
+                desc_ptr = trait.desc_ptr
+            else:
+                # Use a generic typed pointer here. Lowering from a byval kernel
+                # argument-backed descriptor field to addrspace(1) leaves an
+                # unrealized conversion cast in LLVM translation, while generic
+                # typed descriptor pointers lower cleanly and are accepted by the
+                # raw NVGPU ``atom_make_tma_*`` ops.
+                ptr_type = runtime_desc_ptr_type()
+                desc_ptr = cn.get_tma_desc_addr(ptr_type, exec_value)
             new_atom = copy_mod.copy(a)
             new_atom._trait = RuntimeDescTMATrait(
                 trait.value,
                 desc_ptr,
                 field_namespace=field_namespace,
                 supports_mbar=supports_mbar,
+                exec_value=exec_value,
             )
             new_args[i] = new_atom
     return new_args

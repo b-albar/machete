@@ -261,27 +261,26 @@ class ActivationOp(Op):
     @cute.jit
     def store(self, page_ptr, tile_B, tile_S, tile_N, y_tma, y_tma_gmem):
         """TMA store of activated result from shared to global memory."""
-        with cute.arch.elect_one():
-            for wi in range(self.num_tma_tiles):
-                gYi = cute.local_tile(
-                    y_tma_gmem,
-                    (self.tma_tile_N, self.tile_size_S, 1),
-                    (Int32(wi), tile_S, tile_B),
-                )
-                sYi = cute.make_tensor(
-                    cute.make_ptr(
-                        self.x_dtype,
-                        page_ptr + Int32(wi * self.chunk_stride_bytes),
-                        cute.AddressSpace.smem,
-                    ),
-                    cute.make_layout((self.tma_tile_N, self.tile_size_S, 1)),
-                )
-                tYsYi, tYgYi = cute.nvgpu.cpasync.tma_partition(
-                    y_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sYi, 0, 3),
-                    cute.group_modes(gYi, 0, 3),
-                )
-                cute.copy(y_tma, tYsYi, tYgYi)
+        for wi in range(self.num_tma_tiles):
+            gYi = cute.local_tile(
+                y_tma_gmem,
+                (self.tma_tile_N, self.tile_size_S, 1),
+                (Int32(wi), tile_S, tile_B),
+            )
+            sYi = cute.make_tensor(
+                cute.make_ptr(
+                    self.x_dtype,
+                    page_ptr + Int32(wi * self.chunk_stride_bytes),
+                    cute.AddressSpace.smem,
+                ),
+                cute.make_layout((self.tma_tile_N, self.tile_size_S, 1)),
+            )
+            tYsYi, tYgYi = cute.nvgpu.cpasync.tma_partition(
+                y_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sYi, 0, 3),
+                cute.group_modes(gYi, 0, 3),
+            )
+            cute.copy(y_tma, tYsYi, tYgYi)
 
 
 __all__ = ["ActivationOp"]

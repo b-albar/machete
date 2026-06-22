@@ -15,7 +15,7 @@ persistent kernel shell. It does not define individual op math.
 import ctypes
 from dataclasses import dataclass
 import inspect
-import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 
@@ -50,7 +50,6 @@ from .backend_ir import PHASE_NAMES
 from .codegen_support import (
     build_kernel_exec_globals,
     build_persistent_kernel_globals,
-    enable_page_free_ring_source,
 )
 from .source_fragments import build_kernel_loop_source, build_persistent_kernel_source
 from .tma_codegen import build_tma_kernel_components
@@ -59,12 +58,27 @@ from .runtime_components import (
     build_kernel_runtime_components,
     build_kernel_static_config,
 )
-from .replay_loops import build_compute_only_kernel_loop, build_ring_kernel_loop
+from .compute_only_replay import (
+    build_compute_only_kernel_loop,
+    build_compute_only_op_metadata_entry,
+    compute_only_op_meta_exec_globals,
+)
+from .full_replay import (
+    INSTR_NO_SMEM_PAGE_BIT,
+    OP_PHASE_COMMUNICATE,
+    OP_PHASE_COMPUTE,
+    OP_PHASE_LOAD,
+    OP_PHASE_STORE,
+    build_full_op_metadata_entry,
+    build_ring_kernel_loop,
+    full_op_meta_exec_globals,
+)
 from .interpreter import (
     global_barrier_signal,
     global_barrier_signal_gpu,
     global_barrier_wait,
     global_barrier_wait_relaxed,
+    global_memory_fence_gpu,
     load_instruction_to_smem,
     prefetch_instruction,
     ld_global_i32,
@@ -89,12 +103,6 @@ from .paged_memory import (
     ld_shared_acquire_cta_i32,
     ld_shared_v2_b32,
     st_shared_v2_b32,
-    FLAG_DISPATCH_LOAD,
-    FLAG_PRODUCE_IDX,
-    FLAG_STORE_IDX,
-    FLAG_LOAD_DONE,
-    FLAG_DATA_RELEASE_IDX,
-    FLAG_DATA_PRODUCE_IDX,
     TILE_INFO_HANDLER_IDX as _TILE_INFO_HANDLER_IDX,
     TILE_INFO_INSTRUCTION_IDX as _TILE_INFO_INSTRUCTION_IDX,
     TILE_INFO_OP_CONFIG as _TILE_INFO_OP_CONFIG,
@@ -135,35 +143,6 @@ _PHASE_DESC_SLOT_PTR_ATTRS = {
     "communicate": "communicate_local_desc_slots_ptr",
 }
 
-# Per-op metadata layout (int32 entries).
-_OP_META_NUM_WARPS = 0
-_OP_META_STRIDE_0 = 1
-_OP_META_STRIDE_1 = 2
-_OP_META_STRIDE_2 = 3
-_OP_META_STRIDE_3 = 4
-_OP_META_COUNT_0 = 5
-_OP_META_COUNT_1 = 6
-_OP_META_COUNT_2 = 7
-_OP_META_COUNT_3 = 8
-_OP_META_HANDLER_IDX = 9
-_OP_META_LOAD_LOCAL_IDX = 10
-_OP_META_COMPUTE_LOCAL_IDX = 11
-_OP_META_STORE_LOCAL_IDX = 12
-_OP_META_COMM_LOCAL_IDX = 13
-_OP_META_WAIT_COUNT = 14
-_OP_META_COMPUTE_WAIT_COUNT = 15
-_OP_META_SIGNAL_COUNT = 16
-_OP_META_WAIT_ACQUIRE = 17
-_OP_META_PHASE_MASK = 18
-_OP_META_STRIDE = 19
-
-_OP_PHASE_LOAD = 1
-_OP_PHASE_COMPUTE = 2
-_OP_PHASE_STORE = 4
-_OP_PHASE_COMMUNICATE = 8
-
-_INSTR_NO_SMEM_PAGE_BIT = 13
-
 # Per-signal-formula metadata layout (int32 entries).
 _SIGNAL_META_BASE = 0
 _SIGNAL_META_GUARD_MAX = 1
@@ -185,9 +164,14 @@ class MegakernelConfig:
 
     Register budget:
         dma_reg_count: Registers per DMA warp thread (default: 40).
+        controller_reg_count: Optional controller warp register cap. When None,
+            uses dma_reg_count.
+        loader_reg_count: Optional load/TMA emit warp register cap. When None,
+            uses dma_reg_count.
+        store_reg_count: Optional store/TMA emit warp register cap. When None,
+            uses dma_reg_count.
         mma_reg_count: Registers per MMA warp thread (default: 232).
-            Total must fit: num_mma_warps * mma_reg_count + NUM_DMA_WARPS * dma_reg_count
-            <= 65536 registers per SM.
+            Total must fit the SM register file after per-role caps resolve.
 
     Compilation:
         opt_level: LLVM optimization level 0-3 (default: 2).
@@ -205,8 +189,12 @@ class MegakernelConfig:
     num_sms: Optional[int] = None
     page_size: int = 49152
     num_pages: Optional[int] = None
+    page_free_extra_slots: int = 0
     tracing: bool = False
     dma_reg_count: int = 40
+    controller_reg_count: Optional[int] = None
+    loader_reg_count: Optional[int] = None
+    store_reg_count: Optional[int] = None
     mma_reg_count: int = 232
     loader_idle_sleep_ns: int = 100
     relaxed_global_barriers: bool = True
@@ -218,6 +206,22 @@ class MegakernelConfig:
     peer_barriers: Optional[Any] = None
     device_idx: int = 0
     num_devices: int = 1
+
+    @property
+    def resolved_controller_reg_count(self) -> int:
+        return (
+            self.dma_reg_count
+            if self.controller_reg_count is None
+            else self.controller_reg_count
+        )
+
+    @property
+    def resolved_loader_reg_count(self) -> int:
+        return self.dma_reg_count if self.loader_reg_count is None else self.loader_reg_count
+
+    @property
+    def resolved_store_reg_count(self) -> int:
+        return self.dma_reg_count if self.store_reg_count is None else self.store_reg_count
 
 
 @dataclass
@@ -463,7 +467,7 @@ class Megakernel:
             return True
 
         threads_per_block = self.config.threads_per_block
-        num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
+        num_dma_warps = 0 if self._use_compute_only_replay() else self._num_dma_warps()
         num_compute_threads = threads_per_block - num_dma_warps * 32
         kernel_config = {"threads_per_row": num_compute_threads}
         config = build_op_config(op, kernel_config=kernel_config)
@@ -504,15 +508,53 @@ class Megakernel:
         if any(getattr(op.op_cls, "pipeline", None) is not None for op in ops):
             Megakernel._unload_active_tma_modules()
             Megakernel._drop_cached_tma_kernels()
-        self._has_page_free_ops = (
-            os.environ.get("MACHETE_ENABLE_PAGE_FREE_OPS", "0") == "1"
-            and any(not bool(getattr(op.op_cls, "uses_smem_page", True)) for op in ops)
-        )
-        # Keep instruction slots separate from physical shared-memory pages for
-        # multi-page kernels. This prevents slot metadata/mbarrier phase reuse
-        # from being coupled to page reuse.
-        self._use_physical_page_ring = self._has_page_free_ops
-
+        # Per-op page requests (N pages per tile, possibly derived from page_size)
+        # and per-page release-timing masks. Default: every op wants 1 page,
+        # released after store (mask 0) == classic single-page behavior.
+        self._op_page_counts = [
+            max(1, int(op.op_cls.requested_page_count_for(self.config.page_size)))
+            for op in ops
+        ]
+        self._op_page_rel_masks = [
+            int(op.op_cls.page_release_after_compute_mask(self.config.page_size))
+            for op in ops
+        ]
+        self._op_page_manual_rel_masks = [
+            int(op.op_cls.page_release_inside_compute_mask(self.config.page_size))
+            for op in ops
+        ]
+        self._max_requested_page_count = max(self._op_page_counts, default=1)
+        for op, page_count, release_mask, manual_release_mask in zip(
+            ops,
+            self._op_page_counts,
+            self._op_page_rel_masks,
+            self._op_page_manual_rel_masks,
+        ):
+            uses_smem_page = bool(getattr(op.op_cls, "uses_smem_page", True))
+            if not uses_smem_page and page_count != 1:
+                raise ValueError(
+                    f"{op.op_cls.__name__} requests {page_count} shared-memory "
+                    "pages but declares uses_smem_page=False."
+                )
+            invalid_mask_bits = release_mask >> page_count
+            if invalid_mask_bits:
+                raise ValueError(
+                    f"{op.op_cls.__name__} page_release_after_compute_mask has "
+                    f"bits outside requested_page_count={page_count}: "
+                    f"mask=0x{release_mask:x}."
+                )
+            invalid_manual_mask_bits = manual_release_mask >> page_count
+            if invalid_manual_mask_bits:
+                raise ValueError(
+                    f"{op.op_cls.__name__} page_release_inside_compute_mask has "
+                    f"bits outside requested_page_count={page_count}: "
+                    f"mask=0x{manual_release_mask:x}."
+                )
+            if manual_release_mask and page_count <= 1:
+                raise ValueError(
+                    f"{op.op_cls.__name__} declares page_release_inside_compute_mask "
+                    "but does not request multiple shared-memory pages."
+                )
         # Detect resident block count if not specified.
         #
         # Occupying every SM is wasteful for small workloads: the persistent
@@ -529,44 +571,90 @@ class Megakernel:
         if self._scheduler is not None and hasattr(self._scheduler, "bind_num_blocks"):
             self._scheduler.bind_num_blocks(self.config.num_sms)
 
+        # Tensor/TMA registries are needed to decide whether this graph can use
+        # the compute-only replay path before shared-memory layout is chosen.
+        self._tensor_registry = TensorRegistry.from_ops(ops)
+        validate_op_compatibility(ops, self._tensor_registry)
+        self._cute_tensors: Optional[List] = None  # torch.Tensor objects for kernel params
+        self._tma_registry = TMARegistry.from_ops(ops, self._tensor_registry)
+        self._tma_cute_tensors: Optional[List] = None  # CuTe tensors with static layout for TMA
+        if self.config.peer_buffers:
+            self._peer_buffer_registry = PeerBufferRegistry.from_config(
+                self.config.peer_buffers, self._tensor_registry, ops
+            )
+            self._peer_tma_registry = PeerTMARegistry.from_ops(ops, self._tensor_registry, self._peer_buffer_registry)
+        else:
+            self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
+            self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
+        self._peer_tma_cute_tensors: Optional[List] = None
+        compute_only_replay = self._use_compute_only_replay()
+        self._has_page_free_ops = (self._max_requested_page_count > 1) and not compute_only_replay
+
         # Create N-page layout (auto-detect max pages or use user-specified)
         if self.config.num_pages is not None:
             # User specified number of pages
-            num_slots = self.config.num_pages
-            if self.config.num_pages > 1 or self._has_page_free_ops:
-                num_slots = min(MAX_PAGES, self.config.num_pages + 2)
-                self._use_physical_page_ring = True
+            num_slots = self._num_slots_for_pages(self.config.num_pages)
             self._layout = NPageLayout(
                 num_pages=self.config.num_pages,
                 num_slots=num_slots,
                 page_size=self.config.page_size,
+                page_release_mbarriers=self._has_page_free_ops,
+                max_pages_per_op=self._max_requested_page_count,
             )
         else:
-            # Auto-detect maximum pages that fit in shared memory
-            self._layout = NPageLayout.for_device(
-                page_size=self.config.page_size,
-                min_pages=1,
-            )
-            if self._layout.num_pages > 1 or self._has_page_free_ops:
-                self._use_physical_page_ring = True
+            if compute_only_replay:
+                num_pages = max(1, self._max_requested_page_count)
+                self._layout = NPageLayout(
+                    num_pages=num_pages,
+                    num_slots=num_pages,
+                    page_size=self.config.page_size,
+                    page_release_mbarriers=False,
+                    max_pages_per_op=self._max_requested_page_count,
+                )
+            else:
+                # Auto-detect maximum pages that fit in shared memory
+                self._layout = NPageLayout.for_device(
+                    page_size=self.config.page_size,
+                    min_pages=1,
+                    page_release_mbarriers=self._has_page_free_ops,
+                    max_pages_per_op=self._max_requested_page_count,
+                )
                 if torch.cuda.is_available():
                     props = torch.cuda.get_device_properties(torch.cuda.current_device())
                     max_smem = props.shared_memory_per_block_optin
                 else:
                     max_smem = 228 * 1024
                 for n in range(self._layout.num_pages, 0, -1):
-                    num_slots = min(MAX_PAGES, n + 2) if n > 1 or self._has_page_free_ops else n
+                    num_slots = self._num_slots_for_pages(n)
                     candidate = NPageLayout(
                         num_pages=n,
                         num_slots=num_slots,
                         page_size=self.config.page_size,
+                        page_release_mbarriers=self._has_page_free_ops,
+                        max_pages_per_op=self._max_requested_page_count,
                     )
                     if candidate.total_size <= max_smem:
                         self._layout = candidate
-                        self._use_physical_page_ring = n > 1 or self._has_page_free_ops
                         break
             # Store computed num_pages back to config for cache key
             self.config.num_pages = self._layout.num_pages
+
+        # A tile that requests N pages needs at least N physical pages live at
+        # once. (Slots and physical pages are decoupled, so num_slots may differ.)
+        if self._layout.num_pages < self._max_requested_page_count:
+            raise ValueError(
+                f"An op requests {self._max_requested_page_count} shared-memory "
+                f"pages but only num_pages={self._layout.num_pages} fit at "
+                f"page_size={self.config.page_size} bytes. Reduce page_size or "
+                f"the requested page count."
+            )
+
+        # Expose the physical page stride so multi-page ops can address their
+        # contiguous sub-pages as page_ptr + i * machete_aligned_page_size.
+        for op in ops:
+            op.static_dims.setdefault(
+                "machete_aligned_page_size", int(self._layout.aligned_page_size)
+            )
 
         # Validate that config page_size is large enough for all ops
         for op in ops:
@@ -634,25 +722,6 @@ class Megakernel:
         self._peer_signal_tensor: Optional[torch.Tensor] = None
         self._max_signal_formulas: int = 1
 
-        # Tensor parameter mode: build registry, validate compatibility, prepare tensors
-        self._tensor_registry = TensorRegistry.from_ops(ops)
-        validate_op_compatibility(ops, self._tensor_registry)
-        self._cute_tensors: Optional[List] = None  # torch.Tensor objects for kernel params
-
-        # TMA parameter mode: build TMA registry for descriptor management
-        self._tma_registry = TMARegistry.from_ops(ops, self._tensor_registry)
-        self._tma_cute_tensors: Optional[List] = None  # CuTe tensors with static layout for TMA
-
-        # Peer TMA parameter mode: build peer registries for multi-GPU communication
-        if self.config.peer_buffers:
-            self._peer_buffer_registry = PeerBufferRegistry.from_config(
-                self.config.peer_buffers, self._tensor_registry, ops
-            )
-            self._peer_tma_registry = PeerTMARegistry.from_ops(ops, self._tensor_registry, self._peer_buffer_registry)
-        else:
-            self._peer_buffer_registry = PeerBufferRegistry(buffers=[], num_peers=0)
-            self._peer_tma_registry = PeerTMARegistry(descriptors=[], op_mappings={}, num_peers=0)
-        self._peer_tma_cute_tensors: Optional[List] = None
         self._tma_runtime_layout_cache: Dict[int, Any] = {}
         self._backend_ir, self._backend = build_backend(self)
         self._launch_state: Optional[_LaunchState] = None
@@ -675,6 +744,12 @@ class Megakernel:
             self._tracing_state = setup_tracing(
                 self.ops, self.num_sms, self.total_tiles, device=self.device
             )
+
+    def _num_slots_for_pages(self, num_pages: int) -> int:
+        if not self._has_page_free_ops:
+            return num_pages
+        extra_slots = max(0, int(getattr(self.config, "page_free_extra_slots", 0)))
+        return min(MAX_PAGES, num_pages + extra_slots)
 
     @property
     def num_sms(self) -> int:
@@ -831,10 +906,64 @@ class Megakernel:
 
     def _prepare_op_metadata_tensors(self) -> None:
         """Build runtime metadata tables for the persistent shell."""
+        if self._use_compute_only_replay():
+            self._prepare_compute_only_op_metadata_tensors()
+        else:
+            self._prepare_full_op_metadata_tensors()
+
+    def _prepare_compute_only_op_metadata_tensors(self) -> None:
+        """Build compact metadata for graphs that only dispatch compute."""
         formulas = self._builder.get_op_barrier_formulas()
-        threads_per_block = self.config.threads_per_block
-        num_dma_warps = 0 if self._use_compute_only_replay() else NUM_DMA_WARPS
-        num_compute_threads = threads_per_block - num_dma_warps * 32
+        op_meta = []
+        op_handler_indices = self._backend.handler_indices()
+        compute_local_indices = self._backend.phase_local_indices("compute")
+
+        for op_idx, op in enumerate(self.ops):
+            _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
+            signal_count = (
+                self._builder._op_signal_counts.get(op_idx, 0)
+                + self._builder._op_compute_signal_counts.get(op_idx, 0)
+            )
+            if signal_count == 0:
+                signal_count = len(_signal_formulas)
+            op_meta.extend(
+                build_compute_only_op_metadata_entry(
+                    handler_idx=op_handler_indices[op_idx],
+                    compute_local_idx=compute_local_indices[op_idx],
+                    wait_count=self._builder._op_wait_counts.get(
+                        op_idx, len(_wait_formulas)
+                    ),
+                    compute_wait_count=self._builder._op_compute_wait_counts.get(
+                        op_idx, 0
+                    ),
+                    signal_count=signal_count,
+                    wait_acquire=op.static_dims.get("barrier_wait_acquire", 0),
+                    origins=(
+                        op.tile_origin_for_axis(axis)
+                        for axis in range(MAX_TILE_DIMS)
+                    ),
+                    page_count=self._op_page_counts[op_idx],
+                )
+            )
+
+        self._op_metadata_tensor = torch.tensor(
+            op_meta, dtype=torch.int32, device=self.device
+        )
+        for phase in PHASE_NAMES:
+            self._phase_local_idx_tensors[phase] = None
+            self._phase_local_transport_position_widths[phase] = 0
+            self._phase_local_transport_position_tensors[phase] = None
+            self._phase_local_desc_slot_widths[phase] = 0
+            self._phase_local_desc_slot_tensors[phase] = None
+
+        self._peer_signal_tensor = None
+        self._local_tma_desc_pool = None
+        self._peer_tma_desc_pool = None
+
+    def _prepare_full_op_metadata_tensors(self) -> None:
+        """Build full metadata for load/store/communicate replay graphs."""
+        formulas = self._builder.get_op_barrier_formulas()
+        num_compute_threads = self.config.threads_per_block - self._num_dma_warps() * 32
         default_num_mma_warps = num_compute_threads // 32
 
         op_meta = []
@@ -846,9 +975,8 @@ class Megakernel:
             phase: self._backend.phase_local_indices(phase)
             for phase in PHASE_NAMES
         }
-        from .backend_dispatch import (
-            _build_tma_runtime_layout,
-        )
+        from .backend_dispatch import _build_tma_runtime_layout
+
         tma_layout = _build_tma_runtime_layout(self._backend, self)
         runtime_transport_records = getattr(self._backend, "runtime_transport_records", False)
         if runtime_transport_records:
@@ -871,38 +999,56 @@ class Megakernel:
             wait_count = self._builder._op_wait_counts.get(op_idx, len(_wait_formulas))
             compute_wait_count = self._builder._op_compute_wait_counts.get(op_idx, 0)
             signal_count = self._builder._op_signal_counts.get(op_idx, len(_signal_formulas))
-            phase_mask = _OP_PHASE_COMPUTE
-            if getattr(op.op_cls, "load") is not Op.load:
-                phase_mask |= _OP_PHASE_LOAD
-            if getattr(op.op_cls, "store") is not Op.store:
-                phase_mask |= _OP_PHASE_STORE
-            if getattr(op.op_cls, "communicate") is not Op.communicate:
-                phase_mask |= _OP_PHASE_COMMUNICATE
-            instruction_phase_mask = phase_mask
+            compute_signal_count = self._builder._op_compute_signal_counts.get(op_idx, 0)
             uses_smem_page = bool(getattr(op.op_cls, "uses_smem_page", True))
+            num_warps = int(
+                getattr(
+                    instance,
+                    "num_compute_warps",
+                    getattr(instance, "num_mma_warps", default_num_mma_warps),
+                )
+            )
+            handler_idx = int(op_handler_indices[op_idx])
+            phase_mask = OP_PHASE_COMPUTE
+            if getattr(op.op_cls, "load") is not Op.load:
+                phase_mask |= OP_PHASE_LOAD
+            if getattr(op.op_cls, "store") is not Op.store:
+                phase_mask |= OP_PHASE_STORE
+            if getattr(op.op_cls, "communicate") is not Op.communicate:
+                phase_mask |= OP_PHASE_COMMUNICATE
+            instruction_phase_mask = phase_mask
             if not uses_smem_page:
-                if phase_mask != _OP_PHASE_COMPUTE:
+                if phase_mask != OP_PHASE_COMPUTE:
                     raise ValueError(
                         f"{op.op_cls.__name__} declares uses_smem_page=False but "
                         "has active load/store/communicate phases. Page-free ops "
                         "must be compute-only."
                     )
-                instruction_phase_mask |= 1 << _INSTR_NO_SMEM_PAGE_BIT
-            num_warps = int(getattr(instance, "num_mma_warps", default_num_mma_warps))
-            handler_idx = int(op_handler_indices[op_idx])
+                instruction_phase_mask |= 1 << INSTR_NO_SMEM_PAGE_BIT
             op_meta.extend(
-                [
-                    num_warps,
-                    *tile_strides,
-                    *tuple(op.tile_counts) + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
-                    handler_idx,
-                    *self._phase_local_indices_for_op(op_phase_local_indices, op_idx),
-                    wait_count,
-                    compute_wait_count,
-                    signal_count,
-                    int(op.static_dims.get("barrier_wait_acquire", 0)),
-                    instruction_phase_mask,
-                ]
+                build_full_op_metadata_entry(
+                    num_warps=num_warps,
+                    tile_strides=tile_strides,
+                    tile_counts=tuple(op.tile_counts)
+                    + (1,) * (MAX_TILE_DIMS - len(op.tile_counts)),
+                    origins=(
+                        op.tile_origin_for_axis(axis)
+                        for axis in range(MAX_TILE_DIMS)
+                    ),
+                    handler_idx=handler_idx,
+                    phase_local_indices=self._phase_local_indices_for_op(
+                        op_phase_local_indices, op_idx
+                    ),
+                    wait_count=wait_count,
+                    compute_wait_count=compute_wait_count,
+                    signal_count=signal_count,
+                    compute_signal_count=compute_signal_count,
+                    wait_acquire=op.static_dims.get("barrier_wait_acquire", 0),
+                    phase_mask=instruction_phase_mask,
+                    page_count=self._op_page_counts[op_idx],
+                    page_release_mask=self._op_page_rel_masks[op_idx],
+                    page_manual_release_mask=self._op_page_manual_rel_masks[op_idx],
+                )
             )
 
             if has_communicate:
@@ -1045,6 +1191,11 @@ class Megakernel:
                 leading_dim = 0
         return cute_t.mark_layout_dynamic(leading_dim=leading_dim)
 
+    def _tma_tensor_rank(self, desc) -> int:
+        """Rank of the tensor view used to create a TMA descriptor."""
+        dim_perm = tuple(getattr(desc, "dim_perm", ()) or ())
+        return len(dim_perm) if dim_perm else len(desc.tile_shape)
+
     def _resolve_local_tma_tensor(self, desc) -> torch.Tensor:
         """Resolve the tensor backing a local TMA descriptor."""
         if desc.original_tensor is not None:
@@ -1053,7 +1204,7 @@ class Megakernel:
             tensor = self._registry_tensor_for_canonical(desc.tensor_canonical).detach()
             if desc.tensor_shape and tuple(tensor.shape) != desc.tensor_shape:
                 tensor = tensor.reshape(desc.tensor_shape)
-        return self._reshape_tensor_for_tma(tensor, len(desc.tile_shape))
+        return self._reshape_tensor_for_tma(tensor, self._tma_tensor_rank(desc))
 
     def _prepare_tma_tensors(self) -> None:
         """Prepare CuTe tensors with static layout for TMA descriptor creation.
@@ -1079,7 +1230,7 @@ class Megakernel:
         # reshape so make_tiled_tma_atom can compose the tile.
         seen = set()
         for desc in self._tma_registry.descriptors:
-            ndim = len(desc.tile_shape)
+            ndim = self._tma_tensor_rank(desc)
             key = (desc.tensor_canonical, ndim)
             if key in seen:
                 continue
@@ -1126,6 +1277,23 @@ class Megakernel:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
 
+        reg_caps = {"mma_reg_count": self.config.mma_reg_count}
+        if not self._use_compute_only_replay():
+            reg_caps.update(
+                {
+                    "dma_reg_count": self.config.dma_reg_count,
+                    "controller_reg_count": self.config.resolved_controller_reg_count,
+                    "loader_reg_count": self.config.resolved_loader_reg_count,
+                    "store_reg_count": self.config.resolved_store_reg_count,
+                }
+            )
+        for name, value in reg_caps.items():
+            if value < 24 or value > 256 or value % 8 != 0:
+                raise RuntimeError(
+                    f"MegakernelConfig.{name} must be a multiple of 8 in [24, 256] "
+                    f"for setmaxnreg; got {value}."
+                )
+
         if self.config.threads_per_block % 32 != 0:
             raise RuntimeError(
                 "MegakernelConfig.threads_per_block must be a multiple of 32 "
@@ -1133,15 +1301,15 @@ class Megakernel:
             )
 
         compute_only = self._use_compute_only_replay()
-        num_dma_warps = 0 if compute_only else NUM_DMA_WARPS
+        num_dma_warps = 0 if compute_only else self._num_dma_warps()
         num_mma_warps = self.config.threads_per_block // 32 - num_dma_warps
         if not compute_only:
             if num_mma_warps < 1:
                 raise RuntimeError(
                     "TMA megakernel replay requires at least one compute warp "
-                    f"in addition to the {NUM_DMA_WARPS} DMA warps. "
+                    f"in addition to the {num_dma_warps} DMA/control warps. "
                     f"Increase MegakernelConfig.threads_per_block to at least "
-                    f"{(NUM_DMA_WARPS + 1) * 32}; got {self.config.threads_per_block}."
+                    f"{(num_dma_warps + 1) * 32}; got {self.config.threads_per_block}."
                 )
         else:
             reg_budget = num_mma_warps * 32 * self.config.mma_reg_count
@@ -1187,6 +1355,12 @@ class Megakernel:
 
         write_trace_perfetto(self._tracing_state, filename)
 
+    def write_dependency_graph_csv(self, op_csv: str, tile_csv: str) -> None:
+        """Write static op and tile dependency graphs as CSV files."""
+        Path(op_csv).parent.mkdir(parents=True, exist_ok=True)
+        Path(tile_csv).parent.mkdir(parents=True, exist_ok=True)
+        self._builder.export_dependency_graph_csv(op_csv, tile_csv)
+
     def _build_pipelined_dispatch_fns(self):
         """Build dispatch functions for pipelined execution phases.
 
@@ -1216,6 +1390,7 @@ class Megakernel:
             dispatch_inputs["phase_tensor_names"],
             dispatch_inputs["phase_tma_names"],
             dispatch_inputs["all_tma_canonical"],
+            dispatch_inputs["compute_manual_page_release"],
         )
 
     @staticmethod
@@ -1260,19 +1435,16 @@ class Megakernel:
             and not any(self._op_has_phased_replay(op) for op in self.ops)
         )
 
-    def _sync_compute_warps_after_tile(self) -> bool:
-        """Return whether any op requires a CTA sync after compute."""
-        return any(
-            bool(getattr(op.op_cls, "sync_compute_warps_after_tile", False))
-            for op in self.ops
-        )
+    def _num_dma_warps(self) -> int:
+        """Number of non-MMA warps used by the ring replay."""
+        return NUM_DMA_WARPS
 
     def _kernel_static_config(self) -> Dict[str, Any]:
         """Collect the compile-time constants used to build the persistent kernel."""
         return build_kernel_static_config(
             self,
             use_compute_only_replay=self._use_compute_only_replay(),
-            num_dma_warps=NUM_DMA_WARPS,
+            num_dma_warps=self._num_dma_warps(),
             mbarrier_stride=NPageLayout._MBARRIER_SIZE,
             tile_info_bytes=NPageLayout._TILE_INFO_SIZE,
         )
@@ -1285,32 +1457,11 @@ class Megakernel:
             self._op_meta_exec_globals(),
         )
 
-    @staticmethod
-    def _op_meta_exec_globals() -> Dict[str, int]:
+    def _op_meta_exec_globals(self) -> Dict[str, int]:
         """Return per-op metadata indices injected into generated kernel code."""
-        return {
-            "_OP_META_NUM_WARPS": _OP_META_NUM_WARPS,
-            "_OP_META_STRIDE_0": _OP_META_STRIDE_0,
-            "_OP_META_STRIDE_1": _OP_META_STRIDE_1,
-            "_OP_META_STRIDE_2": _OP_META_STRIDE_2,
-            "_OP_META_STRIDE_3": _OP_META_STRIDE_3,
-            "_OP_META_COUNT_0": _OP_META_COUNT_0,
-            "_OP_META_COUNT_1": _OP_META_COUNT_1,
-            "_OP_META_COUNT_2": _OP_META_COUNT_2,
-            "_OP_META_COUNT_3": _OP_META_COUNT_3,
-            "_OP_META_HANDLER_IDX": _OP_META_HANDLER_IDX,
-            "_OP_META_LOAD_LOCAL_IDX": _OP_META_LOAD_LOCAL_IDX,
-            "_OP_META_COMPUTE_LOCAL_IDX": _OP_META_COMPUTE_LOCAL_IDX,
-            "_OP_META_STORE_LOCAL_IDX": _OP_META_STORE_LOCAL_IDX,
-            "_OP_META_COMM_LOCAL_IDX": _OP_META_COMM_LOCAL_IDX,
-            "_OP_META_WAIT_COUNT": _OP_META_WAIT_COUNT,
-            "_OP_META_COMPUTE_WAIT_COUNT": _OP_META_COMPUTE_WAIT_COUNT,
-            "_OP_META_SIGNAL_COUNT": _OP_META_SIGNAL_COUNT,
-            "_OP_META_WAIT_ACQUIRE": _OP_META_WAIT_ACQUIRE,
-            "_OP_META_PHASE_MASK": _OP_META_PHASE_MASK,
-            "_OP_META_STRIDE": _OP_META_STRIDE,
-            "_INSTR_NO_SMEM_PAGE_BIT": _INSTR_NO_SMEM_PAGE_BIT,
-        }
+        if self._use_compute_only_replay():
+            return compute_only_op_meta_exec_globals()
+        return full_op_meta_exec_globals()
 
     @staticmethod
     def _tile_info_exec_globals() -> Dict[str, int]:
@@ -1343,11 +1494,10 @@ class Megakernel:
             runtime,
             op_meta=self._op_meta_exec_globals(),
             tile_info=self._tile_info_exec_globals(),
-            sync_compute_warps_after_tile=self._sync_compute_warps_after_tile(),
             min_idle_regs=MIN_IDLE_REGS,
-            op_phase_load=_OP_PHASE_LOAD,
-            op_phase_store=_OP_PHASE_STORE,
-            op_phase_communicate=_OP_PHASE_COMMUNICATE,
+            op_phase_load=OP_PHASE_LOAD,
+            op_phase_store=OP_PHASE_STORE,
+            op_phase_communicate=OP_PHASE_COMMUNICATE,
         )
 
     def _build_ring_kernel_loop(self, kernel_cfg: Dict[str, Any], runtime: Dict[str, Any]):
@@ -1381,6 +1531,7 @@ class Megakernel:
         extra_exec_globals=None,
     ):
         """Build the PersistentKernel via source transformation."""
+        compute_only = self._use_compute_only_replay()
         all_canonical = self._backend.all_canonical(self)
         tensor_sig = self._signature_suffix(all_canonical)
 
@@ -1402,15 +1553,16 @@ class Megakernel:
             tensor_sig=tensor_sig,
             tma_sig=tma_sig,
             peer_tma_sig=peer_tma_sig,
-            has_communicate=bool(peer_tma_registry.has_peer_tma),
+            has_communicate=(False if compute_only else bool(peer_tma_registry.has_peer_tma)),
             tracing=bool(self.config.tracing),
             local_idx_tensors=self._phase_local_idx_tensors,
             transport_position_tensors=self._phase_local_transport_position_tensors,
             desc_slot_tensors=self._phase_local_desc_slot_tensors,
             dispatch_extra_params=dispatch_extra_params,
         )
-        if extra_exec_globals and extra_exec_globals.get("has_page_free_ops", False):
-            fn_source = enable_page_free_ring_source(fn_source)
+        # The decoupled physical-page allocator is emitted inline in
+        # build_ring_kernel_loop under `const_expr(has_page_free_ops)` gates
+        # (see replay_loops.py), so no source post-patch is required here.
 
         exec_globals = build_kernel_exec_globals(
             tracing=bool(self.config.tracing),
@@ -1437,7 +1589,7 @@ class Megakernel:
             tensor_sig=tensor_sig,
             kernel_tma_sig=tma_sig,
             tma_components=tma_components,
-            has_communicate=bool(peer_tma_registry.has_peer_tma),
+            has_communicate=(False if compute_only else bool(peer_tma_registry.has_peer_tma)),
             tracing=bool(self.config.tracing),
             local_idx_tensors=self._phase_local_idx_tensors,
             transport_position_tensors=self._phase_local_transport_position_tensors,
@@ -1523,36 +1675,57 @@ class Megakernel:
         handler_keys = tuple(
             spec.compile_key for spec in self._backend_ir.handler_specs
         )
-        phase_runtime_keys = tuple(
-            (
-                phase,
-                self._phase_local_transport_position_widths[phase],
-                self._phase_local_desc_slot_widths[phase],
-                self._phase_local_transport_position_tensors[phase] is not None,
-                self._phase_local_desc_slot_tensors[phase] is not None,
+        compute_only = self._use_compute_only_replay()
+        phase_runtime_keys = (
+            ()
+            if compute_only
+            else tuple(
+                (
+                    phase,
+                    self._phase_local_transport_position_widths[phase],
+                    self._phase_local_desc_slot_widths[phase],
+                    self._phase_local_transport_position_tensors[phase] is not None,
+                    self._phase_local_desc_slot_tensors[phase] is not None,
+                )
+                for phase in PHASE_NAMES
             )
-            for phase in PHASE_NAMES
         )
         signal_shape_key = (
             self._max_wait_formulas,
             self._max_compute_wait_formulas,
             self._max_signal_formulas,
+            tuple(self._builder._op_compute_signal_counts.get(i, 0) for i in range(len(self.ops))),
+        )
+        page_release_key = (
+            tuple(self._op_page_manual_rel_masks),
+            tuple(self._op_page_rel_masks),
+            tuple(self._op_page_counts),
         )
 
+        role_reg_key = (
+            (0, 0, 0, 0)
+            if compute_only
+            else (
+                self.config.dma_reg_count,
+                self.config.resolved_controller_reg_count,
+                self.config.resolved_loader_reg_count,
+                self.config.resolved_store_reg_count,
+            )
+        )
         config_key = (
             self.config.threads_per_block,
             self.config.num_sms,
             self.config.page_size,
             self.config.num_pages,
             self.config.tracing,
-            self.config.dma_reg_count,
+            *role_reg_key,
             self.config.mma_reg_count,
             self.config.num_devices,
-            self._sync_compute_warps_after_tile(),
-            self.config.loader_idle_sleep_ns,
+            0 if compute_only else self.config.loader_idle_sleep_ns,
             self.config.relaxed_global_barriers,
             self.config.global_barrier_sleep_ns,
             self.config.opt_level,
+            page_release_key,
         )
 
         # TMA descriptors are created at launch time from runtime tensors, but
@@ -1668,37 +1841,11 @@ class Megakernel:
                 cu_stream = cuda.CUstream(torch_stream.cuda_stream)
 
                 launch_state = self._build_launch_state()
-                compile_args = [
-                    launch_state.instructions_ptr,
-                    launch_state.barriers_ptr,
-                    launch_state.op_configs_ptr,
-                    launch_state.op_meta_ptr,
-                    *self._phase_local_idx_launch_args(launch_state),
-                    *self._phase_local_transport_position_launch_args(launch_state),
-                    *self._phase_local_desc_slot_launch_args(launch_state),
-                    launch_state.signal_meta_ptr,
-                ]
-                if self._peer_tma_registry.has_peer_tma:
-                    compile_args.append(launch_state.peer_signal_ptr)
-                compile_args.extend(
-                    [
-                        launch_state.wait_info_ptr,
-                        launch_state.compute_wait_info_ptr,
-                        self._num_instructions_i32,
-                    ]
-                )
-                if self.config.tracing:
-                    compile_args.append(launch_state.trace_buffer_ptr)
-                compile_args.extend(
-                    [
-                        *launch_state.cute_tensors,
-                        launch_state.local_tma_desc_pool_ptr,
-                        launch_state.peer_tma_desc_pool_ptr,
-                        *launch_state.tma_tensor_args,
-                        *launch_state.peer_tma_tensor_args,
-                        self._needs_tma_desc_pool_init,
-                        cu_stream,
-                    ]
+                compile_args = self._kernel_abi_args(
+                    launch_state,
+                    num_instructions=self._num_instructions_i32,
+                    desc_pool_init_needed=self._needs_tma_desc_pool_init,
+                    stream=cu_stream,
                 )
                 self._compiled_kernel = cute.compile(self._compiled_kernel, *compile_args)
                 if self._eager_load_compiled_kernel_for_current_device():
@@ -1793,9 +1940,10 @@ class Megakernel:
         schedule() was called.
         """
         for op in self.ops:
-            if not op.tensor_metas:
+            validation_metas = op.tensor_validation_metas or op.tensor_metas
+            if not validation_metas:
                 continue
-            for name, meta in op.tensor_metas.items():
+            for name, meta in validation_metas.items():
                 ref = op.tensor_refs.get(name)
                 if ref is None:
                     continue
@@ -1925,6 +2073,54 @@ class Megakernel:
             for phase in phase_ptrs
         }
 
+    def _kernel_abi_args(
+        self,
+        launch_state: _LaunchState,
+        *,
+        num_instructions: Int32,
+        desc_pool_init_needed: bool,
+        stream,
+        trace_buffer_ptr: Optional[Int64] = None,
+    ) -> List[Any]:
+        """Return persistent-kernel ABI args for compile and launch."""
+        args = [
+            launch_state.instructions_ptr,
+            launch_state.barriers_ptr,
+            launch_state.op_configs_ptr,
+            launch_state.op_meta_ptr,
+            *self._phase_local_idx_launch_args(launch_state),
+            *self._phase_local_transport_position_launch_args(launch_state),
+            *self._phase_local_desc_slot_launch_args(launch_state),
+            launch_state.signal_meta_ptr,
+        ]
+        if self._peer_tma_registry.has_peer_tma:
+            args.append(launch_state.peer_signal_ptr)
+        args.extend(
+            [
+                launch_state.wait_info_ptr,
+                launch_state.compute_wait_info_ptr,
+                num_instructions,
+            ]
+        )
+        if self.config.tracing:
+            args.append(
+                trace_buffer_ptr
+                if trace_buffer_ptr is not None
+                else launch_state.trace_buffer_ptr
+            )
+        args.extend(
+            [
+                *launch_state.cute_tensors,
+                launch_state.local_tma_desc_pool_ptr,
+                launch_state.peer_tma_desc_pool_ptr,
+                *launch_state.tma_tensor_args,
+                *launch_state.peer_tma_tensor_args,
+                desc_pool_init_needed,
+                stream,
+            ]
+        )
+        return args
+
     @staticmethod
     def _phase_local_indices_for_op(
         op_phase_local_indices: Dict[str, List[int]],
@@ -2053,43 +2249,6 @@ class Megakernel:
         if hasattr(self._compiled_kernel, "smem_size"):
             self._compiled_kernel.smem_size = self.smem_size
 
-        def _launch_args(num_instructions: Int32, desc_pool_init_needed: bool) -> List[Any]:
-            launch_args = [
-                launch_state.instructions_ptr,
-                launch_state.barriers_ptr,
-                launch_state.op_configs_ptr,
-                launch_state.op_meta_ptr,
-                *self._phase_local_idx_launch_args(launch_state),
-                *self._phase_local_transport_position_launch_args(launch_state),
-                *self._phase_local_desc_slot_launch_args(launch_state),
-                launch_state.signal_meta_ptr,
-            ]
-            if self._peer_tma_registry.has_peer_tma:
-                launch_args.append(launch_state.peer_signal_ptr)
-            launch_args.extend(
-                [
-                    launch_state.wait_info_ptr,
-                    launch_state.compute_wait_info_ptr,
-                    num_instructions,
-                ]
-            )
-            if self.config.tracing:
-                launch_args.append(
-                    trace_buffer_ptr if trace_buffer_ptr is not None else launch_state.trace_buffer_ptr
-                )
-            launch_args.extend(
-                [
-                    *launch_state.cute_tensors,
-                    launch_state.local_tma_desc_pool_ptr,
-                    launch_state.peer_tma_desc_pool_ptr,
-                    *launch_state.tma_tensor_args,
-                    *launch_state.peer_tma_tensor_args,
-                    desc_pool_init_needed,
-                ]
-            )
-            launch_args.append(stream)
-            return launch_args
-
         needs_desc_pool_init = self._needs_tma_desc_pool_init and (
             self._tma_registry.has_tma or self._peer_tma_registry.has_peer_tma
         )
@@ -2099,11 +2258,27 @@ class Megakernel:
             # race the first runtime-TMA descriptor use in fully async mode, so
             # first run a zero-instruction launch that only initializes the
             # descriptor pool, drain it, then launch the real work hot path.
-            self._compiled_kernel(*_launch_args(Int32(0), True))
+            self._compiled_kernel(
+                *self._kernel_abi_args(
+                    launch_state,
+                    num_instructions=Int32(0),
+                    desc_pool_init_needed=True,
+                    stream=stream,
+                    trace_buffer_ptr=trace_buffer_ptr,
+                )
+            )
             _sync_tma_desc_init_stream(stream)
             self._needs_tma_desc_pool_init = False
 
-        self._compiled_kernel(*_launch_args(self._num_instructions_i32, False))
+        self._compiled_kernel(
+            *self._kernel_abi_args(
+                launch_state,
+                num_instructions=self._num_instructions_i32,
+                desc_pool_init_needed=False,
+                stream=stream,
+                trace_buffer_ptr=trace_buffer_ptr,
+            )
+        )
         self._needs_tma_desc_pool_init = False
 
     def wait(self) -> None:
@@ -2207,15 +2382,17 @@ class Megakernel:
         """Create a KernelBenchSpec for raw GPU kernel timing.
 
         Returns a spec that can be passed to the benchmark framework for
-        precise kernel-only timing via per-iteration CUDA event timing.
+        aggregate CUDA event timing over back-to-back launches.
 
         The persistent megakernel requires barrier resets between invocations,
-        so CUDA graph replay cannot be used. Each timed iteration calls
-        launch_fn() which resets barriers and launches the kernel.
+        so CUDA graph replay cannot be used. Each launch resets barriers on the
+        benchmark stream and launches the cached compiled kernel without
+        re-entering the host-side prepare path.
 
         Args:
-            setup_fn: Optional callable invoked before each timed iteration
-                to reset input tensors or other state.
+            setup_fn: Optional callable invoked before each launch to reset
+                input tensors or other state. It is part of the launch closure
+                for aggregate two-event benchmark timing.
             keep_alive: Optional list of tensors/objects to prevent from being
                 garbage collected. The kernel references GPU memory via raw
                 pointers in op_configs_tensor — if the original tensors are
@@ -2239,24 +2416,19 @@ class Megakernel:
 
         self.compile()
         self._cache_launch_state()
+        self.wait()
         bench_stream = torch.cuda.Stream()
         cu_stream = cuda.CUstream(bench_stream.cuda_stream)
+        launch_state = self._launch_state
+        trace_buffer_ptr = launch_state.trace_buffer_ptr
         barriers_tensor = self._barriers_tensor
 
-        def _setup():
-            """Reset benchmark-visible runtime state before each launch."""
-            self.wait()
+        def _launch():
+            """Reset benchmark-visible runtime state and launch the kernel."""
             with torch.cuda.stream(bench_stream):
                 if setup_fn is not None:
                     setup_fn()
                 barriers_tensor.zero_()
-
-        def _launch():
-            launch_state, _, trace_buffer_ptr = self.prepare_run(
-                stream=cu_stream,
-                validate=False,
-                reset_barriers=False,
-            )
             self.launch_prepared(
                 launch_state,
                 cu_stream,
@@ -2266,7 +2438,7 @@ class Megakernel:
 
         return KernelBenchSpec(
             launch_fn=_launch,
-            setup_fn=_setup,
+            setup_fn=None,
             stream=(bench_stream, cu_stream),
             _keep_alive=(self, keep_alive),  # prevent GC from freeing GPU memory
         )

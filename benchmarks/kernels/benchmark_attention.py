@@ -105,13 +105,13 @@ _fa2_cache = {}
 # =============================================================================
 
 _BASE_FWD_CONFIGS = [
-    # (M, N, D) — prefill shapes (M=N, D=128 typical)
-    (512, 512, 128),
-    (1024, 1024, 128),
-    (2048, 2048, 128),
-    (4096, 4096, 128),
-    (8192, 8192, 128),
-    (16384, 16384, 128),
+    # (M, N, D) — generic FlashAttentionSm120Op currently supports D <= 64.
+    (512, 512, 64),
+    (1024, 1024, 64),
+    (2048, 2048, 64),
+    (4096, 4096, 64),
+    (8192, 8192, 64),
+    (16384, 16384, 64),
 ]
 
 FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
@@ -123,16 +123,16 @@ def bench_attention(BH, M, N, D, page_size):
     torch_dtype = torch.bfloat16
 
     torch.manual_seed(42)
-    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
-    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    q = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
     # torch SDPA (4D input so flash attention backend is used)
-    q4d = q.unsqueeze(0)  # (1, BH, M, D) → (batch, heads, seq, head_dim)
-    k4d = k.unsqueeze(0)
-    v4d = v.unsqueeze(0)
+    q4d = q.transpose(1, 2).contiguous()
+    k4d = k.transpose(1, 2).contiguous()
+    v4d = v.transpose(1, 2).contiguous()
     funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q4d, k4d, v4d)
 
     # CuTe DSL Flash Attention v2 (fp16, tensor cores)
@@ -223,12 +223,12 @@ def bench_attention(BH, M, N, D, page_size):
 
 _BASE_CAUSAL_FWD_CONFIGS = [
     # (M, N, D) — causal prefill shapes (M=N)
-    (512, 512, 128),
-    (1024, 1024, 128),
-    (2048, 2048, 128),
-    (4096, 4096, 128),
-    (8192, 8192, 128),
-    (16384, 16384, 128),
+    (512, 512, 64),
+    (1024, 1024, 64),
+    (2048, 2048, 64),
+    (4096, 4096, 64),
+    (8192, 8192, 64),
+    (16384, 16384, 64),
 ]
 
 CAUSAL_FWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_CAUSAL_FWD_CONFIGS for bh in BH_SIZES for ps in PAGE_SIZES]
@@ -240,16 +240,16 @@ def bench_attention_causal(BH, M, N, D, page_size):
     torch_dtype = torch.bfloat16
 
     torch.manual_seed(42)
-    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
-    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
+    q = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
     # torch SDPA (causal)
-    q4d = q.unsqueeze(0)
-    k4d = k.unsqueeze(0)
-    v4d = v.unsqueeze(0)
+    q4d = q.transpose(1, 2).contiguous()
+    k4d = k.transpose(1, 2).contiguous()
+    v4d = v.transpose(1, 2).contiguous()
     funcs["sdpa"] = lambda: F.scaled_dot_product_attention(q4d, k4d, v4d, is_causal=True)
 
     # Megakernel bf16 (causal)
@@ -280,11 +280,11 @@ def bench_attention_causal(BH, M, N, D, page_size):
 
 _BASE_BWD_CONFIGS = [
     # (M, N, D) — prefill shapes (M=N)
-    (512, 512, 128),
-    (1024, 1024, 128),
-    (2048, 2048, 128),
-    (4096, 4096, 128),
-    (8192, 8192, 128),
+    (512, 512, 64),
+    (1024, 1024, 64),
+    (2048, 2048, 64),
+    (4096, 4096, 64),
+    (8192, 8192, 64),
 ]
 
 BWD_CONFIGS = [(bh,) + c + (ps,) for c in _BASE_BWD_CONFIGS for bh in BH_SIZES for ps in BACKWARD_PAGE_SIZES]
@@ -296,20 +296,20 @@ def bench_attention_bwd(BH, M, N, D, page_size):
     torch_dtype = torch.bfloat16
 
     torch.manual_seed(42)
-    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
-    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    q = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
     # torch SDPA backward
-    dout4d = dout.unsqueeze(0)
+    dout4d = dout.transpose(1, 2).contiguous()
 
     def sdpa_bwd():
-        q_ = q.unsqueeze(0).detach().requires_grad_(True)
-        k_ = k.unsqueeze(0).detach().requires_grad_(True)
-        v_ = v.unsqueeze(0).detach().requires_grad_(True)
+        q_ = q.transpose(1, 2).contiguous().detach().requires_grad_(True)
+        k_ = k.transpose(1, 2).contiguous().detach().requires_grad_(True)
+        v_ = v.transpose(1, 2).contiguous().detach().requires_grad_(True)
         o = F.scaled_dot_product_attention(q_, k_, v_)
         o.backward(dout4d)
         return q_.grad, k_.grad, v_.grad
@@ -321,7 +321,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
         try:
             # Run forward to get lse
             o_mk = torch.zeros_like(q)
-            lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            lse = torch.empty(1, M, BH, dtype=torch.float32, device="cuda")
             fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_mk, lse=lse, page_size=page_size,
             )
@@ -333,7 +333,7 @@ def bench_attention_bwd(BH, M, N, D, page_size):
 
             # Setup backward
             dpsum = (dout.float() * o_mk.float()).sum(dim=-1).contiguous()
-            dq_accum = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dq_accum = torch.zeros_like(q, dtype=torch.float32)
             dk = torch.zeros_like(k)
             dv = torch.zeros_like(v)
 
@@ -375,20 +375,20 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
     torch_dtype = torch.bfloat16
 
     torch.manual_seed(42)
-    q = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
-    k = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    v = torch.randn(BH, N, D, dtype=torch_dtype, device="cuda")
-    dout = torch.randn(BH, M, D, dtype=torch_dtype, device="cuda")
+    q = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
+    k = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    v = torch.randn(1, N, BH, D, dtype=torch_dtype, device="cuda")
+    dout = torch.randn(1, M, BH, D, dtype=torch_dtype, device="cuda")
 
     funcs = {}
 
     # torch SDPA backward (causal)
-    dout4d = dout.unsqueeze(0)
+    dout4d = dout.transpose(1, 2).contiguous()
 
     def sdpa_bwd():
-        q_ = q.unsqueeze(0).detach().requires_grad_(True)
-        k_ = k.unsqueeze(0).detach().requires_grad_(True)
-        v_ = v.unsqueeze(0).detach().requires_grad_(True)
+        q_ = q.transpose(1, 2).contiguous().detach().requires_grad_(True)
+        k_ = k.transpose(1, 2).contiguous().detach().requires_grad_(True)
+        v_ = v.transpose(1, 2).contiguous().detach().requires_grad_(True)
         o = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True)
         o.backward(dout4d)
         return q_.grad, k_.grad, v_.grad
@@ -400,7 +400,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
         try:
             # Run forward to get lse
             o_mk = torch.zeros_like(q)
-            lse = torch.empty(BH, M, dtype=torch.float32, device="cuda")
+            lse = torch.empty(1, M, BH, dtype=torch.float32, device="cuda")
             fwd_ops = FlashAttentionSm120Op.schedule(
                 q=q, k=k, v=v, o=o_mk, lse=lse, causal=True, page_size=page_size,
             )
@@ -412,7 +412,7 @@ def bench_attention_causal_bwd(BH, M, N, D, page_size):
 
             # Setup backward
             dpsum = (dout.float() * o_mk.float()).sum(dim=-1).contiguous()
-            dq_accum = torch.zeros(BH, M, D, dtype=torch.float32, device="cuda")
+            dq_accum = torch.zeros_like(q, dtype=torch.float32)
             dk = torch.zeros_like(k)
             dv = torch.zeros_like(v)
 

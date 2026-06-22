@@ -1,7 +1,6 @@
 # Copyright (c) 2025, Machete Authors
 """Flash Attention kernels for the megakernel framework."""
 
-from .sm_100 import FlashAttentionSm100Op
 from .sm_120 import FlashAttentionSm120Op
 from .sm_120_bwd import FlashAttentionSm120BwdOp
 from .dpsum import AttentionDPSumOp
@@ -13,18 +12,27 @@ from .flash_decoding import (
 import torch
 
 
+class _DisabledFlashAttentionOp:
+    dynamic_dims = FlashAttentionSm120Op.dynamic_dims
+
+    @staticmethod
+    def schedule(*args, **kwargs):
+        raise RuntimeError("FlashAttentionOp is only available for SM120 in this build")
+
+    @staticmethod
+    def kernel_config(*args, **kwargs):
+        raise RuntimeError("FlashAttentionOp is only available for SM120 in this build")
+
+
 def _get_flash_attention_op():
     if not torch.cuda.is_available():
-        return FlashAttentionSm100Op
+        return FlashAttentionSm120Op
     major, _ = torch.cuda.get_device_capability()
     match major:
         case m if m == 12:
             return FlashAttentionSm120Op
-        case m if m == 10:
-            return FlashAttentionSm100Op
         case _:
-            print(f"FlashAttentionOp: unsupported GPU (SM {major}x), requires Hopper (SM90+)")
-            return FlashAttentionSm100Op
+            return _DisabledFlashAttentionOp
 
 
 FlashAttentionOp = _get_flash_attention_op()
@@ -131,7 +139,7 @@ def flash_attention_schedule(q, k, v, o, causal=False, page_size=None,
 
 
 __all__ = [
-    "FlashAttentionOp", "FlashAttentionSm100Op", "FlashAttentionSm120Op",
+    "FlashAttentionOp", "FlashAttentionSm120Op",
     "FlashAttentionSm120BwdOp",
     "AttentionDPSumOp",
     "FlashDecodingSplitOp", "flash_decoding_schedule",

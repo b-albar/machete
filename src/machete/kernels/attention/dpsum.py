@@ -5,7 +5,7 @@ Computes ``dpsum = rowsum(dout * o)`` for BSHD tensors:
 
     dout:  (B, S, H, D)
     o:     (B, S, H, D)
-    dpsum: (B, H, S)
+    dpsum: (B, S, H)
 
 This is the missing in-graph reduction needed to feed FlashAttention backward
 inside a single megakernel, where ``dout`` is itself produced by an earlier op.
@@ -26,14 +26,14 @@ from machete.megakernel.ops import (
 
 
 class AttentionDPSumOp(Op):
-    """Compute ``rowsum(dout * o)`` for BSHD attention tensors."""
+    """Compute ``rowsum(dout * o)`` in native BSH layout."""
 
     reads = {
         "dout": (None, ("B", "S", "H", "D")),
         "o": (None, ("B", "S", "H", "D")),
     }
     writes = {
-        "dpsum": (cutlass.Float32, ("B", "H", "S")),
+        "dpsum": (cutlass.Float32, ("B", "S", "H")),
     }
     tile = ("B", "S", "H")
     dynamic_dims = ("B", "S")
@@ -41,14 +41,15 @@ class AttentionDPSumOp(Op):
     def __init__(self, **config):
         super().__init__(**config)
         self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
+        self.num_mma_warps = 1
 
     @classmethod
-    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+    def schedule(cls, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, dim_windows=None, **tensors):
         tile_sizes = dict(tile_sizes or {})
         tile_sizes.setdefault("B", 1)
-        tile_sizes.setdefault("S", 16)
+        tile_sizes.setdefault("S", 32)
         tile_sizes.setdefault("H", 1)
-        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, dim_windows=dim_windows, **tensors)]
         ops[0].static_dims["page_size"] = page_size
         dout = tensors.get("dout")
         if dout is not None:
@@ -76,7 +77,7 @@ class AttentionDPSumOp(Op):
             op_config_ptr,
             "dpsum",
             self.dpsum_dtype,
-            runtime_B * Int32(self.H * self.S),
+            runtime_B * Int32(self.S * self.H),
             type(self),
         )
 
@@ -122,7 +123,7 @@ class AttentionDPSumOp(Op):
                             row_sum = cute.arch.warp_reduction(partial, operator.add)
 
                             if lane_idx == 0:
-                                dpsum_idx = b * Int32(self.H * self.S) + h * Int32(self.S) + s
+                                dpsum_idx = b * Int32(self.S * self.H) + s * Int32(self.H) + h
                                 dpsum[dpsum_idx] = row_sum
 
 

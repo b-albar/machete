@@ -28,6 +28,7 @@ import re
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute as cute_ir
 from cutlass._mlir.dialects import cute_nvgpu as cn
+from cutlass._mlir.dialects._cute_nvgpu_ops_gen import atom_set_value
 from cutlass.base_dsl.dsl import extract_mlir_values, new_from_mlir_values
 import cutlass.cute as cute
 from cutlass.cute import atom, core
@@ -209,6 +210,30 @@ def make_runtime_tma_gmem(
     raise ValueError(f"unsupported TMA direction: {direction}")
 
 
+def runtime_tma_tensor_view(gmem_tensor, dim_perm):
+    """Return the TMA-coordinate view of a reconstructed runtime tensor.
+
+    TMA descriptors are created from tensors permuted into a stride-sorted
+    mode order. When a phase wrapper reconstructs the original tensor from
+    ``op_config_ptr``, rebuild the same permuted view before creating the
+    non-exec gmem partition. Otherwise the descriptor and partition coordinates
+    disagree and the hardware TMA op can fault.
+    """
+    if not dim_perm:
+        return gmem_tensor
+    rank = len(dim_perm)
+    if rank <= 1:
+        return gmem_tensor
+    shape = tuple(gmem_tensor.shape[i] for i in dim_perm)
+    stride = tuple(gmem_tensor.stride[i] for i in dim_perm)
+    view = cute.make_tensor(
+        gmem_tensor.iterator,
+        cute.make_layout(shape, stride=stride),
+    )
+    view.mark_layout_dynamic(leading_dim=0)
+    return view
+
+
 def _parse_exec_tma_type(nonexec_type, field_namespace: str):
     """Build the exec-TMA type corresponding to a non-exec TMA atom type."""
     type_str = str(nonexec_type)
@@ -267,7 +292,6 @@ def _make_tma_g_stride(*, loc=None, ip=None):
     )
 
 
-
 def make_runtime_tma_load(exec_type, desc_ptr, *, tma_bar_ptr, cache_policy=None, loc=None, ip=None):
     """Backend-owned runtime TMA load primitive."""
     return cn.atom_make_tma_load(
@@ -308,24 +332,39 @@ def make_runtime_tma_reduce(exec_type, desc_ptr, *, cache_policy=None, loc=None,
 class RuntimeDescTMATrait(Trait):
     """TMA trait carrying a non-exec atom plus runtime descriptor pointer."""
 
-    def __init__(self, value, desc_ptr, *, field_namespace: str, supports_mbar: bool):
+    def __init__(
+        self,
+        value,
+        desc_ptr,
+        *,
+        field_namespace: str,
+        supports_mbar: bool,
+        exec_value=None,
+    ):
         self.value = value
         self.desc_ptr = desc_ptr
         self.field_namespace = field_namespace
         self.supports_mbar = supports_mbar
+        self.exec_value = exec_value
 
     def __extract_mlir_values__(self):
-        return [self.value] + extract_mlir_values(self.desc_ptr)
+        values = [self.value]
+        if self.exec_value is not None:
+            values.append(self.exec_value)
+        return values + extract_mlir_values(self.desc_ptr)
 
     def __new_from_mlir_values__(self, values):
         desc_template_vals = extract_mlir_values(self.desc_ptr)
-        desc_vals = values[1:1 + len(desc_template_vals)]
+        exec_offset = 2 if self.exec_value is not None else 1
+        exec_value = values[1] if self.exec_value is not None else None
+        desc_vals = values[exec_offset:exec_offset + len(desc_template_vals)]
         desc_ptr = new_from_mlir_values(self.desc_ptr, desc_vals)
         return self.__class__(
             values[0],
             desc_ptr,
             field_namespace=self.field_namespace,
             supports_mbar=self.supports_mbar,
+            exec_value=exec_value,
         )
 
     def unpack(self, *, tma_bar_ptr=None, tma_desc_ptr=None, cache_policy=None, loc=None, ip=None, **kwargs):
@@ -334,6 +373,30 @@ class RuntimeDescTMATrait(Trait):
         # actual runtime transport selects the concrete descriptor separately.
         desc_source = tma_desc_ptr if tma_desc_ptr is not None else self.desc_ptr
         desc_value = extract_mlir_values(desc_source)[0]
+        if self.exec_value is not None:
+            exec_value = self.exec_value
+            if self.supports_mbar and tma_bar_ptr is not None:
+                attr = ir.Attribute.parse(
+                    f"#cute_nvgpu.atom_copy_field_{self.field_namespace}<tma_bar>"
+                )
+                exec_value = atom_set_value(
+                    exec_value, attr, tma_bar_ptr.value, loc=loc, ip=ip
+                )
+            attr = ir.Attribute.parse(
+                f"#cute_nvgpu.atom_copy_field_{self.field_namespace}<tma_descriptor_ptr>"
+            )
+            exec_value = atom_set_value(
+                exec_value, attr, desc_value, loc=loc, ip=ip
+            )
+            if cache_policy is not None:
+                attr = ir.Attribute.parse(
+                    f"#cute_nvgpu.atom_copy_field_{self.field_namespace}<cache_policy>"
+                )
+                exec_value = atom_set_value(
+                    exec_value, attr, cache_policy.value, loc=loc, ip=ip
+                )
+            return exec_value
+
         exec_type = _parse_exec_tma_type(self.value.type, self.field_namespace)
 
         if self.field_namespace == "tmaload":

@@ -71,13 +71,13 @@ def _auto_tile_S(D, elem_bytes, page_size):
     """Compute tile_size_S from page budget minus scratch."""
     usable = page_size - SCRATCH_BYTES
     tile_s = max(1, usable // (D * elem_bytes))
-    # Large hidden-size RMSNorm saturates early; oversized row tiles mostly
-    # increase barrier traffic and persistent-shell latency. Keep a moderately
-    # larger tile at 32 KB, then clamp to 4 rows once more page budget is
-    # available.
+    # Large hidden-size RMSNorm is usually part of a producer/consumer chain in
+    # fused layers. At 32 KB pages, oversized row tiles underfeed persistent CTAs
+    # and leave less independent work for page overlap; small row groups give the
+    # scheduler enough ready tiles without shrinking the hidden dimension tile.
     if D >= 1024:
         if page_size <= 32 * 1024:
-            return min(tile_s, 8)
+            return min(tile_s, 2)
         return min(tile_s, 4)
     return tile_s
 
@@ -535,27 +535,26 @@ class RMSNormOp(Op):
     def store(self, page_ptr, tile_B, tile_S, tile_D,
               y_tma, y_tma_gmem):
         """TMA store y (D × tile_S × 1) from smem[0] to global."""
-        with cute.arch.elect_one():
-            for wi in range(self.num_tma_tiles):
-                gYi = cute.local_tile(
-                    y_tma_gmem,
-                    (self.tma_tile_D, self.tile_size_S, 1),
-                    (Int32(wi), tile_S, tile_B),
-                )
-                sYi = cute.make_tensor(
-                    cute.make_ptr(
-                        self.x_dtype,
-                        page_ptr + Int32(wi * self.chunk_stride_bytes),
-                        cute.AddressSpace.smem,
-                    ),
-                    cute.make_layout((self.tma_tile_D, self.tile_size_S, 1)),
-                )
-                tYsYi, tYgYi = cute.nvgpu.cpasync.tma_partition(
-                    y_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sYi, 0, 3),
-                    cute.group_modes(gYi, 0, 3),
-                )
-                cute.copy(y_tma, tYsYi, tYgYi)
+        for wi in range(self.num_tma_tiles):
+            gYi = cute.local_tile(
+                y_tma_gmem,
+                (self.tma_tile_D, self.tile_size_S, 1),
+                (Int32(wi), tile_S, tile_B),
+            )
+            sYi = cute.make_tensor(
+                cute.make_ptr(
+                    self.x_dtype,
+                    page_ptr + Int32(wi * self.chunk_stride_bytes),
+                    cute.AddressSpace.smem,
+                ),
+                cute.make_layout((self.tma_tile_D, self.tile_size_S, 1)),
+            )
+            tYsYi, tYgYi = cute.nvgpu.cpasync.tma_partition(
+                y_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sYi, 0, 3),
+                cute.group_modes(gYi, 0, 3),
+            )
+            cute.copy(y_tma, tYsYi, tYgYi)
 
 
 # =============================================================================
@@ -1022,27 +1021,26 @@ class RMSNormBwdOp(Op):
     def store(self, page_ptr, tile_B, tile_S, tile_D,
               dx_tma, dx_tma_gmem):
         """TMA store dx (D × tile_S × 1) from smem[0] to global."""
-        with cute.arch.elect_one():
-            for chunk_idx in range(self.num_tma_tiles):
-                gDXi = cute.local_tile(
-                    dx_tma_gmem,
-                    (self.tma_tile_D, self.tile_size_S, 1),
-                    (Int32(chunk_idx), tile_S, tile_B),
-                )
-                sDXi = cute.make_tensor(
-                    cute.make_ptr(
-                        self.x_dtype,
-                        page_ptr + Int32(chunk_idx * self.chunk_stride_bytes),
-                        cute.AddressSpace.smem,
-                    ),
-                    cute.make_layout((self.tma_tile_D, self.tile_size_S, 1)),
-                )
-                tDXsDXi, tDXgDXi = cute.nvgpu.cpasync.tma_partition(
-                    dx_tma, Int32(0), cute.make_layout(1),
-                    cute.group_modes(sDXi, 0, 3),
-                    cute.group_modes(gDXi, 0, 3),
-                )
-                cute.copy(dx_tma, tDXsDXi, tDXgDXi)
+        for chunk_idx in range(self.num_tma_tiles):
+            gDXi = cute.local_tile(
+                dx_tma_gmem,
+                (self.tma_tile_D, self.tile_size_S, 1),
+                (Int32(chunk_idx), tile_S, tile_B),
+            )
+            sDXi = cute.make_tensor(
+                cute.make_ptr(
+                    self.x_dtype,
+                    page_ptr + Int32(chunk_idx * self.chunk_stride_bytes),
+                    cute.AddressSpace.smem,
+                ),
+                cute.make_layout((self.tma_tile_D, self.tile_size_S, 1)),
+            )
+            tDXsDXi, tDXgDXi = cute.nvgpu.cpasync.tma_partition(
+                dx_tma, Int32(0), cute.make_layout(1),
+                cute.group_modes(sDXi, 0, 3),
+                cute.group_modes(gDXi, 0, 3),
+            )
+            cute.copy(dx_tma, tDXsDXi, tDXgDXi)
 
 
 __all__ = [

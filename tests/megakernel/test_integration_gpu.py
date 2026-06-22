@@ -33,7 +33,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64
 
 from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-from machete.megakernel.ops import Op
+from machete.megakernel.ops import AccessRegions, Op, RegionAxis, TensorAccessRegion
 from machete.megakernel.paged_memory import (
     st_shared_i32,
     ld_shared_i32,
@@ -57,6 +57,7 @@ def _pack_ptr(config, offset, ptr):
 _stamp_result_ptr = 0
 _check_result_ptr = 0
 _check_stale_ptr = 0
+_compute_multipage_result_ptr = 0
 
 
 def _assert_i32_sequence(actual, values, label):
@@ -82,8 +83,8 @@ def _run_stamp_check_case(num_tiles, *, num_sms=None):
     _check_stale_ptr = check_stale.data_ptr()
 
     ops = [
-        ScheduledOp(StampOp, tile_counts=(num_tiles,)),
-        ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
+        ScheduledOp(StampOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+        ScheduledOp(CheckOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
     ]
     config = MegakernelConfig() if num_sms is None else MegakernelConfig(num_sms=num_sms)
     kernel = Megakernel(ops, config=config)
@@ -98,6 +99,9 @@ def _run_stamp_check_case(num_tiles, *, num_sms=None):
 
 class StampOp(Op):
     """Writes tile_0 * 100 + 42 to output page, stores readback to global tensor."""
+
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["stamp"]
 
     @cute.jit
     def compute(self, page_ptr, tile_0):
@@ -114,6 +118,9 @@ class StampOp(Op):
 class CheckOp(Op):
     """Reads stale page data, writes tile_0 * 200 + 7, stores results to global tensors."""
 
+    INPUTS: ClassVar[List[str]] = ["stamp"]
+    OUTPUTS: ClassVar[List[str]] = []
+
     @cute.jit
     def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
@@ -129,6 +136,39 @@ class CheckOp(Op):
             st_global_i32(Int64(_check_result_ptr), tile_0, readback)
             cute.printf("[CheckOp] tile_0=%d wrote=%d readback=%d",
                         tile_0, value, readback)
+
+
+class ComputeOnlyMultiPageOp(Op):
+    """Compute-only op that requires page_ptr to be a page-address table."""
+
+    requested_page_count = 2
+
+    @cute.jit
+    def compute(self, page_ptr, tile_0):
+        tidx = cute.arch.thread_idx()[0]
+        if tidx == Int32(0):
+            p0 = self.page_address(page_ptr, 0)
+            p1 = self.page_address(page_ptr, 1)
+            v0 = tile_0 * Int32(10) + Int32(1)
+            v1 = tile_0 * Int32(10) + Int32(2)
+            st_shared_i32(p0, v0)
+            st_shared_i32(p1, v1)
+            st_global_i32(
+                Int64(_compute_multipage_result_ptr),
+                tile_0 * Int32(3),
+                ld_shared_i32(p0),
+            )
+            st_shared_i32(p0, Int32(-777))
+            st_global_i32(
+                Int64(_compute_multipage_result_ptr),
+                tile_0 * Int32(3) + Int32(1),
+                ld_shared_i32(p1),
+            )
+            st_global_i32(
+                Int64(_compute_multipage_result_ptr),
+                tile_0 * Int32(3) + Int32(2),
+                ld_shared_i32(p0),
+            )
 
 
 # =============================================================================
@@ -167,6 +207,23 @@ class TestSequentialOpsGPU:
 
         _assert_linear_op(stamp_results, 100, 42, "StampOp")
 
+    def test_compute_only_multipage_table(self):
+        """Compute-only replay passes a page-address table to multipage ops."""
+        global _compute_multipage_result_ptr
+        num_tiles = 4
+        results = torch.zeros(num_tiles * 3, dtype=torch.int32, device="cuda")
+        _compute_multipage_result_ptr = results.data_ptr()
+
+        ops = [ScheduledOp(ComputeOnlyMultiPageOp, tile_counts=(num_tiles,))]
+        kernel = Megakernel(ops, config=MegakernelConfig(num_pages=2))
+        assert kernel._use_compute_only_replay()
+        kernel.run()
+
+        expected = []
+        for tile in range(num_tiles):
+            expected.extend([tile * 10 + 1, tile * 10 + 2, -777])
+        _assert_i32_sequence(results, expected, "ComputeOnlyMultiPageOp")
+
 
 # =============================================================================
 # Zero-Page Ops (write directly to global memory, no shared memory pages)
@@ -181,6 +238,9 @@ _opc_result_ptr = 0
 class OpA(Op):
     """Zero-page op: writes tile_0 * 100 + 1 to global tensor."""
 
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["a"]
+
     @cute.jit
     def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
@@ -192,6 +252,9 @@ class OpA(Op):
 class OpB(Op):
     """Zero-page op: writes tile_0 * 200 + 2 to global tensor."""
 
+    INPUTS: ClassVar[List[str]] = ["a"]
+    OUTPUTS: ClassVar[List[str]] = ["b"]
+
     @cute.jit
     def compute(self, page_ptr, tile_0):
         tidx = cute.arch.thread_idx()[0]
@@ -202,6 +265,9 @@ class OpB(Op):
 
 class OpC(Op):
     """Zero-page op: writes tile_0 * 300 + 3 to global tensor."""
+
+    INPUTS: ClassVar[List[str]] = ["b"]
+    OUTPUTS: ClassVar[List[str]] = []
 
     @cute.jit
     def compute(self, page_ptr, tile_0):
@@ -223,6 +289,9 @@ class Tag2DOp(Op):
     the instruction stream ordering from InstructionStreamBuilder).
     """
 
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["tag2d"]
+
     @cute.jit
     def compute(self, page_ptr, tile_0, tile_1):
         tidx = cute.arch.thread_idx()[0]
@@ -234,6 +303,9 @@ class Tag2DOp(Op):
 
 class Tag2DOpB(Op):
     """Second 2D zero-page op: writes tile_0 * 2000 + tile_1 to separate tensor."""
+
+    INPUTS: ClassVar[List[str]] = ["tag2d"]
+    OUTPUTS: ClassVar[List[str]] = []
 
     @cute.jit
     def compute(self, page_ptr, tile_0, tile_1):
@@ -252,6 +324,8 @@ _nprod_result_ptr = 0
 _ncons_result_ptr = 0
 _nprody_result_ptr = 0
 _nfanin_result_ptr = 0
+_packed_region_data_ptr = 0
+_packed_region_result_ptr = 0
 
 
 class NamedProducerOp(Op):
@@ -310,6 +384,91 @@ class NamedFanInOp(Op):
             st_global_i32(Int64(_nfanin_result_ptr), tile_0, value)
 
 
+class PackedRegionProducerOp(Op):
+    """Produces four N groups in one logical packed buffer."""
+
+    INPUTS: ClassVar[List[str]] = []
+    OUTPUTS: ClassVar[List[str]] = ["x"]
+    reads = {}
+    writes = {"x": (None, ("B", "S", "N"))}
+    tile = ("B", "S", "N")
+
+    @classmethod
+    def access_regions(cls, op):
+        return AccessRegions(
+            writes={
+                "x": TensorAccessRegion(
+                    tensor="x",
+                    axes=(
+                        RegionAxis(name="B", tile_dim="B"),
+                        RegionAxis(name="S", tile_dim="S"),
+                        RegionAxis(name="N", tile_dim="N"),
+                    ),
+                    group_dim="N",
+                    group_tiles=1,
+                    group_count=4,
+                )
+            }
+        )
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_N):
+        tidx = cute.arch.thread_idx()[0]
+        if tidx == Int32(0):
+            st_global_i32(
+                Int64(_packed_region_data_ptr),
+                tile_N,
+                tile_N + Int32(10),
+            )
+
+
+class PackedRegionConsumerOp(Op):
+    """Consumes two discontiguous regions of one logical packed input."""
+
+    INPUTS: ClassVar[List[str]] = ["x"]
+    OUTPUTS: ClassVar[List[str]] = []
+    reads = {"x": (None, ("B", "S", "D"))}
+    writes = {}
+    tile = ("B", "S", "D")
+
+    @classmethod
+    def access_regions(cls, op):
+        axes = (
+            RegionAxis(name="B", tile_dim="B"),
+            RegionAxis(name="S", tile_dim="S"),
+            RegionAxis(name="N", tile_dim="D"),
+        )
+        return AccessRegions(
+            reads={
+                "x": (
+                    TensorAccessRegion(
+                        tensor="x",
+                        axes=axes,
+                        group_index_dim="N",
+                    ),
+                    TensorAccessRegion(
+                        tensor="x",
+                        axes=axes,
+                        group_index_dim="N",
+                        group_index_offset=2,
+                    ),
+                )
+            }
+        )
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_D):
+        tidx = cute.arch.thread_idx()[0]
+        if tidx == Int32(0):
+            gate = ld_global_i32(Int64(_packed_region_data_ptr), tile_D)
+            up = ld_global_i32(Int64(_packed_region_data_ptr), tile_D + Int32(2))
+            st_global_i32(
+                Int64(_packed_region_result_ptr),
+                tile_D,
+                gate * Int32(100) + up,
+            )
+
+
 # =============================================================================
 # Many-to-One Ops
 # =============================================================================
@@ -361,7 +520,7 @@ class TestComprehensiveGPU:
     """
 
     def test_three_op_chain(self):
-        """Three-op linear chain: OpA -> OpB -> OpC.
+        """Three-op named dependency chain: OpA -> OpB -> OpC.
 
         Verifies:
         - Barrier dependencies form correct chain (OpC waits on OpB, not OpA)
@@ -380,9 +539,9 @@ class TestComprehensiveGPU:
         _opc_result_ptr = c_results.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tile_counts=(num_tiles,)),
-            ScheduledOp(OpB, tile_counts=(num_tiles,)),
-            ScheduledOp(OpC, tile_counts=(num_tiles,)),
+            ScheduledOp(OpA, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(OpB, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(OpC, tile_counts=(num_tiles,), dim_names={"tile": 0}),
         ]
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
@@ -391,6 +550,33 @@ class TestComprehensiveGPU:
         _assert_linear_op(a_results, 100, 1, "OpA")
         _assert_linear_op(b_results, 200, 2, "OpB")
         _assert_linear_op(c_results, 300, 3, "OpC")
+
+    def test_multiple_read_regions_execute_on_gpu(self):
+        """A consumer can wait on two discontiguous regions of one input buffer."""
+        global _packed_region_data_ptr, _packed_region_result_ptr
+
+        data = torch.full((4,), -1, dtype=torch.int32, device="cuda")
+        result = torch.zeros(2, dtype=torch.int32, device="cuda")
+        _packed_region_data_ptr = data.data_ptr()
+        _packed_region_result_ptr = result.data_ptr()
+
+        ops = [
+            ScheduledOp(
+                PackedRegionProducerOp,
+                tile_counts=(1, 1, 4),
+                dim_names={"B": 0, "S": 1, "N": 2},
+            ),
+            ScheduledOp(
+                PackedRegionConsumerOp,
+                tile_counts=(1, 1, 2),
+                dim_names={"B": 0, "S": 1, "D": 2},
+            ),
+        ]
+        kernel = Megakernel(ops, config=MegakernelConfig(num_sms=2))
+        kernel.run()
+
+        _assert_i32_sequence(data, [10, 11, 12, 13], "PackedRegionProducerOp")
+        _assert_i32_sequence(result, [1012, 1113], "PackedRegionConsumerOp")
 
     @pytest.mark.parametrize("tiles_a,tiles_b", [(8, 4), (4, 8)])
     def test_mismatched_tile_counts(self, tiles_a, tiles_b):
@@ -409,8 +595,8 @@ class TestComprehensiveGPU:
         _opb_result_ptr = b_results.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tile_counts=(tiles_a,)),
-            ScheduledOp(OpB, tile_counts=(tiles_b,)),
+            ScheduledOp(OpA, tile_counts=(tiles_a,), dim_names={"tile": 0}),
+            ScheduledOp(OpB, tile_counts=(tiles_b,), dim_names={"tile": 0}),
         ]
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
@@ -467,8 +653,8 @@ class TestComprehensiveGPU:
         _opb_result_ptr = b_results.data_ptr()
 
         ops = [
-            ScheduledOp(Tag2DOp, tile_counts=(tiles_m, tiles_n)),
-            ScheduledOp(Tag2DOpB, tile_counts=(tiles_m, tiles_n)),
+            ScheduledOp(Tag2DOp, tile_counts=(tiles_m, tiles_n), dim_names={"M": 0, "N": 1}),
+            ScheduledOp(Tag2DOpB, tile_counts=(tiles_m, tiles_n), dim_names={"M": 0, "N": 1}),
         ]
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
@@ -657,8 +843,8 @@ class TestComprehensiveGPU:
         _check_stale_ptr = check_stale.data_ptr()
 
         ops = [
-            ScheduledOp(StampOp, tile_counts=(num_tiles,)),
-            ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
+            ScheduledOp(StampOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(CheckOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
         ]
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
@@ -717,8 +903,8 @@ class TestComprehensiveGPU:
         _check_stale_ptr = check_stale.data_ptr()
 
         ops = [
-            ScheduledOp(StampOp, tile_counts=(num_tiles,)),
-            ScheduledOp(CheckOp, tile_counts=(num_tiles,)),
+            ScheduledOp(StampOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(CheckOp, tile_counts=(num_tiles,), dim_names={"tile": 0}),
         ]
         config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=config)
@@ -757,9 +943,9 @@ class TestComprehensiveGPU:
         _opc_result_ptr = c_results.data_ptr()
 
         ops = [
-            ScheduledOp(OpA, tile_counts=(num_tiles,)),
-            ScheduledOp(OpB, tile_counts=(num_tiles,)),
-            ScheduledOp(OpC, tile_counts=(num_tiles,)),
+            ScheduledOp(OpA, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(OpB, tile_counts=(num_tiles,), dim_names={"tile": 0}),
+            ScheduledOp(OpC, tile_counts=(num_tiles,), dim_names={"tile": 0}),
         ]
         config = MegakernelConfig(num_sms=4)
         kernel = Megakernel(ops, config=config)
@@ -942,9 +1128,23 @@ class TestConfigPointerGPU:
         config_a = pack_scale_config(input_a, output_a, 2)
         config_b = pack_scale_config(input_b, output_b, 5)
 
+        class IndependentScaleOp(ScaleOp):
+            INPUTS: ClassVar[List[str]] = []
+            OUTPUTS: ClassVar[List[str]] = ["scaled"]
+
         ops = [
-            ScheduledOp(ScaleOp, tile_counts=(num_tiles,), config_data=config_a),
-            ScheduledOp(ScaleOp, tile_counts=(num_tiles,), config_data=config_b),
+            ScheduledOp(
+                IndependentScaleOp,
+                tile_counts=(num_tiles,),
+                config_data=config_a,
+                tensor_ptrs={"scaled": output_a.data_ptr()},
+            ),
+            ScheduledOp(
+                IndependentScaleOp,
+                tile_counts=(num_tiles,),
+                config_data=config_b,
+                tensor_ptrs={"scaled": output_b.data_ptr()},
+            ),
         ]
         kernel_config = MegakernelConfig(num_sms=2)
         kernel = Megakernel(ops, config=kernel_config)

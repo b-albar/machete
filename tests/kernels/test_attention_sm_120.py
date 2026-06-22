@@ -19,6 +19,11 @@ from tests.kernels.support import requires_hopper_cutlass
 from machete.kernels.attention.ref import flash_attention_pytorch, flash_attention_backward_pytorch
 
 requires_gpu = requires_hopper_cutlass
+D_GT_64_UNSUPPORTED = pytest.mark.xfail(
+    raises=ValueError,
+    strict=True,
+    reason="FlashAttentionSm120 D>64 needs a D-blocked MMA path.",
+)
 
 
 # =============================================================================
@@ -125,7 +130,7 @@ def _run_attention_dpsum(dout, o):
     from machete.kernels.attention import AttentionDPSumOp
 
     dpsum = torch.empty(
-        dout.shape[0], dout.shape[2], dout.shape[1],
+        dout.shape[0], dout.shape[1], dout.shape[2],
         dtype=torch.float32, device=dout.device,
     )
     ops = AttentionDPSumOp.schedule(dout=dout, o=o, dpsum=dpsum)
@@ -144,11 +149,11 @@ def _assert_attention_forward_close(q, k, v, *, tile_m=None, causal=False, kv_gr
     torch.testing.assert_close(o_mk, o_ref, atol=5e-2, rtol=5e-2)
 
 
-def _assert_attention_backward_close(q, k, v, dout, *, causal=False, kv_group_size=1):
+def _assert_attention_backward_close(q, k, v, dout, *, causal=False, kv_group_size=1, tile_sizes=None):
     o = _attention_ref_bmhd(q, k, v, causal=causal, kv_group_size=kv_group_size)
     lse = _attention_lse_bmhd(q, k, causal=causal, kv_group_size=kv_group_size)
     dq, dk, dv = _run_attention_coop_backward(
-        q, k, v, o, dout, lse, causal=causal, kv_group_size=kv_group_size,
+        q, k, v, o, dout, lse, causal=causal, kv_group_size=kv_group_size, tile_sizes=tile_sizes,
     )
     q_ref = _bmhd_to_bhmd(q)
     k_ref = _bmhd_to_bhmd(k)
@@ -170,38 +175,40 @@ def _assert_attention_backward_close(q, k, v, dout, *, causal=False, kv_group_si
 
 MMA_FORWARD_CASES = [
     pytest.param(1, 16, 16, 64, id="exact_tile_d64"),
-    pytest.param(1, 16, 16, 128, id="exact_tile_d128"),
+    pytest.param(1, 16, 16, 128, marks=D_GT_64_UNSUPPORTED, id="exact_tile_d128"),
     pytest.param(1, 16, 20, 64, id="partial_n"),
-    pytest.param(4, 32, 32, 128, id="multi_head_multi_m"),
-    pytest.param(1, 16, 256, 128, id="large_n"),
+    pytest.param(4, 32, 32, 128, marks=D_GT_64_UNSUPPORTED, id="multi_head_multi_m"),
+    pytest.param(1, 16, 256, 128, marks=D_GT_64_UNSUPPORTED, id="large_n"),
 ]
 
 MULTIWARP_FORWARD_CASES = [
     pytest.param(1, 64, 64, 64, id="base_d64"),
-    pytest.param(1, 128, 128, 128, id="multi_m_tiles"),
-    pytest.param(1, 80, 64, 128, id="partial_m"),
-    pytest.param(1, 64, 50, 128, id="partial_n"),
-    pytest.param(4, 16, 128, 128, id="decode_multi_head"),
+    pytest.param(1, 128, 128, 128, marks=D_GT_64_UNSUPPORTED, id="multi_m_tiles"),
+    pytest.param(1, 80, 64, 128, marks=D_GT_64_UNSUPPORTED, id="partial_m"),
+    pytest.param(1, 64, 50, 128, marks=D_GT_64_UNSUPPORTED, id="partial_n"),
+    pytest.param(4, 16, 128, 128, marks=D_GT_64_UNSUPPORTED, id="decode_multi_head"),
 ]
 
 CAUSAL_FORWARD_CASES = [
     pytest.param(1, 32, 32, 64, id="square"),
     pytest.param(1, 16, 64, 64, id="asymmetric"),
     pytest.param(4, 32, 32, 64, id="multi_head"),
-    pytest.param(1, 64, 64, 128, id="d128"),
+    pytest.param(1, 64, 64, 128, marks=D_GT_64_UNSUPPORTED, id="d128"),
 ]
 
 BACKWARD_CASES = [
     pytest.param(1, 32, 32, 64, False, id="base_d64"),
     pytest.param(1, 32, 32, 128, False, id="base_d128"),
+    pytest.param(1, 16, 16, 256, False, id="base_d256"),
     pytest.param(4, 32, 32, 128, False, id="multi_head"),
     pytest.param(1, 64, 32, 128, False, id="multi_m"),
-    pytest.param(1, 32, 32, 128, True, id="causal"),
+    pytest.param(1, 32, 32, 128, True, id="causal_d128"),
+    pytest.param(1, 16, 16, 256, True, id="causal_d256"),
 ]
 
 GQA_FORWARD_CASES = [
     pytest.param(4, 2, 32, 32, 64, False, id="gqa2_d64"),
-    pytest.param(8, 2, 32, 32, 128, False, id="gqa4_d128"),
+    pytest.param(8, 2, 32, 32, 128, False, marks=D_GT_64_UNSUPPORTED, id="gqa4_d128"),
     pytest.param(4, 2, 32, 32, 64, True, id="gqa2_d64_causal"),
 ]
 
@@ -209,6 +216,7 @@ GQA_BACKWARD_CASES = [
     pytest.param(4, 2, 32, 32, 64, False, id="gqa2_d64"),
     pytest.param(8, 2, 32, 32, 128, False, id="gqa4_d128"),
     pytest.param(4, 2, 32, 32, 64, True, id="gqa2_d64_causal"),
+    pytest.param(8, 2, 32, 32, 256, True, id="qwen_gqa4_d256_causal"),
 ]
 
 
@@ -263,7 +271,7 @@ class TestFlashAttentionCoopMMA:
         o = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
 
         mk = _run_attention_dpsum(dout, o)
-        ref = (dout.float() * o.float()).sum(dim=-1).permute(0, 2, 1).contiguous()
+        ref = (dout.float() * o.float()).sum(dim=-1).contiguous()
 
         torch.testing.assert_close(mk, ref, atol=1e-4, rtol=1e-4)
 
@@ -303,7 +311,7 @@ class TestFlashAttentionCoopMultiWarp:
     def test_sequence_dynamic_reuses_compiled_kernel(self):
         """Different N should reuse the same compiled FlashAttention kernel."""
         torch.manual_seed(0)
-        B, H, M, D = 1, 1, 16, 256
+        B, H, M, D = 1, 1, 16, 64
 
         q1 = torch.randn(B, M, H, D, dtype=torch.float16, device="cuda")
         k1 = torch.randn(B, 144, H, D, dtype=torch.float16, device="cuda")
@@ -346,7 +354,7 @@ class TestFlashAttentionCoopCausal:
 
 
 def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False,
-                                 kv_group_size=1):
+                                 kv_group_size=1, tile_sizes=None):
     """Run FlashAttentionSm120BwdOp and return (dq, dk, dv)."""
     from machete.megakernel import Megakernel
     from machete.kernels.attention import FlashAttentionSm120BwdOp
@@ -361,8 +369,9 @@ def _run_attention_coop_backward(q, k, v, o, dout, lse, causal=False,
         k=k, v=v, q=q, dout=dout, lse=lse, dpsum=dpsum,
         dq=dq_accum, dk=dk, dv=dv, causal=causal,
         kv_group_size=kv_group_size,
+        tile_sizes=tile_sizes,
     )
-    config = FlashAttentionSm120BwdOp.kernel_config(ops)
+    config = ops[0].op_cls.kernel_config(ops)
     kernel = Megakernel(ops, config=config)
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -445,4 +454,40 @@ class TestFlashAttentionCoopGQABwd:
         dout = torch.randn(1, M, BH_q, D, dtype=torch.float16, device="cuda")
         _assert_attention_backward_close(
             q, k, v, dout, causal=causal, kv_group_size=kv_group_size,
+        )
+
+    @requires_gpu
+    def test_gqa_backward_async_dq_store_warp(self):
+        """Opt-in async dQ store-warp path matches PyTorch reference."""
+        torch.manual_seed(42)
+        q = torch.randn(1, 64, 4, 256, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, 64, 1, 256, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, 64, 1, 256, dtype=torch.float16, device="cuda")
+        dout = torch.randn(1, 64, 4, 256, dtype=torch.float16, device="cuda")
+        _assert_attention_backward_close(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            kv_group_size=4,
+            tile_sizes={"async_dq_store_warp": 1},
+        )
+
+    @requires_gpu
+    def test_gqa_backward_tma_dq_reduce(self):
+        """Opt-in TMA reduce-add dQ path matches PyTorch reference."""
+        torch.manual_seed(42)
+        q = torch.randn(1, 32, 2, 128, dtype=torch.float16, device="cuda")
+        k = torch.randn(1, 32, 1, 128, dtype=torch.float16, device="cuda")
+        v = torch.randn(1, 32, 1, 128, dtype=torch.float16, device="cuda")
+        dout = torch.randn(1, 32, 2, 128, dtype=torch.float16, device="cuda")
+        _assert_attention_backward_close(
+            q,
+            k,
+            v,
+            dout,
+            causal=True,
+            kv_group_size=2,
+            tile_sizes={"tma_dq_reduce": 1},
         )

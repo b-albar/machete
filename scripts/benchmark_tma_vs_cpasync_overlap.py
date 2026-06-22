@@ -30,7 +30,6 @@ from cutlass import Float32, Int32
 from cutlass.cute.nvgpu.cpasync import (
     CopyBulkG2SOp,
     CopyBulkS2GOp,
-    group_bulk_copy_modes,
 )
 
 from machete.megakernel.interpreter import mbarrier_arrive, mbarrier_arrive_expect_tx
@@ -142,7 +141,8 @@ class _OverlapCpAsyncBulkOp(Op):
         )
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, Int32(self.tile_size_M * self.N * ELEM_BYTES))
-        gsrc, sdst = group_bulk_copy_modes(g, s)
+        gsrc = cute.group_modes(g, 0, 1)
+        sdst = cute.group_modes(s, 0, 1)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -174,7 +174,8 @@ class _OverlapCpAsyncBulkOp(Op):
             y.iterator + tile_M * Int32(self.tile_size_M * self.N),
             cute.make_layout(self.tile_size_M * self.N),
         )
-        ssrc, gdst = group_bulk_copy_modes(s, g)
+        ssrc = cute.group_modes(s, 0, 1)
+        gdst = cute.group_modes(g, 0, 1)
         cute.copy(s2g, ssrc, gdst)
 
 

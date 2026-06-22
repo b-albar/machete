@@ -25,15 +25,20 @@ from x). Backward overwrites in-place (dx has same stride as x, no barrier).
 
 import cutlass
 import cutlass.cute as cute
+from dataclasses import replace
 from cutlass import Int32, Float32
 
 from machete.megakernel.ops import (
+    AccessRegions,
     Op,
     DEFAULT_PAGE_SIZE,
+    RegionAxis,
+    TensorAccessRegion,
     config_dim_i32,
     config_ptr_i64,
 )
 from machete.megakernel.interpreter import (
+    global_memory_fence_gpu,
     mbarrier_arrive_expect_tx,
     named_barrier_sync,
 )
@@ -76,6 +81,37 @@ def _pick_forward_tile_size_s(x, y, activation, page_size):
     if activation == ACT_SILU and y.shape[-1] >= 1024 and raw_tile_size_s > 3:
         return 2
     return raw_tile_size_s
+
+
+def _pick_direct_glu_tile_sizes(x, y, activation, tile_sizes):
+    tile_sizes = dict(tile_sizes or {})
+    tile_sizes.setdefault("B", 1)
+    D = y.shape[-1]
+    prefer_wide_tile = (
+        activation in ("silu", "swish")
+        and x.shape[0] > 1
+        and D % 896 == 0
+    )
+    tile_sizes.setdefault("S", 32 if prefer_wide_tile else 16)
+    if "D" not in tile_sizes:
+        candidates = (
+            (896, 512, 256, 128, 64, 32)
+            if prefer_wide_tile
+            else (512, 256, 128, 64, 32)
+        )
+        for tile_d in candidates:
+            if D % tile_d == 0:
+                tile_sizes["D"] = tile_d
+                break
+        else:
+            tile_sizes["D"] = min(D, 256)
+    return tile_sizes
+
+
+def _staged_direct_glu_fits_page(x, tile_sizes, page_size):
+    elem_bytes = x.element_size()
+    chunk_tile_bytes = tile_sizes["S"] * tile_sizes["D"] * elem_bytes
+    return 2 * _align_up(chunk_tile_bytes, 128) <= page_size
 
 
 @cute.jit
@@ -290,6 +326,13 @@ def _glu_forward_core_direct(page_ptr, y_offset, tile_S,
                     y_reg[i] = (act_val * u).to(x_dtype)
 
                 cute.autovec_copy(y_reg, y_part)
+
+        # DirectGLU writes global memory from the compute phase. In the full
+        # replay path there is no store-warp fence for this op, so publish these
+        # writes before the framework signals compute_done and a later TMA load
+        # may consume y.
+        global_memory_fence_gpu()
+        cute.arch.fence_proxy("async.global")
 
 
 @cute.jit
@@ -560,8 +603,7 @@ class GLUOp(Op):
             cute.group_modes(sY, 0, 3),
             cute.group_modes(gY, 0, 3),
         )
-        with cute.arch.elect_one():
-            cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
+        cute.copy(y_tma, tYsY, tYgY[(None, tile_D, tile_S, tile_B)])
 
 
 class DirectGLUOp(Op):
@@ -581,6 +623,7 @@ class DirectGLUOp(Op):
     }
     tile = ("B", "S", "D")
     dynamic_dims = ("B", "S")
+    uses_smem_page = False
 
     def __init__(self, **config):
         super().__init__(**config)
@@ -591,29 +634,65 @@ class DirectGLUOp(Op):
         ) // self.num_warps
 
     @classmethod
+    def access_regions(cls, op) -> AccessRegions:
+        regions = super().access_regions(op)
+        x_region = regions.reads.get("x")
+        if x_region is None:
+            return regions
+
+        d_axis = regions.writes.get("y").axis("D") if regions.writes.get("y") is not None else None
+        if d_axis is None or d_axis.tile_dim != "D":
+            return regions
+
+        tile_size_d = int(d_axis.tile_size)
+        d_extent = int(d_axis.extent)
+        d_tiles = op.tile_counts[op.dim_names["D"]]
+
+        def packed_region(offset_tiles: int) -> TensorAccessRegion:
+            axes = []
+            for axis in x_region.axes:
+                if axis.name == "N":
+                    axes.append(
+                        RegionAxis(
+                            name="N",
+                            extent=d_extent,
+                            tile_dim="D",
+                            tile_size=tile_size_d,
+                            tile_origin=int(op.tile_origins.get("D", 0)),
+                        )
+                    )
+                else:
+                    axes.append(axis)
+            return replace(
+                x_region,
+                axes=tuple(axes),
+                group_index_dim="N",
+                group_index_offset=offset_tiles,
+                group_index_group_tiles=1,
+            )
+
+        y_region = regions.writes.get("y")
+        writes = dict(regions.writes)
+        if y_region is not None:
+            writes["y"] = replace(
+                y_region,
+                group_dim="D",
+                group_tiles=1,
+                group_count=d_tiles,
+            )
+        return AccessRegions(
+            reads={"x": (packed_region(0), packed_region(d_tiles))},
+            writes=writes,
+        )
+
+    @classmethod
     def schedule(cls, tile_sizes=None, activation="silu", page_size=DEFAULT_PAGE_SIZE, **tensors):
         x = tensors["x"]
         y = tensors["y"]
         assert x.shape[-1] == 2 * y.shape[-1], (
             f"DirectGLU: x last dim ({x.shape[-1]}) must be 2 * y last dim ({y.shape[-1]})"
         )
-        tile_sizes = dict(tile_sizes or {})
-        tile_sizes.setdefault("B", 1)
-        D = y.shape[-1]
-        prefer_wide_tile = (
-            activation in ("silu", "swish")
-            and x.shape[0] > 1
-            and D % 896 == 0
-        )
-        tile_sizes.setdefault("S", 32 if prefer_wide_tile else 16)
-        if "D" not in tile_sizes:
-            candidates = (896, 512, 256, 128, 64, 32) if prefer_wide_tile else (512, 256, 128, 64, 32)
-            for tile_d in candidates:
-                if D % tile_d == 0:
-                    tile_sizes["D"] = tile_d
-                    break
-            else:
-                tile_sizes["D"] = min(D, 256)
+        tile_sizes = _pick_direct_glu_tile_sizes(x, y, activation, tile_sizes)
         if y.shape[-1] % tile_sizes["D"] != 0:
             raise ValueError(
                 f"DirectGLU requires D % tile_size_D == 0, got "
@@ -711,6 +790,264 @@ class DirectGLUOp(Op):
                     y_reg[i] = (act_val * u).to(self.y_dtype)
 
                 cute.autovec_copy(y_reg, y_part)
+
+
+class StagedDirectGLUOp(Op):
+    """D-chunked GLU forward with page-staged gate/up loads."""
+
+    reads = {
+        "gate": (None, ("B", "S", "D")),
+        "up": (None, ("B", "S", "D")),
+    }
+    writes = {
+        "y": (None, ("B", "S", "D")),
+    }
+    tile = ("B", "S", "D")
+    dynamic_dims = ("B", "S")
+    inline_phases = ("load", "compute", "store")
+
+    tma_loads = {"gate", "up"}
+    tma_stores = {"y"}
+
+    @classmethod
+    def get_tma_tile_shape(cls, tensor_name, tile_sizes, static_dims):
+        if tensor_name in {"gate", "up", "y"}:
+            return (1, tile_sizes["S"], tile_sizes["D"])
+        return None
+
+    @classmethod
+    def get_tma_smem_layout_src(cls, tensor_name, tma_tile_shape, tile_sizes, static_dims):
+        if tensor_name in {"gate", "up", "y"}:
+            tile_d, tile_s, tile_b = tma_tile_shape
+            return f"cute.make_layout(({tile_d}, {tile_s}, {tile_b}))"
+        return None
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.activation = getattr(self, "activation", ACT_SILU)
+        self.page_size = getattr(self, "page_size", DEFAULT_PAGE_SIZE)
+        if self.gate_dtype in (cutlass.Float16, cutlass.BFloat16):
+            self.elem_bytes = 2
+        else:
+            self.elem_bytes = 4
+
+        assert self.D >= 32 and self.D % self.tile_size_D == 0, (
+            f"StagedDirectGLU requires D % tile_size_D == 0, got "
+            f"D={self.D}, tile_size_D={self.tile_size_D}"
+        )
+        self.num_d_tiles = self.D // self.tile_size_D
+        self.chunk_tile_bytes = self.tile_size_S * self.tile_size_D * self.elem_bytes
+        self.chunk_stride_bytes = _align_up(self.chunk_tile_bytes, 128)
+        self.up_smem_offset = self.chunk_stride_bytes
+        self.x_tile_bytes = 2 * self.chunk_stride_bytes
+        assert self.x_tile_bytes <= self.page_size, (
+            f"StagedDirectGLU x tile ({self.x_tile_bytes}B) > page "
+            f"({self.page_size}B); got tile_size_S={self.tile_size_S}, "
+            f"tile_size_D={self.tile_size_D}"
+        )
+
+        self.num_warps = self.threads_per_row // 32
+        self.effective_warps = min(self.num_warps, max(1, self.tile_size_S))
+        self.rows_per_warp = (
+            self.tile_size_S + self.effective_warps - 1
+        ) // self.effective_warps
+
+    @classmethod
+    def schedule(cls, tile_sizes=None, activation="silu", page_size=DEFAULT_PAGE_SIZE, **tensors):
+        y = tensors["y"]
+        tile_sizes = dict(tile_sizes or {})
+        tile_sizes.setdefault("B", 1)
+        if "gate" in tensors and "up" in tensors:
+            gate = tensors["gate"]
+            up = tensors["up"]
+            assert gate.shape == up.shape, (
+                f"StagedDirectGLU: gate shape {gate.shape} must match up shape {up.shape}"
+            )
+            D = gate.shape[-1]
+            assert y.shape[-1] == D, (
+                f"StagedDirectGLU: y last dim ({y.shape[-1]}) must match gate/up last dim ({D})"
+            )
+        else:
+            x = tensors["x"]
+            assert x.shape[-1] == 2 * y.shape[-1], (
+                f"StagedDirectGLU: x last dim ({x.shape[-1]}) must be 2 * y last dim ({y.shape[-1]})"
+            )
+            D = y.shape[-1]
+            tensors = dict(tensors)
+            tensors["gate"] = x[..., :D]
+            tensors["up"] = x[..., D:]
+            tensors.pop("x")
+            gate = tensors["gate"]
+        elem_bytes = gate.element_size()
+
+        if "D" not in tile_sizes:
+            direct_tile_sizes = _pick_direct_glu_tile_sizes(gate, y, activation, tile_sizes)
+            if _staged_direct_glu_fits_page(gate, direct_tile_sizes, page_size):
+                tile_sizes["D"] = direct_tile_sizes["D"]
+                tile_sizes.setdefault("S", direct_tile_sizes["S"])
+            else:
+                for tile_d in (512, 256, 128, 64, 32):
+                    if D % tile_d != 0:
+                        continue
+                    raw_s = max(1, page_size // (2 * tile_d * elem_bytes))
+                    if raw_s >= 1:
+                        tile_sizes["D"] = tile_d
+                        tile_sizes.setdefault("S", min(16, raw_s))
+                        break
+                else:
+                    tile_sizes["D"] = min(D, 256)
+                    raw_s = max(1, page_size // (2 * tile_sizes["D"] * elem_bytes))
+                    tile_sizes.setdefault("S", min(16, raw_s))
+        elif "S" not in tile_sizes:
+            raw_s = max(1, page_size // (2 * tile_sizes["D"] * elem_bytes))
+            tile_sizes["S"] = min(16, raw_s)
+
+        if y.shape[-1] % tile_sizes["D"] != 0:
+            raise ValueError(
+                f"StagedDirectGLU requires D % tile_size_D == 0, got "
+                f"D={y.shape[-1]}, tile_size_D={tile_sizes['D']}"
+            )
+        if not _staged_direct_glu_fits_page(gate, tile_sizes, page_size):
+            chunk_tile_bytes = tile_sizes["S"] * tile_sizes["D"] * elem_bytes
+            raise ValueError(
+                f"StagedDirectGLU x tile ({2 * _align_up(chunk_tile_bytes, 128)}B) "
+                f"exceeds page ({page_size}B); got tile_size_S={tile_sizes['S']}, "
+                f"tile_size_D={tile_sizes['D']}"
+            )
+
+        ops = [cls._schedule_single(tile_sizes=tile_sizes, **tensors)]
+        ops[0].static_dims["activation"] = ACT_MAP.get(activation, ACT_SILU)
+        ops[0].static_dims["page_size"] = page_size
+        return ops
+
+    @classmethod
+    def kernel_config(cls, ops):
+        from machete.megakernel import MegakernelConfig
+
+        page_size = ops[0].static_dims.get("page_size", DEFAULT_PAGE_SIZE)
+        return MegakernelConfig(page_size=page_size)
+
+    @cute.jit
+    def load(self, page_ptr, tile_B, tile_S, tile_D,
+             gate_tma, gate_tma_gmem, up_tma, up_tma_gmem, work_mbar):
+        sGate = cute.make_tensor(
+            cute.make_ptr(self.gate_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gGate = cute.local_tile(
+            gate_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tGsGate, tGgGate = cute.nvgpu.cpasync.tma_partition(
+            gate_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sGate, 0, 3),
+            cute.group_modes(gGate, 0, 3),
+        )
+
+        nbytes = Int32(self.x_tile_bytes)
+        mbar_ptr = cute.make_ptr(
+            cutlass.Int64, work_mbar, cute.AddressSpace.smem
+        )
+        with cute.arch.elect_one():
+            mbarrier_arrive_expect_tx(work_mbar, nbytes)
+        cute.copy(gate_tma, tGgGate, tGsGate, tma_bar_ptr=mbar_ptr)
+
+        sUp = cute.make_tensor(
+            cute.make_ptr(
+                self.up_dtype,
+                page_ptr + Int32(self.up_smem_offset),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gUp = cute.local_tile(
+            up_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tUsUp, tUgUp = cute.nvgpu.cpasync.tma_partition(
+            up_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sUp, 0, 3),
+            cute.group_modes(gUp, 0, 3),
+        )
+        cute.copy(up_tma, tUgUp, tUsUp, tma_bar_ptr=mbar_ptr)
+
+    @cute.jit
+    def compute(self, page_ptr, tile_B, tile_S, tile_D, op_config_ptr):
+        runtime_S = config_dim_i32(op_config_ptr, "S", type(self))
+        warp_idx = cute.arch.warp_idx()
+        lane_idx = cute.arch.lane_idx()
+        thr_layout = cute.make_layout(32)
+        row_start = tile_S * Int32(self.tile_size_S)
+        gate_smem = cute.make_ptr(self.gate_dtype, page_ptr, cute.AddressSpace.smem)
+        up_smem = cute.make_ptr(
+            self.up_dtype,
+            page_ptr + Int32(self.up_smem_offset),
+            cute.AddressSpace.smem,
+        )
+        y_smem = gate_smem
+
+        if warp_idx < Int32(self.effective_warps):
+            for ri in cutlass.range_constexpr(self.rows_per_warp):
+                local_row = warp_idx + Int32(ri * self.effective_warps)
+                row_idx = row_start + local_row
+                if local_row < Int32(self.tile_size_S) and row_idx < runtime_S:
+                    gate_row = cute.make_tensor(
+                        gate_smem + local_row * Int32(self.tile_size_D),
+                        cute.make_layout(self.tile_size_D),
+                    )
+                    up_row = cute.make_tensor(
+                        up_smem + local_row * Int32(self.tile_size_D),
+                        cute.make_layout(self.tile_size_D),
+                    )
+                    y_row = cute.make_tensor(
+                        y_smem + local_row * Int32(self.tile_size_D),
+                        cute.make_layout(self.tile_size_D),
+                    )
+                    gate_part = cute.local_partition(gate_row, thr_layout, lane_idx)
+                    up_part = cute.local_partition(up_row, thr_layout, lane_idx)
+                    y_part = cute.local_partition(y_row, thr_layout, lane_idx)
+                    gate_reg = cute.make_fragment_like(gate_part)
+                    up_reg = cute.make_fragment_like(up_part)
+                    y_reg = cute.make_fragment_like(y_part)
+                    cute.autovec_copy(gate_part, gate_reg)
+                    cute.autovec_copy(up_part, up_reg)
+                    for i in range(cute.size(gate_reg)):
+                        g = gate_reg[i].to(Float32)
+                        u = up_reg[i].to(Float32)
+                        act_val = g
+                        if self.activation == ACT_RELU:
+                            act_val = g
+                            if g < Float32(0.0):
+                                act_val = Float32(0.0)
+                        elif self.activation == ACT_IDENTITY:
+                            act_val = g
+                        else:
+                            neg_g = Float32(0.0) - g
+                            exp_neg = cute.math.exp(neg_g, fastmath=True)
+                            act_val = g / (Float32(1.0) + exp_neg)
+                        y_reg[i] = (act_val * u).to(self.y_dtype)
+                    cute.autovec_copy(y_reg, y_part)
+
+    @cute.jit
+    def store(self, page_ptr, tile_B, tile_S, tile_D,
+              y_tma, y_tma_gmem):
+        sY = cute.make_tensor(
+            cute.make_ptr(self.y_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gY = cute.local_tile(
+            y_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tYsY, tYgY = cute.nvgpu.cpasync.tma_partition(
+            y_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sY, 0, 3),
+            cute.group_modes(gY, 0, 3),
+        )
+        cute.copy(y_tma, tYsY, tYgY)
 
 
 # =============================================================================
@@ -1033,39 +1370,38 @@ class GLUBwdOp(Op):
     def store(self, page_ptr, tile_B, tile_S, tile_D,
              dx_tma, dx_tma_gmem):
         """TMA store d_gate/d_up D chunks from smem to dx."""
-        with cute.arch.elect_one():
-            sDGate = cute.make_tensor(
-                cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
-                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
-            )
-            gDGate = cute.local_tile(
-                dx_tma_gmem,
-                (self.tile_size_D, self.tile_size_S, 1),
-                (tile_D, tile_S, tile_B),
-            )
-            tDGsDGate, tDGgDGate = cute.nvgpu.cpasync.tma_partition(
-                dx_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sDGate, 0, 3),
-                cute.group_modes(gDGate, 0, 3),
-            )
-            cute.copy(dx_tma, tDGsDGate, tDGgDGate)
+        sDGate = cute.make_tensor(
+            cute.make_ptr(self.x_dtype, page_ptr, cute.AddressSpace.smem),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gDGate = cute.local_tile(
+            dx_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D, tile_S, tile_B),
+        )
+        tDGsDGate, tDGgDGate = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDGate, 0, 3),
+            cute.group_modes(gDGate, 0, 3),
+        )
+        cute.copy(dx_tma, tDGsDGate, tDGgDGate)
 
-            sDUp = cute.make_tensor(
-                cute.make_ptr(
-                    self.x_dtype,
-                    page_ptr + Int32(self.up_smem_offset),
-                    cute.AddressSpace.smem,
-                ),
-                cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
-            )
-            gDUp = cute.local_tile(
-                dx_tma_gmem,
-                (self.tile_size_D, self.tile_size_S, 1),
-                (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
-            )
-            tDUsDUp, tDUgDUp = cute.nvgpu.cpasync.tma_partition(
-                dx_tma, Int32(0), cute.make_layout(1),
-                cute.group_modes(sDUp, 0, 3),
-                cute.group_modes(gDUp, 0, 3),
-            )
-            cute.copy(dx_tma, tDUsDUp, tDUgDUp)
+        sDUp = cute.make_tensor(
+            cute.make_ptr(
+                self.x_dtype,
+                page_ptr + Int32(self.up_smem_offset),
+                cute.AddressSpace.smem,
+            ),
+            cute.make_layout((self.tile_size_D, self.tile_size_S, 1)),
+        )
+        gDUp = cute.local_tile(
+            dx_tma_gmem,
+            (self.tile_size_D, self.tile_size_S, 1),
+            (tile_D + Int32(self.num_d_tiles), tile_S, tile_B),
+        )
+        tDUsDUp, tDUgDUp = cute.nvgpu.cpasync.tma_partition(
+            dx_tma, Int32(0), cute.make_layout(1),
+            cute.group_modes(sDUp, 0, 3),
+            cute.group_modes(gDUp, 0, 3),
+        )
+        cute.copy(dx_tma, tDUsDUp, tDUgDUp)

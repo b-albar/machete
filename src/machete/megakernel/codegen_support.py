@@ -12,11 +12,13 @@ from .interpreter import (
     get_smem_base_ptr,
     global_barrier_signal,
     global_barrier_signal_gpu,
+    global_memory_fence_gpu,
     ld_global_i64,
     load_instruction_to_smem,
     mbarrier_arrive,
     mbarrier_init,
     mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_wait,
     named_barrier_sync,
     nanosleep,
@@ -70,12 +72,14 @@ def build_kernel_exec_globals(
         "ld_global_i64": ld_global_i64,
         "mbarrier_init": mbarrier_init,
         "mbarrier_init_fence": mbarrier_init_fence,
+        "mbarrier_init_fence_async_proxy": mbarrier_init_fence_async_proxy,
         "mbarrier_arrive": mbarrier_arrive,
         "mbarrier_wait": mbarrier_wait,
         "nanosleep": nanosleep,
         "named_barrier_sync": named_barrier_sync,
         "global_barrier_signal": global_barrier_signal,
         "global_barrier_signal_gpu": global_barrier_signal_gpu,
+        "global_memory_fence_gpu": global_memory_fence_gpu,
         "num_pages": num_pages,
         "num_slots": num_slots,
         "iq_offset": iq_offset,
@@ -136,78 +140,3 @@ def build_persistent_kernel_globals(tma_registry, peer_tma_registry, kernel_loop
         pk_globals["ReductionOp"] = ReductionOp
 
     return pk_globals
-
-
-def replace_required(source: str, old: str, new: str) -> str:
-    """Replace a generated-source fragment, accepting one indentation variant."""
-    if old not in source:
-        def _shift_left(text: str) -> str:
-            lines = text.splitlines(True)
-            return "".join(
-                line[8:] if line.startswith("        ") else line
-                for line in lines
-            )
-
-        old_shifted = _shift_left(old)
-        new_shifted = _shift_left(new)
-        if old_shifted in source:
-            return source.replace(old_shifted, new_shifted, 1)
-        raise RuntimeError("Failed to patch generated page-free ring source")
-    return source.replace(old, new, 1)
-
-
-def enable_page_free_ring_source(source: str) -> str:
-    """Specialize the generated ring loop for ops that do not own smem pages."""
-    source = replace_required(
-        source,
-        "                _temp_instr = iq_base\n",
-        "                data_release_idx_ptr = flags_ptr + FLAG_DATA_RELEASE_IDX\n"
-        "                data_produce_idx_ptr = flags_ptr + FLAG_DATA_PRODUCE_IDX\n"
-        "                _temp_instr = iq_base\n"
-    )
-    source = replace_required(
-        source,
-        "                            st_shared_i32(\n"
-        "                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
-        "                                _p_slot % Int32(num_pages),\n"
-        "                            )\n",
-        "                            _ctrl_no_page = (\n"
-        "                                (_ctrl_cached_phase_mask // Int32(1 << _INSTR_NO_SMEM_PAGE_BIT))\n"
-        "                                % Int32(2)\n"
-        "                            )\n"
-        "                            st_shared_i32(\n"
-        "                                _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
-        "                                Int32(-1),\n"
-        "                            )\n"
-        "                            if _ctrl_no_page == Int32(0):\n"
-        "                                _dp = ld_shared_i32(data_produce_idx_ptr)\n"
-        "                                _dr = ld_shared_acquire_cta_i32(data_release_idx_ptr)\n"
-        "                                while (_dp - _dr) >= Int32(num_pages):\n"
-        "                                    nanosleep(Int32(loader_idle_sleep_ns))\n"
-        "                                    _dr = ld_shared_acquire_cta_i32(data_release_idx_ptr)\n"
-        "                                st_shared_i32(\n"
-        "                                    _p_ti + Int32(4 * _TILE_INFO_PAGE_ID),\n"
-        "                                    _dp % Int32(num_pages),\n"
-        "                                )\n"
-        "                                st_shared_i32(data_produce_idx_ptr, _dp + Int32(1))\n",
-    )
-    source = replace_required(
-        source,
-        "                load_done_ptr = flags_ptr + FLAG_LOAD_DONE\n"
-        "                while _sw_done == Int32(0):\n",
-        "                load_done_ptr = flags_ptr + FLAG_LOAD_DONE\n"
-        "                data_release_idx_ptr = flags_ptr + FLAG_DATA_RELEASE_IDX\n"
-        "                while _sw_done == Int32(0):\n",
-    )
-    source = replace_required(
-        source,
-        "                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))\n",
-        "                            if _ds_page >= Int32(0):\n"
-        "                                _store_data_release_idx = ld_shared_i32(data_release_idx_ptr) + Int32(1)\n"
-        "                                st_shared_release_cta_i32(\n"
-        "                                    data_release_idx_ptr,\n"
-        "                                    _store_data_release_idx,\n"
-        "                                )\n"
-        "                            st_shared_i32(store_idx_ptr, _s_idx + Int32(1))\n",
-    )
-    return source

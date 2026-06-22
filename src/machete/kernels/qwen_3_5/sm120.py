@@ -18,13 +18,13 @@ from cutlass import Float32, Int32, const_expr
 from machete.kernels.gemm import GemmOp
 from machete.kernels.gemm.gemm import _gemm_epilogue_store_no_mbar_inval_helper
 from machete.kernels.qknorm_rope import QKNormRopeOp as _BaseQKNormRopeOp
-from machete.kernels.qknorm_rope.qknorm_rope import CopyBulkS2GOp, group_bulk_copy_modes
+from cutlass.cute.nvgpu.cpasync import CopyBulkS2GOp
 from machete.megakernel.interpreter import (
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_inval,
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_wait,
     named_barrier_sync,
 )
@@ -77,9 +77,11 @@ class Qwen3_5StagedDecodeGemmSm120Op(StreamingPipelineOpMixin, GemmOp):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         k_block = Int32(0)
         while k_block < Int32(self.num_k_blocks):
@@ -301,9 +303,11 @@ class Qwen3_5RMSAddStagedDecodeGemmSm120Op(Qwen3_5StagedDecodeGemmSm120Op):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         lane_idx = cute.arch.lane_idx()
         row_start = tile_S * Int32(self.tile_size_S)
@@ -490,7 +494,7 @@ class Qwen3_5RangedLmHeadSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             mbarrier_arrive(bf_1)
 
@@ -889,7 +893,7 @@ class Qwen3_5RMSAddRangedDecodeMatvecSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(1))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
         with cute.arch.elect_one():
             mbarrier_arrive(bf_1)
 
@@ -1190,7 +1194,7 @@ class Qwen3_5RMSAddRangedDecodeGemmSm120Op(StreamingPipelineOpMixin, Op):
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
             mbarrier_init(kr_0, Int32(1))
             mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+        mbarrier_init_fence_async_proxy()
 
         total_stream_blocks = (tile_3 - tile_N) * Int32(self.num_k_blocks)
         first_stream_blocks = Int32(2)
@@ -1557,6 +1561,8 @@ class Qwen3_5PackedQkvChunkProjectSm120Op(Qwen3_5DecodeMatvecGemmSm120Op):
         )
         with cute.arch.elect_one():
             cute.copy(c_tma, tCsC, tCgC[(None, tile_N, tile_S, tile_B)])
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
 
         # Phase 2: accumulate per-head chunk sums of squares for Q/K normalization.
         head = tile_N // Int32(self.head_chunks)
@@ -1716,7 +1722,7 @@ class Qwen3_5ComputeTmaRMSAddPackedQkvChunkProjectSm120Op(Qwen3_5RMSAddStagedDec
             with cute.arch.elect_one():
                 mbarrier_init(kr_0, Int32(1))
                 mbarrier_init(kr_1, Int32(1))
-            mbarrier_init_fence()
+            mbarrier_init_fence_async_proxy()
 
             # Phase 2: compute residual-add RMS statistics and residual output.
             rstd_scratch = cute.make_tensor(
@@ -2089,9 +2095,11 @@ class Qwen3_5PackedQkvProjectSm120Op(StreamingPipelineOpMixin, Op):
         with cute.arch.elect_one():
             mbarrier_init(bf_0, Int32(self.num_mma_warps))
             mbarrier_init(bf_1, Int32(self.num_mma_warps))
-            mbarrier_init(kr_0, Int32(1))
-            mbarrier_init(kr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+                mbarrier_init(kr_0, Int32(1))
+                mbarrier_init(kr_1, Int32(1))
+        if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         total_stream_blocks = Int32(self.num_head_blocks * self.num_k_blocks)
         first_stream_blocks = Int32(2)
@@ -2524,8 +2532,9 @@ class Qwen3_5PackedQkvProjectSm120Op(StreamingPipelineOpMixin, Op):
             if tidx == Int32(0):
                 mbarrier_inval(bf_0)
                 mbarrier_inval(bf_1)
-                mbarrier_inval(kr_0)
-                mbarrier_inval(kr_1)
+                if const_expr(self.num_head_blocks * self.num_k_blocks > 2):
+                    mbarrier_inval(kr_0)
+                    mbarrier_inval(kr_1)
 
 
 class Qwen3_5PackedQkvFinalizeSm120Op(Op):
@@ -2747,7 +2756,8 @@ class Qwen3_5QKNormRopeKCacheStoreSm120Op(_BaseQKNormRopeOp):
                     + head_start * Int32(self.dst_k_stride_H),
                     cute.make_layout((self.q_row_elems,)),
                 )
-                ssrc_k, kdst = group_bulk_copy_modes(s_tile, dst_k_tile)
+                ssrc_k = cute.group_modes(s_tile, 0, 1)
+                kdst = cute.group_modes(dst_k_tile, 0, 1)
                 cute.copy(s2g, ssrc_k, kdst)
 
 

@@ -1,5 +1,5 @@
 import itertools
-import math
+import inspect
 from typing import Any, List, Callable, Optional
 import copy
 import time
@@ -13,12 +13,52 @@ from .benchmark_utils import (
     benchmark_backward,
     benchmark_memory,
     benchmark_fwd_bwd,
-    benchmark_jit_kernel,
     KernelBenchSpec,
+    recommended_input_group_count,
     efficiency,
     memory_throughput,
-    CUTLASS_AVAILABLE,
 )
+
+
+DEFAULT_KERNEL_WARMUP = 500
+DEFAULT_KERNEL_REP = 100
+DEFAULT_KERNEL_COOLDOWN_MS = 500
+
+
+def _accepts_group_index(fn: Callable) -> bool:
+    """Return True when a benchmark callback should receive a group index.
+
+    Many benchmark closures use default positional arguments only to capture
+    objects, e.g. ``lambda c=c: c.zero_()``. Passing the input-group index to
+    those callables overwrites the captured object and can turn a valid closure
+    into ``int(...)``. Only pass a group index when the callable has a required
+    positional parameter or accepts varargs.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if (
+            param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            and param.default is inspect.Parameter.empty
+        ):
+            return True
+    return False
+
+
+def _call_bench_callback(fn: Optional[Callable], group_idx: int, accepts_group_idx: bool) -> None:
+    if fn is None:
+        return
+    if accepts_group_idx:
+        fn(group_idx)
+    else:
+        fn()
 
 
 class Benchmark:
@@ -149,13 +189,14 @@ class Benchmark:
     def _bench_kernel_func(self, func_or_spec, warmup, rep, force_host_timer: bool = False):
         """Benchmark a kernel callable or `KernelBenchSpec`.
 
-        Kernel-mode benchmarks are timed directly with CUDA events on a
-        dedicated stream. `KernelBenchSpec` instances may also provide a
-        `setup_fn` that runs before each launch.
+        Kernel-mode benchmarks are timed with a production-style CUDA event
+        convention: run all warmup launches back-to-back, then record one start
+        event before the full profiling loop and one end event after it. This
+        avoids per-sample synchronization and matches CUTLASS-style reporting.
 
-        This avoids CUDA graph capture entirely for kernel benchmarks, which
-        is important for megakernels, dynamic launch sequences, and plain
-        callables that allocate outputs during execution.
+        `KernelBenchSpec` may opt into L2-evicting input rotation by setting
+        `input_size_bytes` (or `num_input_groups`) and by accepting a group
+        index argument in `launch_fn`/`setup_fn`.
 
         Args:
             func_or_spec: A callable or a KernelBenchSpec.
@@ -166,70 +207,77 @@ class Benchmark:
             Execution time in milliseconds.
         """
         if isinstance(func_or_spec, KernelBenchSpec):
-            torch_stream, _ = func_or_spec.stream
+            if func_or_spec.stream is None:
+                torch_stream = torch.cuda.Stream()
+            else:
+                torch_stream, _ = func_or_spec.stream
             launch = func_or_spec.launch_fn
             setup = func_or_spec.setup_fn
             use_host_timer = func_or_spec.use_host_timer
+            if func_or_spec.num_input_groups is not None:
+                num_input_groups = max(1, int(func_or_spec.num_input_groups))
+            else:
+                num_input_groups = recommended_input_group_count(func_or_spec.input_size_bytes)
+            cooldown_ms = (
+                DEFAULT_KERNEL_COOLDOWN_MS
+                if func_or_spec.cooldown_ms is None
+                else max(0, int(func_or_spec.cooldown_ms))
+            )
         else:
             torch_stream = torch.cuda.Stream()
             launch = func_or_spec
             setup = None
             use_host_timer = False
+            num_input_groups = 1
+            cooldown_ms = DEFAULT_KERNEL_COOLDOWN_MS
 
         use_host_timer = use_host_timer or force_host_timer
+        launch_accepts_group = _accepts_group_index(launch)
+        setup_accepts_group = _accepts_group_index(setup) if setup is not None else False
+
+        warmup = int(DEFAULT_KERNEL_WARMUP if warmup is None else warmup)
+        rep = int(DEFAULT_KERNEL_REP if rep is None else rep)
+        if warmup < 0:
+            raise ValueError("warmup must be non-negative")
+        if rep <= 0:
+            raise ValueError("rep must be positive")
+
+        def _setup_and_launch(iter_idx: int) -> None:
+            group_idx = iter_idx % num_input_groups
+            _call_bench_callback(setup, group_idx, setup_accepts_group)
+            _call_bench_callback(launch, group_idx, launch_accepts_group)
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        times = []
         if use_host_timer:
-            # Host timing is too noisy for very small kernels if we only time
-            # one launch per sample. Probe once, then batch multiple launches
-            # into each timed sample and divide back down.
-            if setup is not None:
-                setup()
+            torch.cuda.synchronize()
+            for i in range(warmup):
+                _setup_and_launch(i)
+            torch.cuda.synchronize()
             t0 = time.perf_counter()
-            launch()
+            for i in range(rep):
+                _setup_and_launch(i)
             torch.cuda.synchronize()
             t1 = time.perf_counter()
-            probe_ms = max((t1 - t0) * 1000.0, 1e-3)
-            inner_repeats = max(1, min(128, int(math.ceil(5.0 / probe_ms))))
+            if cooldown_ms:
+                time.sleep(cooldown_ms / 1000.0)
+            return ((t1 - t0) * 1000.0) / rep
 
-            for _ in range(warmup):
-                for _ in range(inner_repeats):
-                    if setup is not None:
-                        setup()
-                    launch()
-                torch.cuda.synchronize()
-
-            for _ in range(rep):
-                t0 = time.perf_counter()
-                for _ in range(inner_repeats):
-                    if setup is not None:
-                        setup()
-                    launch()
-                torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                times.append(((t1 - t0) * 1000.0) / inner_repeats)
-
-            return sum(times) / len(times)
-
+        torch.cuda.synchronize()
         with torch.cuda.stream(torch_stream):
-            for _ in range(warmup):
-                if setup is not None:
-                    setup()
-                launch()
-            torch_stream.synchronize()
+            for i in range(warmup):
+                _setup_and_launch(i)
 
-            for _ in range(rep):
-                if setup is not None:
-                    setup()
-                start.record(torch_stream)
-                launch()
-                end.record(torch_stream)
-                torch_stream.synchronize()
-                times.append(start.elapsed_time(end))
+            start.record(torch_stream)
+            for i in range(rep):
+                _setup_and_launch(i)
+            end.record(torch_stream)
 
-        return sum(times) / len(times)
+        end.synchronize()
+        elapsed_ms = start.elapsed_time(end) / rep
+        if cooldown_ms:
+            time.sleep(cooldown_ms / 1000.0)
+        return elapsed_ms
 
     def _print_kernel_summary(self, results, names, bytes_fn):
         """Print a formatted summary table for kernel benchmark results."""
@@ -388,8 +436,8 @@ class Benchmark:
         key_split: Optional[str] = None,
         path_graphics: Optional[str] = None,
         bytes_fn: Optional[Callable] = None,
-        warmup: int = 25,
-        rep: int = 100,
+        warmup: Optional[int] = DEFAULT_KERNEL_WARMUP,
+        rep: Optional[int] = DEFAULT_KERNEL_REP,
         print_summary: bool = True,
         columns: Optional[list] = None,
     ):

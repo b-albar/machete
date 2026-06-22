@@ -204,14 +204,21 @@ def _tma_rebind_preamble(instance, tma_rebind_specs) -> str:
 
     lines: List[str] = []
     for spec in tma_rebind_specs:
-        gmem_line = (
-            f"\n    {spec['local_gmem_name']} = make_runtime_tma_gmem(\n"
-            f"        {spec['direction']!r},\n"
-            f"        {spec['runtime_tensor_name']},\n"
-            f"        {spec['smem_layout_src']},\n"
-            f"        {spec['cta_tiler_src']},\n"
-            f"    )"
+        tensor_view_expr = (
+            f"runtime_tma_tensor_view({spec['runtime_tensor_name']}, "
+            f"{tuple(spec.get('dim_perm', ()))!r})"
         )
+        if spec.get("partition_from_tensor_view", False):
+            gmem_line = f"\n    {spec['local_gmem_name']} = {spec['runtime_tensor_name']}"
+        else:
+            gmem_line = (
+                f"\n    {spec['local_gmem_name']} = make_runtime_tma_gmem(\n"
+                f"        {spec['direction']!r},\n"
+                f"        {tensor_view_expr},\n"
+                f"        {spec['smem_layout_src']},\n"
+                f"        {spec['cta_tiler_src']},\n"
+                f"    )"
+            )
         lines.append(
             f"    {spec['local_atom_name']} = copy.copy({spec['wrapper_atom_name']})\n"
             f"    {spec['local_atom_name']}._trait = RuntimeDescTMATrait(\n"
@@ -219,6 +226,7 @@ def _tma_rebind_preamble(instance, tma_rebind_specs) -> str:
             f"        runtime_desc_ptr_from_pool({spec['desc_pool_name']}, {spec['desc_slot_name']}),\n"
             f"        field_namespace={spec['field_namespace']!r},\n"
             f"        supports_mbar={spec['supports_mbar']},\n"
+            f"        exec_value=getattr({spec['wrapper_atom_name']}._trait, 'exec_value', None),\n"
             f"    ){gmem_line}"
         )
     return "\n".join(lines) + "\n"
@@ -426,6 +434,11 @@ def _build_phase_wrapper(
             "page_ptr",
             "op_config_ptr",
             "work_mbar",
+            "page_release_table_ptr",
+            "page_release_page_base",
+            "page_release_mbar_base",
+            "page_release_mbar_stride",
+            "page_release_page_size",
             "start_linear",
             "tile_count",
         }
@@ -455,6 +468,11 @@ def _build_phase_wrapper(
     # Check if method expects special framework params
     if "work_mbar" in method_params and extra_params and "work_mbar" in extra_params:
         call_args.append("work_mbar")
+    for extra_param in extra_params or []:
+        if extra_param == "work_mbar":
+            continue
+        if extra_param in method_params:
+            call_args.append(extra_param)
 
     call_str = ", ".join(call_args)
 
@@ -519,12 +537,18 @@ def _build_phase_wrapper(
     if tma_rebind_specs:
         import copy
 
-        from .transport import RuntimeDescTMATrait, make_runtime_tma_gmem, runtime_desc_ptr_from_pool
+        from .transport import (
+            RuntimeDescTMATrait,
+            make_runtime_tma_gmem,
+            runtime_desc_ptr_from_pool,
+            runtime_tma_tensor_view,
+        )
 
         exec_globals["copy"] = copy
         exec_globals["RuntimeDescTMATrait"] = RuntimeDescTMATrait
         exec_globals["make_runtime_tma_gmem"] = make_runtime_tma_gmem
         exec_globals["runtime_desc_ptr_from_pool"] = runtime_desc_ptr_from_pool
+        exec_globals["runtime_tma_tensor_view"] = runtime_tma_tensor_view
     if reconstruct_preamble:
         from .interpreter import ld_global_i32, ld_global_i64
 

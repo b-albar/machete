@@ -11,6 +11,13 @@ import torch
 from tests.megakernel.support import get_nop_op
 
 
+def _named_nop_op():
+    class NamedNopOp(get_nop_op()):
+        OUTPUTS = ["x"]
+
+    return NamedNopOp
+
+
 # =============================================================================
 # Host-Side Tests (No GPU Required)
 # =============================================================================
@@ -22,11 +29,11 @@ class TestMegakernelHost:
     def test_init(self):
         """Test megakernel initialization."""
         from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
-        NopOp = get_nop_op()
+        NopOp = _named_nop_op()
 
         ops = [
-            ScheduledOp(NopOp, tile_counts=(16,)),
-            ScheduledOp(NopOp, tile_counts=(16,)),
+            ScheduledOp(NopOp, tile_counts=(16,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopOp, tile_counts=(16,), tensor_ptrs={"x": 2}),
         ]
 
         config = MegakernelConfig(num_sms=8)
@@ -35,7 +42,7 @@ class TestMegakernelHost:
         assert kernel.num_sms == 8
         assert len(kernel.ops) == 2
         assert kernel.total_tiles == 32
-        assert kernel.num_barriers == 32
+        assert kernel.num_barriers == 0
 
     def test_repr(self):
         """Test string representation."""
@@ -74,6 +81,29 @@ class TestMegakernelHost:
 
         assert k0._make_cache_key() == k1._make_cache_key()
 
+    def test_compute_only_metadata_uses_compact_stride(self):
+        """Compute-only replay should not carry full load/store phase metadata."""
+        from machete.megakernel import Megakernel, MegakernelConfig, ScheduledOp
+        NopOp = _named_nop_op()
+
+        ops = [
+            ScheduledOp(NopOp, tile_counts=(4,), tensor_ptrs={"x": 1}),
+            ScheduledOp(NopOp, tile_counts=(4,), tensor_ptrs={"x": 2}),
+        ]
+        kernel = Megakernel(
+            ops,
+            config=MegakernelConfig(num_sms=1, num_pages=1),
+            device="cpu",
+        )
+
+        assert kernel._use_compute_only_replay()
+        kernel._prepare_tensors()
+
+        op_meta = kernel._op_meta_exec_globals()
+        assert op_meta["_OP_META_STRIDE"] == 11
+        assert "_OP_META_PHASE_MASK" not in op_meta
+        assert kernel._op_metadata_tensor.numel() == len(ops) * 11
+
 
 # =============================================================================
 # GPU Tests (Require Hopper)
@@ -95,9 +125,12 @@ class TestMegakernelGPU:
     def test_nop_kernel_run(self, num_ops):
         """Test running _NOPOp kernels with barrier reset across multiple runs."""
         from machete.megakernel import Megakernel, ScheduledOp
-        NopOp = get_nop_op()
+        NopOp = _named_nop_op()
 
-        ops = [ScheduledOp(NopOp, tile_counts=(8,)) for _ in range(num_ops)]
+        ops = [
+            ScheduledOp(NopOp, tile_counts=(8,), tensor_ptrs={"x": i + 1})
+            for i in range(num_ops)
+        ]
         kernel = Megakernel(ops)
 
         # Run multiple times to verify barrier reset

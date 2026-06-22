@@ -40,23 +40,97 @@ class KernelBenchSpec:
 
     Attributes:
         launch_fn: Callable that launches the kernel (timed).
-            Must be called on the stream specified in ``stream``.
+            Must be called on the stream specified in ``stream``. If it accepts
+            one positional argument, the benchmark framework passes the input
+            group index for L2-evicting input rotation.
         setup_fn: Optional callable for per-iteration setup (barrier resets,
-            output zeroing, etc.). Called BEFORE the timed region so it does
-            not inflate kernel timing.
+            output zeroing, etc.). If it accepts one positional argument, the
+            benchmark framework passes the input group index.
         stream: A (torch.cuda.Stream, CUstream) pair.
         use_host_timer: If True, benchmark with host wall-clock time and
             explicit CUDA synchronization instead of CUDA events. This is less
             pure, but some persistent megakernel paths are not stable under
             event-based timing.
+        input_size_bytes: Total bytes read/written by one input group. When
+            provided, benchmark timing rotates through enough independent input
+            groups to naturally evict the previous group from L2.
+        num_input_groups: Explicit input group count. Overrides the L2-derived
+            count when set.
+        cooldown_ms: Optional post-benchmark idle time. Defaults to the shared
+            benchmark convention when unset.
     """
 
     launch_fn: Callable
     setup_fn: Optional[Callable] = None
     stream: Any = None
     use_host_timer: bool = False
+    input_size_bytes: Optional[int] = None
+    num_input_groups: Optional[int] = None
+    cooldown_ms: Optional[int] = None
     metadata: Optional[str] = None
     _keep_alive: Any = None  # Prevent GC of objects whose GPU memory is referenced by the kernel
+
+
+def cuda_l2_cache_size(device: Optional[Any] = None) -> int:
+    """Return the selected CUDA device L2 cache size in bytes."""
+    props = torch.cuda.get_device_properties(device if device is not None else torch.cuda.current_device())
+    return int(getattr(props, "l2_cache_size", 0) or 0)
+
+
+def recommended_input_group_count(
+    input_size_bytes: Optional[int],
+    *,
+    device: Optional[Any] = None,
+    l2_multiplier: int = 3,
+) -> int:
+    """Choose an input rotation count that naturally evicts L2 residency.
+
+    The convention is one group when a single input group is already at least
+    ``l2_multiplier`` times larger than L2; otherwise allocate enough groups so
+    the rotation footprint exceeds that threshold.
+    """
+    if input_size_bytes is None:
+        return 1
+    input_size_bytes = int(input_size_bytes)
+    if input_size_bytes <= 0:
+        return 1
+    l2_size = cuda_l2_cache_size(device)
+    if l2_size <= 0:
+        return 1
+    target_bytes = int(l2_multiplier) * l2_size
+    if input_size_bytes >= target_bytes:
+        return 1
+    return target_bytes // input_size_bytes + 1
+
+
+def tensor_tree_nbytes(obj: Any, *, unique_storage: bool = True) -> int:
+    """Estimate tensor bytes in a nested object.
+
+    This is useful for benchmark setup code that needs to populate
+    ``KernelBenchSpec.input_size_bytes``. By default each storage is counted
+    once so views do not inflate the input footprint.
+    """
+    seen: set[tuple[int, int]] = set()
+
+    def _walk(value: Any) -> int:
+        if isinstance(value, torch.Tensor):
+            if unique_storage:
+                try:
+                    storage = value.untyped_storage()
+                    key = (int(storage.data_ptr()), int(storage.nbytes()))
+                except RuntimeError:
+                    key = (int(value.data_ptr()), int(value.numel() * value.element_size()))
+                if key in seen:
+                    return 0
+                seen.add(key)
+            return int(value.numel() * value.element_size())
+        if isinstance(value, dict):
+            return sum(_walk(v) for v in value.values())
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return sum(_walk(v) for v in value)
+        return 0
+
+    return _walk(obj)
 
 
 def combine_megakernel_bench_spec(
@@ -143,7 +217,7 @@ def chain_kernel_bench_specs(
 
 def benchmark_cuda_graph(
     fn: Callable,
-    warmup: int = 25,
+    warmup: int = 500,
     rep: int = 100,
 ) -> float:
     """Benchmark a callable using CUDA graph capture + CUDA event timing.
@@ -179,19 +253,18 @@ def benchmark_cuda_graph(
             graph.replay()
     torch.cuda.synchronize()
 
-    # Timed runs with CUDA events
+    # Timed runs with two CUDA events around the full profiling loop.
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    times = []
     with torch.cuda.stream(stream):
+        start.record(stream)
         for _ in range(rep):
-            start.record(stream)
             graph.replay()
-            end.record(stream)
-            stream.synchronize()
-            times.append(start.elapsed_time(end))
+        end.record(stream)
 
-    return sum(times) / len(times)
+    end.synchronize()
+    time.sleep(0.5)
+    return start.elapsed_time(end) / rep
 
 
 # =============================================================================
@@ -204,7 +277,7 @@ def benchmark_jit_kernel(
     *,
     workspace_generator: Optional[Callable[[], Any]] = None,
     kernel_arguments: Optional[Any] = None,
-    warmup_iterations: int = 10,
+    warmup_iterations: int = 500,
     iterations: int = 100,
     workspace_count: int = 10,
     stream: Optional[Any] = None,
@@ -216,6 +289,7 @@ def benchmark_jit_kernel(
     This provides more accurate timing than PyTorch benchmarking because it:
     - Uses CUDA events for precise GPU timing
     - Supports workspace rotation to avoid L2 cache effects
+    - Uses a 500 warmup / 100 profiling iteration convention by default
     - Can use CUDA graphs for reduced launch overhead
 
     Args:
@@ -586,7 +660,7 @@ def memory_throughput(bytes_transferred: int, time_us: float) -> float:
 def compare_kernels(
     kernels: dict[str, Callable],
     workspace_generator: Optional[Callable] = None,
-    warmup_iterations: int = 10,
+    warmup_iterations: int = 500,
     iterations: int = 100,
     workspace_count: int = 10,
     bytes_transferred: Optional[int] = None,

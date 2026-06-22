@@ -36,12 +36,12 @@ Page layout (2-stage double buffer):
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, const_expr
 
 from machete.megakernel.ops import Op, DEFAULT_PAGE_SIZE
 from machete.megakernel.interpreter import (
     mbarrier_init,
-    mbarrier_init_fence,
+    mbarrier_init_fence_async_proxy,
     mbarrier_arrive,
     mbarrier_arrive_expect_tx,
     mbarrier_wait,
@@ -191,9 +191,11 @@ class MoeGemmBwdOp(Op):
         with cute.arch.elect_one():
             mbarrier_init(_bf_0, Int32(1))
             mbarrier_init(_bf_1, Int32(1))
-            mbarrier_init(_nr_0, Int32(1))
-            mbarrier_init(_nr_1, Int32(1))
-        mbarrier_init_fence()
+            if const_expr(self.num_n_blocks > 2):
+                mbarrier_init(_nr_0, Int32(1))
+                mbarrier_init(_nr_1, Int32(1))
+        if const_expr(self.num_n_blocks > 2):
+            mbarrier_init_fence_async_proxy()
 
         _n_block = Int32(0)
         while _n_block < Int32(self.num_n_blocks):
@@ -547,8 +549,7 @@ class MoeGemmBwdOp(Op):
             cute.group_modes(gDX, 0, 2),
         )
 
-        with cute.arch.elect_one():
-            cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_K, tile_M)])
+        cute.copy(dx_tma, tDXsDX, tDXgDX[(None, tile_K, tile_M)])
 
     # =========================================================================
     # Scheduling

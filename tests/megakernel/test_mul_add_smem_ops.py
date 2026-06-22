@@ -19,7 +19,6 @@ from cutlass import Int32, Int64
 from cutlass.cute.nvgpu.cpasync import (
     CopyBulkG2SOp,
     CopyBulkS2GOp,
-    group_bulk_copy_modes,
 )
 from machete.megakernel.megakernel import Megakernel
 from machete.megakernel.ops import Op
@@ -75,7 +74,8 @@ class MulTwoOp(Op):
         # Signal work_mbar with expected tx bytes + issue async copy
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
+        gsrc = cute.group_modes(g_tile, 0, 1)
+        sdst = cute.group_modes(s_tile, 0, 1)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -102,7 +102,8 @@ class MulTwoOp(Op):
             cute.make_layout((self.tile_size_M,)),
         )
 
-        ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+        ssrc = cute.group_modes(s_tile, 0, 1)
+        gdst = cute.group_modes(g_tile, 0, 1)
         cute.copy(s2g, ssrc, gdst)
 
 
@@ -129,7 +130,8 @@ class AddTwoOp(Op):
 
         mbar_ptr = cute.make_ptr(cutlass.Int64, work_mbar, cute.AddressSpace.smem)
         mbarrier_arrive_expect_tx(work_mbar, nbytes)
-        gsrc, sdst = group_bulk_copy_modes(g_tile, s_tile)
+        gsrc = cute.group_modes(g_tile, 0, 1)
+        sdst = cute.group_modes(s_tile, 0, 1)
         cute.copy(g2s, gsrc, sdst, mbar_ptr=mbar_ptr)
 
     @cute.jit
@@ -156,7 +158,8 @@ class AddTwoOp(Op):
             cute.make_layout((self.tile_size_M,)),
         )
 
-        ssrc, gdst = group_bulk_copy_modes(s_tile, g_tile)
+        ssrc = cute.group_modes(s_tile, 0, 1)
+        gdst = cute.group_modes(g_tile, 0, 1)
         cute.copy(s2g, ssrc, gdst)
 
 
@@ -184,6 +187,51 @@ class TestSmemPipelinedOps:
         ops = (MulTwoOp.schedule(x=x, y=y, tile_sizes={"M": TILE_ELEMS})
                + AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS}))
         Megakernel(ops).run()
+        torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
+
+    def test_dim_window_single_op_dispatches_physical_tile(self):
+        x = torch.arange(4 * TILE_ELEMS, dtype=torch.float16, device="cuda")
+        y = torch.full_like(x, -1)
+
+        ops = MulTwoOp.schedule(
+            x=x,
+            y=y,
+            tile_sizes={"M": TILE_ELEMS},
+            dim_windows={"M": (2 * TILE_ELEMS, TILE_ELEMS)},
+        )
+        Megakernel(ops).run()
+
+        torch.testing.assert_close(y[: 2 * TILE_ELEMS], torch.full_like(y[: 2 * TILE_ELEMS], -1))
+        torch.testing.assert_close(
+            y[2 * TILE_ELEMS : 3 * TILE_ELEMS],
+            x[2 * TILE_ELEMS : 3 * TILE_ELEMS] * 2,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+        torch.testing.assert_close(y[3 * TILE_ELEMS :], torch.full_like(y[3 * TILE_ELEMS :], -1))
+
+    def test_dim_windowed_producers_feed_full_consumer(self):
+        x = torch.arange(2 * TILE_ELEMS, dtype=torch.float16, device="cuda")
+        y = torch.empty_like(x)
+        z = torch.empty_like(x)
+
+        ops = (
+            MulTwoOp.schedule(
+                x=x,
+                y=y,
+                tile_sizes={"M": TILE_ELEMS},
+                dim_windows={"M": (0, TILE_ELEMS)},
+            )
+            + MulTwoOp.schedule(
+                x=x,
+                y=y,
+                tile_sizes={"M": TILE_ELEMS},
+                dim_windows={"M": (TILE_ELEMS, TILE_ELEMS)},
+            )
+            + AddTwoOp.schedule(a=y, b=z, tile_sizes={"M": TILE_ELEMS})
+        )
+        Megakernel(ops).run()
+
         torch.testing.assert_close(z, x * 2 + 2, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

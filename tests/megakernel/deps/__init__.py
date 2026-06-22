@@ -24,12 +24,6 @@ test_many_to_one_tile_ratio.py
     Producer (2D) feeds consumer (1D), producer collapses over N dimension.
     Pattern: A(M x N) -> B(M), expected = N signals per barrier
 
-test_producer_only_dims.py
-    Alias for many:1 pattern - producer has dims consumer doesn't use.
-
-test_consumer_only_dims.py
-    Alias for 1:many pattern - consumer has dims producer doesn't use.
-
 test_chain_mixed_sizes.py
     Chains with alternating 1D and 2D ops.
     Tests dimension expansion and collapse in multi-op chains.
