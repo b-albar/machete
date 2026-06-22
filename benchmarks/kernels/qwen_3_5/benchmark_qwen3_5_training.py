@@ -35,15 +35,13 @@ from machete.utils.benchmark_utils import KernelBenchSpec
 from machete.utils.output import suppress_stdout_stderr, suppress_torch_compile_logs
 
 DEFAULT_PAGE_SIZE = 32768
+DEFAULT_BATCHES = [1, 4]
+DEFAULT_SEQ_LENS = [128, 512, 1024, 2048, 4096]
 CONFIGS = [
-    (1, 128, DEFAULT_PAGE_SIZE, "forward"),
-    (1, 128, DEFAULT_PAGE_SIZE, "backward"),
-    (1, 512, DEFAULT_PAGE_SIZE, "forward"),
-    (1, 512, DEFAULT_PAGE_SIZE, "backward"),
-    (4, 128, DEFAULT_PAGE_SIZE, "forward"),
-    (4, 128, DEFAULT_PAGE_SIZE, "backward"),
-    (4, 512, DEFAULT_PAGE_SIZE, "forward"),
-    (4, 512, DEFAULT_PAGE_SIZE, "backward"),
+    (batch, seq_len, DEFAULT_PAGE_SIZE, direction)
+    for batch in DEFAULT_BATCHES
+    for seq_len in DEFAULT_SEQ_LENS
+    for direction in ("forward", "backward")
 ]
 MACHETE_VARIANTS = ("default",)
 POINTWISE_PAGE_SIZE_OVERRIDE = 0
@@ -259,8 +257,8 @@ def bench_qwen35_block(batch: int, seq_len: int, page_size: int, direction: str)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, nargs="+", default=[1, 4])
-    parser.add_argument("--seq-len", type=int, nargs="+", default=[128, 512])
+    parser.add_argument("--batch", type=int, nargs="+", default=DEFAULT_BATCHES)
+    parser.add_argument("--seq-len", type=int, nargs="+", default=DEFAULT_SEQ_LENS)
     parser.add_argument("--page-size", type=int, nargs="+", default=[DEFAULT_PAGE_SIZE])
     parser.add_argument(
         "--pointwise-page-size",

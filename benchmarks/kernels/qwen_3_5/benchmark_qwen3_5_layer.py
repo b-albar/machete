@@ -10,6 +10,8 @@ block benchmark.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -29,12 +31,15 @@ from machete.kernels.qwen_3_5.qwen_3_5_forward import (
 )
 from machete.kernels.qwen_3_5.sm120 import QWEN3_5_EPS
 from machete.megakernel import Megakernel, MegakernelConfig, OverlapTileScheduler
+from machete.megakernel.ops import AccessRegions, Op, iter_tensor_access_regions
 from machete.utils.benchmark import Benchmark
 from machete.utils.benchmark_utils import KernelBenchSpec
 from machete.utils.output import suppress_stdout_stderr, suppress_torch_compile_logs
 
 
 DEFAULT_PAGE_SIZE = 32768
+DEFAULT_BATCHES = [1]
+DEFAULT_SEQ_LENS = [128, 512, 1024, 2048, 4096]
 HIDDEN = 1024
 INTERMEDIATE = 3584
 NUM_Q_HEADS = 8
@@ -46,9 +51,9 @@ KV_GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS
 D2 = 32
 
 CONFIGS = [
-    (128, 1, DEFAULT_PAGE_SIZE),
-    (512, 1, DEFAULT_PAGE_SIZE),
-    (1024, 1, DEFAULT_PAGE_SIZE),
+    (seq_len, batch, DEFAULT_PAGE_SIZE)
+    for seq_len in DEFAULT_SEQ_LENS
+    for batch in DEFAULT_BATCHES
 ]
 
 BENCH_USE_PACKED_QKV_PROJECTION = True
@@ -64,6 +69,7 @@ BENCH_BWD_SCHEDULER = "overlap-adaptive"
 BENCH_BWD_FETCH_STRIDE = 16
 BENCH_PROJECTION_BWD_INPUT_TILE_S = 0
 BENCH_PROJECTION_BWD_REDUCE_TILE_N = 0
+BENCH_REGION_MODE = "fine"
 
 
 def _configs_with_fetch_stride(fetch_stride: int):
@@ -125,6 +131,77 @@ def _scheduler(variant: str, fetch_stride: int | None = None):
     raise ValueError(f"unknown scheduler variant: {variant}")
 
 
+def _default_access_regions_for_cls(cls, op):
+    return Op.access_regions.__func__(cls, op)
+
+
+def _rename_region_axes(access, prefix: str):
+    return tuple(
+        replace(
+            region,
+            axes=tuple(
+                replace(axis, name=f"{prefix}_{region.tensor}_{axis.name}")
+                for axis in region.axes
+            ),
+            group_dim=None,
+            group_count=None,
+            group_index=None,
+            group_index_dim=None,
+            group_index_all=False,
+            prefix_dim=None,
+            prefix_index_dim=None,
+            prefix_group_count=None,
+        )
+        for region in iter_tensor_access_regions(access)
+    )
+
+
+def _whole_tensor_access_regions_for_cls(cls, op):
+    regions = _default_access_regions_for_cls(cls, op)
+    return AccessRegions(
+        reads={
+            name: renamed[0] if len(renamed) == 1 else renamed
+            for name, access in regions.reads.items()
+            for renamed in (_rename_region_axes(access, "read"),)
+        },
+        writes={
+            name: renamed[0] if len(renamed) == 1 else renamed
+            for name, access in regions.writes.items()
+            for renamed in (_rename_region_axes(access, "write"),)
+        },
+    )
+
+
+@contextmanager
+def _region_mode_context(ops, region_mode: str):
+    if region_mode == "fine":
+        yield
+        return
+    if region_mode not in ("coarse", "whole"):
+        raise ValueError(f"unknown region mode: {region_mode}")
+
+    saved = []
+    replacement = (
+        _default_access_regions_for_cls
+        if region_mode == "coarse"
+        else _whole_tensor_access_regions_for_cls
+    )
+    for op in ops:
+        op_cls = op.op_cls
+        if any(existing_cls is op_cls for existing_cls, _has_attr, _value in saved):
+            continue
+        saved.append((op_cls, "access_regions" in op_cls.__dict__, op_cls.__dict__.get("access_regions")))
+        op_cls.access_regions = classmethod(replacement)
+    try:
+        yield
+    finally:
+        for op_cls, had_attr, value in reversed(saved):
+            if had_attr:
+                op_cls.access_regions = value
+            else:
+                delattr(op_cls, "access_regions")
+
+
 def _rope_tables(seq_len: int, dtype: torch.dtype, device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
     pos = torch.arange(seq_len, device=device, dtype=torch.float32)
     dims = torch.arange(D2, device=device, dtype=torch.float32)
@@ -171,6 +248,7 @@ def megakernel_forward_build(
     split_attention_splits: int = 1,
     attention_tile_m: int | None = None,
     forward_op_limit: int | None = None,
+    region_mode: str = "fine",
 ):
     forward = schedule_qwen3_5_forward_ops(
         batch,
@@ -211,23 +289,24 @@ def megakernel_forward_build(
     ops = forward.ops
 
     with suppress_stdout_stderr():
-        kernel = Megakernel(
-            ops,
-            config=_config_for(
+        with _region_mode_context(ops, region_mode):
+            kernel = Megakernel(
                 ops,
-                page_size,
-                tracing=tracing,
-                num_pages=num_pages,
-                page_free_extra_slots=page_free_extra_slots,
-            ),
-            scheduler=scheduler,
-        )
-        spec = kernel.bench_spec(
-            keep_alive=[
-                x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
-                w_o, mlp_norm, w_gate_up, w_down, *forward.keep_alive, kernel,
-            ]
-        )
+                config=_config_for(
+                    ops,
+                    page_size,
+                    tracing=tracing,
+                    num_pages=num_pages,
+                    page_free_extra_slots=page_free_extra_slots,
+                ),
+                scheduler=scheduler,
+            )
+            spec = kernel.bench_spec(
+                keep_alive=[
+                    x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
+                    w_o, mlp_norm, w_gate_up, w_down, *forward.keep_alive, kernel,
+                ]
+            )
     return spec, forward.output, forward.residual
 
 
@@ -257,6 +336,7 @@ def megakernel_layer_bwd_build(
     attention_bwd_batch_window: int = 4,
     projection_bwd_input_tile_s: int | None = None,
     projection_bwd_reduce_tile_n: int | None = None,
+    region_mode: str = "fine",
 ):
     backward = schedule_qwen3_5_backward_ops(
         batch,
@@ -283,23 +363,24 @@ def megakernel_layer_bwd_build(
     ops = backward.ops
 
     with suppress_stdout_stderr():
-        kernel = Megakernel(
-            ops,
-            config=_config_for(
+        with _region_mode_context(ops, region_mode):
+            kernel = Megakernel(
                 ops,
-                page_size,
-                tracing=tracing,
-                num_pages=num_pages,
-                page_free_extra_slots=page_free_extra_slots,
-            ),
-            scheduler=scheduler,
-        )
-        spec = kernel.bench_spec(
-            keep_alive=[
-                x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
-                w_o, mlp_norm, w_gate_up, w_down, *backward.keep_alive, kernel,
-            ]
-        )
+                config=_config_for(
+                    ops,
+                    page_size,
+                    tracing=tracing,
+                    num_pages=num_pages,
+                    page_free_extra_slots=page_free_extra_slots,
+                ),
+                scheduler=scheduler,
+            )
+            spec = kernel.bench_spec(
+                keep_alive=[
+                    x, residual, attn_norm, w_q, w_k, w_v, q_norm, k_norm, cos, sin,
+                    w_o, mlp_norm, w_gate_up, w_down, *backward.keep_alive, kernel,
+                ]
+            )
     return spec, backward.output
 
 
@@ -543,7 +624,7 @@ def run_incremental(batch, seqs, steps, *, page_size=DEFAULT_PAGE_SIZE,
                     use_fused_rms_proj=False, use_qknorm_4d=True,
                     use_tma_attention=True, use_split_attention=True,
                     split_attention_splits=1, use_two_page_attention=False,
-                    use_three_page_attention=False):
+                    use_three_page_attention=False, region_mode="fine"):
     import contextlib, io
     if use_tma_attention and not use_split_attention:
         use_packed_qkv_projection = False
@@ -566,7 +647,8 @@ def run_incremental(batch, seqs, steps, *, page_size=DEFAULT_PAGE_SIZE,
                     use_three_page_attention=use_three_page_attention,
                     use_split_attention=use_split_attention,
                     split_attention_splits=split_attention_splits,
-                    forward_op_limit=op_limit)
+                    forward_op_limit=op_limit,
+                    region_mode=region_mode)
             if spec.setup_fn is not None:
                 spec.setup_fn()
             spec.launch_fn(); torch.cuda.synchronize()
@@ -636,9 +718,10 @@ def _build_traced_forward(
 @Benchmark.configs(["seq_len", "batch", "page_size", "fetch_stride"], _configs_with_fetch_stride(0))
 def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_stride: int = 0):
     args = _alloc_layer(batch, seq_len)
+    mk_name = "megakernel" if BENCH_REGION_MODE == "fine" else f"megakernel_{BENCH_REGION_MODE}"
     return {
         "torch_compile": _torch_forward_spec(batch, seq_len, page_size),
-        "megakernel": megakernel_forward_build(
+        mk_name: megakernel_forward_build(
             *args,
             page_size=page_size,
             scheduler=_scheduler("qwen-causal-rank", fetch_stride),
@@ -651,6 +734,7 @@ def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_strid
             use_split_attention=BENCH_USE_SPLIT_ATTENTION,
             split_attention_splits=BENCH_SPLIT_ATTENTION_SPLITS,
             attention_tile_m=BENCH_ATTENTION_TILE_M,
+            region_mode=BENCH_REGION_MODE,
         )[0],
     }
 
@@ -658,9 +742,10 @@ def bench_qwen35_layer_fwd(seq_len: int, batch: int, page_size: int, fetch_strid
 @Benchmark.configs(["seq_len", "batch", "page_size", "fetch_stride"], _configs_with_fetch_stride(0))
 def bench_qwen35_layer_bwd(seq_len: int, batch: int, page_size: int, fetch_stride: int = 0):
     args = _alloc_layer(batch, seq_len)
+    mk_name = "megakernel" if BENCH_REGION_MODE == "fine" else f"megakernel_{BENCH_REGION_MODE}"
     return {
         "torch_compile": _torch_backward_spec(batch, seq_len, page_size),
-        "megakernel": megakernel_layer_bwd_build(
+        mk_name: megakernel_layer_bwd_build(
             *args,
             page_size=page_size,
             scheduler=_scheduler(BENCH_BWD_SCHEDULER, fetch_stride),
@@ -674,14 +759,15 @@ def bench_qwen35_layer_bwd(seq_len: int, batch: int, page_size: int, fetch_strid
                 if BENCH_PROJECTION_BWD_REDUCE_TILE_N <= 0
                 else BENCH_PROJECTION_BWD_REDUCE_TILE_N
             ),
+            region_mode=BENCH_REGION_MODE,
         )[0],
     }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, nargs="+", default=[1])
-    parser.add_argument("--seq-len", type=int, nargs="+", default=[128])
+    parser.add_argument("--batch", type=int, nargs="+", default=DEFAULT_BATCHES)
+    parser.add_argument("--seq-len", type=int, nargs="+", default=DEFAULT_SEQ_LENS)
     parser.add_argument("--page-size", type=int, nargs="+", default=[DEFAULT_PAGE_SIZE])
     parser.add_argument("--direction", choices=["forward", "backward"], nargs="+", default=["forward", "backward"])
     parser.add_argument(
@@ -707,6 +793,16 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Use the experimental projection backward reduce-split path; 0 disables it.",
+    )
+    parser.add_argument(
+        "--region-mode",
+        choices=["fine", "coarse", "whole"],
+        default="fine",
+        help=(
+            "Dependency-region mode for Machete. 'fine' uses op-declared regions; "
+            "'coarse' uses base tensor/tile regions without Qwen-specific groups; "
+            "'whole' forces every dependency to wait for the full producer tensor surface."
+        ),
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rep", type=int, default=20)
@@ -808,7 +904,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     args.split_attention = args.attention_path == "split"
-    args.tma_attention = args.attention_path == "tma"
+    args.tma_attention = args.attention_path in ("tma", "split")
     if args.two_page_attention:
         args.three_page_attention = False
 
@@ -824,6 +920,7 @@ if __name__ == "__main__":
     BENCH_BWD_SCHEDULER = args.bwd_scheduler
     BENCH_PROJECTION_BWD_INPUT_TILE_S = args.projection_bwd_input_tile_s
     BENCH_PROJECTION_BWD_REDUCE_TILE_N = args.projection_bwd_reduce_tile_n
+    BENCH_REGION_MODE = args.region_mode
 
     if args.incremental:
         for batch in args.batch:
@@ -840,6 +937,7 @@ if __name__ == "__main__":
             use_three_page_attention=args.three_page_attention,
             use_split_attention=args.split_attention,
             split_attention_splits=args.split_attention_splits,
+            region_mode=args.region_mode,
         )
         sys.exit(0)
 

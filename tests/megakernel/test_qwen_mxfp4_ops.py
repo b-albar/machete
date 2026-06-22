@@ -170,6 +170,10 @@ def test_qwen_forward_layer_dependencies_are_region_declared():
         if glu_x_edges:
             assert [dep.mode for dep in glu_x_edges] == ["declared_group", "declared_group"]
             assert [dep.consumer_region_index for dep in glu_x_edges] == [0, 1]
+            glu_waits = builder.dependency_plan().formulas[glu_x_edges[0].consumer_idx][0]
+            assert len(glu_waits) == 2
+            assert [wait.expected for wait in glu_waits] == [4, 4]
+            assert [wait.offset for wait in glu_waits] == [0, 14]
         assert builder.dependency_plan().barrier_count > 0
 
 

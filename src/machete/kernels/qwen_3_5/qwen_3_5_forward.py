@@ -41,6 +41,7 @@ from machete.kernels.decode_matvec import ResidualAddSm120Op as _BaseResidualAdd
 from machete.kernels.gemm import GemmOp as _BaseGemmOp
 from machete.kernels.gemm.gemm import (
     ProjectionDaReduceGemmOp,
+    _gemm_compute_unscaled_core,
     _gemm_epilogue_store_no_mbar_inval_helper,
 )
 from machete.kernels.glu import DirectGLUOp, GLUBwdOp, GLUOp as _BaseGLUOp
@@ -832,7 +833,14 @@ class Qwen3_5ForwardProjectionOp(_BaseGemmOp):
         if n_extent in (KV_DIM, Q_DIM + KV_DIM, Q_DIM + 2 * KV_DIM):
             group_elems = KV_DIM
         elif n_extent == 2 * INTERMEDIATE:
-            group_elems = int(n_axis.tile_size)
+            # Qwen's DirectGLU consumes gate_up in 256-wide D chunks: one
+            # chunk from the gate half and one matching chunk from the up half.
+            # The gate_up projection may use smaller N tiles (64/128), so its
+            # dependency-visible write groups must aggregate producer tiles to
+            # the same 256-wide unit. Otherwise GLU can start after only the
+            # first producer tile of a chunk has completed and read partially
+            # initialized data.
+            group_elems = 256
         else:
             return AccessRegions(reads=reads, writes=regions.writes)
         group_tiles = max(1, group_elems // int(n_axis.tile_size))
@@ -3242,6 +3250,8 @@ class Qwen3_5ForwardThreePageTmaAttentionOp(Qwen3_5ForwardTmaAttentionOp):
             op.static_dims["tma_separate_kv_pages"] = 1
             op.static_dims["tma_scratch_after_k"] = scratch_after_k
             op.static_dims["tma_chunked_kv_swizzle"] = 1
+            if kwargs.get("k") is not None and int(kwargs["k"].shape[1]) >= 2048:
+                op.static_dims["tma_flash_kv_layout"] = 1
             op.static_dims["tma_even_n_block"] = int(int(kwargs["k"].shape[1]) % n_block == 0) if kwargs.get("k") is not None else 0
             op.static_dims.setdefault("num_mma_warps", max(1, tile_m // 16))
         return ops
@@ -3418,9 +3428,6 @@ class Qwen3_5ForwardDirectGLUOp(DirectGLUOp):
     writes = DirectGLUOp.writes
     tile = DirectGLUOp.tile
     dynamic_dims = ("B", "S")
-    inline_phases = ("load", "compute", "store")
-    tma_loads = {"x"}
-    tma_stores = {"y"}
 
     @classmethod
     def access_regions(cls, op) -> AccessRegions:
@@ -3917,6 +3924,65 @@ class Qwen3_5ProjectionDaReduceGemmOp(ProjectionDaReduceGemmOp):
             )
         reads["a"] = a_region
         return AccessRegions(reads=reads, writes=regions.writes)
+
+
+class Qwen3_5SplitKDownReduceOp(ProjectionDaReduceGemmOp):
+    """Forward down partial GEMM with scheduler-visible K chunks.
+
+    Computes ``c += a[:, :, K_r] @ b[:, K_r]^T`` for each R chunk using TMA
+    reduce-add. The output must be initialized before this op runs.
+    """
+
+    @cute.jit
+    def compute(self, page_ptr):
+        tidx = cute.arch.thread_idx()[0]
+        if tidx < Int32(self.num_mma_threads):
+            _gemm_compute_unscaled_core(
+                page_ptr,
+                tidx,
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.num_mma_warps,
+                1,
+                self.num_mma_threads,
+                self.tile_size_S,
+                self.tile_size_N,
+                self.tile_K,
+                self.buf_stride,
+                self.b_offset,
+                self.mbar_offset,
+                self.swz_B_ab,
+                self.swz_B_c,
+                0,
+                Int32(self.num_k_blocks),
+            )
+
+    @classmethod
+    def access_regions(cls, op) -> AccessRegions:
+        regions = super().access_regions(op)
+        a_region = regions.reads.get("a")
+        if not isinstance(a_region, TensorAccessRegion):
+            return regions
+        reads = dict(regions.reads)
+        reads["a"] = replace(
+            a_region,
+            group_index_dim="K",
+            group_index_group_tiles=1,
+        )
+        return AccessRegions(reads=reads, writes=regions.writes)
+
+    @classmethod
+    def schedule(cls, *, reduce_tile_n=256, tile_sizes=None, page_size=DEFAULT_PAGE_SIZE, **tensors):
+        ops = super().schedule(
+            reduce_tile_n=reduce_tile_n,
+            tile_sizes=tile_sizes,
+            page_size=page_size,
+            **tensors,
+        )
+        for op in ops:
+            op.static_dims["barrier_allow_piecewise_overlap"] = 1
+        return ops
 
 
 class Qwen3_5ForwardOverlapScheduler(OverlapTileScheduler):
