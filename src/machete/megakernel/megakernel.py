@@ -920,6 +920,12 @@ class Megakernel:
 
         for op_idx, op in enumerate(self.ops):
             _wait_formulas, _signal_formulas = formulas.get(op_idx, ([], []))
+            signal_count = (
+                self._builder._op_signal_counts.get(op_idx, 0)
+                + self._builder._op_compute_signal_counts.get(op_idx, 0)
+            )
+            if signal_count == 0:
+                signal_count = len(_signal_formulas)
             op_meta.extend(
                 build_compute_only_op_metadata_entry(
                     handler_idx=op_handler_indices[op_idx],
@@ -930,9 +936,7 @@ class Megakernel:
                     compute_wait_count=self._builder._op_compute_wait_counts.get(
                         op_idx, 0
                     ),
-                    signal_count=self._builder._op_signal_counts.get(
-                        op_idx, len(_signal_formulas)
-                    ),
+                    signal_count=signal_count,
                     wait_acquire=op.static_dims.get("barrier_wait_acquire", 0),
                     origins=(
                         op.tile_origin_for_axis(axis)
